@@ -1,14 +1,14 @@
 # DORIS - Deep Ocean Research and Imaging System
 # BlueOS Extension Dockerfile
 
-# Stage 1: Build frontend
-FROM node:20-slim AS frontend-builder
+# Stage 1: Build frontend (on native platform - output is platform-independent)
+FROM --platform=$BUILDPLATFORM node:20-slim AS frontend-builder
 
 WORKDIR /frontend
 
-# Install dependencies
+# Install dependencies (increased timeout for slow ARM emulation)
 COPY frontend/package.json frontend/yarn.lock ./
-RUN yarn install --frozen-lockfile
+RUN yarn config set network-timeout 600000 && yarn install --frozen-lockfile
 
 # Copy source and build
 COPY frontend/ ./
