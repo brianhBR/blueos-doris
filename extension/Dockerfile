@@ -95,7 +95,7 @@ LABEL type="device-integration"
 
 ARG REPO=blueos-doris-extension
 ARG OWNER=bluerobotics
-LABEL readme='https://raw.githubusercontent.com/bluerobotics/blueos-doris-extension/{tag}/README.md'
+LABEL readme='https://raw.githubusercontent.com/bluerobotics/blueos-doris-extension/{tag}/extension/README.md'
 LABEL links='{\
     "website": "https://bluerobotics.com",\
     "source": "https://github.com/bluerobotics/blueos-doris-extension"\
