@@ -23,6 +23,7 @@ jobs:
           docker-password: ${{ secrets.DOCKER_PASSWORD }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           image-name: ${{ env.IMAGE_NAME }}
+          dockerfile-location: ./extension
 
   deploy-ghcr:
     runs-on: ubuntu-latest
