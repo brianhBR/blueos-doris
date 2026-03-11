@@ -26,6 +26,19 @@ def register_sensor_routes(app: Robyn) -> None:
                 headers={"Content-Type": "application/json"},
             )
 
+    @app.get("/api/v1/sensors/streams")
+    async def get_video_streams(request):
+        """Get all available video streams from the Camera Manager."""
+        try:
+            streams = await sensor_service.get_video_streams()
+            return json.dumps([s.model_dump(mode="json") for s in streams])
+        except Exception as e:
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+
     @app.get("/api/v1/sensors/:sensor_id/readings")
     async def get_sensor_readings(request):
         """Get recent readings from a specific sensor."""

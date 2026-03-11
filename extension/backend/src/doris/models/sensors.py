@@ -19,6 +19,25 @@ class ModuleInfo(BaseModel):
     firmware_version: str | None = None
 
 
+class VideoStream(BaseModel):
+    """A video stream from the Camera Manager."""
+
+    id: str
+    name: str
+    running: bool
+    error: str | None = None
+    encode: str | None = None
+    width: int | None = None
+    height: int | None = None
+    fps: int | None = None
+    endpoints: list[str] = []
+    source_type: str | None = None
+    manufacturer: str | None = None
+    model: str | None = None
+    serial_number: str | None = None
+    firmware_version: str | None = None
+
+
 class SensorReading(BaseModel):
     """A sensor data reading."""
 

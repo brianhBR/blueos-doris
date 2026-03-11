@@ -1,14 +1,19 @@
 """Sensor and module service."""
 
+import logging
 from datetime import datetime
+from typing import Any
 
 from ..config import blueos_services
 from ..models.sensors import (
     ModuleInfo,
     SensorConfig,
     SensorReading,
+    VideoStream,
 )
 from .base import BlueOSClient
+
+logger = logging.getLogger(__name__)
 
 
 class SensorService:
@@ -17,6 +22,7 @@ class SensorService:
     def __init__(self):
         self.ping_service = BlueOSClient(blueos_services.ping_service)
         self.mavlink2rest = BlueOSClient(blueos_services.mavlink2rest)
+        self.camera_manager = BlueOSClient(blueos_services.camera_manager)
 
     async def get_connected_modules(self) -> list[ModuleInfo]:
         """Get all connected modules."""
@@ -89,23 +95,71 @@ class SensorService:
         except Exception:
             return False
 
-    async def _get_camera_module(self) -> ModuleInfo | None:
-        """Get camera module info."""
+    async def get_video_streams(self) -> list[VideoStream]:
+        """Get all video streams from the Camera Manager."""
         try:
-            camera_client = BlueOSClient(blueos_services.camera_manager)
-            cameras = await camera_client.get("/cameras")
-            await camera_client.close()
+            streams_data: list[dict[str, Any]] = await self.camera_manager.get(  # type: ignore[assignment]
+                "/streams"
+            )
+            streams: list[VideoStream] = []
+            for s in streams_data:
+                vs = s.get("video_and_stream", {})
+                stream_info = vs.get("stream_information", {})
+                config = stream_info.get("configuration", {})
+                video_source = vs.get("video_source", {})
 
-            if cameras:
-                cam = cameras[0]
+                source_type, source_details = self._parse_video_source(video_source)
+                frame_interval = config.get("frame_interval", {})
+                denominator = frame_interval.get("denominator", 0)
+                numerator = frame_interval.get("numerator", 1)
+                fps = int(denominator / numerator) if numerator > 0 else None
+
+                streams.append(
+                    VideoStream(
+                        id=s.get("id", ""),
+                        name=vs.get("name", "Unknown"),
+                        running=s.get("running", False),
+                        error=s.get("error"),
+                        encode=config.get("encode"),
+                        width=config.get("width"),
+                        height=config.get("height"),
+                        fps=fps,
+                        endpoints=stream_info.get("endpoints", []),
+                        source_type=source_type,
+                        manufacturer=source_details.get("manufacturer"),
+                        model=source_details.get("model"),
+                        serial_number=source_details.get("serial_number"),
+                        firmware_version=source_details.get("firmware_version"),
+                    )
+                )
+            return streams
+        except Exception as e:
+            logger.warning(f"Failed to get video streams: {e}")
+            return []
+
+    def _parse_video_source(
+        self, video_source: dict[str, Any]
+    ) -> tuple[str | None, dict[str, Any]]:
+        """Extract source type and metadata from a video_source dict."""
+        for source_type, details in video_source.items():
+            if isinstance(details, dict):
+                return source_type, details
+        return None, {}
+
+    async def _get_camera_module(self) -> ModuleInfo | None:
+        """Get camera module info from the Camera Manager streams."""
+        try:
+            streams = await self.get_video_streams()
+            if streams:
+                first = streams[0]
                 return ModuleInfo(
                     id="camera-1",
                     name="Camera Module",
                     type="camera",
                     status="connected",
-                    module_status="Ready: Active",
+                    module_status="Ready: Active" if first.running else "Stopped",
                     power_usage=95.0,
-                    firmware_version=cam.get("firmware_version"),
+                    firmware_version=first.firmware_version,
                     last_reading=datetime.now().isoformat(),
                 )
         except Exception:
@@ -203,4 +257,5 @@ class SensorService:
         """Close HTTP clients."""
         await self.ping_service.close()
         await self.mavlink2rest.close()
+        await self.camera_manager.close()
 
