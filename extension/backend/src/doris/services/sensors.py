@@ -28,10 +28,9 @@ class SensorService:
         """Get all connected modules."""
         modules = []
 
-        # Get camera module
-        camera = await self._get_camera_module()
-        if camera:
-            modules.append(camera)
+        # Get camera modules (one per video stream)
+        camera_modules = await self._get_camera_modules()
+        modules.extend(camera_modules)
 
         # Get ping/sonar sensors
         ping_modules = await self._get_ping_modules()
@@ -115,25 +114,26 @@ class SensorService:
                 return source_type, details
         return None, {}
 
-    async def _get_camera_module(self) -> ModuleInfo | None:
-        """Get camera module info from the Camera Manager streams."""
+    async def _get_camera_modules(self) -> list[ModuleInfo]:
+        """Get a ModuleInfo for each video stream from the Camera Manager."""
+        modules: list[ModuleInfo] = []
         try:
             streams = await self.get_video_streams()
-            if streams:
-                first = streams[0]
-                return ModuleInfo(
-                    id="camera-1",
-                    name="Camera Module",
-                    type="camera",
-                    status="connected",
-                    module_status="Ready: Active" if first.running else "Stopped",
-                    power_usage=95.0,
-                    firmware_version=first.firmware_version,
-                    last_reading=datetime.now().isoformat(),
+            for stream in streams:
+                modules.append(
+                    ModuleInfo(
+                        id=f"camera-{stream.id}",
+                        name=f"Camera ({stream.name})",
+                        type="camera",
+                        status="connected" if stream.running else "disconnected",
+                        module_status="Ready: Active" if stream.running else "Stopped",
+                        firmware_version=stream.firmware_version,
+                        last_reading=datetime.now().isoformat() if stream.running else None,
+                    )
                 )
-        except Exception:
-            pass
-        return None
+        except Exception as e:
+            logger.warning(f"Failed to get camera modules: {e}")
+        return modules
 
     async def _get_ping_modules(self) -> list[ModuleInfo]:
         """Get ping/sonar sensor modules from GET /v1.0/sensors."""
