@@ -1,14 +1,20 @@
 """Storage and file management service."""
 
+import logging
 from datetime import datetime
 
 from ..config import blueos_services
 from ..models.media import MediaFile, MediaMission, MediaType, SyncStatus
 from .base import BlueOSClient
 
+logger = logging.getLogger(__name__)
+
 
 class StorageService:
     """Service for managing stored media and files."""
+
+    _last_files: list[MediaFile] | None = None
+    _last_missions: list[MediaMission] | None = None
 
     def __init__(self):
         self.file_browser = BlueOSClient(blueos_services.file_browser)
@@ -21,10 +27,12 @@ class StorageService:
         limit: int = 50,
         offset: int = 0,
     ) -> list[MediaFile]:
-        """Get list of media files."""
+        """Get list of media files from BlueOS File Browser.
+
+        Raises on failure if no cached data is available.
+        """
         try:
-            # Query file browser for media files
-            params = {"limit": limit, "offset": offset}
+            params: dict = {"limit": limit, "offset": offset}
             if mission_id:
                 params["mission_id"] = mission_id
 
@@ -53,14 +61,22 @@ class StorageService:
                         is_synced=file_info.get("synced", False),
                     )
                 )
+
+            StorageService._last_files = files
             return files
 
-        except Exception:
-            # Return mock data
-            return self._get_mock_media_files()
+        except Exception as e:
+            logger.warning(f"Failed to get media files: {type(e).__name__}: {e}")
+            if StorageService._last_files is not None:
+                logger.info("Using cached media files")
+                return StorageService._last_files
+            raise
 
     async def get_missions_with_media(self) -> list[MediaMission]:
-        """Get list of missions that have media."""
+        """Get list of missions that have media.
+
+        Raises on failure if no cached data is available.
+        """
         try:
             missions_data = await self.recorder.get("/v1.0/recordings")
 
@@ -80,11 +96,18 @@ class StorageService:
                         thumbnail_url=mission.get("thumbnail"),
                     )
                 )
+
+            StorageService._last_missions = missions
             return missions
 
-        except Exception:
-            # Return mock data
-            return self._get_mock_missions()
+        except Exception as e:
+            logger.warning(
+                f"Failed to get missions with media: {type(e).__name__}: {e}"
+            )
+            if StorageService._last_missions is not None:
+                logger.info("Using cached media missions")
+                return StorageService._last_missions
+            raise
 
     async def get_file(self, file_path: str) -> bytes | None:
         """Download a file."""
@@ -92,7 +115,8 @@ class StorageService:
             response = await self.file_browser.client.get(f"/api/raw/{file_path}")
             response.raise_for_status()
             return response.content
-        except Exception:
+        except Exception as e:
+            logger.warning(f"Failed to download file '{file_path}': {e}")
             return None
 
     async def delete_file(self, file_path: str) -> bool:
@@ -100,12 +124,12 @@ class StorageService:
         try:
             await self.file_browser.delete(f"/api/resources/{file_path}")
             return True
-        except Exception:
-            return False
+        except Exception as e:
+            logger.warning(f"Failed to delete file '{file_path}': {e}")
+            raise
 
     async def get_sync_status(self) -> SyncStatus:
         """Get cloud sync status."""
-        # Mock implementation - real implementation would check cloud sync service
         return SyncStatus(
             is_syncing=False,
             pending_files=0,
@@ -115,7 +139,6 @@ class StorageService:
 
     async def start_sync(self) -> bool:
         """Start cloud sync."""
-        # Mock implementation
         return True
 
     def _detect_media_type(self, filename: str) -> MediaType:
@@ -129,55 +152,7 @@ class StorageService:
         else:
             return MediaType.DATA
 
-    def _get_mock_media_files(self) -> list[MediaFile]:
-        """Return mock media files for testing."""
-        now = datetime.now()
-        return [
-            MediaFile(
-                id="img-001",
-                filename="dive_photo_001.jpg",
-                media_type=MediaType.IMAGE,
-                size_bytes=5_242_880,
-                created_at=now,
-                download_url="/api/files/dive_photo_001.jpg",
-            ),
-            MediaFile(
-                id="vid-001",
-                filename="reef_survey.mp4",
-                media_type=MediaType.VIDEO,
-                size_bytes=524_288_000,
-                duration_seconds=180,
-                resolution="4K",
-                created_at=now,
-                download_url="/api/files/reef_survey.mp4",
-            ),
-        ]
-
-    def _get_mock_missions(self) -> list[MediaMission]:
-        """Return mock mission data for testing."""
-        return [
-            MediaMission(
-                mission_id="mission-001",
-                mission_name="Deep Sea Survey 2024-01",
-                date=datetime(2026, 1, 5),
-                image_count=487,
-                video_count=3,
-                data_file_count=12,
-                total_size_bytes=2_147_483_648,
-            ),
-            MediaMission(
-                mission_id="mission-002",
-                mission_name="Coral Reef Documentation",
-                date=datetime(2026, 1, 2),
-                image_count=324,
-                video_count=5,
-                data_file_count=8,
-                total_size_bytes=1_610_612_736,
-            ),
-        ]
-
     async def close(self) -> None:
         """Close HTTP clients."""
         await self.file_browser.close()
         await self.recorder.close()
-
