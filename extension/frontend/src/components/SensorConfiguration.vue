@@ -1,10 +1,23 @@
 <script setup lang="ts">
-import { ref, watch, nextTick } from 'vue'
+import { ref, watch, nextTick, onMounted, onUnmounted } from 'vue'
 import {
   Gauge, Wifi, WifiOff, Settings, Upload, RefreshCw,
   Camera, Lightbulb, Thermometer, Waves, Activity, Wind, Satellite, Radio
 } from 'lucide-vue-next'
-import type { Screen, SensorModule } from '../types'
+import { useSensors } from '../composables/useApi'
+import type { SensorModule as ApiSensorModule } from '../composables/useApi'
+import type { Screen } from '../types'
+
+interface DisplayModule {
+  id: string
+  name: string
+  type: string
+  connected: boolean
+  power: number
+  sampleRate?: number
+  calibrationFile?: string
+  moduleStatus: string
+}
 
 interface Props {
   targetSensor?: string | null
@@ -18,21 +31,39 @@ const emit = defineEmits<{
   navigate: [screen: Screen]
 }>()
 
-const modules = ref<SensorModule[]>([
-  { id: 1, name: 'Camera', type: 'camera', connected: true, power: 20, moduleStatus: 'Ready: Active' },
-  { id: 2, name: 'Conductivity', type: 'sensor', connected: true, power: 12, sampleRate: 1, calibrationFile: 'ctd_cal_2024.cal', moduleStatus: 'Ready: Active' },
-  { id: 3, name: 'Temperature', type: 'sensor', connected: true, power: 12, sampleRate: 1, calibrationFile: 'ctd_cal_2024.cal', moduleStatus: 'Ready: Active' },
-  { id: 4, name: 'Depth', type: 'sensor', connected: true, power: 12, sampleRate: 1, calibrationFile: 'ctd_cal_2024.cal', moduleStatus: 'Ready: Active' },
-  { id: 5, name: 'Light', type: 'light', connected: true, power: 15, moduleStatus: 'Ready: Active' },
-  { id: 6, name: 'Carbon Dioxide (CO₂)', type: 'sensor', connected: false, power: 0, sampleRate: 1, moduleStatus: 'Disconnected' },
-  { id: 7, name: 'Oxygen (O₂)', type: 'sensor', connected: false, power: 0, sampleRate: 1, moduleStatus: 'Disconnected' },
-  { id: 8, name: 'Iridium', type: 'communication', connected: true, power: 12, moduleStatus: 'Ready: Active' },
-  { id: 9, name: 'LoRa', type: 'communication', connected: true, power: 9, moduleStatus: 'Ready: Active' },
-])
+const { modules: apiModules, fetchModules } = useSensors()
 
-const selectedModule = ref<SensorModule | null>(null)
+const modules = ref<DisplayModule[]>([])
+
+watch(apiModules, (newModules) => {
+  if (newModules.length > 0) {
+    modules.value = newModules.map((m: ApiSensorModule) => ({
+      id: m.id,
+      name: m.name,
+      type: m.type,
+      connected: m.status === 'connected',
+      power: m.power_usage,
+      sampleRate: m.sample_rate ?? undefined,
+      calibrationFile: m.firmware_version ?? undefined,
+      moduleStatus: m.module_status,
+    }))
+  }
+}, { immediate: true })
+
+let pollInterval: number | undefined
+
+onMounted(() => {
+  fetchModules()
+  pollInterval = setInterval(fetchModules, 5000) as unknown as number
+})
+
+onUnmounted(() => {
+  if (pollInterval) clearInterval(pollInterval)
+})
+
+const selectedModule = ref<DisplayModule | null>(null)
 const isDetecting = ref(false)
-const moduleRefs = ref<Record<number, HTMLDivElement | null>>({})
+const moduleRefs = ref<Record<string, HTMLDivElement | null>>({})
 
 const sensorMapping: Record<string, string> = {
   'Camera': 'Camera',
@@ -60,21 +91,19 @@ watch(() => props.targetSensor, (sensor) => {
   }
 }, { immediate: true })
 
-const detectSensors = () => {
+const detectSensors = async () => {
   isDetecting.value = true
-  setTimeout(() => {
-    isDetecting.value = false
-    alert('Sensor detection complete. All modules refreshed.')
-  }, 1500)
+  await fetchModules()
+  isDetecting.value = false
 }
 
-const toggleConnection = (id: number) => {
+const toggleConnection = (id: string) => {
   modules.value = modules.value.map(m =>
     m.id === id ? { ...m, connected: !m.connected, power: !m.connected ? 85 : 0 } : m
   )
 }
 
-const setModuleRef = (id: number, el: HTMLDivElement | null) => {
+const setModuleRef = (id: string, el: HTMLDivElement | null) => {
   moduleRefs.value[id] = el
 }
 

@@ -1,19 +1,27 @@
 <script setup lang="ts">
-import { ref } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { Wifi, Lock, RefreshCw, Signal, AlertCircle, CheckCircle, Smartphone } from 'lucide-vue-next'
-import type { Network } from '../types'
+import { useWifiNetworks } from '../composables/useApi'
 
 const emit = defineEmits<{
   connect: [connected: boolean]
 }>()
 
+const {
+  networks: apiNetworks,
+  connectionStatus: apiConnectionStatus,
+  scanning,
+  fetchNetworks,
+  scanNetworks,
+  connectToNetwork,
+} = useWifiNetworks()
+
 const dorisSerialNumber = 'D-2847-AQ'
-const dorisMACAddress = 'A4:CF:12:8B:3E:D1'
+const dorisMACAddress = computed(() => apiConnectionStatus.value?.mac_address ?? 'A4:CF:12:8B:3E:D1')
 const dorisHotspotName = `DORIS_${dorisSerialNumber}`
 
-const isScanning = ref(false)
 const showAdvanced = ref(true)
-const selectedNetwork = ref<Network | null>(null)
+const selectedNetwork = ref<DisplayNetwork | null>(null)
 const password = ref('')
 const connectionStatus = ref<'idle' | 'connecting' | 'connected' | 'failed'>('idle')
 const manualSSID = ref('')
@@ -24,33 +32,71 @@ const subnetMask = ref('255.255.255.0')
 const gateway = ref('')
 const dnsServer = ref('')
 
-const networks = ref<Network[]>([
-  { ssid: dorisHotspotName, signal: 95, frequency: '2.4GHz', security: 'WPA2', saved: true },
-  { ssid: 'Ocean_Lab_Wifi', signal: 82, frequency: '2.4GHz', security: 'WPA3', saved: false },
-  { ssid: 'Research_Vessel_5G', signal: 65, frequency: '5GHz', security: 'WPA2', saved: false },
-  { ssid: 'BlueROV_Network', signal: 45, frequency: '2.4GHz', security: 'WPA2', saved: false },
-])
-
-const handleScan = () => {
-  isScanning.value = true
-  setTimeout(() => { isScanning.value = false }, 2000)
+interface DisplayNetwork {
+  ssid: string
+  signal: number
+  frequency: string
+  security: string
+  saved: boolean
 }
 
-const handleConnect = () => {
-  connectionStatus.value = 'connecting'
-  setTimeout(() => {
+const networks = computed<DisplayNetwork[]>(() => {
+  if (apiNetworks.value.length > 0) {
+    return apiNetworks.value.map((n) => ({
+      ssid: n.ssid,
+      signal: n.signal_strength,
+      frequency: n.frequency,
+      security: n.security,
+      saved: n.is_saved,
+    }))
+  }
+  return []
+})
+
+let pollInterval: number | undefined
+
+onMounted(() => {
+  fetchNetworks()
+  if (apiConnectionStatus.value?.is_connected) {
     connectionStatus.value = 'connected'
     emit('connect', true)
-  }, 2000)
+  }
+  pollInterval = setInterval(fetchNetworks, 10000) as unknown as number
+})
+
+onUnmounted(() => {
+  if (pollInterval) clearInterval(pollInterval)
+})
+
+const isScanning = computed(() => scanning.value)
+
+const handleScan = async () => {
+  await scanNetworks()
 }
 
-const handleManualConnect = () => {
-  if (manualSSID.value && manualPassword.value) {
-    connectionStatus.value = 'connecting'
-    setTimeout(() => {
-      connectionStatus.value = 'connected'
-      emit('connect', true)
-    }, 2000)
+const handleConnect = async () => {
+  if (!selectedNetwork.value) return
+  connectionStatus.value = 'connecting'
+  const ssid = selectedNetwork.value.ssid
+  const pwd = selectedNetwork.value.saved ? '' : password.value
+  const success = await connectToNetwork(ssid, pwd)
+  if (success) {
+    connectionStatus.value = 'connected'
+    emit('connect', true)
+  } else {
+    connectionStatus.value = 'failed'
+  }
+}
+
+const handleManualConnect = async () => {
+  if (!manualSSID.value || !manualPassword.value) return
+  connectionStatus.value = 'connecting'
+  const success = await connectToNetwork(manualSSID.value, manualPassword.value)
+  if (success) {
+    connectionStatus.value = 'connected'
+    emit('connect', true)
+  } else {
+    connectionStatus.value = 'failed'
   }
 }
 

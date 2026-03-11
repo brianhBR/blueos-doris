@@ -1,119 +1,63 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import {
   Database, Calendar, Clock, MapPin, Camera, Image, FileText, Play,
-  Download, Settings, Trash2, AlertTriangle, Archive, Search, X, Gauge
+  Download, Trash2, AlertTriangle, Archive, Search, X
 } from 'lucide-vue-next'
-import type { Screen, DiveData, Mission } from '../types'
+import { useMissions } from '../composables/useApi'
+import type { MissionSummary } from '../composables/useApi'
+import type { Screen, DiveData } from '../types'
 
 const emit = defineEmits<{
   navigate: [screen: Screen, diveData?: DiveData]
 }>()
 
-const selectedMission = ref<number | null>(null)
+const { missions: apiMissions, fetchMissions, deleteMission } = useMissions()
+
+interface DisplayMission {
+  id: string
+  name: string
+  status: string
+  date: string
+  duration: string
+  location: string
+  maxDepth: number
+  images: number
+  videos: number
+}
+
+const previousMissions = computed<DisplayMission[]>(() => {
+  return apiMissions.value.map((m: MissionSummary) => ({
+    id: m.id,
+    name: m.name,
+    status: m.status,
+    date: new Date(m.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
+    duration: m.duration,
+    location: m.location ?? 'Unknown',
+    maxDepth: m.max_depth ?? 0,
+    images: m.image_count,
+    videos: m.video_count,
+  }))
+})
+
+let pollInterval: number | undefined
+
+onMounted(() => {
+  fetchMissions()
+  pollInterval = setInterval(fetchMissions, 15000) as unknown as number
+})
+
+onUnmounted(() => {
+  if (pollInterval) clearInterval(pollInterval)
+})
+
+const selectedMission = ref<string | null>(null)
 const nameFilter = ref('')
 const dateSort = ref<'recent' | 'oldest'>('recent')
-
-const previousMissions: Mission[] = [
-  {
-    id: 1,
-    name: 'DeepSeaSurvey_20260105143022',
-    configuration: 'DORIS 6 Hour Dive Configuration',
-    date: 'Jan 5, 2026',
-    duration: '3h 45m',
-    location: '41.7128° N, 74.0060° W',
-    maxDepth: 125,
-    images: 487,
-    videos: 3,
-    status: 'completed',
-    calibrationFiles: {
-      camera: 'CAM_CAL_20260105_v2.3.cal',
-      depthSensor: 'DEPTH_CAL_20251220_v1.8.cal',
-      temperature: 'TEMP_CAL_20260102_v3.1.cal',
-      conductivity: 'COND_CAL_20251215_v2.0.cal',
-      imu: 'IMU_CAL_20260101_v4.2.cal'
-    }
-  },
-  {
-    id: 2,
-    name: 'CoralReefDoc_20260102091530',
-    configuration: 'DORIS 4 Hour Dive Configuration',
-    date: 'Jan 2, 2026',
-    duration: '2h 18m',
-    location: '25.7617° N, 80.1918° W',
-    maxDepth: 45,
-    images: 324,
-    videos: 5,
-    status: 'completed',
-    calibrationFiles: {
-      camera: 'CAM_CAL_20260101_v2.3.cal',
-      depthSensor: 'DEPTH_CAL_20251220_v1.8.cal',
-      temperature: 'TEMP_CAL_20260102_v3.1.cal',
-      conductivity: 'COND_CAL_20251215_v2.0.cal',
-      imu: 'IMU_CAL_20260101_v4.2.cal'
-    }
-  },
-  {
-    id: 3,
-    name: 'KelpForestStudy_20251228103045',
-    configuration: 'DORIS 6 Hour Dive Configuration',
-    date: 'Dec 28, 2025',
-    duration: '4h 12m',
-    location: '36.6002° N, 121.8947° W',
-    maxDepth: 78,
-    images: 612,
-    videos: 7,
-    status: 'completed',
-    calibrationFiles: {
-      camera: 'CAM_CAL_20251220_v2.2.cal',
-      depthSensor: 'DEPTH_CAL_20251220_v1.8.cal',
-      temperature: 'TEMP_CAL_20251215_v3.0.cal',
-      conductivity: 'COND_CAL_20251215_v2.0.cal',
-      imu: 'IMU_CAL_20251222_v4.1.cal'
-    }
-  },
-  {
-    id: 4,
-    name: 'ShipwreckInv_20251220074512',
-    configuration: 'DORIS 12 Hour Dive Configuration',
-    date: 'Dec 20, 2025',
-    duration: '5h 30m',
-    location: '42.3601° N, 71.0589° W',
-    maxDepth: 156,
-    images: 893,
-    videos: 12,
-    status: 'completed',
-    calibrationFiles: {
-      camera: 'CAM_CAL_20251220_v2.2.cal',
-      depthSensor: 'DEPTH_CAL_20251220_v1.8.cal',
-      temperature: 'TEMP_CAL_20251215_v3.0.cal',
-      conductivity: 'COND_CAL_20251210_v1.9.cal',
-      imu: 'IMU_CAL_20251218_v4.0.cal'
-    }
-  },
-  {
-    id: 5,
-    name: 'BioLuminescence_20251215195520',
-    configuration: 'DORIS 12 Hour Dive Configuration',
-    date: 'Dec 15, 2025',
-    duration: '6h 05m',
-    location: '32.7157° N, 117.1611° W',
-    maxDepth: 98,
-    images: 1247,
-    videos: 8,
-    status: 'completed',
-    calibrationFiles: {
-      camera: 'CAM_CAL_20251210_v2.1.cal',
-      depthSensor: 'DEPTH_CAL_20251205_v1.7.cal',
-      temperature: 'TEMP_CAL_20251215_v3.0.cal',
-      conductivity: 'COND_CAL_20251210_v1.9.cal',
-      imu: 'IMU_CAL_20251212_v4.0.cal'
-    }
-  }
-]
+const isDeleting = ref(false)
 
 const filteredMissions = computed(() => {
-  return previousMissions
+  return previousMissions.value
     .filter(mission => mission.name.toLowerCase().includes(nameFilter.value.toLowerCase()))
     .sort((a, b) => {
       const dateA = new Date(a.date).getTime()
@@ -122,7 +66,7 @@ const filteredMissions = computed(() => {
     })
 })
 
-const handleViewMedia = (mission: Mission) => {
+const handleViewMedia = (mission: DisplayMission) => {
   const diveData: DiveData = {
     name: mission.name,
     date: mission.date,
@@ -133,6 +77,14 @@ const handleViewMedia = (mission: Mission) => {
     videos: mission.videos
   }
   emit('navigate', 'viewmedia', diveData)
+}
+
+const handleDeleteMission = async () => {
+  if (!selectedMission.value) return
+  isDeleting.value = true
+  await deleteMission(selectedMission.value)
+  selectedMission.value = null
+  isDeleting.value = false
 }
 </script>
 
@@ -201,6 +153,17 @@ const handleViewMedia = (mission: Mission) => {
         Showing {{ filteredMissions.length }} of {{ previousMissions.length }} dives
       </div>
 
+      <!-- Loading State -->
+      <div
+        v-if="previousMissions.length === 0"
+        class="rounded-lg p-8 text-center"
+        style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)"
+      >
+        <Database class="w-12 h-12 mx-auto mb-3" style="color: #41B9C3; opacity: 0.5" />
+        <p class="text-white text-lg mb-2">Loading dives...</p>
+        <p class="text-sm" style="color: #96EEF2">Fetching data from the backend</p>
+      </div>
+
       <!-- No Results -->
       <div
         v-if="filteredMissions.length === 0"
@@ -252,14 +215,6 @@ const handleViewMedia = (mission: Mission) => {
                 </div>
               </div>
 
-              <!-- Configuration -->
-              <div class="mb-3">
-                <div class="flex items-center gap-2">
-                  <Settings class="w-4 h-4" style="color: #96EEF2" />
-                  <span class="text-sm" style="color: #96EEF2">Configuration: {{ mission.configuration }}</span>
-                </div>
-              </div>
-
               <!-- Media Counts -->
               <div class="flex items-center gap-4">
                 <div class="flex items-center gap-2">
@@ -269,41 +224,6 @@ const handleViewMedia = (mission: Mission) => {
                 <div class="flex items-center gap-2">
                   <Image class="w-4 h-4" style="color: #41B9C3" />
                   <span class="text-sm" style="color: #96EEF2">{{ mission.videos }} videos</span>
-                </div>
-              </div>
-
-              <!-- Calibration Files -->
-              <div
-                class="mt-4 rounded-lg p-3"
-                style="background-color: rgba(65, 185, 195, 0.1); border: 1px solid rgba(65, 185, 195, 0.2)"
-              >
-                <div class="flex items-center gap-2 mb-2">
-                  <Gauge class="w-4 h-4" style="color: #41B9C3" />
-                  <span class="text-sm font-semibold" style="color: #96EEF2">
-                    Sensor Calibration Files
-                  </span>
-                </div>
-                <div class="grid grid-cols-1 md:grid-cols-2 gap-2 text-xs" style="color: #96EEF2">
-                  <div class="flex items-start gap-1.5">
-                    <span class="opacity-70">Camera:</span>
-                    <span class="font-mono text-xs break-all">{{ mission.calibrationFiles.camera }}</span>
-                  </div>
-                  <div class="flex items-start gap-1.5">
-                    <span class="opacity-70">Depth:</span>
-                    <span class="font-mono text-xs break-all">{{ mission.calibrationFiles.depthSensor }}</span>
-                  </div>
-                  <div class="flex items-start gap-1.5">
-                    <span class="opacity-70">Temp:</span>
-                    <span class="font-mono text-xs break-all">{{ mission.calibrationFiles.temperature }}</span>
-                  </div>
-                  <div class="flex items-start gap-1.5">
-                    <span class="opacity-70">Conductivity:</span>
-                    <span class="font-mono text-xs break-all">{{ mission.calibrationFiles.conductivity }}</span>
-                  </div>
-                  <div class="flex items-start gap-1.5">
-                    <span class="opacity-70">IMU:</span>
-                    <span class="font-mono text-xs break-all">{{ mission.calibrationFiles.imu }}</span>
-                  </div>
                 </div>
               </div>
             </div>
@@ -384,11 +304,11 @@ const handleViewMedia = (mission: Mission) => {
               </p>
               <div class="rounded p-3 mt-3" style="background-color: rgba(65, 185, 195, 0.1)">
                 <p class="text-white font-semibold mb-1">
-                  {{ previousMissions.find(m => m.id === selectedMission)?.name }}
+                  {{ previousMissions.find((m: DisplayMission) => m.id === selectedMission)?.name }}
                 </p>
                 <p style="color: #96EEF2" class="text-xs">
-                  {{ previousMissions.find(m => m.id === selectedMission)?.images }} images,
-                  {{ previousMissions.find(m => m.id === selectedMission)?.videos }} videos
+                  {{ previousMissions.find((m: DisplayMission) => m.id === selectedMission)?.images }} images,
+                  {{ previousMissions.find((m: DisplayMission) => m.id === selectedMission)?.videos }} videos
                 </p>
               </div>
             </div>
@@ -403,12 +323,13 @@ const handleViewMedia = (mission: Mission) => {
               Cancel
             </button>
             <button
-              @click="selectedMission = null"
+              @click="handleDeleteMission"
+              :disabled="isDeleting"
               class="flex-1 px-4 py-2 rounded-lg transition-all hover:opacity-90 flex items-center justify-center gap-2"
               style="background-color: #DD2C1D; color: white"
             >
               <Trash2 class="w-4 h-4" />
-              Delete Dive
+              {{ isDeleting ? 'Deleting...' : 'Delete Dive' }}
             </button>
           </div>
         </div>

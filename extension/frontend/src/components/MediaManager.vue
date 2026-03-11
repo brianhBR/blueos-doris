@@ -1,25 +1,31 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import {
   Download, FolderOpen, Image as ImageIcon, Video, FileText, Search,
   ArrowUpDown, ArrowUp, ArrowDown, Trash2, AlertTriangle, Play,
   ChevronLeft, ChevronRight
 } from 'lucide-vue-next'
+import { useMedia, useStorage } from '../composables/useApi'
+import type { MediaFile as ApiMediaFile } from '../composables/useApi'
 import type { Screen } from '../types'
 
-interface MediaFile {
-  id: number
+interface DisplayFile {
+  id: string
   fileName: string
   type: 'video' | 'image' | 'sensor' | 'log'
   diveName: string
   date: string
   size: string
   timestamp: string
+  downloadUrl: string
 }
 
 const emit = defineEmits<{
-  navigate: [screen: Screen, diveData?: any]
+  navigate: [screen: Screen, diveData?: { name: string; date: string; duration: string; maxDepth: string; location: string }]
 }>()
+
+const { files: apiFiles, fetchFiles, deleteFile } = useMedia()
+const { storage, fetchStorage } = useStorage()
 
 type SortField = 'diveName' | 'fileName' | 'date' | 'type'
 type SortDirection = 'asc' | 'desc' | null
@@ -27,45 +33,59 @@ type SortDirection = 'asc' | 'desc' | null
 const searchQuery = ref('')
 const sortField = ref<SortField>('date')
 const sortDirection = ref<SortDirection>('desc')
-const selectedFiles = ref<number[]>([])
+const selectedFiles = ref<string[]>([])
 const showDeleteConfirm = ref(false)
 const currentPage = ref(1)
 const itemsPerPage = ref(10)
 const showEraseAllConfirm = ref(false)
 const eraseAllStep = ref<1 | 2>(1)
+const isDeleting = ref(false)
 
-const mediaFiles: MediaFile[] = [
-  { id: 1, fileName: '20241120143022_Video.mp4', type: 'video', diveName: 'DiveII_20241120143022', date: '2024-11-20', size: '2.3 GB', timestamp: '14:30:22 UTC' },
-  { id: 2, fileName: '20241120143530_Image.TIFF', type: 'image', diveName: 'DiveII_20241120143022', date: '2024-11-20', size: '45 MB', timestamp: '14:35:30 UTC' },
-  { id: 3, fileName: '20241120143000_Conductivity.csv', type: 'sensor', diveName: 'DiveII_20241120143022', date: '2024-11-20', size: '1.2 MB', timestamp: '14:30:00 UTC' },
-  { id: 4, fileName: '20241120150045_Video.mp4', type: 'video', diveName: 'DiveII_20241120143022', date: '2024-11-20', size: '3.1 GB', timestamp: '15:00:45 UTC' },
-  { id: 5, fileName: '20241120143000_Temperature.csv', type: 'sensor', diveName: 'DiveII_20241120143022', date: '2024-11-20', size: '950 KB', timestamp: '14:30:00 UTC' },
-  { id: 6, fileName: '20241120143000_Depth.csv', type: 'sensor', diveName: 'DiveII_20241120143022', date: '2024-11-20', size: '820 KB', timestamp: '14:30:00 UTC' },
-  { id: 7, fileName: '20241118092500_Video.mp4', type: 'video', diveName: 'DeepReefSurvey_20241118092045', date: '2024-11-18', size: '4.2 GB', timestamp: '09:25:00 UTC' },
-  { id: 8, fileName: '20241118093015_Image.TIFF', type: 'image', diveName: 'DeepReefSurvey_20241118092045', date: '2024-11-18', size: '52 MB', timestamp: '09:30:15 UTC' },
-  { id: 9, fileName: '20241118094530_Image.TIFF', type: 'image', diveName: 'DeepReefSurvey_20241118092045', date: '2024-11-18', size: '48 MB', timestamp: '09:45:30 UTC' },
-  { id: 10, fileName: '20241118092000_Salinity.csv', type: 'sensor', diveName: 'DeepReefSurvey_20241118092045', date: '2024-11-18', size: '1.5 MB', timestamp: '09:20:00 UTC' },
-  { id: 11, fileName: '20241118100045_Video.mp4', type: 'video', diveName: 'DeepReefSurvey_20241118092045', date: '2024-11-18', size: '3.8 GB', timestamp: '10:00:45 UTC' },
-  { id: 12, fileName: '20241118092000_Temperature.csv', type: 'sensor', diveName: 'DeepReefSurvey_20241118092045', date: '2024-11-18', size: '1.3 MB', timestamp: '09:20:00 UTC' },
-  { id: 13, fileName: '20241118092000_Depth.csv', type: 'sensor', diveName: 'DeepReefSurvey_20241118092045', date: '2024-11-18', size: '1.1 MB', timestamp: '09:20:00 UTC' },
-  { id: 14, fileName: '20241118102245_Image.TIFF', type: 'image', diveName: 'DeepReefSurvey_20241118092045', date: '2024-11-18', size: '51 MB', timestamp: '10:22:45 UTC' },
-  { id: 15, fileName: '20241115082000_Video.mp4', type: 'video', diveName: 'CoastalStudy01_20241115081530', date: '2024-11-15', size: '2.8 GB', timestamp: '08:20:00 UTC' },
-  { id: 16, fileName: '20241115083515_Image.TIFF', type: 'image', diveName: 'CoastalStudy01_20241115081530', date: '2024-11-15', size: '43 MB', timestamp: '08:35:15 UTC' },
-  { id: 17, fileName: '20241115081500_Conductivity.csv', type: 'sensor', diveName: 'CoastalStudy01_20241115081530', date: '2024-11-15', size: '980 KB', timestamp: '08:15:00 UTC' },
-  { id: 18, fileName: '20241115081500_Temperature.csv', type: 'sensor', diveName: 'CoastalStudy01_20241115081530', date: '2024-11-15', size: '890 KB', timestamp: '08:15:00 UTC' },
-  { id: 19, fileName: '20241115081500_Depth.csv', type: 'sensor', diveName: 'CoastalStudy01_20241115081530', date: '2024-11-15', size: '750 KB', timestamp: '08:15:00 UTC' },
-  { id: 20, fileName: '20241115090030_Image.TIFF', type: 'image', diveName: 'CoastalStudy01_20241115081530', date: '2024-11-15', size: '46 MB', timestamp: '09:00:30 UTC' },
-  { id: 21, fileName: '20241115091545_Video.mp4', type: 'video', diveName: 'CoastalStudy01_20241115081530', date: '2024-11-15', size: '3.2 GB', timestamp: '09:15:45 UTC' },
-  { id: 22, fileName: '20241120151530_Image.TIFF', type: 'image', diveName: 'DiveII_20241120143022', date: '2024-11-20', size: '47 MB', timestamp: '15:15:30 UTC' },
-  { id: 23, fileName: '20241120153045_Image.TIFF', type: 'image', diveName: 'DiveII_20241120143022', date: '2024-11-20', size: '49 MB', timestamp: '15:30:45 UTC' },
-  { id: 24, fileName: '20241120143000_SystemLog.txt', type: 'log', diveName: 'DiveII_20241120143022', date: '2024-11-20', size: '125 KB', timestamp: '14:30:00 UTC' },
-  { id: 25, fileName: '20241120143000_ErrorLog.txt', type: 'log', diveName: 'DiveII_20241120143022', date: '2024-11-20', size: '38 KB', timestamp: '14:30:00 UTC' },
-  { id: 26, fileName: '20241118105530_Video.mp4', type: 'video', diveName: 'DeepReefSurvey_20241118092045', date: '2024-11-18', size: '4.5 GB', timestamp: '10:55:30 UTC' },
-  { id: 27, fileName: '20241118111045_Image.TIFF', type: 'image', diveName: 'DeepReefSurvey_20241118092045', date: '2024-11-18', size: '54 MB', timestamp: '11:10:45 UTC' },
-  { id: 28, fileName: '20241118092000_SystemLog.txt', type: 'log', diveName: 'DeepReefSurvey_20241118092045', date: '2024-11-18', size: '142 KB', timestamp: '09:20:00 UTC' },
-  { id: 29, fileName: '20241115081500_SystemLog.txt', type: 'log', diveName: 'CoastalStudy01_20241115081530', date: '2024-11-15', size: '98 KB', timestamp: '08:15:00 UTC' },
-  { id: 30, fileName: '20241115081500_ErrorLog.txt', type: 'log', diveName: 'CoastalStudy01_20241115081530', date: '2024-11-15', size: '22 KB', timestamp: '08:15:00 UTC' },
-]
+function formatFileSize(bytes: number): string {
+  if (bytes >= 1e9) return `${(bytes / 1e9).toFixed(1)} GB`
+  if (bytes >= 1e6) return `${(bytes / 1e6).toFixed(0)} MB`
+  if (bytes >= 1e3) return `${(bytes / 1e3).toFixed(0)} KB`
+  return `${bytes} B`
+}
+
+function mapMediaType(mediaType: string): 'video' | 'image' | 'sensor' | 'log' {
+  if (mediaType === 'video') return 'video'
+  if (mediaType === 'image') return 'image'
+  if (mediaType === 'data') return 'sensor'
+  return 'log'
+}
+
+const mediaFiles = computed<DisplayFile[]>(() => {
+  return apiFiles.value.map((f: ApiMediaFile) => {
+    const createdDate = new Date(f.created_at)
+    return {
+      id: f.id,
+      fileName: f.filename,
+      type: mapMediaType(f.media_type),
+      diveName: f.mission_id ?? 'Unknown',
+      date: createdDate.toISOString().split('T')[0],
+      size: formatFileSize(f.size_bytes),
+      timestamp: createdDate.toISOString().split('T')[1]?.replace('Z', ' UTC') ?? '',
+      downloadUrl: f.download_url,
+    }
+  })
+})
+
+const storageTotalGb = computed(() => storage.value?.total_gb ?? 500)
+const storageAvailableGb = computed(() => storage.value?.available_gb ?? 275)
+const storageAvailablePercent = computed(() => storageTotalGb.value > 0 ? Math.round((storageAvailableGb.value / storageTotalGb.value) * 100) : 0)
+
+let pollInterval: number | undefined
+
+onMounted(() => {
+  fetchFiles()
+  fetchStorage()
+  pollInterval = setInterval(fetchFiles, 15000) as unknown as number
+})
+
+onUnmounted(() => {
+  if (pollInterval) clearInterval(pollInterval)
+})
 
 const getFileIcon = (type: string) => {
   switch (type) {
@@ -106,7 +126,7 @@ const getTypeBadgeStyle = (type: string) => {
 }
 
 const filteredFiles = computed(() => {
-  return mediaFiles.filter(file =>
+  return mediaFiles.value.filter(file =>
     file.fileName.toLowerCase().includes(searchQuery.value.toLowerCase()) ||
     file.diveName.toLowerCase().includes(searchQuery.value.toLowerCase())
   )
@@ -150,7 +170,7 @@ const handleSort = (field: SortField) => {
   }
 }
 
-const handleSelectFile = (id: number) => {
+const handleSelectFile = (id: string) => {
   const idx = selectedFiles.value.indexOf(id)
   if (idx >= 0) selectedFiles.value.splice(idx, 1)
   else selectedFiles.value.push(id)
@@ -164,19 +184,24 @@ const handleSelectAll = () => {
   }
 }
 
-const handleViewMedia = (file: MediaFile) => {
+const handleViewMedia = (file: DisplayFile) => {
   emit('navigate', 'viewmedia', {
     name: file.diveName,
     date: file.date,
-    duration: '2h 15m',
-    maxDepth: '125',
-    location: '41.7128° N, 74.0060° W'
+    duration: '',
+    maxDepth: '',
+    location: ''
   })
 }
 
-const confirmDelete = () => {
+const confirmDelete = async () => {
+  isDeleting.value = true
+  for (const fileId of selectedFiles.value) {
+    await deleteFile(fileId)
+  }
   selectedFiles.value = []
   showDeleteConfirm.value = false
+  isDeleting.value = false
 }
 
 const handlePageChange = (page: number) => {
@@ -203,15 +228,15 @@ const handlePageChange = (page: number) => {
         style="background-color: rgba(65, 185, 195, 0.1); border: 1px solid rgba(65, 185, 195, 0.3)"
       >
         <div>
-          <p class="text-sm md:text-base" style="color: #96EEF2">Total Storage: 500 GB</p>
-          <p class="text-sm md:text-base" style="color: #41B9C3">Available: 275 GB (55%)</p>
+          <p class="text-sm md:text-base" style="color: #96EEF2">Total Storage: {{ storageTotalGb.toFixed(0) }} GB</p>
+          <p class="text-sm md:text-base" style="color: #41B9C3">Available: {{ storageAvailableGb.toFixed(0) }} GB ({{ storageAvailablePercent }}%)</p>
         </div>
         <div class="text-left md:text-right">
           <p class="text-sm md:text-base" style="color: #96EEF2">Total Files: {{ mediaFiles.length }}</p>
           <p class="text-sm md:text-base" style="color: #96EEF2">
-            {{ mediaFiles.filter(f => f.type === 'video').length }} videos,
-            {{ mediaFiles.filter(f => f.type === 'image').length }} images,
-            {{ mediaFiles.filter(f => f.type === 'sensor').length }} sensor files
+            {{ mediaFiles.filter((f: DisplayFile) => f.type === 'video').length }} videos,
+            {{ mediaFiles.filter((f: DisplayFile) => f.type === 'image').length }} images,
+            {{ mediaFiles.filter((f: DisplayFile) => f.type === 'sensor').length }} sensor files
           </p>
         </div>
       </div>
@@ -585,7 +610,7 @@ const handlePageChange = (page: number) => {
               </p>
               <div class="rounded p-3 mt-3 max-h-40 overflow-y-auto" style="background-color: rgba(65, 185, 195, 0.1)">
                 <p
-                  v-for="file in mediaFiles.filter(f => selectedFiles.includes(f.id))"
+                  v-for="file in mediaFiles.filter((f: DisplayFile) => selectedFiles.includes(f.id))"
                   :key="file.id"
                   class="text-white text-xs mb-1"
                 >
@@ -605,11 +630,12 @@ const handlePageChange = (page: number) => {
             </button>
             <button
               @click="confirmDelete"
+              :disabled="isDeleting"
               class="flex-1 px-4 py-2 rounded-lg transition-all hover:opacity-90 flex items-center justify-center gap-2"
               style="background-color: #DD2C1D; color: white"
             >
               <Trash2 class="w-4 h-4" />
-              Delete Files
+              {{ isDeleting ? 'Deleting...' : 'Delete Files' }}
             </button>
           </div>
         </div>
@@ -636,7 +662,7 @@ const handlePageChange = (page: number) => {
             <div class="flex-1">
               <h3 class="text-white text-xl mb-2">Erase All Files?</h3>
               <p style="color: #96EEF2" class="text-sm mb-2">
-                Are you sure you want to erase all {{ mediaFiles.length }} file{{ mediaFiles.length > 1 ? 's' : '' }}? This action will reformat the DORIS drive and cannot be undone.
+                Are you sure you want to erase all {{ mediaFiles.length }} file{{ mediaFiles.length !== 1 ? 's' : '' }}? This action will reformat the DORIS drive and cannot be undone.
               </p>
               <div
                 v-if="eraseAllStep === 1"

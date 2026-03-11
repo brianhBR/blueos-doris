@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted, onUnmounted } from 'vue'
 import {
   Battery,
   HardDrive,
@@ -13,6 +13,8 @@ import {
   Droplets,
   Loader2
 } from 'lucide-vue-next'
+import { useSystemStatus, useBattery, useStorage, useLocation, useSensors } from '../composables/useApi'
+import type { SensorModule } from '../composables/useApi'
 
 const mdiCompassOutline = 'M7,17L10.2,10.2L17,7L13.8,13.8L7,17M12,11.1A0.9,0.9 0 0,0 11.1,12A0.9,0.9 0 0,0 12,12.9A0.9,0.9 0 0,0 12.9,12A0.9,0.9 0 0,0 12,11.1M12,2A10,10 0 0,1 22,12A10,10 0 0,1 12,22A10,10 0 0,1 2,12A10,10 0 0,1 12,2M12,4A8,8 0 0,0 4,12A8,8 0 0,0 12,20A8,8 0 0,0 20,12A8,8 0 0,0 12,4Z'
 import type { Screen } from '../types'
@@ -29,9 +31,58 @@ const emit = defineEmits<{
   configurationSelect: [config: string]
 }>()
 
-const batteryLevel = ref(87)
-const storageUsed = ref(45)
-const gpsStatus = ref<'active' | 'searching' | 'inactive'>('active')
+const { status: systemStatus, fetchStatus } = useSystemStatus()
+const { battery, fetchBattery } = useBattery()
+const { storage, fetchStorage } = useStorage()
+const { location, fetchLocation } = useLocation()
+const { modules: sensorModules, fetchModules } = useSensors()
+
+const batteryLevel = computed(() => battery.value?.level ?? systemStatus.value?.battery_level ?? 0)
+const storageUsed = computed(() => storage.value?.used_percent ?? systemStatus.value?.storage_used_percent ?? 0)
+const storageTotal = computed(() => storage.value?.total_gb ?? systemStatus.value?.storage_total_gb ?? 100)
+const storageAvailableGb = computed(() => storage.value?.available_gb ?? (storageTotal.value - (storage.value?.used_gb ?? systemStatus.value?.storage_used_gb ?? 0)))
+const batteryTimeRemaining = computed(() => battery.value?.time_remaining ?? systemStatus.value?.battery_time_remaining ?? 'Unknown')
+
+const gpsStatus = computed<'active' | 'searching' | 'inactive'>(() => {
+  if (!location.value) return 'inactive'
+  if (location.value.fix_type === 'none') return 'inactive'
+  if (location.value.satellites > 0) return 'active'
+  return 'searching'
+})
+
+const modules = computed<{ id: string; name: string; status: 'connected' | 'disconnected'; moduleStatus: string }[]>(() => {
+  if (sensorModules.value.length > 0) {
+    return sensorModules.value.map((m: SensorModule) => ({
+      id: m.id,
+      name: m.name,
+      status: m.status === 'connected' ? 'connected' as const : 'disconnected' as const,
+      moduleStatus: m.module_status,
+    }))
+  }
+  return []
+})
+
+let pollInterval: number | undefined
+
+onMounted(() => {
+  fetchStatus()
+  fetchBattery()
+  fetchStorage()
+  fetchLocation()
+  fetchModules()
+  pollInterval = setInterval(() => {
+    fetchStatus()
+    fetchBattery()
+    fetchStorage()
+    fetchLocation()
+    fetchModules()
+  }, 5000) as unknown as number
+})
+
+onUnmounted(() => {
+  if (pollInterval) clearInterval(pollInterval)
+})
+
 const diveName = ref('')
 const username = ref('')
 const selectedConfiguration = ref('')
@@ -71,18 +122,6 @@ const configurationElapsedTimes: Record<string, number> = {
   'My Saved Configuration 4': 6,
   'My Saved Configuration 5': 4
 }
-
-const modules = [
-  { id: 1, name: 'Camera', status: 'connected' as const, moduleStatus: 'Ready: Active' },
-  { id: 2, name: 'Light', status: 'connected' as const, moduleStatus: 'Ready: Active' },
-  { id: 3, name: 'Conductivity', status: 'connected' as const, moduleStatus: 'Ready: Active' },
-  { id: 4, name: 'Temperature', status: 'connected' as const, moduleStatus: 'Ready: Active' },
-  { id: 5, name: 'Depth', status: 'connected' as const, moduleStatus: 'Ready: Active' },
-  { id: 6, name: 'Carbon Dioxide (CO₂)', status: 'disconnected' as const, moduleStatus: 'Disconnected' },
-  { id: 7, name: 'Oxygen (O₂)', status: 'disconnected' as const, moduleStatus: 'Disconnected' },
-  { id: 8, name: 'Iridium', status: 'connected' as const, moduleStatus: 'Ready: Active' },
-  { id: 9, name: 'LoRa', status: 'connected' as const, moduleStatus: 'Ready: Active' },
-]
 
 const depthWarningLevel = computed(() => {
   const depth = parseFloat(estimatedDepth.value)
@@ -182,7 +221,7 @@ const batteryBarColor = computed(() => {
 })
 
 const sortedModules = computed(() => {
-  const sorted = [...modules]
+  const sorted = [...modules.value]
   if (!sortColumn.value) return sorted
   return sorted.sort((a, b) => {
     if (sortColumn.value === 'sensor') {
@@ -579,7 +618,7 @@ const formatReleaseTime = (date: Date) => {
             }"
           />
         </div>
-        <p class="text-sm mt-2" style="color: #96EEF2">Estimated: 12.5 hrs remaining</p>
+        <p class="text-sm mt-2" style="color: #96EEF2">Estimated: {{ batteryTimeRemaining }} remaining</p>
       </div>
 
       <!-- Storage Available -->
@@ -589,7 +628,7 @@ const formatReleaseTime = (date: Date) => {
             <HardDrive class="w-5 h-5" style="color: #96EEF2" />
             <span class="text-white">Storage Available</span>
           </div>
-          <span style="color: #FCD869">{{ 100 - storageUsed }}%</span>
+          <span style="color: #FCD869">{{ Math.round(100 - storageUsed) }}%</span>
         </div>
         <div class="w-full rounded-full h-2" style="background-color: rgba(14, 36, 70, 0.6)">
           <div
@@ -600,7 +639,7 @@ const formatReleaseTime = (date: Date) => {
             }"
           />
         </div>
-        <p class="text-sm mt-2" style="color: #96EEF2">{{ 100 - storageUsed }} GB available of 100 GB</p>
+        <p class="text-sm mt-2" style="color: #96EEF2">{{ storageAvailableGb.toFixed(1) }} GB available of {{ storageTotal.toFixed(0) }} GB</p>
       </div>
 
       <!-- Location -->
