@@ -200,11 +200,19 @@ async function fetchApi<T>(endpoint: string, params?: Record<string, string>): P
 }
 
 async function postApi<T>(endpoint: string, body?: unknown): Promise<T> {
-  const response = await fetch(`${API_BASE}${endpoint}`, {
-    method: 'POST',
-    headers: body ? { 'Content-Type': 'application/json' } : {},
-    body: body ? JSON.stringify(body) : undefined,
-  })
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), 30000)
+  let response: Response
+  try {
+    response = await fetch(`${API_BASE}${endpoint}`, {
+      method: 'POST',
+      headers: body ? { 'Content-Type': 'application/json' } : {},
+      body: body ? JSON.stringify(body) : undefined,
+      signal: controller.signal,
+    })
+  } finally {
+    clearTimeout(timeout)
+  }
   if (!response.ok) {
     throw new Error(`API error: ${response.status} ${response.statusText}`)
   }
