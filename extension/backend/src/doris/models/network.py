@@ -30,6 +30,8 @@ class NetworkInfo(BaseModel):
     connection: ConnectionStatus
     available_networks: list[WifiNetwork] = []
     is_scanning: bool = False
+    serial_number: str | None = None
+    hotspot_ssid: str | None = None
 
 
 class NetworkCredentials(BaseModel):

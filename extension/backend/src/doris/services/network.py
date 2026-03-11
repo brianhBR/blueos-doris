@@ -1,48 +1,88 @@
 """Network/WiFi service."""
 
+import logging
+from typing import Any
+
 from ..config import blueos_services
 from ..models.network import ConnectionStatus, NetworkCredentials, NetworkInfo, WifiNetwork
+from .base import BlueOSClient
 from .blueos.network import NetworkClient
+
+logger = logging.getLogger(__name__)
+
+DORIS_SERIAL_NUMBER = "D-BB-00"
 
 
 class NetworkService:
     """Service for managing network connections via BlueOS WiFi Manager.
 
     Uses the unified NetworkClient which auto-detects v1/v2 API availability.
+    Fetches MAC address from linux2rest /system/network.
     """
 
     def __init__(self):
         self._client = NetworkClient(blueos_services.wifi_manager)
+        self._linux2rest = BlueOSClient(blueos_services.linux2rest)
+        self._cached_mac: str | None = None
 
     async def get_network_info(self) -> NetworkInfo:
-        """Get current network information."""
+        """Get current network information including device identity."""
         connection = await self.get_connection_status()
         networks = await self.scan_networks()
+        hotspot_ssid = await self._get_hotspot_ssid()
 
         return NetworkInfo(
             connection=connection,
             available_networks=networks,
             is_scanning=False,
+            serial_number=DORIS_SERIAL_NUMBER,
+            hotspot_ssid=hotspot_ssid,
         )
+
+    async def _get_hotspot_ssid(self) -> str | None:
+        """Get the hotspot SSID from the WiFi Manager hotspot credentials."""
+        try:
+            creds = await self._client.get_hotspot_credentials()
+            return creds.get("ssid")
+        except Exception as e:
+            logger.warning(f"Failed to get hotspot credentials: {e}")
+            return None
+
+    async def _get_wlan_mac(self) -> str | None:
+        """Get MAC address of the wlan0 interface from linux2rest."""
+        try:
+            interfaces: list[dict[str, Any]] = await self._linux2rest.get(  # type: ignore[assignment]
+                "/system/network"
+            )
+            for iface in interfaces:
+                if iface.get("name", "").startswith("wlan"):
+                    mac = iface.get("mac")
+                    if mac:
+                        self._cached_mac = mac
+                    return mac
+        except Exception as e:
+            logger.warning(f"Failed to get MAC from linux2rest: {e}")
+        return self._cached_mac
 
     async def get_connection_status(self) -> ConnectionStatus:
         """Get current connection status."""
         try:
             status = await self._client.get_status()
-
             is_connected = status.get("state") == "connected"
+            mac_address = await self._get_wlan_mac()
 
             return ConnectionStatus(
                 is_connected=is_connected,
                 ssid=status.get("ssid"),
                 ip_address=status.get("ip_address"),
-                mac_address=status.get("address"),
+                mac_address=mac_address,
                 signal_strength=status.get("signallevel"),
             )
         except Exception:
             return ConnectionStatus(
                 is_connected=False,
                 ssid=None,
+                mac_address=self._cached_mac,
             )
 
     async def scan_networks(self) -> list[WifiNetwork]:
@@ -82,9 +122,7 @@ class NetworkService:
             return networks
 
         except Exception as e:
-            import logging
-
-            logging.getLogger(__name__).warning(f"Failed to scan networks: {e}")
+            logger.warning(f"Failed to scan networks: {e}")
             return []
 
     def _parse_security(self, flags: str) -> str:
@@ -144,5 +182,6 @@ class NetworkService:
         return "2.4GHz"
 
     async def close(self) -> None:
-        """Close HTTP client."""
+        """Close HTTP clients."""
         await self._client.close()
+        await self._linux2rest.close()
