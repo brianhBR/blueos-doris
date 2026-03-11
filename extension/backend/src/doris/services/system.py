@@ -1,8 +1,10 @@
 """System information service."""
 
 import logging
+import math
+
 from ..config import blueos_services
-from ..models.system import SystemStatus, BatteryInfo, StorageInfo, LocationInfo
+from ..models.system import BatteryInfo, LocationInfo, StorageInfo, SystemStatus
 from .base import BlueOSClient
 
 logger = logging.getLogger(__name__)
@@ -11,8 +13,8 @@ logger = logging.getLogger(__name__)
 class SystemService:
     """Service for getting system information from BlueOS."""
 
-    # Cache for last known good values (to avoid showing mock data on temporary failures)
     _last_storage: StorageInfo | None = None
+    _last_battery: BatteryInfo | None = None
     _last_location: LocationInfo | None = None
 
     def __init__(self):
@@ -21,11 +23,25 @@ class SystemService:
         self.mavlink2rest = BlueOSClient(blueos_services.mavlink2rest)
 
     async def get_system_status(self) -> SystemStatus:
-        """Get complete system status."""
-        battery = await self.get_battery_info()
-        storage = await self.get_storage_info()
+        """Get complete system status.
 
-        # Get system metrics from linux2rest
+        Aggregates battery, storage, and system metrics.
+        Individual subsystem failures are logged and surfaced as
+        unavailable values rather than fake data.
+        """
+        battery: BatteryInfo | None = None
+        storage: StorageInfo | None = None
+
+        try:
+            battery = await self.get_battery_info()
+        except Exception as e:
+            logger.warning(f"Battery info unavailable: {e}")
+
+        try:
+            storage = await self.get_storage_info()
+        except Exception as e:
+            logger.warning(f"Storage info unavailable: {e}")
+
         cpu_percent = 0.0
         memory_percent = 0.0
         temperature = None
@@ -40,17 +56,17 @@ class SystemService:
             hours, remainder = divmod(int(uptime_secs), 3600)
             minutes, seconds = divmod(remainder, 60)
             uptime = f"{hours}:{minutes:02d}:{seconds:02d}"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"System info unavailable: {e}")
 
         return SystemStatus(
             connected=True,
-            battery_level=battery.level,
-            battery_voltage=battery.voltage or 0.0,
-            battery_time_remaining=battery.time_remaining,
-            storage_used_percent=storage.used_percent,
-            storage_used_gb=storage.used_gb,
-            storage_total_gb=storage.total_gb,
+            battery_level=battery.level if battery else 0.0,
+            battery_voltage=battery.voltage or 0.0 if battery else 0.0,
+            battery_time_remaining=battery.time_remaining if battery else "Unavailable",
+            storage_used_percent=storage.used_percent if storage else 0.0,
+            storage_used_gb=storage.used_gb if storage else 0.0,
+            storage_total_gb=storage.total_gb if storage else 0.0,
             cpu_usage=cpu_percent,
             memory_usage=memory_percent,
             temperature=temperature,
@@ -58,61 +74,67 @@ class SystemService:
         )
 
     async def get_battery_info(self) -> BatteryInfo:
-        """Get battery information from MAVLink."""
+        """Get battery information from MAVLink.
+
+        Raises on failure so the caller (route or get_system_status)
+        can decide how to handle it.
+        """
         try:
-            # Try to get battery info from MAVLink2Rest
             battery_data = await self.mavlink2rest.get(
                 "/mavlink/vehicles/1/components/1/messages/BATTERY_STATUS"
             )
 
-            # BlueOS returns None if no battery data available
             if battery_data is None:
-                raise ValueError("No battery data available")
+                raise ValueError("No battery data available from MAVLink")
 
             message = battery_data.get("message", {})
             if not message:
-                raise ValueError("No battery message")
+                raise ValueError("Empty BATTERY_STATUS message")
 
             voltages = message.get("voltages", [0])
-            voltage = voltages[0] / 1000.0 if voltages and voltages[0] > 0 else None  # mV to V
-            current = message.get("current_battery", 0) / 100.0  # cA to A
+            voltage = voltages[0] / 1000.0 if voltages and voltages[0] > 0 else None
+            current = message.get("current_battery", 0) / 100.0
             remaining = message.get("battery_remaining", -1)
 
-            # -1 means battery remaining is unknown
-            if remaining < 0:
-                remaining = 100  # Assume full if unknown
+            if remaining < 0 and voltage is not None:
+                k = 3.0
+                v_mid = 14.52
+                soc = 100.0 / (1.0 + math.exp(-k * (voltage - v_mid)))
+                remaining = max(0.0, min(100.0, soc))
+            elif remaining < 0:
+                remaining = 0.0
 
             remaining_hours = self._estimate_remaining_hours(remaining, current)
 
-            return BatteryInfo(
+            result = BatteryInfo(
                 level=float(remaining),
                 voltage=voltage,
                 current=current,
                 time_remaining=self._format_time_remaining(remaining_hours),
             )
-        except Exception:
-            # Return mock data if unable to get real data
-            return BatteryInfo(
-                level=87.0,
-                voltage=14.2,
-                time_remaining="12.5 hours",
-            )
+            SystemService._last_battery = result
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to get battery info: {type(e).__name__}: {e}")
+            if SystemService._last_battery is not None:
+                logger.info("Using cached battery info")
+                return SystemService._last_battery
+            raise
 
     async def get_storage_info(self) -> StorageInfo:
-        """Get storage information."""
+        """Get storage information.
+
+        Raises on failure if no cached data is available.
+        """
         try:
-            # BlueOS returns an array of disk partitions
             disk_info = await self.linux2rest.get("/system/disk")
 
-            # Find the main partition (usually the largest or root)
             if isinstance(disk_info, list) and len(disk_info) > 0:
-                # Use the first entry (usually overlay/root)
                 main_disk = disk_info[0]
                 total = main_disk.get("total_space_B", 0)
                 available = main_disk.get("available_space_B", 0)
 
                 if total <= 0:
-                    logger.warning(f"Invalid disk info: total_space_B={total}")
                     raise ValueError(f"Invalid total disk space: {total}")
 
                 used = total - available
@@ -123,46 +145,36 @@ class SystemService:
                     available_gb=available / (1024**3),
                     used_percent=(used / total) * 100,
                 )
-                # Cache successful result
                 SystemService._last_storage = result
                 return result
 
-            logger.warning(f"Empty or invalid disk_info response: {disk_info}")
             raise ValueError(f"No disk info available: {disk_info}")
         except Exception as e:
-            # Log the error
-            logger.warning(f"Failed to get storage info from BlueOS: {type(e).__name__}: {e}")
-
-            # Return cached value if available, otherwise mock data
+            logger.warning(f"Failed to get storage info: {type(e).__name__}: {e}")
             if SystemService._last_storage is not None:
                 logger.info("Using cached storage info")
                 return SystemService._last_storage
-
-            return StorageInfo(
-                total_gb=500.0,
-                used_gb=225.0,
-                available_gb=275.0,
-                used_percent=45.0,
-            )
+            raise
 
     async def get_location(self) -> LocationInfo:
-        """Get GPS location from MAVLink."""
+        """Get GPS location from MAVLink.
+
+        Raises on failure if no cached data is available.
+        """
         try:
             gps_data = await self.mavlink2rest.get(
                 "/mavlink/vehicles/1/components/1/messages/GPS_RAW_INT"
             )
             message = gps_data.get("message", {})
 
-            lat = message.get("lat", 0) / 1e7  # degE7 to degrees
+            lat = message.get("lat", 0) / 1e7
             lon = message.get("lon", 0) / 1e7
-            alt = message.get("alt", 0) / 1000.0  # mm to m
+            alt = message.get("alt", 0) / 1000.0
             satellites = message.get("satellites_visible", 0)
 
-            # fix_type can be an integer or an object like {"type": "GPS_FIX_TYPE_RTK_FIXED"}
             fix_type_raw = message.get("fix_type", 0)
             if isinstance(fix_type_raw, dict):
                 fix_type_str = fix_type_raw.get("type", "")
-                # Parse from MAVLink enum name
                 fix_type_map = {
                     "GPS_FIX_TYPE_NO_GPS": "none",
                     "GPS_FIX_TYPE_NO_FIX": "no_fix",
@@ -187,15 +199,12 @@ class SystemService:
                 }
                 fix_type = fix_type_names.get(fix_type_raw, "unknown")
 
-            # Get timestamp from status
             status = gps_data.get("status", {})
             time_info = status.get("time", {})
             last_update_str = time_info.get("last_update", "")
-
-            # Format as relative time
             last_update = "Just now" if last_update_str else "Unknown"
 
-            return LocationInfo(
+            result = LocationInfo(
                 latitude=lat,
                 longitude=lon,
                 altitude=alt,
@@ -203,25 +212,23 @@ class SystemService:
                 satellites=satellites,
                 last_update=last_update,
             )
-        except Exception:
-            # Return mock data
-            return LocationInfo(
-                latitude=41.7128,
-                longitude=-74.0060,
-                fix_type="3d",
-                satellites=12,
-                last_update="2 minutes ago",
-            )
+            SystemService._last_location = result
+            return result
+        except Exception as e:
+            logger.warning(f"Failed to get location: {type(e).__name__}: {e}")
+            if SystemService._last_location is not None:
+                logger.info("Using cached location info")
+                return SystemService._last_location
+            raise
 
     def _estimate_remaining_hours(
         self, percent: float, current: float | None
     ) -> float | None:
         """Estimate remaining battery hours."""
         if current is None or current <= 0:
-            # Rough estimate: assume 10A average draw, 100Ah battery
-            return (percent / 100) * 10
-        # More accurate: based on current draw
-        capacity_ah = 100  # Assume 100Ah battery
+            capacity_ah = 100
+            return (percent / 100) * (capacity_ah / 10)
+        capacity_ah = 100
         remaining_ah = (percent / 100) * capacity_ah
         return remaining_ah / current if current > 0 else None
 
@@ -239,4 +246,3 @@ class SystemService:
         await self.helper.close()
         await self.linux2rest.close()
         await self.mavlink2rest.close()
-
