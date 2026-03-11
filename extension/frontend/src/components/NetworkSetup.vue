@@ -1,6 +1,7 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { Wifi, Lock, RefreshCw, Signal, AlertCircle, CheckCircle, Smartphone } from 'lucide-vue-next'
+import { mdiIpOutline } from '@mdi/js'
 import { useWifiNetworks } from '../composables/useApi'
 
 const emit = defineEmits<{
@@ -16,6 +17,7 @@ const {
   fetchNetworks,
   scanNetworks,
   connectToNetwork,
+  disconnectFromNetwork,
 } = useWifiNetworks()
 
 const dorisMACAddress = computed(() => apiConnectionStatus.value?.mac_address ?? '—')
@@ -39,6 +41,7 @@ interface DisplayNetwork {
   frequency: string
   security: string
   saved: boolean
+  connected: boolean
 }
 
 const networks = computed<DisplayNetwork[]>(() => {
@@ -49,10 +52,13 @@ const networks = computed<DisplayNetwork[]>(() => {
       frequency: n.frequency,
       security: n.security,
       saved: n.is_saved,
+      connected: n.is_connected,
     }))
   }
   return []
 })
+
+const connectedNetwork = computed(() => networks.value.find((n) => n.connected))
 
 let pollInterval: number | undefined
 
@@ -84,6 +90,20 @@ const handleConnect = async () => {
   if (success) {
     connectionStatus.value = 'connected'
     emit('connect', true)
+    await fetchNetworks()
+  } else {
+    connectionStatus.value = 'failed'
+  }
+}
+
+const handleDisconnect = async () => {
+  connectionStatus.value = 'connecting'
+  const success = await disconnectFromNetwork()
+  if (success) {
+    connectionStatus.value = 'idle'
+    selectedNetwork.value = null
+    emit('connect', false)
+    await fetchNetworks()
   } else {
     connectionStatus.value = 'failed'
   }
@@ -154,14 +174,20 @@ const manualConnectDisabled = () => {
 
       <!-- Connection Status: Connected -->
       <div
-        v-if="connectionStatus === 'connected'"
+        v-if="connectionStatus === 'connected' || connectedNetwork"
         class="rounded-lg p-4 mb-4 flex items-center gap-3"
         style="background-color: rgba(252, 216, 105, 0.1); border: 1px solid rgba(252, 216, 105, 0.3)"
       >
-        <CheckCircle class="w-5 h-5" style="color: #FCD869" />
-        <div>
-          <p style="color: #FCD869">Connected Successfully</p>
-          <p class="text-sm" style="color: #96EEF2">Network: {{ selectedNetwork?.ssid || manualSSID }}</p>
+        <CheckCircle class="w-5 h-5 flex-shrink-0" style="color: #FCD869" />
+        <div class="flex-1">
+          <p style="color: #FCD869">Connected</p>
+          <p class="text-sm" style="color: #96EEF2">Network: {{ connectedNetwork?.ssid || selectedNetwork?.ssid || manualSSID }}</p>
+        </div>
+        <div v-if="apiConnectionStatus?.ip_address" class="flex items-center gap-1.5 flex-shrink-0">
+          <svg class="w-4 h-4" viewBox="0 0 24 24" style="color: #FCD869">
+            <path :d="mdiIpOutline" fill="currentColor" />
+          </svg>
+          <span class="text-sm font-mono" style="color: #FCD869">{{ apiConnectionStatus.ip_address }}</span>
         </div>
       </div>
 
@@ -250,7 +276,14 @@ const manualConnectDisabled = () => {
                 <div class="flex items-center gap-2">
                   <p class="text-white">{{ network.ssid }}</p>
                   <span
-                    v-if="network.saved"
+                    v-if="network.connected"
+                    class="text-xs px-2 py-0.5 rounded"
+                    style="background-color: rgba(252, 216, 105, 0.2); color: #FCD869"
+                  >
+                    Connected
+                  </span>
+                  <span
+                    v-else-if="network.saved"
                     class="text-xs bg-green-500/20 text-green-400 px-2 py-0.5 rounded"
                   >
                     Saved
@@ -268,9 +301,25 @@ const manualConnectDisabled = () => {
             <span class="text-sm" style="color: #41B9C3">{{ network.signal }}%</span>
           </div>
 
-          <!-- Password Input for unsaved selected network -->
+          <!-- Disconnect button for connected network -->
           <div
-            v-if="selectedNetwork?.ssid === network.ssid && !network.saved"
+            v-if="selectedNetwork?.ssid === network.ssid && network.connected"
+            class="mt-4 pt-4"
+            style="border-top: 1px solid rgba(65, 185, 195, 0.2)"
+            @click.stop
+          >
+            <button
+              @click="handleDisconnect"
+              class="w-full px-4 py-2 text-white rounded-lg transition-all hover:opacity-90"
+              style="background: linear-gradient(135deg, #DD2C1D 0%, #a82215 100%)"
+            >
+              Disconnect
+            </button>
+          </div>
+
+          <!-- Password Input for unsaved, not-connected selected network -->
+          <div
+            v-else-if="selectedNetwork?.ssid === network.ssid && !network.saved"
             class="mt-4 pt-4"
             style="border-top: 1px solid rgba(65, 185, 195, 0.2)"
             @click.stop
@@ -303,9 +352,9 @@ const manualConnectDisabled = () => {
             </button>
           </div>
 
-          <!-- Connect button for saved selected network -->
+          <!-- Connect button for saved, not-connected selected network -->
           <div
-            v-if="selectedNetwork?.ssid === network.ssid && network.saved"
+            v-else-if="selectedNetwork?.ssid === network.ssid && network.saved"
             class="mt-4 pt-4"
             style="border-top: 1px solid rgba(65, 185, 195, 0.2)"
             @click.stop
