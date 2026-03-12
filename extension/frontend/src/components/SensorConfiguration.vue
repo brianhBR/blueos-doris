@@ -126,7 +126,8 @@ const getModuleIcon = (mod: DisplayModule): string => {
   if (type === 'camera' || name.includes('camera')) return mdiCameraOutline
   if (type === 'video' || name.includes('video') || name.includes('stream')) return mdiVideoOutline
   if (type === 'light' || name.includes('light')) return mdiLightbulbOnOutline
-  if (name.includes('temperature') || name.includes('temp')) return mdiThermometerLines
+  if (name.includes('thermometer') || name.includes('temperature') || name.includes('temp')) return mdiThermometerLines
+  if (name.includes('barometer')) return mdiGauge
   if (name.includes('depth') || name.includes('pressure')) return mdiWaves
   if (name.includes('conductivity') || name.includes('ctd')) return mdiSineWave
   if (name.includes('co2') || name.includes('co₂') || name.includes('carbon')) return mdiMoleculeCo2
