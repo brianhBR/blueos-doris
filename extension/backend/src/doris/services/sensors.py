@@ -12,6 +12,7 @@ from ..models.sensors import (
     VideoStream,
 )
 from .base import BlueOSClient
+from .lights import LightService
 
 logger = logging.getLogger(__name__)
 
@@ -21,8 +22,8 @@ class SensorService:
 
     def __init__(self):
         self.ping_service = BlueOSClient(blueos_services.ping_service)
-        self.mavlink2rest = BlueOSClient(blueos_services.mavlink2rest)
         self.camera_manager = BlueOSClient(blueos_services.camera_manager)
+        self.light_service = LightService()
 
     async def get_connected_modules(self) -> list[ModuleInfo]:
         """Get all connected modules."""
@@ -35,6 +36,10 @@ class SensorService:
         # Get ping/sonar sensors
         ping_modules = await self._get_ping_modules()
         modules.extend(ping_modules)
+
+        # Get configured light modules
+        light_modules = await self.light_service.get_light_modules()
+        modules.extend(light_modules)
 
         return modules
 
@@ -170,6 +175,6 @@ class SensorService:
     async def close(self) -> None:
         """Close HTTP clients."""
         await self.ping_service.close()
-        await self.mavlink2rest.close()
         await self.camera_manager.close()
+        await self.light_service.close()
 
