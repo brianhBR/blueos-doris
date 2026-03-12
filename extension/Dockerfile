@@ -61,7 +61,7 @@ LABEL permissions='\
   },\
   "HostConfig": {\
     "Binds": [\
-      "/usr/blueos/extensions/doris:/data"\
+      "/usr/blueos/extensions/doris:/tmp/storage"\
     ],\
     "ExtraHosts": [\
       "host.docker.internal:host-gateway"\
