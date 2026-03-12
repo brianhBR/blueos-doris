@@ -61,7 +61,9 @@ LABEL permissions='\
   },\
   "HostConfig": {\
     "Binds": [\
-      "/usr/blueos/extensions/doris:/tmp/storage"\
+      "/root/.config/ardupilot-manager/firmware:/tmp/storage/firmware",\
+      "/usr/blueos/extensions/doris:/tmp/storage/internal",\
+      "/usr/blueos/userdata/recorder:/tmp/storage/recorder"\
     ],\
     "ExtraHosts": [\
       "host.docker.internal:host-gateway"\
