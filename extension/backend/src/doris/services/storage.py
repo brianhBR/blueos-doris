@@ -17,7 +17,7 @@ logger = logging.getLogger(__name__)
 
 IMAGE_EXTENSIONS = frozenset(("jpg", "jpeg", "png", "gif", "bmp", "tiff", "raw", "dng"))
 VIDEO_EXTENSIONS = frozenset(("mp4", "avi", "mov", "mkv", "webm", "ts"))
-DATA_EXTENSIONS = frozenset(("csv", "json", "bin", "log", "txt", "bag", "mcap"))
+DATA_EXTENSIONS = frozenset(("csv", "json", "bin", "log", "txt", "bag", "mcap", "lua"))
 ALL_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | DATA_EXTENSIONS
 
 DATA_ROOT = Path(os.environ.get("DORIS_DATA_ROOT", "/tmp/storage"))
