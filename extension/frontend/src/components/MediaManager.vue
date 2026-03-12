@@ -23,7 +23,7 @@ const emit = defineEmits<{
   navigate: [screen: Screen, diveData?: { name: string; date: string; duration: string; maxDepth: string; location: string }]
 }>()
 
-const { files: apiFiles, loading: mediaLoading, error: mediaError, fetchFiles, deleteFile } = useMedia()
+const { files: apiFiles, loading: mediaLoading, error: mediaError, fetchFiles, deleteFile, downloadFile } = useMedia()
 const { storage, loading: storageLoading, error: storageError, fetchStorage } = useStorage()
 
 type SortField = 'diveName' | 'fileName' | 'date' | 'type'
@@ -207,6 +207,35 @@ const confirmDelete = async () => {
   selectedFiles.value = []
   showDeleteConfirm.value = false
   isDeleting.value = false
+  await fetchFiles()
+}
+
+const handleDownloadSelected = () => {
+  for (const fileId of selectedFiles.value) {
+    const file = mediaFiles.value.find(f => f.id === fileId)
+    if (file) downloadFile(fileId, file.fileName)
+  }
+}
+
+const handleDownloadSingle = (file: DisplayFile) => {
+  downloadFile(file.id, file.fileName)
+}
+
+const handleDeleteSingle = (file: DisplayFile) => {
+  selectedFiles.value = [file.id]
+  showDeleteConfirm.value = true
+}
+
+const confirmEraseAll = async () => {
+  isDeleting.value = true
+  for (const file of mediaFiles.value) {
+    await deleteFile(file.id)
+  }
+  selectedFiles.value = []
+  showEraseAllConfirm.value = false
+  eraseAllStep.value = 1
+  isDeleting.value = false
+  await fetchFiles()
 }
 
 const handlePageChange = (page: number) => {
@@ -297,6 +326,7 @@ const handlePageChange = (page: number) => {
         </div>
         <div v-if="selectedFiles.length > 0" class="flex gap-2">
           <button
+            @click="handleDownloadSelected"
             class="flex-1 md:flex-none px-3 md:px-4 py-2 rounded-lg transition-all hover:opacity-90 flex items-center justify-center gap-2 text-sm whitespace-nowrap"
             style="background-color: #41B9C3; color: white"
           >
@@ -431,11 +461,19 @@ const handlePageChange = (page: number) => {
                     View
                   </button>
                   <button
+                    @click="handleDownloadSingle(file)"
                     class="px-3 py-1.5 rounded-lg transition-all hover:opacity-80 flex items-center gap-2 text-sm"
                     style="background-color: #41B9C3; color: white"
                   >
                     <Download class="w-3.5 h-3.5" />
                     Download
+                  </button>
+                  <button
+                    @click="handleDeleteSingle(file)"
+                    class="px-3 py-1.5 rounded-lg transition-all hover:opacity-80 flex items-center gap-2 text-sm"
+                    style="background-color: rgba(221, 44, 29, 0.8); color: white"
+                  >
+                    <Trash2 class="w-3.5 h-3.5" />
                   </button>
                 </div>
               </td>
@@ -547,11 +585,19 @@ const handlePageChange = (page: number) => {
                   View
                 </button>
                 <button
+                  @click="handleDownloadSingle(file)"
                   class="flex-1 px-3 py-2 rounded-lg transition-all hover:opacity-80 flex items-center justify-center gap-2 text-sm"
                   style="background-color: #41B9C3; color: white"
                 >
                   <Download class="w-3.5 h-3.5" />
                   Download
+                </button>
+                <button
+                  @click="handleDeleteSingle(file)"
+                  class="px-3 py-2 rounded-lg transition-all hover:opacity-80 flex items-center justify-center text-sm"
+                  style="background-color: rgba(221, 44, 29, 0.8); color: white"
+                >
+                  <Trash2 class="w-3.5 h-3.5" />
                 </button>
               </div>
             </div>
@@ -746,12 +792,14 @@ const handlePageChange = (page: number) => {
               Cancel
             </button>
             <button
-              @click="eraseAllStep === 1 ? eraseAllStep = 2 : showEraseAllConfirm = false"
+              @click="eraseAllStep === 1 ? eraseAllStep = 2 : confirmEraseAll()"
+              :disabled="isDeleting"
               class="flex-1 px-4 py-2 rounded-lg transition-all hover:opacity-90 flex items-center justify-center gap-2"
               style="background-color: #DD2C1D; color: white"
             >
-              <Trash2 class="w-4 h-4" />
-              {{ eraseAllStep === 1 ? 'Confirm Erase' : 'Erase All Files' }}
+              <Loader2 v-if="isDeleting" class="w-4 h-4 animate-spin" />
+              <Trash2 v-else class="w-4 h-4" />
+              {{ isDeleting ? 'Erasing...' : eraseAllStep === 1 ? 'Confirm Erase' : 'Erase All Files' }}
             </button>
           </div>
         </div>

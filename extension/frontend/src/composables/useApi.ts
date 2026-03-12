@@ -579,15 +579,28 @@ export function useMedia() {
     }
   }
 
-  async function deleteFile(fileId: string): Promise<boolean> {
+  async function deleteFile(filePath: string): Promise<boolean> {
     try {
-      await deleteApi(`/media/files/${fileId}`)
-      files.value = files.value.filter(f => f.id !== fileId)
+      const params = new URLSearchParams({ path: filePath }).toString()
+      const response = await fetch(`${API_BASE}/media/files?${params}`, { method: 'DELETE' })
+      if (!response.ok) throw new Error(`Delete failed: ${response.statusText}`)
+      files.value = files.value.filter(f => f.id !== filePath)
       return true
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Failed to delete file'
       return false
     }
+  }
+
+  function downloadFile(filePath: string, fileName?: string) {
+    const params = new URLSearchParams({ path: filePath }).toString()
+    const url = `${API_BASE}/media/download?${params}`
+    const a = document.createElement('a')
+    a.href = url
+    a.download = fileName || filePath.split('/').pop() || 'download'
+    document.body.appendChild(a)
+    a.click()
+    document.body.removeChild(a)
   }
 
   async function fetchSyncStatus() {
@@ -618,6 +631,7 @@ export function useMedia() {
     fetchFiles,
     fetchMediaMissions,
     deleteFile,
+    downloadFile,
     fetchSyncStatus,
     startSync,
   }
