@@ -18,8 +18,8 @@ from ..models.sensors import ModuleInfo
 
 logger = logging.getLogger(__name__)
 
-SERVO_FUNCTION_RCIN9 = 59  # Lights 1
-SERVO_FUNCTION_RCIN10 = 60  # Lights 2
+SERVO_FUNCTION_RCIN9 = 181  # Lights 1
+SERVO_FUNCTION_RCIN10 = 182  # Lights 2
 
 LIGHT_FUNCTIONS: dict[int, str] = {
     SERVO_FUNCTION_RCIN9: "Lights 1",
