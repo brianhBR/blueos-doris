@@ -15,6 +15,7 @@ import {
 } from 'lucide-vue-next'
 import { mdiCompassOutline } from '@mdi/js'
 import { useSystemStatus, useBattery, useStorage, useLocation, useSensors, useConfigurations } from '../composables/useApi'
+import AttitudeVisualization from './AttitudeVisualization.vue'
 import type { SensorModule } from '../composables/useApi'
 import type { Screen } from '../types'
 
@@ -670,27 +671,10 @@ const formatReleaseTime = (date: Date) => {
           System Overview
         </h2>
         <div
-          class="aspect-[3/4] rounded-lg flex items-center justify-center"
-          style="background: linear-gradient(135deg, rgba(0, 77, 100, 0.4) 0%, rgba(14, 36, 70, 0.6) 100%); border: 1px solid rgba(65, 185, 195, 0.2)"
+          class="aspect-[3/4] rounded-lg overflow-hidden"
+          style="border: 1px solid rgba(65, 185, 195, 0.2)"
         >
-          <div class="text-center">
-            <div
-              class="w-24 h-24 mx-auto mb-4 rounded-full flex items-center justify-center"
-              style="background: linear-gradient(135deg, #41B9C3 0%, #96EEF2 100%)"
-            >
-              <div
-                class="rounded-full border-4 flex items-center justify-center"
-                style="border-color: rgba(255, 255, 255, 0.3); width: 72px; height: 72px"
-              >
-                <div
-                  class="w-12 h-12 rounded-full"
-                  style="background-color: rgba(150, 238, 242, 0.3)"
-                />
-              </div>
-            </div>
-            <p style="color: #96EEF2">3D DORIS Model</p>
-            <p class="text-xs" style="color: #41B9C3">(Interactive visualization)</p>
-          </div>
+          <AttitudeVisualization />
         </div>
       </div>
 
