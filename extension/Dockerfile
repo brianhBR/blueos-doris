@@ -61,6 +61,7 @@ LABEL permissions='\
     "8095/tcp": {}\
   },\
   "HostConfig": {\
+    "Privileged": true,\
     "Binds": [\
       "/dev:/dev:rw",\
       "/root/.config/blueos/ardupilot-manager/firmware:/tmp/storage/firmware",\
