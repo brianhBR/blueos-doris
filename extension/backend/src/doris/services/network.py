@@ -78,13 +78,13 @@ class NetworkService:
         return "D-0000"
 
     async def _get_wlan_mac(self) -> str | None:
-        """Get MAC address of the wlan0 interface from linux2rest."""
+        """Get MAC address of the wlan1 interface from linux2rest."""
         try:
             interfaces: list[dict[str, Any]] = await self._linux2rest.get(  # type: ignore[assignment]
                 "/system/network"
             )
             for iface in interfaces:
-                if iface.get("name", "").startswith("wlan"):
+                if iface.get("name") == "wlan1":
                     mac = iface.get("mac")
                     if mac:
                         self._cached_mac = mac
