@@ -100,7 +100,7 @@ const releaseWeightDate = ref('2026-02-07')
 const releaseWeightTime = ref('12:00')
 const sortColumn = ref<'sensor' | 'status' | null>(null)
 const sortDirection = ref<'asc' | 'desc'>('asc')
-const leakDetected = ref(true)
+const leakDetected = ref(false)
 const isCheckingLeaks = ref(false)
 
 const previousUsernames = ['Captain Smith', 'Dr. Johnson', 'Prof. Lee', 'Researcher Chen']
