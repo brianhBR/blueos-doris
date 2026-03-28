@@ -62,7 +62,7 @@ LABEL permissions='\
   },\
   "HostConfig": {\
     "Binds": [\
-      "/root/.config/ardupilot-manager/firmware:/tmp/storage/firmware",\
+      "/root/.config/blueos/ardupilot-manager/firmware:/tmp/storage/firmware",\
       "/usr/blueos/extensions/doris:/tmp/storage/internal",\
       "/usr/blueos/userdata/recorder:/tmp/storage/recorder"\
     ],\
