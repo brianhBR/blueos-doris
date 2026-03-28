@@ -808,12 +808,12 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                   <input type="radio" value="continuous-video" v-model="descentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                   <span style="color: #96EEF2">Continuous Video</span>
                 </label>
-                <label class="flex items-center gap-2 cursor-pointer">
-                  <input type="radio" value="video-interval" v-model="descentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
+                <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
+                  <input type="radio" value="video-interval" v-model="descentCameraType" disabled class="w-4 h-4" />
                   <span style="color: #96EEF2">Interval Video</span>
                 </label>
-                <label class="flex items-center gap-2 cursor-pointer">
-                  <input type="radio" value="timelapse" v-model="descentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
+                <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
+                  <input type="radio" value="timelapse" v-model="descentCameraType" disabled class="w-4 h-4" />
                   <span style="color: #96EEF2">Timelapse Images</span>
                 </label>
               </div>
@@ -886,23 +886,12 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
               </div>
             </div>
 
-            <!-- Sleep Timer -->
-            <div class="mt-4">
-              <label class="flex items-center gap-2 mb-2 text-sm cursor-pointer" style="color: #96EEF2">
-                <input type="checkbox" v-model="descentSleepTimerEnabled" @change="hasUnsavedChanges = true" class="w-4 h-4 cursor-pointer" style="accent-color: #41B9C3" />
+            <!-- Sleep Timer (disabled) -->
+            <div class="mt-4 opacity-40">
+              <label class="flex items-center gap-2 mb-2 text-sm cursor-not-allowed" style="color: #96EEF2">
+                <input type="checkbox" disabled class="w-4 h-4 cursor-not-allowed" style="accent-color: #41B9C3" />
                 Optional: Stop recording and go to sleep after elapsed time of:
               </label>
-              <div v-if="descentSleepTimerEnabled">
-                <div class="flex gap-2">
-                  <input type="number" v-model="descentSleepTimerNumber" @input="hasUnsavedChanges = true" placeholder="0" class="w-1/2 px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" min="0" step="0.1" />
-                  <select v-model="descentSleepTimerUnit" @change="hasUnsavedChanges = true" class="w-1/2 px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle">
-                    <option value="seconds">seconds</option>
-                    <option value="minutes">minutes</option>
-                    <option value="hours">hours</option>
-                  </select>
-                </div>
-                <p class="text-xs mt-1" style="color: rgba(150, 238, 242, 0.7)">Camera will stop recording and enter sleep mode after this duration</p>
-              </div>
             </div>
 
             <!-- Camera Settings Toggle -->
@@ -1003,8 +992,8 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                   <input type="radio" value="continuous" v-model="descentLightMode" class="w-4 h-4" />
                   <span style="color: #96EEF2">Continuous Light</span>
                 </label>
-                <label class="flex items-center gap-2 cursor-pointer">
-                  <input type="radio" value="interval" v-model="descentLightMode" class="w-4 h-4" />
+                <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
+                  <input type="radio" value="interval" v-model="descentLightMode" disabled class="w-4 h-4" />
                   <span style="color: #96EEF2">Interval Light</span>
                 </label>
               </div>
@@ -1105,12 +1094,12 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                   <input type="radio" value="continuous-video" v-model="bottomCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                   <span style="color: #96EEF2">Continuous Video</span>
                 </label>
-                <label class="flex items-center gap-2 cursor-pointer">
-                  <input type="radio" value="video-interval" v-model="bottomCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
+                <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
+                  <input type="radio" value="video-interval" v-model="bottomCameraType" disabled class="w-4 h-4" />
                   <span style="color: #96EEF2">Interval Video</span>
                 </label>
-                <label class="flex items-center gap-2 cursor-pointer">
-                  <input type="radio" value="timelapse" v-model="bottomCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
+                <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
+                  <input type="radio" value="timelapse" v-model="bottomCameraType" disabled class="w-4 h-4" />
                   <span style="color: #96EEF2">Timelapse Images</span>
                 </label>
               </div>
@@ -1148,21 +1137,12 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
               </div>
             </div>
 
-            <!-- Sleep Timer -->
-            <div class="mt-4">
-              <label class="flex items-center gap-2 mb-2 text-sm cursor-pointer" style="color: #96EEF2">
-                <input type="checkbox" v-model="bottomSleepTimerEnabled" @change="hasUnsavedChanges = true" class="w-4 h-4 cursor-pointer" style="accent-color: #41B9C3" />
+            <!-- Sleep Timer (disabled) -->
+            <div class="mt-4 opacity-40">
+              <label class="flex items-center gap-2 mb-2 text-sm cursor-not-allowed" style="color: #96EEF2">
+                <input type="checkbox" disabled class="w-4 h-4 cursor-not-allowed" style="accent-color: #41B9C3" />
                 Optional: Stop recording and go to sleep after elapsed time of:
               </label>
-              <div v-if="bottomSleepTimerEnabled">
-                <div class="flex gap-2">
-                  <input type="number" v-model="bottomSleepTimerNumber" @input="hasUnsavedChanges = true" placeholder="0" class="w-1/2 px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" min="0" step="0.1" />
-                  <select v-model="bottomSleepTimerUnit" @change="hasUnsavedChanges = true" class="w-1/2 px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle">
-                    <option value="seconds">seconds</option><option value="minutes">minutes</option><option value="hours">hours</option>
-                  </select>
-                </div>
-                <p class="text-xs mt-1" style="color: rgba(150, 238, 242, 0.7)">Camera will stop recording and enter sleep mode after this duration</p>
-              </div>
             </div>
 
             <button @click="bottomAdvancedOpen = !bottomAdvancedOpen" class="flex items-center gap-2 px-4 py-2 mt-2 rounded-lg transition-all hover:opacity-80" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4); color: #96EEF2">
@@ -1278,8 +1258,8 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                   <input type="radio" value="continuous" v-model="bottomLightMode" class="w-4 h-4" />
                   <span style="color: #96EEF2">Continuous Light</span>
                 </label>
-                <label class="flex items-center gap-2 cursor-pointer">
-                  <input type="radio" value="interval" v-model="bottomLightMode" class="w-4 h-4" />
+                <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
+                  <input type="radio" value="interval" v-model="bottomLightMode" disabled class="w-4 h-4" />
                   <span style="color: #96EEF2">Interval Light</span>
                 </label>
               </div>
@@ -1411,12 +1391,12 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                     <input type="radio" value="continuous-video" v-model="ascentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                     <span style="color: #96EEF2">Continuous Video</span>
                   </label>
-                  <label class="flex items-center gap-2 cursor-pointer">
-                    <input type="radio" value="video-interval" v-model="ascentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
+                  <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
+                    <input type="radio" value="video-interval" v-model="ascentCameraType" disabled class="w-4 h-4" />
                     <span style="color: #96EEF2">Interval Video</span>
                   </label>
-                  <label class="flex items-center gap-2 cursor-pointer">
-                    <input type="radio" value="timelapse" v-model="ascentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
+                  <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
+                    <input type="radio" value="timelapse" v-model="ascentCameraType" disabled class="w-4 h-4" />
                     <span style="color: #96EEF2">Timelapse Images</span>
                   </label>
                 </div>
@@ -1454,21 +1434,12 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                 </div>
               </div>
 
-              <!-- Sleep Timer -->
-              <div class="mt-4">
-                <label class="flex items-center gap-2 mb-2 text-sm cursor-pointer" style="color: #96EEF2">
-                  <input type="checkbox" v-model="ascentSleepTimerEnabled" @change="hasUnsavedChanges = true" class="w-4 h-4 cursor-pointer" style="accent-color: #41B9C3" />
+              <!-- Sleep Timer (disabled) -->
+              <div class="mt-4 opacity-40">
+                <label class="flex items-center gap-2 mb-2 text-sm cursor-not-allowed" style="color: #96EEF2">
+                  <input type="checkbox" disabled class="w-4 h-4 cursor-not-allowed" style="accent-color: #41B9C3" />
                   Optional: Stop recording and go to sleep after elapsed time of:
                 </label>
-                <div v-if="ascentSleepTimerEnabled">
-                  <div class="flex gap-2">
-                    <input type="number" v-model="ascentSleepTimerNumber" @input="hasUnsavedChanges = true" placeholder="0" class="w-1/2 px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" min="0" step="0.1" />
-                    <select v-model="ascentSleepTimerUnit" @change="hasUnsavedChanges = true" class="w-1/2 px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle">
-                      <option value="seconds">seconds</option><option value="minutes">minutes</option><option value="hours">hours</option>
-                    </select>
-                  </div>
-                  <p class="text-xs mt-1" style="color: rgba(150, 238, 242, 0.7)">Camera will stop recording and enter sleep mode after this duration</p>
-                </div>
               </div>
 
               <!-- Same as Descent -->
@@ -1573,8 +1544,8 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                     <input type="radio" value="continuous" v-model="ascentLightMode" class="w-4 h-4" />
                     <span style="color: #96EEF2">Continuous Light</span>
                   </label>
-                  <label class="flex items-center gap-2 cursor-pointer">
-                    <input type="radio" value="interval" v-model="ascentLightMode" class="w-4 h-4" />
+                  <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
+                    <input type="radio" value="interval" v-model="ascentLightMode" disabled class="w-4 h-4" />
                     <span style="color: #96EEF2">Interval Light</span>
                   </label>
                 </div>
