@@ -151,16 +151,40 @@ const useIridium = ref(false)
 const useLoRA = ref(false)
 
 const batteryData = computed(() => {
-  const basePower = 2
-  let totalPower = basePower
-  if (descentCameraOn.value || bottomCameraOn.value || ascentCameraOn.value) totalPower += 5
-  if (descentLightOn.value || bottomLightOn.value || ascentLightOn.value) totalPower += 10
-  totalPower += 1.5
-  const batteryCapacity = 100
-  const batteryLife = batteryCapacity / totalPower
-  const diveDuration = 6
-  const batteryUsagePercent = Math.min((diveDuration / batteryLife) * 100, 100)
-  return { basePower, totalPower, batteryLife, batteryUsagePercent, diveDuration }
+  // -- Descent / ascent parameters --
+  const descentRate_m_per_s = 1          // descent speed in meters per second
+  const descentRate_m_per_min = descentRate_m_per_s * 60
+
+  // -- Power consumption (watts) --
+  const powerRPi5_W = 15                // Raspberry Pi 5 single-board computer
+  const powerRadCAM_W = 5               // RadCAM camera module
+  const powerPerLumen_W = 15            // each lumen light module
+  const lumenCount = 2                  // number of lumen lights installed
+
+  // -- Battery --
+  const batteryCapacity_Wh = 266        // onboard battery capacity in watt-hours
+
+  // -- Dive duration from depth + release weight settings --
+  const depth = parseFloat(estimatedDepth.value) || 0
+  const descentTimeHours = depth / descentRate_m_per_min / 60
+  const ascentTimeHours = depth / descentRate_m_per_min / 60
+
+  let diveDuration = 0
+  if (props.releaseWeightBy === 'elapsed') {
+    const num = Number(releaseWeightElapsedNumber.value) || 0
+    const unit = releaseWeightElapsedUnit.value
+    diveDuration = unit === 'hours' ? num : unit === 'minutes' ? num / 60 : num / 3600
+  } else {
+    diveDuration = descentTimeHours + ascentTimeHours
+  }
+
+  // -- Derived values --
+  const totalPower = powerRPi5_W + powerRadCAM_W + (powerPerLumen_W * lumenCount)
+  const batteryLife = totalPower > 0 ? batteryCapacity_Wh / totalPower : 0
+  const batteryUsagePercent = batteryLife > 0
+    ? Math.min((diveDuration / batteryLife) * 100, 100)
+    : 0
+  return { totalPower, batteryLife, batteryUsagePercent, diveDuration }
 })
 
 const descentCaptureFrequencyTooLow = computed(() => {
@@ -1622,9 +1646,10 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
 
       <!-- Battery Planning -->
       <div class="mt-6">
-        <button @click="showBatteryPlanning = !showBatteryPlanning" class="w-full flex items-center justify-between p-4 rounded-lg transition-all" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.3)">
+        <button @click="showBatteryPlanning = !showBatteryPlanning" class="w-full flex items-center justify-between p-4 rounded-lg transition-all" :class="{ 'battery-warning-pulse': batteryData.batteryUsagePercent > 80 }" :style="{ backgroundColor: batteryData.batteryUsagePercent > 80 ? 'rgba(221, 44, 29, 0.25)' : 'rgba(14, 36, 70, 0.5)', border: batteryData.batteryUsagePercent > 80 ? '1px solid rgba(221, 44, 29, 0.6)' : '1px solid rgba(65, 185, 195, 0.3)' }">
           <div class="flex items-center gap-3">
-            <Battery class="w-6 h-6" style="color: #41B9C3" />
+            <AlertTriangle v-if="batteryData.batteryUsagePercent > 80" class="w-6 h-6" style="color: #DD2C1D" />
+            <Battery v-else class="w-6 h-6" style="color: #41B9C3" />
             <span class="text-white text-xl">Battery Planning</span>
           </div>
           <ChevronUp v-if="showBatteryPlanning" class="w-6 h-6" style="color: #96EEF2" />
@@ -1807,3 +1832,20 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
     </Teleport>
   </div>
 </template>
+
+<style>
+.battery-warning-pulse {
+  animation: batteryPulse 2s ease-in-out infinite;
+}
+
+@keyframes batteryPulse {
+  0%, 100% {
+    box-shadow: 0 0 8px 2px rgba(221, 44, 29, 0.3);
+    background-color: rgba(221, 44, 29, 0.15);
+  }
+  50% {
+    box-shadow: 0 0 24px 6px rgba(221, 44, 29, 0.7);
+    background-color: rgba(221, 44, 29, 0.35);
+  }
+}
+</style>

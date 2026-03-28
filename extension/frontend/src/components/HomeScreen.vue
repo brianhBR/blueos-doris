@@ -135,9 +135,12 @@ const diveFeasibility = computed(() => {
   const depth = parseFloat(estimatedDepth.value)
   if (isNaN(depth) || depth <= 0) return null
 
-  const descentAscentRate = 10
-  const descentTimeMinutes = depth / descentAscentRate
-  const ascentTimeMinutes = depth / descentAscentRate
+  // -- Descent / ascent parameters --
+  const descentRate_m_per_s = 1          // descent speed in meters per second
+  const descentRate_m_per_min = descentRate_m_per_s * 60  // converted to m/min for time calc
+
+  const descentTimeMinutes = depth / descentRate_m_per_min
+  const ascentTimeMinutes = depth / descentRate_m_per_min
   const descentTimeHours = descentTimeMinutes / 60
   const ascentTimeHours = ascentTimeMinutes / 60
 
@@ -156,19 +159,18 @@ const diveFeasibility = computed(() => {
     bottomTimeHours = Math.max(0, totalDiveTimeHours - descentTimeHours - ascentTimeHours)
   }
 
-  const basePower = 2
-  const cameraPower = 5
-  const lightPower = 10
-  const dataPower = 1.5
-  let totalPowerDraw = basePower + dataPower
-  const cameraOnHours = bottomTimeHours
-  const lightOnHours = bottomTimeHours
-  const cameraAveragePower = totalDiveTimeHours > 0 ? (cameraPower * cameraOnHours) / totalDiveTimeHours : 0
-  const lightAveragePower = totalDiveTimeHours > 0 ? (lightPower * lightOnHours) / totalDiveTimeHours : 0
-  totalPowerDraw += cameraAveragePower + lightAveragePower
+  // -- Power consumption (watts) --
+  const powerRPi5_W = 15                // Raspberry Pi 5 single-board computer
+  const powerRadCAM_W = 5               // RadCAM camera module
+  const powerPerLumen_W = 15            // each lumen light module
+  const lumenCount = 2                  // number of lumen lights installed
 
-  const batteryCapacity = 100
-  const batteryLifeHours = totalPowerDraw > 0 ? batteryCapacity / totalPowerDraw : 0
+  // -- Battery --
+  const batteryCapacity_Wh = 266        // onboard battery capacity in watt-hours
+
+  // -- Derived values --
+  const totalPowerDraw = powerRPi5_W + powerRadCAM_W + (powerPerLumen_W * lumenCount)
+  const batteryLifeHours = totalPowerDraw > 0 ? batteryCapacity_Wh / totalPowerDraw : 0
   const batteryUsagePercent = Math.min(
     batteryLifeHours > 0 ? (totalDiveTimeHours / batteryLifeHours) * 100 : 100,
     100
