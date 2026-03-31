@@ -1,9 +1,11 @@
 --[[
-   Simple dive script for ArduSub
-   - Arms the vehicle
-   - Descends for a configurable duration
-   - Ascends back to surface until depth <= target surface depth
-   - Disarms the vehicle
+   DORIS dive script for ArduSub
+
+   Mission phases:
+     WAIT_START -> INIT -> ARMING -> DESCENDING -> ON_BOTTOM -> SURFACING -> DISARMING -> DONE
+
+   Configuration is received via DORIS_* MAVLink parameters that the
+   backend pushes before setting DORIS_START=1.
 
    Requires: ArduSub with Lua scripting enabled (SCR_ENABLE = 1)
 --]]
@@ -22,85 +24,157 @@ local MAV_SEVERITY = {
     DEBUG     = 7,
 }
 
--- ArduSub modes
-local MODE_ALT_HOLD  = 2
-local MODE_SURFACE   = 9
+-- ArduSub flight modes
+local MODE_ALT_HOLD = 2
+local MODE_SURFACE  = 9
 
--- configurable header variables
-local DIVE_DURATION_MS   = 10000   -- how long to descend (ms)
-local SURFACE_DEPTH_M    = 0.5     -- target depth to stop ascending (m)
-local DESCENT_THROTTLE   = 1300    -- RC3 PWM for descending (below 1500 = down in ArduSub)
-local NEUTRAL_THROTTLE   = 1500    -- RC3 PWM for neutral buoyancy
-local UPDATE_INTERVAL_MS = 500     -- main loop rate (ms)
-local ARM_RETRY_MS       = 2000    -- time between arm attempts (ms)
-local ARM_TIMEOUT_MS     = 10000   -- give up arming after this long (ms)
-local SURFACE_PRESSURE   = 101325  -- surface pressure in Pa (standard atmospheric)
-local WATER_DENSITY      = 1025.0  -- seawater density in kg/m^3
-local GRAVITY            = 9.80665 -- gravitational acceleration in m/s^2
+-- fixed constants
+local SURFACE_DEPTH_M    = 0.5
+local DESCENT_THROTTLE   = 1300
+local ASCENT_THROTTLE    = 1700
+local NEUTRAL_THROTTLE   = 1500
+local UPDATE_INTERVAL_MS = 500
+local ARM_RETRY_MS       = 2000
+local ARM_TIMEOUT_MS     = 10000
+local WATER_DENSITY      = 1025.0
+local GRAVITY            = 9.80665
+
+-- calibrate surface pressure from the barometer at script load
+local SURFACE_PRESSURE = baro:get_pressure() or 101325
+
+-- light PWM range
+local LIGHT_PWM_MIN = 1100
+local LIGHT_PWM_MAX = 1900
 
 -- state machine
 local STATE_WAIT_START = -1
 local STATE_INIT       = 0
 local STATE_ARMING     = 1
-local STATE_DIVING     = 2
-local STATE_SURFACING  = 3
-local STATE_DISARMING  = 4
-local STATE_DONE       = 5
+local STATE_DESCENDING = 2
+local STATE_ON_BOTTOM  = 3
+local STATE_SURFACING  = 4
+local STATE_DISARMING  = 5
+local STATE_DONE       = 6
 
--- DORIS_START parameter: set to 1 to begin the dive
-local PARAM_TABLE_KEY = 73
-assert(param:add_table(PARAM_TABLE_KEY, "DORIS_", 1), "DIVE: could not add DORIS_ param table")
-assert(param:add_param(PARAM_TABLE_KEY, 1, "START", 0), "DIVE: could not add DORIS_START param")
-local DORIS_START = Parameter("DORIS_START")
--- Always reset on script load so a persisted value of 1 doesn't trigger a dive on reboot
+-- ── DORIS parameter table ──────────────────────────────────────────
+local PARAM_TABLE_KEY  = 73
+local PARAM_TABLE_SIZE = 7
+
+assert(param:add_table(PARAM_TABLE_KEY, "DORIS_", PARAM_TABLE_SIZE),
+       "DIVE: could not add DORIS_ param table")
+
+assert(param:add_param(PARAM_TABLE_KEY, 1, "START",   0), "DIVE: could not add DORIS_START")
+assert(param:add_param(PARAM_TABLE_KEY, 2, "DSC_DUR", 30), "DIVE: could not add DORIS_DSC_DUR")
+assert(param:add_param(PARAM_TABLE_KEY, 3, "RLS_SEC", 60), "DIVE: could not add DORIS_RLS_SEC")
+assert(param:add_param(PARAM_TABLE_KEY, 4, "DSC_LGT", 0), "DIVE: could not add DORIS_DSC_LGT")
+assert(param:add_param(PARAM_TABLE_KEY, 5, "BTM_LGT", 0), "DIVE: could not add DORIS_BTM_LGT")
+assert(param:add_param(PARAM_TABLE_KEY, 6, "ASC_LGT", 0), "DIVE: could not add DORIS_ASC_LGT")
+assert(param:add_param(PARAM_TABLE_KEY, 7, "LGT_BRT", 75), "DIVE: could not add DORIS_LGT_BRT")
+
+local DORIS_START   = Parameter("DORIS_START")
+local DORIS_DSC_DUR = Parameter("DORIS_DSC_DUR")
+local DORIS_RLS_SEC = Parameter("DORIS_RLS_SEC")
+local DORIS_DSC_LGT = Parameter("DORIS_DSC_LGT")
+local DORIS_BTM_LGT = Parameter("DORIS_BTM_LGT")
+local DORIS_ASC_LGT = Parameter("DORIS_ASC_LGT")
+local DORIS_LGT_BRT = Parameter("DORIS_LGT_BRT")
+
 DORIS_START:set_and_save(0)
 
--- runtime variables
-local state             = STATE_WAIT_START
-local elapsed_time      = 0
-local dive_start_ms     = 0
-local arm_start_ms      = 0
-local last_update_ms    = 0
-local script_start_ms   = 0
-local RC3 = rc:get_channel(3)
+-- ── runtime state ──────────────────────────────────────────────────
+local state           = STATE_WAIT_START
+local dive_start_ms   = 0
+local arm_start_ms    = 0
+local last_update_ms  = 0
+local script_start_ms = 0
 
+-- snapshotted config (read once when DORIS_START goes to 1)
+local cfg_dsc_dur_ms  = 30000
+local cfg_rls_sec_ms  = 60000
+local cfg_dsc_lgt     = false
+local cfg_btm_lgt     = false
+local cfg_asc_lgt     = false
+local cfg_lgt_pwm     = LIGHT_PWM_MIN
+
+local RC3 = rc:get_channel(3)
+local RC9 = rc:get_channel(9)
+
+-- ── helpers ────────────────────────────────────────────────────────
 local function get_depth_m()
     local pressure = baro:get_pressure()
-    if not pressure then
-        return nil
-    end
+    if not pressure then return nil end
     return (pressure - SURFACE_PRESSURE) / (WATER_DENSITY * GRAVITY)
 end
 
+local function brightness_to_pwm(pct)
+    if pct <= 0 then return LIGHT_PWM_MIN end
+    if pct >= 100 then return LIGHT_PWM_MAX end
+    return math.floor(LIGHT_PWM_MIN + (pct / 100.0) * (LIGHT_PWM_MAX - LIGHT_PWM_MIN))
+end
+
+local function set_lights(on)
+    if on then
+        RC9:set_override(cfg_lgt_pwm)
+    else
+        RC9:set_override(LIGHT_PWM_MIN)
+    end
+end
+
+local function snapshot_config()
+    local dsc_dur = DORIS_DSC_DUR:get()
+    local rls_sec = DORIS_RLS_SEC:get()
+    local brt     = DORIS_LGT_BRT:get()
+
+    cfg_dsc_dur_ms = math.max(dsc_dur, 1) * 1000
+    cfg_rls_sec_ms = math.max(rls_sec, 1) * 1000
+    cfg_dsc_lgt    = DORIS_DSC_LGT:get() >= 1
+    cfg_btm_lgt    = DORIS_BTM_LGT:get() >= 1
+    cfg_asc_lgt    = DORIS_ASC_LGT:get() >= 1
+    cfg_lgt_pwm    = brightness_to_pwm(brt)
+
+    gcs:send_text(MAV_SEVERITY.INFO,
+        string.format("DIVE: config dsc=%ds rls=%ds dsc_l=%d btm_l=%d asc_l=%d brt=%d%%",
+            dsc_dur, rls_sec,
+            cfg_dsc_lgt and 1 or 0,
+            cfg_btm_lgt and 1 or 0,
+            cfg_asc_lgt and 1 or 0,
+            brt))
+end
+
+-- ── main loop ──────────────────────────────────────────────────────
 function update()
     local now_ms = millis():tofloat()
 
-    if last_update_ms > 0 then
-        elapsed_time = now_ms - script_start_ms
-    else
+    if last_update_ms == 0 then
         script_start_ms = now_ms
     end
     last_update_ms = now_ms
 
+    -- ─── WAIT_START ────────────────────────────────────────────────
     if state == STATE_WAIT_START then
         if DORIS_START:get() >= 1 then
             gcs:send_text(MAV_SEVERITY.INFO, "DIVE: DORIS_START=1, beginning sequence")
+            snapshot_config()
             state = STATE_INIT
         end
 
+    -- ─── INIT ──────────────────────────────────────────────────────
     elseif state == STATE_INIT then
-        gcs:send_text(MAV_SEVERITY.INFO, "DIVE: initialising")
+        gcs:send_text(MAV_SEVERITY.INFO, "DIVE: initialising — ALT_HOLD")
         vehicle:set_mode(MODE_ALT_HOLD)
+        set_lights(cfg_dsc_lgt)
         arm_start_ms = now_ms
         state = STATE_ARMING
 
+    -- ─── ARMING ────────────────────────────────────────────────────
     elseif state == STATE_ARMING then
         if arming:is_armed() then
             gcs:send_text(MAV_SEVERITY.INFO, "DIVE: armed, beginning descent")
             dive_start_ms = now_ms
-            state = STATE_DIVING
+            state = STATE_DESCENDING
         elseif now_ms - arm_start_ms > ARM_TIMEOUT_MS then
             gcs:send_text(MAV_SEVERITY.ERROR, "DIVE: arm timeout, aborting")
+            set_lights(false)
             state = STATE_DONE
         else
             if math.fmod(now_ms - arm_start_ms, ARM_RETRY_MS) < UPDATE_INTERVAL_MS then
@@ -109,19 +183,38 @@ function update()
             end
         end
 
-    elseif state == STATE_DIVING then
+    -- ─── DESCENDING ────────────────────────────────────────────────
+    elseif state == STATE_DESCENDING then
         RC3:set_override(DESCENT_THROTTLE)
+        set_lights(cfg_dsc_lgt)
 
-        local dive_elapsed = now_ms - dive_start_ms
-        if dive_elapsed >= DIVE_DURATION_MS then
+        local elapsed = now_ms - dive_start_ms
+        if elapsed >= cfg_dsc_dur_ms then
             gcs:send_text(MAV_SEVERITY.INFO,
-                string.format("DIVE: descent complete (%.1fs), surfacing", dive_elapsed / 1000.0))
+                string.format("DIVE: descent done (%.1fs), on bottom", elapsed / 1000.0))
             RC3:set_override(NEUTRAL_THROTTLE)
+            set_lights(cfg_btm_lgt)
+            state = STATE_ON_BOTTOM
+        end
+
+    -- ─── ON_BOTTOM ─────────────────────────────────────────────────
+    elseif state == STATE_ON_BOTTOM then
+        RC3:set_override(NEUTRAL_THROTTLE)
+        set_lights(cfg_btm_lgt)
+
+        local total_elapsed = now_ms - dive_start_ms
+        if total_elapsed >= cfg_rls_sec_ms then
+            gcs:send_text(MAV_SEVERITY.INFO,
+                string.format("DIVE: release time reached (%.1fs), surfacing", total_elapsed / 1000.0))
+            set_lights(cfg_asc_lgt)
             state = STATE_SURFACING
         end
 
+    -- ─── SURFACING ─────────────────────────────────────────────────
     elseif state == STATE_SURFACING then
-        vehicle:set_mode(MODE_SURFACE)
+        vehicle:set_mode(MODE_ALT_HOLD)
+        RC3:set_override(ASCENT_THROTTLE)
+        set_lights(cfg_asc_lgt)
 
         local depth = get_depth_m()
         if depth then
@@ -129,25 +222,29 @@ function update()
                 string.format("DIVE: surfacing, depth=%.2fm", depth))
             if depth <= SURFACE_DEPTH_M then
                 gcs:send_text(MAV_SEVERITY.INFO,
-                    string.format("DIVE: reached %.2fm, disarming", depth))
+                    string.format("DIVE: surface reached (%.2fm), disarming", depth))
                 RC3:set_override(NEUTRAL_THROTTLE)
+                set_lights(false)
                 state = STATE_DISARMING
             end
         end
 
+    -- ─── DISARMING ─────────────────────────────────────────────────
     elseif state == STATE_DISARMING then
         RC3:set_override(NEUTRAL_THROTTLE)
+        set_lights(false)
         arming:disarm()
         if not arming:is_armed() then
+            local total = (now_ms - dive_start_ms) / 1000.0
             gcs:send_text(MAV_SEVERITY.INFO,
-                string.format("DIVE: complete, total time %.1fs", elapsed_time / 1000.0))
+                string.format("DIVE: complete, total time %.1fs", total))
             state = STATE_DONE
         end
 
+    -- ─── DONE ──────────────────────────────────────────────────────
     elseif state == STATE_DONE then
         DORIS_START:set(0)
-        gcs:send_text(MAV_SEVERITY.INFO, "DIVE: complete, set DORIS_START=1 to run again")
-        elapsed_time = 0
+        gcs:send_text(MAV_SEVERITY.INFO, "DIVE: mission done, DORIS_START=0")
         last_update_ms = 0
         state = STATE_WAIT_START
     end
@@ -155,5 +252,5 @@ function update()
     return update, UPDATE_INTERVAL_MS
 end
 
-gcs:send_text(MAV_SEVERITY.INFO, "DIVE: script loaded, set DORIS_START=1 to begin")
+gcs:send_text(MAV_SEVERITY.INFO, "DIVE: script loaded, waiting for DORIS_START=1")
 return update()
