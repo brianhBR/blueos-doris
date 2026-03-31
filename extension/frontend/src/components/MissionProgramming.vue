@@ -695,15 +695,19 @@ function handleAscentCameraToggle(checked: boolean) {
   ascentLightOn.value = checked
 }
 
-function handleOverwriteSave() {
-  configurationName.value = ''
-  showSaveModal.value = false
-  hasUnsavedChanges.value = false
-  if (pendingConfigurationChange.value) {
-    selectedConfiguration.value = pendingConfigurationChange.value
-    if (pendingConfigurationChange.value === 'New Configuration') resetToDefaults()
-    pendingConfigurationChange.value = ''
-    showNavigationWarning.value = false
+async function handleOverwriteSave() {
+  const payload = buildConfigPayload(selectedConfiguration.value)
+  const saved = await saveConfiguration(payload)
+  if (saved) {
+    configurationName.value = ''
+    showSaveModal.value = false
+    hasUnsavedChanges.value = false
+    if (pendingConfigurationChange.value) {
+      selectedConfiguration.value = pendingConfigurationChange.value
+      if (pendingConfigurationChange.value === 'New Configuration') resetToDefaults()
+      pendingConfigurationChange.value = ''
+      showNavigationWarning.value = false
+    }
   }
 }
 
