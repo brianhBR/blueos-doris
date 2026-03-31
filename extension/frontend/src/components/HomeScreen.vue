@@ -118,21 +118,10 @@ const isCheckingLeaks = ref(false)
 
 const previousUsernames = ['Captain Smith', 'Dr. Johnson', 'Prof. Lee', 'Researcher Chen']
 
-const { configurations: savedConfigSummaries, fetchConfigurations } = useConfigurations()
+const { configurations: savedConfigSummaries, fetchConfigurations, loadConfiguration } = useConfigurations()
 const savedConfigurations = computed(() => savedConfigSummaries.value.map(c => c.name))
 
-const configurationElapsedTimes: Record<string, number> = {
-  'DORIS 24 Hour Dive Configuration': 24,
-  'DORIS 12 Hour Dive Configuration': 12,
-  'DORIS 6 Hour Dive Configuration': 6,
-  'DORIS 4 Hour Dive Configuration': 4,
-  'Release Date Time Test': 0,
-  'My Saved Configuration 1': 8,
-  'My Saved Configuration 2': 10,
-  'My Saved Configuration 3': 12,
-  'My Saved Configuration 4': 6,
-  'My Saved Configuration 5': 4
-}
+const loadedElapsedTimeHours = ref(0)
 
 const depthWarningLevel = computed(() => {
   const depth = parseFloat(estimatedDepth.value)
@@ -167,8 +156,7 @@ const diveFeasibility = computed(() => {
     }
     totalDiveTimeHours = descentTimeHours + bottomTimeHours + ascentTimeHours
   } else {
-    const elapsedTime = configurationElapsedTimes[selectedConfiguration.value] || 0
-    totalDiveTimeHours = elapsedTime
+    totalDiveTimeHours = loadedElapsedTimeHours.value
     bottomTimeHours = Math.max(0, totalDiveTimeHours - descentTimeHours - ascentTimeHours)
   }
 
@@ -268,13 +256,30 @@ const handleRecheckLeaks = () => {
   }, 2000)
 }
 
-const handleConfigurationChange = () => {
+const handleConfigurationChange = async () => {
   if (selectedConfiguration.value === '__new__') {
     selectedConfiguration.value = ''
     emit('navigate', 'dives')
     return
   }
   if (selectedConfiguration.value) {
+    const cfg = await loadConfiguration(selectedConfiguration.value)
+    if (cfg) {
+      const rw = cfg.ascent.release_weight
+      emit('update:releaseWeightBy', rw.method)
+      if (rw.method === 'elapsed') {
+        const num = Number(rw.elapsed.number) || 0
+        loadedElapsedTimeHours.value = rw.elapsed.unit === 'hours'
+          ? num
+          : rw.elapsed.unit === 'minutes'
+          ? num / 60
+          : num / 3600
+      }
+      if (rw.method === 'datetime') {
+        releaseWeightDate.value = rw.release_date
+        releaseWeightTime.value = rw.release_time
+      }
+    }
     emit('configurationSelect', selectedConfiguration.value)
   }
 }

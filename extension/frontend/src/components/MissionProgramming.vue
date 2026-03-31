@@ -234,6 +234,7 @@ watch([selectedConfiguration, diveName, descentCameraOn, descentCameraType, desc
 
 function resetToDefaults() {
   diveName.value = 'Dive II'
+  estimatedDepth.value = ''
   selectedConfiguration.value = 'New Configuration'
   warnings.value = []
   hasUnsavedChanges.value = false
@@ -251,6 +252,9 @@ function resetToDefaults() {
   descentCaptureFrequency.value = 10
   descentCaptureFrequencyUnit.value = 'seconds'
   descentFocus.value = 'auto'
+  descentSleepTimerEnabled.value = false
+  descentSleepTimerNumber.value = ''
+  descentSleepTimerUnit.value = 'hours'
   descentAdvancedOpen.value = false
   descentISO.value = 'auto'
   descentWhiteBalance.value = 'auto'
@@ -280,6 +284,9 @@ function resetToDefaults() {
   bottomCaptureFrequency.value = 10
   bottomCaptureFrequencyUnit.value = 'seconds'
   bottomFocus.value = 'auto'
+  bottomSleepTimerEnabled.value = false
+  bottomSleepTimerNumber.value = ''
+  bottomSleepTimerUnit.value = 'hours'
   bottomAdvancedOpen.value = false
   bottomISO.value = 'auto'
   bottomWhiteBalance.value = 'auto'
@@ -315,6 +322,9 @@ function resetToDefaults() {
   ascentCaptureFrequency.value = 10
   ascentCaptureFrequencyUnit.value = 'seconds'
   ascentFocus.value = 'auto'
+  ascentSleepTimerEnabled.value = false
+  ascentSleepTimerNumber.value = ''
+  ascentSleepTimerUnit.value = 'hours'
   ascentAdvancedOpen.value = false
   ascentISO.value = 'auto'
   ascentWhiteBalance.value = 'auto'
