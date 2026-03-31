@@ -716,51 +716,6 @@ function handleSaveAsNew() {
   configurationName.value = nextName
 }
 
-function resetDescentCameraDefaults() {
-  descentResolution.value = '4K'
-  descentImageType.value = 'High-Rez JPG'
-  descentFileFormat.value = 'JPEG'
-  descentFrameRate.value = 30
-  descentCaptureFrequency.value = 10
-  descentCaptureFrequencyUnit.value = 'seconds'
-  descentFocus.value = 'auto'
-  descentISO.value = 'auto'
-  descentWhiteBalance.value = 'auto'
-  descentExposure.value = '0'
-  descentSharpness.value = 'medium'
-  hasUnsavedChanges.value = true
-}
-
-function resetBottomCameraDefaults() {
-  bottomResolution.value = '4K'
-  bottomImageType.value = 'High-Rez JPG'
-  bottomFileFormat.value = 'JPEG'
-  bottomFrameRate.value = 30
-  bottomCaptureFrequency.value = 10
-  bottomCaptureFrequencyUnit.value = 'seconds'
-  bottomFocus.value = 'auto'
-  bottomISO.value = 'auto'
-  bottomWhiteBalance.value = 'auto'
-  bottomExposure.value = '0'
-  bottomSharpness.value = 'medium'
-  hasUnsavedChanges.value = true
-}
-
-function resetAscentCameraDefaults() {
-  ascentResolution.value = '4K'
-  ascentImageType.value = 'High-Rez JPG'
-  ascentFileFormat.value = 'JPEG'
-  ascentFrameRate.value = 30
-  ascentCaptureFrequency.value = 10
-  ascentCaptureFrequencyUnit.value = 'seconds'
-  ascentFocus.value = 'auto'
-  ascentISO.value = 'auto'
-  ascentWhiteBalance.value = 'auto'
-  ascentExposure.value = '0'
-  ascentSharpness.value = 'medium'
-  hasUnsavedChanges.value = true
-}
-
 function handleBeforeUnload(e: BeforeUnloadEvent) {
   if (hasUnsavedChanges.value) {
     e.preventDefault()
