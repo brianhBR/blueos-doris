@@ -186,6 +186,10 @@ function update()
 
     -- ─── DESCENDING ────────────────────────────────────────────────
     elseif state == STATE_DESCENDING then
+        if not arming:is_armed() then
+            gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: unexpectedly disarmed during descent, re-arming")
+            arming:arm()
+        end
         RC3:set_override(DESCENT_THROTTLE)
         set_lights(cfg_dsc_lgt)
 
@@ -200,6 +204,10 @@ function update()
 
     -- ─── ON_BOTTOM ─────────────────────────────────────────────────
     elseif state == STATE_ON_BOTTOM then
+        if not arming:is_armed() then
+            gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: unexpectedly disarmed on bottom, re-arming")
+            arming:arm()
+        end
         RC3:set_override(NEUTRAL_THROTTLE)
         set_lights(cfg_btm_lgt)
 
@@ -213,6 +221,10 @@ function update()
 
     -- ─── SURFACING ─────────────────────────────────────────────────
     elseif state == STATE_SURFACING then
+        if not arming:is_armed() then
+            gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: unexpectedly disarmed while surfacing, re-arming")
+            arming:arm()
+        end
         vehicle:set_mode(MODE_ALT_HOLD)
         RC3:set_override(ASCENT_THROTTLE)
         set_lights(cfg_asc_lgt)
