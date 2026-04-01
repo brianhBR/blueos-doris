@@ -256,6 +256,34 @@ const handleRecheckLeaks = () => {
   }, 2000)
 }
 
+const canStartDive = computed(() => {
+  return (
+    diveName.value.trim() !== '' &&
+    username.value.trim() !== '' &&
+    selectedConfiguration.value !== '' &&
+    selectedConfiguration.value !== '__new__' &&
+    estimatedDepth.value.trim() !== '' &&
+    !isNaN(parseFloat(estimatedDepth.value)) &&
+    parseFloat(estimatedDepth.value) > 0
+  )
+})
+
+function computeReleaseDateTimeFromElapsed(elapsedNumber: number, elapsedUnit: string) {
+  const now = new Date()
+  let offsetMs = 0
+  if (elapsedUnit === 'hours') offsetMs = elapsedNumber * 3600 * 1000
+  else if (elapsedUnit === 'minutes') offsetMs = elapsedNumber * 60 * 1000
+  else offsetMs = elapsedNumber * 1000
+  const release = new Date(now.getTime() + offsetMs)
+  const yyyy = release.getUTCFullYear()
+  const mm = String(release.getUTCMonth() + 1).padStart(2, '0')
+  const dd = String(release.getUTCDate()).padStart(2, '0')
+  releaseWeightDate.value = `${yyyy}-${mm}-${dd}`
+  const hh = String(release.getUTCHours()).padStart(2, '0')
+  const min = String(release.getUTCMinutes()).padStart(2, '0')
+  releaseWeightTime.value = `${hh}:${min}`
+}
+
 const handleConfigurationChange = async () => {
   if (selectedConfiguration.value === '__new__') {
     selectedConfiguration.value = ''
@@ -274,6 +302,7 @@ const handleConfigurationChange = async () => {
           : rw.elapsed.unit === 'minutes'
           ? num / 60
           : num / 3600
+        computeReleaseDateTimeFromElapsed(num, rw.elapsed.unit)
       }
       if (rw.method === 'datetime') {
         releaseWeightDate.value = rw.release_date
@@ -285,7 +314,16 @@ const handleConfigurationChange = async () => {
 }
 
 async function handleStartDive() {
-  await startDive(selectedConfiguration.value || undefined)
+  if (!canStartDive.value) return
+  const diveData = {
+    dive_name: diveName.value.trim(),
+    username: username.value.trim(),
+    configuration: selectedConfiguration.value,
+    estimated_depth: estimatedDepth.value.trim(),
+    release_weight_date: releaseWeightDate.value,
+    release_weight_time: releaseWeightTime.value,
+  }
+  await startDive(selectedConfiguration.value, diveData)
 }
 
 const formatReleaseTime = (date: Date) => {
@@ -444,9 +482,9 @@ const formatReleaseTime = (date: Date) => {
         <div class="flex items-end">
           <button
             @click="handleStartDive"
-            :disabled="diveLoading || isDiving"
+            :disabled="diveLoading || isDiving || !canStartDive"
             class="w-full px-6 py-3 rounded-lg text-white transition-all disabled:cursor-not-allowed"
-            :style="{ backgroundColor: isDiving ? '#6B7280' : '#FF9937', opacity: diveLoading ? 0.5 : 1 }"
+            :style="{ backgroundColor: isDiving ? '#6B7280' : (!canStartDive ? '#6B7280' : '#FF9937'), opacity: (diveLoading || !canStartDive) ? 0.5 : 1 }"
           >
             {{ isDiving ? 'Diving started' : diveLoading ? 'Starting...' : 'Start Dive' }}
           </button>

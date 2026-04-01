@@ -816,12 +816,14 @@ export function useDiveControl() {
   const loading = ref(false)
   const error = ref<string | null>(null)
 
-  async function startDive(configurationName?: string): Promise<boolean> {
+  async function startDive(configurationName?: string, diveData?: Record<string, string>): Promise<boolean> {
     loading.value = true
     error.value = null
     try {
-      const body = configurationName ? { configuration: configurationName } : undefined
-      const result = await postApi<{ success: boolean; message: string }>('/dive/start', body)
+      const body: Record<string, unknown> = {}
+      if (configurationName) body.configuration = configurationName
+      if (diveData) Object.assign(body, diveData)
+      const result = await postApi<{ success: boolean; message: string }>('/dive/start', Object.keys(body).length > 0 ? body : undefined)
       if (result.success) await fetchDiveStatus()
       return result.success
     } catch (e) {
