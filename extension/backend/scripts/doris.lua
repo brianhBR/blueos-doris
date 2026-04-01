@@ -25,7 +25,7 @@ local MAV_SEVERITY = {
 }
 
 -- ArduSub flight modes
-local MODE_ALT_HOLD = 2
+local MODE_MANUAL   = 19
 local MODE_SURFACE  = 9
 
 -- fixed constants
@@ -161,8 +161,8 @@ function update()
 
     -- ─── INIT ──────────────────────────────────────────────────────
     elseif state == STATE_INIT then
-        gcs:send_text(MAV_SEVERITY.INFO, "DIVE: initialising — ALT_HOLD")
-        vehicle:set_mode(MODE_ALT_HOLD)
+        gcs:send_text(MAV_SEVERITY.INFO, "DIVE: initialising — MANUAL")
+        vehicle:set_mode(MODE_MANUAL)
         set_lights(cfg_dsc_lgt)
         arm_start_ms = now_ms
         state = STATE_ARMING
@@ -225,7 +225,7 @@ function update()
             gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: unexpectedly disarmed while surfacing, re-arming")
             arming:arm()
         end
-        vehicle:set_mode(MODE_ALT_HOLD)
+        vehicle:set_mode(MODE_MANUAL)
         RC3:set_override(ASCENT_THROTTLE)
         set_lights(cfg_asc_lgt)
 
