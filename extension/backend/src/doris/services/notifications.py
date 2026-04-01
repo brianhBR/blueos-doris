@@ -22,8 +22,9 @@ from ..services.storage import DATA_ROOT
 
 logger = logging.getLogger(__name__)
 
-NOTIFICATIONS_FILE = DATA_ROOT / "notifications.json"
-SETTINGS_FILE = DATA_ROOT / "notification_settings.json"
+NOTIFICATIONS_DIR = DATA_ROOT / "notifications"
+NOTIFICATIONS_FILE = NOTIFICATIONS_DIR / "notifications.json"
+SETTINGS_FILE = NOTIFICATIONS_DIR / "notification_settings.json"
 MAX_NOTIFICATIONS = 100
 
 
@@ -31,7 +32,7 @@ class NotificationService:
     """Manages notifications backed by JSON files on disk."""
 
     def __init__(self) -> None:
-        DATA_ROOT.mkdir(parents=True, exist_ok=True)
+        NOTIFICATIONS_DIR.mkdir(parents=True, exist_ok=True)
         self._notifications: list[NotificationItem] = []
         self._settings: NotificationSettings = NotificationSettings()
         self._active_keys: set[str] = set()
