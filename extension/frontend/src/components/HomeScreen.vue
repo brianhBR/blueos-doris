@@ -287,6 +287,7 @@ function computeReleaseDateTimeFromElapsed(elapsedNumber: number, elapsedUnit: s
 const handleConfigurationChange = async () => {
   if (selectedConfiguration.value === '__new__') {
     selectedConfiguration.value = ''
+    emit('configurationSelect', 'New Configuration')
     emit('navigate', 'dives')
     return
   }

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, watch, onMounted, onUnmounted, computed } from 'vue'
+import { ref, watch, nextTick, onMounted, onUnmounted, computed } from 'vue'
 import { Settings, Save, Copy, AlertTriangle, ChevronDown, ChevronUp, Camera as CameraIcon, Lightbulb, Database as DatabaseIcon, Battery, ArrowDown, Anchor, ArrowUp, Radio, X } from 'lucide-vue-next'
 import type { Screen } from '../types'
 import { useConfigurations } from '../composables/useApi'
@@ -25,6 +25,7 @@ const showBatteryPlanning = ref(false)
 const showSaveModal = ref(false)
 const configurationName = ref('')
 const hasUnsavedChanges = ref(false)
+let suppressUnsavedTracking = false
 const showNavigationWarning = ref(false)
 const pendingConfigurationChange = ref('')
 const {
@@ -221,18 +222,20 @@ watch(() => props.initialConfiguration, (val) => {
   if (val) selectedConfiguration.value = val
 })
 
-watch([selectedConfiguration, diveName, descentCameraOn, descentCameraType, descentResolution, descentCaptureFrequency,
+watch([diveName, descentCameraOn, descentCameraType, descentResolution, descentCaptureFrequency,
   descentLightOn, descentLightMode, descentLightBrightness, bottomCameraOn, bottomCameraType, bottomResolution,
   bottomCaptureFrequency, bottomLightOn, bottomLightMode, bottomLightBrightness, ascentCameraOn, ascentCameraType,
   ascentResolution, ascentCaptureFrequency, ascentLightOn, ascentLightMode, ascentLightBrightness,
   activateMastLight, updateFrequency, useIridium, useLoRA, releaseWeightElapsedNumber
 ], () => {
-  if (selectedConfiguration.value === 'New Configuration') {
+  if (suppressUnsavedTracking) return
+  if (selectedConfiguration.value) {
     hasUnsavedChanges.value = true
   }
 })
 
 function resetToDefaults() {
+  suppressUnsavedTracking = true
   diveName.value = 'Dive II'
   estimatedDepth.value = ''
   selectedConfiguration.value = 'New Configuration'
@@ -342,6 +345,7 @@ function resetToDefaults() {
   updateFrequency.value = '5min'
   useIridium.value = false
   useLoRA.value = false
+  nextTick(() => { suppressUnsavedTracking = false })
 }
 
 function buildConfigPayload(name: string): DeploymentConfiguration {
@@ -460,6 +464,7 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
 }
 
 function applyConfig(cfg: DeploymentConfiguration) {
+  suppressUnsavedTracking = true
   diveName.value = cfg.dive_name
   estimatedDepth.value = cfg.estimated_depth
 
@@ -569,6 +574,7 @@ function applyConfig(cfg: DeploymentConfiguration) {
   useLoRA.value = cfg.recovery.use_lora
 
   hasUnsavedChanges.value = false
+  nextTick(() => { suppressUnsavedTracking = false })
 }
 
 function generateNextConfigName(baseName: string): string {
@@ -631,7 +637,7 @@ function handleOpenSaveModal() {
 }
 
 async function handleConfigurationChange(value: string) {
-  if (hasUnsavedChanges.value && selectedConfiguration.value === 'New Configuration' && value !== selectedConfiguration.value) {
+  if (hasUnsavedChanges.value && value !== selectedConfiguration.value) {
     pendingConfigurationChange.value = value
     showNavigationWarning.value = true
     return
