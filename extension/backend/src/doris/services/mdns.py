@@ -2,7 +2,7 @@
 
 On startup, configures:
   1. Avahi hostname → "doris" so doris.local resolves to the device IP
-  2. nginx redirect so http://doris.local/ → /extensionv2/doris/
+  2. nginx redirect so http://doris.local/ → http://doris.local:8095/
 """
 
 import logging
@@ -21,7 +21,7 @@ NGINX_CONF = Path("/tmp/nginx/doris-redirect.conf")
 
 NGINX_REDIRECT_CONTENT = """\
 if ($host = "doris.local") {
-    rewrite ^/$ /extensionv2/doris/ redirect;
+    rewrite ^/$ http://doris.local:8095/ redirect;
 }
 """
 
