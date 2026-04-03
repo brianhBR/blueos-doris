@@ -23,6 +23,7 @@ from .routes import (
 )
 from .services.external_storage import start_external_storage_setup
 from .services.mdns import setup_doris_local
+from .services.wifi_driver import setup_wifi_driver
 from .utils import deploy_artemis_svl, deploy_lua_scripts, disable_usb_autosuspend, restart_firmware
 
 
@@ -66,7 +67,6 @@ def create_app() -> Robyn:
     register_attitude_routes(app)
     register_artemis_routes(app)
 
-    # Configure secondary WiFi interface as hotspot on startup
     logger = logging.getLogger(__name__)
 
     @app.startup_handler
@@ -78,6 +78,11 @@ def create_app() -> Robyn:
 
         if lua_deployed:
             await restart_firmware(logger)
+
+        try:
+            await setup_wifi_driver()
+        except Exception as e:
+            logger.warning("WiFi driver setup skipped: %s", e)
 
         network_service = NetworkService()
         try:

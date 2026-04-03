@@ -41,6 +41,9 @@ RUN python -m pip install --extra-index-url https://www.piwheels.org/simple -e .
 COPY backend/src ./src
 COPY backend/scripts ./scripts
 
+# Copy WiFi driver (out-of-tree 88x2bu for USB WiFi adapter)
+COPY driver/ ./driver/
+
 # Copy built frontend to be served by backend
 COPY --from=frontend-builder /frontend/dist ./frontend/dist
 
