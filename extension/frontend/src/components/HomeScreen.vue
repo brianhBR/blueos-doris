@@ -35,7 +35,7 @@ const { battery, fetchBattery } = useBattery()
 const { storage, fetchStorage } = useStorage()
 const { location, fetchLocation } = useLocation()
 const { modules: sensorModules, loading: sensorsLoading, fetchModules } = useSensors()
-const { status: diveStatus, startDive, loading: diveLoading, fetchDiveStatus } = useDiveControl()
+const { status: diveStatus, startDive, stopDive, loading: diveLoading, fetchDiveStatus } = useDiveControl()
 const isDiving = computed(() => diveStatus.value?.active === true)
 
 const batteryLevel = computed(() => battery.value?.level ?? systemStatus.value?.battery_level ?? 0)
@@ -504,14 +504,23 @@ const formatReleaseTime = (date: Date) => {
           </div>
         </template>
 
-        <div class="flex items-end">
+        <div class="flex items-end gap-3">
           <button
             @click="handleStartDive"
             :disabled="diveLoading || isDiving || !canStartDive"
-            class="w-full px-6 py-3 rounded-lg text-white transition-all disabled:cursor-not-allowed"
+            class="flex-1 px-6 py-3 rounded-lg text-white transition-all disabled:cursor-not-allowed"
             :style="{ backgroundColor: isDiving ? '#6B7280' : (!canStartDive ? '#6B7280' : '#FF9937'), opacity: (diveLoading || !canStartDive) ? 0.5 : 1 }"
           >
             {{ isDiving ? 'Diving started' : diveLoading ? 'Starting...' : 'Start Dive' }}
+          </button>
+          <button
+            v-if="isDiving"
+            @click="stopDive"
+            :disabled="diveLoading"
+            class="flex-1 px-6 py-3 rounded-lg text-white transition-all disabled:cursor-not-allowed"
+            :style="{ backgroundColor: '#DD2C1D', opacity: diveLoading ? 0.5 : 1 }"
+          >
+            {{ diveLoading ? 'Cancelling...' : 'Cancel Dive' }}
           </button>
         </div>
       </div>
