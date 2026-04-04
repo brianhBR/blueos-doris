@@ -68,6 +68,30 @@ const gpsStatus = computed<'active' | 'searching' | 'inactive'>(() => {
   return 'searching'
 })
 
+function formatCoord(value: number, pos: string, neg: string): string {
+  const dir = value >= 0 ? pos : neg
+  const abs = Math.abs(value)
+  const deg = Math.floor(abs)
+  const min = ((abs - deg) * 60).toFixed(4)
+  return `${deg}° ${min}' ${dir}`
+}
+
+const formattedLat = computed(() => {
+  if (!location.value) return '—'
+  return formatCoord(location.value.latitude, 'N', 'S')
+})
+
+const formattedLon = computed(() => {
+  if (!location.value) return '—'
+  return formatCoord(location.value.longitude, 'E', 'W')
+})
+
+const formattedFixType = computed(() => {
+  if (!location.value) return '—'
+  const map: Record<string, string> = { 'none': 'No Fix', '2d': '2D Fix', '3d': '3D Fix', 'dgps': 'DGPS', 'rtk_float': 'RTK Float', 'rtk_fixed': 'RTK Fixed' }
+  return map[location.value.fix_type] ?? location.value.fix_type
+})
+
 const modules = computed<{ id: string; name: string; status: 'connected' | 'disconnected'; moduleStatus: string }[]>(() => {
   if (sensorModules.value.length > 0) {
     return sensorModules.value.map((m: SensorModule) => ({
@@ -722,7 +746,45 @@ const formatReleaseTime = (date: Date) => {
             {{ gpsStatus === 'active' ? 'Active' : gpsStatus === 'searching' ? 'Searching' : 'Inactive' }}
           </span>
         </div>
-        <p class="text-sm" style="color: #96EEF2">Use the LoRa locator device or your Iridium app to track DORIS location.</p>
+
+        <template v-if="location && gpsStatus !== 'inactive'">
+          <div class="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
+            <div>
+              <span style="color: rgba(150, 238, 242, 0.6)" class="text-xs uppercase tracking-wide">Lat</span>
+              <p class="text-white font-mono">{{ formattedLat }}</p>
+            </div>
+            <div>
+              <span style="color: rgba(150, 238, 242, 0.6)" class="text-xs uppercase tracking-wide">Lon</span>
+              <p class="text-white font-mono">{{ formattedLon }}</p>
+            </div>
+            <div>
+              <span style="color: rgba(150, 238, 242, 0.6)" class="text-xs uppercase tracking-wide">Satellites</span>
+              <p class="text-white font-mono">{{ location.satellites }}</p>
+            </div>
+            <div>
+              <span style="color: rgba(150, 238, 242, 0.6)" class="text-xs uppercase tracking-wide">Fix</span>
+              <p class="text-white font-mono">{{ formattedFixType }}</p>
+            </div>
+            <div>
+              <span style="color: rgba(150, 238, 242, 0.6)" class="text-xs uppercase tracking-wide">Alt</span>
+              <p class="text-white font-mono">{{ location.altitude.toFixed(1) }} m</p>
+            </div>
+            <div>
+              <span style="color: rgba(150, 238, 242, 0.6)" class="text-xs uppercase tracking-wide">Heading</span>
+              <p class="text-white font-mono">{{ location.heading.toFixed(1) }}°</p>
+            </div>
+            <div>
+              <span style="color: rgba(150, 238, 242, 0.6)" class="text-xs uppercase tracking-wide">Speed</span>
+              <p class="text-white font-mono">{{ location.speed.toFixed(1) }} m/s</p>
+            </div>
+            <div>
+              <span style="color: rgba(150, 238, 242, 0.6)" class="text-xs uppercase tracking-wide">Updated</span>
+              <p class="text-white font-mono text-xs">{{ location.last_update }}</p>
+            </div>
+          </div>
+        </template>
+
+        <p v-else class="text-sm" style="color: #96EEF2">Use the LoRa locator device or your Iridium app to track DORIS location.</p>
       </div>
     </div>
 
