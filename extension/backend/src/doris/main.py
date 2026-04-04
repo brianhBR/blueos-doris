@@ -21,6 +21,7 @@ from .routes import (
     register_sensor_routes,
     register_system_routes,
 )
+from .services.external_storage import start_external_storage_setup
 from .services.mdns import setup_doris_local
 from .utils import deploy_artemis_svl, deploy_lua_scripts, restart_firmware
 
@@ -81,6 +82,11 @@ def create_app() -> Robyn:
             await network_service.configure_hotspot()
         except Exception as e:
             logger.warning("Hotspot configuration skipped: %s", e)
+
+        try:
+            start_external_storage_setup()
+        except Exception as e:
+            logger.warning("External storage setup skipped: %s", e)
 
         try:
             await setup_doris_local()

@@ -4,6 +4,7 @@ import json
 
 from robyn import Response, Robyn
 
+from ..services.external_storage import get_migration_status
 from ..services.system import SystemService
 
 
@@ -69,6 +70,11 @@ def register_system_routes(app: Robyn) -> None:
                 description=json.dumps({"error": str(e)}),
                 headers={"Content-Type": "application/json"},
             )
+
+    @app.get("/api/v1/system/storage/migration")
+    async def get_storage_migration(request):
+        """Get external-storage migration status."""
+        return json.dumps(get_migration_status())
 
     @app.get("/api/v1/health")
     async def health_check(request):

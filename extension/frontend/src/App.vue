@@ -1,7 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { HardDrive, Loader2, AlertTriangle } from 'lucide-vue-next'
 import type { Screen, DiveData } from './types'
-import { useDiveControl, useNotifications } from './composables/useApi'
+import { useDiveControl, useNotifications, useStorageMigration } from './composables/useApi'
 import Navigation from './components/Navigation.vue'
 import Footer from './components/Footer.vue'
 import HomeScreen from './components/HomeScreen.vue'
@@ -25,18 +26,23 @@ const { status: diveStatus, fetchDiveStatus } = useDiveControl()
 const isDiveActive = computed(() => diveStatus.value?.active === true)
 
 const { unreadCount: notificationCount, fetchUnreadCount } = useNotifications()
+const { status: migrationStatus, isActive: migrationActive, isError: migrationError, fetchMigrationStatus } = useStorageMigration()
 
 let divePolling: number | undefined
 let notifPolling: number | undefined
+let migrationPolling: number | undefined
 onMounted(() => {
   fetchDiveStatus()
   fetchUnreadCount()
+  fetchMigrationStatus()
   divePolling = setInterval(fetchDiveStatus, 5000) as unknown as number
   notifPolling = setInterval(fetchUnreadCount, 15000) as unknown as number
+  migrationPolling = setInterval(fetchMigrationStatus, 3000) as unknown as number
 })
 onUnmounted(() => {
   if (divePolling) clearInterval(divePolling)
   if (notifPolling) clearInterval(notifPolling)
+  if (migrationPolling) clearInterval(migrationPolling)
 })
 const selectedDiveData = ref<DiveData | null>(null)
 const releaseWeightBy = ref<'datetime' | 'elapsed'>('elapsed')
@@ -81,6 +87,29 @@ const setConnected = (connected: boolean) => {
       style="background-color: #DD2C1D; font-family: Montserrat, sans-serif"
     >
       Active Dive
+    </div>
+
+    <div
+      v-if="migrationActive"
+      class="w-full py-3 px-4 flex items-center justify-center gap-3"
+      style="background: linear-gradient(90deg, #0E2446 0%, #004D64 100%); border-bottom: 1px solid rgba(65, 185, 195, 0.4); font-family: Montserrat, sans-serif"
+    >
+      <Loader2 class="w-5 h-5 animate-spin" style="color: #96EEF2" />
+      <span class="text-white text-sm font-medium">
+        <HardDrive class="w-4 h-4 inline-block mr-1" style="color: #96EEF2" />
+        {{ migrationStatus?.message || 'Migrating recorder data to external drive…' }}
+      </span>
+    </div>
+
+    <div
+      v-else-if="migrationError"
+      class="w-full py-3 px-4 flex items-center justify-center gap-3"
+      style="background-color: rgba(221, 44, 29, 0.15); border-bottom: 1px solid rgba(221, 44, 29, 0.5); font-family: Montserrat, sans-serif"
+    >
+      <AlertTriangle class="w-5 h-5" style="color: #DD2C1D" />
+      <span class="text-sm" style="color: #FF6B6B">
+        External storage migration failed: {{ migrationStatus?.error }}
+      </span>
     </div>
 
     <Navigation

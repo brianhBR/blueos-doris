@@ -4,7 +4,7 @@
  * Backend API base: /api/v1
  * See backend OpenAPI spec at /openapi.json for full endpoint docs.
  */
-import { ref, readonly } from 'vue'
+import { ref, readonly, computed } from 'vue'
 
 const API_BASE = '/api/v1'
 
@@ -1172,6 +1172,40 @@ export function useNotifications() {
     deleteNotification,
     fetchSettings,
     updateSettings,
+  }
+}
+
+// ── Storage migration status ────────────────────────────────────────
+
+export interface StorageMigrationStatus {
+  state: 'idle' | 'checking' | 'mounting' | 'migrating' | 'linking' | 'done' | 'skipped' | 'error'
+  message: string
+  error: string
+}
+
+export function useStorageMigration() {
+  const status = ref<StorageMigrationStatus | null>(null)
+
+  async function fetchMigrationStatus() {
+    try {
+      status.value = await fetchApi<StorageMigrationStatus>('/system/storage/migration')
+    } catch {
+      // backend not reachable yet, ignore
+    }
+  }
+
+  const isActive = computed(() => {
+    if (!status.value) return false
+    return ['checking', 'mounting', 'migrating', 'linking'].includes(status.value.state)
+  })
+
+  const isError = computed(() => status.value?.state === 'error')
+
+  return {
+    status: readonly(status),
+    isActive: readonly(isActive),
+    isError: readonly(isError),
+    fetchMigrationStatus,
   }
 }
 
