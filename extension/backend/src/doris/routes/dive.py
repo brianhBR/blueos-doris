@@ -17,6 +17,7 @@ from pathlib import Path
 
 from robyn import Robyn
 
+from ..services.camera import CameraService
 from ..services.dive import DiveService
 from ..services.storage import DATA_ROOT, StorageService
 
@@ -24,6 +25,7 @@ logger = logging.getLogger(__name__)
 
 dive_service = DiveService()
 storage_service = StorageService()
+camera_service = CameraService()
 
 DIVES_DIR = DATA_ROOT / "dives"
 
@@ -38,6 +40,30 @@ def _next_dive_filename() -> Path:
         if m:
             highest = max(highest, int(m.group(1)))
     return DIVES_DIR / f"dive_{highest + 1:04d}.json"
+
+
+def _update_active_dive_record(new_status: str) -> None:
+    """Find the most recent active dive record and update its status."""
+    DIVES_DIR.mkdir(parents=True, exist_ok=True)
+    pattern = re.compile(r"^dive_(\d{4})\.json$")
+    dive_files = []
+    for f in DIVES_DIR.iterdir():
+        m = pattern.match(f.name)
+        if m:
+            dive_files.append((int(m.group(1)), f))
+    dive_files.sort(reverse=True)
+
+    for _, dive_file in dive_files:
+        try:
+            record = json.loads(dive_file.read_text())
+            if record.get("status") == "active":
+                record["status"] = new_status
+                record["ended_at"] = datetime.now(tz=timezone.utc).isoformat()
+                dive_file.write_text(json.dumps(record, indent=2, default=str))
+                logger.info(f"Dive record updated: {dive_file.name} -> {new_status}")
+                return
+        except Exception as e:
+            logger.warning(f"Error reading {dive_file.name}: {e}")
 
 
 def register_dive_routes(app: Robyn) -> None:
@@ -91,7 +117,21 @@ def register_dive_routes(app: Robyn) -> None:
     @app.post("/api/v1/dive/stop")
     async def stop_dive():
         ok = await dive_service.stop_dive()
-        return json.dumps({"success": ok, "message": "DORIS_START set to 0" if ok else "Failed to set parameter"})
+
+        # Stop video recording
+        try:
+            await camera_service.stop_recording()
+            logger.info("Video recording stopped")
+        except Exception as e:
+            logger.warning(f"Failed to stop recording: {e}")
+
+        # Update the most recent active dive record
+        try:
+            _update_active_dive_record("cancelled")
+        except Exception as e:
+            logger.warning(f"Failed to update dive record: {e}")
+
+        return json.dumps({"success": ok, "message": "Dive cancelled" if ok else "Failed to set parameter"})
 
     @app.get("/api/v1/dive/status")
     async def dive_status():
