@@ -33,6 +33,8 @@ const {
   fetchConfigurations,
   loadConfiguration,
   saveConfiguration,
+  error: configurationSaveError,
+  clearError: clearConfigurationSaveError,
 } = useConfigurations()
 
 const savedConfigurations = computed(() => savedConfigSummaries.value.map(c => c.name))
@@ -348,6 +350,12 @@ function resetToDefaults() {
   nextTick(() => { suppressUnsavedTracking = false })
 }
 
+/** v-model.number can be NaN when the field is cleared; JSON would send null and fail API validation. */
+function safePositiveInt(value: number, fallback: number): number {
+  const n = Number(value)
+  return Number.isFinite(n) && n >= 1 ? Math.floor(n) : fallback
+}
+
 function buildConfigPayload(name: string): DeploymentConfiguration {
   return {
     name,
@@ -357,7 +365,7 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
       camera: {
         enabled: descentCameraOn.value,
         camera_type: descentCameraType.value,
-        capture_frequency: descentCaptureFrequency.value,
+        capture_frequency: safePositiveInt(descentCaptureFrequency.value, 10),
         capture_frequency_unit: descentCaptureFrequencyUnit.value as 'seconds' | 'minutes' | 'hours',
         video_record: { number: descentVideoRecordNumber.value, unit: descentVideoRecordUnit.value as 'seconds' | 'minutes' | 'hours' },
         video_pause: { number: descentVideoPauseNumber.value, unit: descentVideoPauseUnit.value as 'seconds' | 'minutes' | 'hours' },
@@ -365,7 +373,7 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         image_type: descentImageType.value,
         file_format: descentFileFormat.value,
         video_file_format: descentVideoFileFormat.value,
-        frame_rate: descentFrameRate.value,
+        frame_rate: safePositiveInt(descentFrameRate.value, 30),
         focus: descentFocus.value,
         iso: descentISO.value,
         white_balance: descentWhiteBalance.value,
@@ -387,7 +395,7 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
       camera: {
         enabled: bottomCameraOn.value,
         camera_type: bottomCameraType.value,
-        capture_frequency: bottomCaptureFrequency.value,
+        capture_frequency: safePositiveInt(bottomCaptureFrequency.value, 10),
         capture_frequency_unit: bottomCaptureFrequencyUnit.value as 'seconds' | 'minutes' | 'hours',
         video_record: { number: bottomVideoRecordNumber.value, unit: bottomVideoRecordUnit.value as 'seconds' | 'minutes' | 'hours' },
         video_pause: { number: bottomVideoPauseNumber.value, unit: bottomVideoPauseUnit.value as 'seconds' | 'minutes' | 'hours' },
@@ -395,7 +403,7 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         image_type: bottomImageType.value,
         file_format: bottomFileFormat.value,
         video_file_format: bottomVideoFileFormat.value,
-        frame_rate: bottomFrameRate.value,
+        frame_rate: safePositiveInt(bottomFrameRate.value, 30),
         focus: bottomFocus.value,
         iso: bottomISO.value,
         white_balance: bottomWhiteBalance.value,
@@ -420,7 +428,7 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
       camera: {
         enabled: ascentCameraOn.value,
         camera_type: ascentCameraType.value,
-        capture_frequency: ascentCaptureFrequency.value,
+        capture_frequency: safePositiveInt(ascentCaptureFrequency.value, 10),
         capture_frequency_unit: ascentCaptureFrequencyUnit.value as 'seconds' | 'minutes' | 'hours',
         video_record: { number: ascentVideoRecordNumber.value, unit: ascentVideoRecordUnit.value as 'seconds' | 'minutes' | 'hours' },
         video_pause: { number: ascentVideoPauseNumber.value, unit: ascentVideoPauseUnit.value as 'seconds' | 'minutes' | 'hours' },
@@ -428,7 +436,7 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         image_type: ascentImageType.value,
         file_format: ascentFileFormat.value,
         video_file_format: ascentVideoFileFormat.value,
-        frame_rate: ascentFrameRate.value,
+        frame_rate: safePositiveInt(ascentFrameRate.value, 30),
         focus: ascentFocus.value,
         iso: ascentISO.value,
         white_balance: ascentWhiteBalance.value,
@@ -632,6 +640,7 @@ function handleCancelNavigation() {
 }
 
 function handleOpenSaveModal() {
+  clearConfigurationSaveError()
   showSaveModal.value = true
   configurationName.value = ''
 }
@@ -1683,12 +1692,16 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
 
       <!-- Save Configuration Button -->
       <div class="mt-6 mb-6">
+        <div v-if="configurationSaveError" class="mb-4 rounded-lg p-4 flex items-start justify-between gap-3" style="background-color: rgba(221, 44, 29, 0.15); border: 1px solid rgba(221, 44, 29, 0.4)">
+          <p class="text-sm flex-1" style="color: #FF9937">{{ configurationSaveError }}</p>
+          <button type="button" class="text-sm shrink-0 px-2 py-1 rounded" style="color: #96EEF2; border: 1px solid rgba(150, 238, 242, 0.4)" @click="clearConfigurationSaveError">Dismiss</button>
+        </div>
         <div class="flex flex-col sm:flex-row gap-3">
           <button @click="handleOpenSaveModal" class="flex-1 px-6 py-4 text-white rounded-lg transition-all hover:opacity-90 flex items-center justify-center gap-2" style="background: linear-gradient(135deg, #41B9C3 0%, #187D8B 100%)">
             <Save class="w-5 h-5" />
             {{ selectedConfiguration && selectedConfiguration !== 'New Configuration' ? 'Save Configuration' : 'Save New Configuration' }}
           </button>
-          <button v-if="selectedConfiguration && selectedConfiguration !== 'New Configuration'" @click="configurationName = ''; showSaveModal = true" class="px-6 py-4 text-white rounded-lg transition-all hover:opacity-90 flex items-center justify-center gap-2" style="background-color: rgba(65, 185, 195, 0.3); border: 1px solid #41B9C3">
+          <button v-if="selectedConfiguration && selectedConfiguration !== 'New Configuration'" @click="clearConfigurationSaveError(); configurationName = ''; showSaveModal = true" class="px-6 py-4 text-white rounded-lg transition-all hover:opacity-90 flex items-center justify-center gap-2" style="background-color: rgba(65, 185, 195, 0.3); border: 1px solid #41B9C3">
             <Copy class="w-5 h-5" />
             Save As...
           </button>

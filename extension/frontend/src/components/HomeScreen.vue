@@ -35,8 +35,27 @@ const { battery, fetchBattery } = useBattery()
 const { storage, fetchStorage } = useStorage()
 const { location, fetchLocation } = useLocation()
 const { modules: sensorModules, loading: sensorsLoading, fetchModules } = useSensors()
-const { status: diveStatus, startDive, stopDive, loading: diveLoading, fetchDiveStatus } = useDiveControl()
+const {
+  status: diveStatus,
+  mission: diveMission,
+  startDive,
+  stopDive,
+  sitlSimulateWaterDrop,
+  loading: diveLoading,
+  sitlDropLoading,
+  fetchDiveStatus,
+  fetchDiveMission,
+} = useDiveControl()
 const isDiving = computed(() => diveStatus.value?.active === true)
+
+const missionPersistedLine = computed(() => {
+  if (diveStatus.value?.active) return ''
+  const m = diveMission.value
+  if (!m || m.status === 'cancelled' || m.status === 'completed') return ''
+  const n = m.configuration_name?.trim()
+  if (n) return `Mission “${n}” is loaded.`
+  return 'A mission is loaded on the vehicle.'
+})
 
 const batteryLevel = computed(() => battery.value?.level ?? systemStatus.value?.battery_level ?? 0)
 const batteryVoltage = computed(() => {
@@ -114,6 +133,7 @@ onMounted(() => {
   fetchModules()
   fetchConfigurations()
   fetchDiveStatus()
+  fetchDiveMission()
   pollInterval = setInterval(() => {
     fetchStatus()
     fetchBattery()
@@ -121,6 +141,7 @@ onMounted(() => {
     fetchLocation()
     fetchModules()
     fetchDiveStatus()
+    fetchDiveMission()
   }, 5000) as unknown as number
 })
 
@@ -351,6 +372,10 @@ async function handleStartDive() {
   await startDive(selectedConfiguration.value, diveData)
 }
 
+async function handleSitlSimulateDrop() {
+  await sitlSimulateWaterDrop(-19.6)
+}
+
 const formatReleaseTime = (date: Date) => {
   return date.toISOString().replace('T', ' ').substring(0, 19) + ' UTC'
 }
@@ -511,7 +536,7 @@ const formatReleaseTime = (date: Date) => {
             class="flex-1 px-6 py-3 rounded-lg text-white transition-all disabled:cursor-not-allowed"
             :style="{ backgroundColor: isDiving ? '#6B7280' : (!canStartDive ? '#6B7280' : '#FF9937'), opacity: (diveLoading || !canStartDive) ? 0.5 : 1 }"
           >
-            {{ isDiving ? 'Diving started' : diveLoading ? 'Starting...' : 'Start Dive' }}
+            {{ isDiving ? 'Mission loaded' : diveLoading ? 'Loading...' : 'Load Mission' }}
           </button>
           <button
             v-if="isDiving"
@@ -525,8 +550,36 @@ const formatReleaseTime = (date: Date) => {
         </div>
       </div>
 
-      <p class="text-sm" style="color: #96EEF2">
-        NOTE: Dive starts when device detects it is at X meters.
+      <p
+        v-if="isDiving"
+        class="text-sm mt-3"
+        style="color: #FCD869"
+      >
+        Mission loaded — ready for deployment.
+      </p>
+      <div v-if="isDiving" class="mt-3 flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          @click="handleSitlSimulateDrop"
+          :disabled="sitlDropLoading || diveLoading"
+          class="px-4 py-2 rounded-lg text-sm text-white transition-all disabled:cursor-not-allowed disabled:opacity-50"
+          style="background-color: rgba(65, 185, 195, 0.35); border: 1px solid rgba(65, 185, 195, 0.6)"
+        >
+          {{ sitlDropLoading ? 'Applying…' : 'SITL: simulate water drop' }}
+        </button>
+        <span class="text-xs" style="color: rgba(150, 238, 242, 0.75)">
+          ArduSub SITL only — sets negative SIM_BUOYANCY so depth passes the gate after pre-arm.
+        </span>
+      </div>
+      <p
+        v-if="missionPersistedLine"
+        class="text-sm mt-1"
+        style="color: #96EEF2"
+      >
+        {{ missionPersistedLine }}
+      </p>
+      <p class="text-sm" :class="isDiving || missionPersistedLine ? 'mt-2' : 'mt-0'" style="color: #96EEF2">
+        Mission begins automatically after pre-arm checks pass (GPS, battery, leak, profile), the vehicle is armed, and DORIS descends below the depth gate (default 3&nbsp;m).
       </p>
     </div>
 

@@ -39,15 +39,45 @@ class NetworkService:
             hotspot_ssid=hotspot_ssid,
         )
 
-    async def _get_hotspot_ssid(self) -> str | None:
-        """Get the hotspot SSID for the wlan1 interface."""
+    async def _resolve_hotspot_interface_name(self) -> str | None:
+        """Interface BlueOS uses for the AP/hotspot (e.g. wlan1 or wifi1).
+
+        Must match configure_hotspot(), which uses WiFi Manager v2's
+        hotspot_interface hint or the second listed adapter.
+        """
         try:
-            status = await self._client._v2.wifi_hotspot_status("wlan1")
-            ssid = status.get("ssid")
-            if ssid:
-                return ssid
+            data = await self._client.list_interfaces()
+            if not data:
+                return None
+            hi = data.get("hotspot_interface")
+            if isinstance(hi, str) and hi.strip():
+                return hi.strip()
+            interfaces = data.get("interfaces", [])
+            if len(interfaces) >= 2:
+                name = interfaces[1].get("name")
+                if isinstance(name, str) and name.strip():
+                    return name.strip()
         except Exception:
             pass
+        return None
+
+    async def _get_hotspot_ssid(self) -> str | None:
+        """Get the hotspot SSID for the secondary / AP WiFi interface."""
+        primary = await self._resolve_hotspot_interface_name()
+        candidates: list[str] = []
+        if primary:
+            candidates.append(primary)
+        for fb in ("wlan1", "wifi1"):
+            if fb not in candidates:
+                candidates.append(fb)
+        for iface in candidates:
+            try:
+                status = await self._client._v2.wifi_hotspot_status(iface)
+                ssid = status.get("ssid")
+                if ssid:
+                    return str(ssid)
+            except Exception:
+                continue
         try:
             creds = await self._client.get_hotspot_credentials()
             return creds.get("ssid")
@@ -78,17 +108,31 @@ class NetworkService:
         return "D-0000"
 
     async def _get_wlan_mac(self) -> str | None:
-        """Get MAC address of the wlan1 interface from linux2rest."""
+        """Get MAC of the secondary WiFi interface (same target as AP/hotspot)."""
+        names: list[str] = []
+        sec = await self._resolve_hotspot_interface_name()
+        if sec:
+            names.append(sec)
+        for n in ("wlan1", "wifi1"):
+            if n not in names:
+                names.append(n)
         try:
             interfaces: list[dict[str, Any]] = await self._linux2rest.get(  # type: ignore[assignment]
                 "/system/network"
             )
-            for iface in interfaces:
-                if iface.get("name") == "wlan1":
-                    mac = iface.get("mac")
-                    if mac:
-                        self._cached_mac = mac
-                    return mac
+            by_name = {
+                iface.get("name"): iface
+                for iface in interfaces
+                if iface.get("name")
+            }
+            for want in names:
+                row = by_name.get(want)
+                if not row:
+                    continue
+                mac = row.get("mac")
+                if mac:
+                    self._cached_mac = mac
+                return mac
         except Exception as e:
             logger.warning(f"Failed to get MAC from linux2rest: {e}")
         return self._cached_mac
@@ -215,11 +259,13 @@ class NetworkService:
         ssid: str = "DORIS",
         password: str = "blueosap",
     ) -> None:
-        """Configure the secondary WiFi interface as a hotspot.
+        """Configure the secondary WiFi interface (typically wlan1) as a hotspot.
 
         Prefers dual mode (client + hotspot) when supported, otherwise
-        falls back to hotspot-only. Sets hotspot credentials on the
-        secondary interface.
+        hotspot-only. Forces the primary (typically wlan0) to normal/client-only
+        mode: disables smart-hotspot, turns off any AP on that radio, and sets
+        mode to ``normal`` when the API allows — avoids two APs and NM fighting
+        the DORIS AP (often mistaken for RF interference).
         """
         if ssid == "DORIS":
             serial = await self._get_serial_number()
@@ -235,9 +281,52 @@ class NetworkService:
             logger.info("Only %d WiFi interface(s) found, skipping hotspot config", len(interfaces))
             return
 
+        primary = interfaces[0]
         secondary = interfaces[1]
+        primary_name = primary.get("name") or ""
         iface_name = secondary["name"]
         logger.info("Configuring secondary WiFi interface: %s", iface_name)
+
+        # BlueOS often keeps a default "BlueOS" AP on the primary radio and/or uses
+        # smart-hotspot to toggle it — that yields two SSIDs and can look like the
+        # hotspot is constantly restarting. Prefer a single DORIS AP on wlan1.
+        try:
+            await self._client.set_smart_hotspot(False)
+            logger.info("Smart hotspot disabled (avoids fighting DORIS wlan1 AP)")
+        except Exception as e:
+            logger.warning("Could not disable smart hotspot: %s", e)
+
+        if primary_name:
+            try:
+                await self._client.set_hotspot(False, interface=primary_name)
+                logger.info("Hotspot disabled on primary interface %s", primary_name)
+            except Exception as e:
+                logger.warning("Could not disable hotspot on %s: %s", primary_name, e)
+
+            try:
+                primary_mode = await self._client.get_interface_mode(primary_name)
+                if primary_mode:
+                    available_p = primary_mode.get("available_modes", [])
+                    current_p = primary_mode.get("current_mode")
+                    if "normal" in available_p and current_p != "normal":
+                        await self._client.set_interface_mode(
+                            primary_name, "normal"
+                        )
+                        logger.info(
+                            "Primary %s set to normal mode (client only)",
+                            primary_name,
+                        )
+                    elif current_p == "normal":
+                        logger.info(
+                            "Primary %s already in normal (client only) mode",
+                            primary_name,
+                        )
+            except Exception as e:
+                logger.warning(
+                    "Could not set primary %s to client-only (normal) mode: %s",
+                    primary_name,
+                    e,
+                )
 
         try:
             await self._client.set_hotspot_credentials(ssid, password, interface=iface_name)
