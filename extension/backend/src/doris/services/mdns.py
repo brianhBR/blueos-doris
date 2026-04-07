@@ -1,14 +1,14 @@
 """DORIS mDNS and nginx setup.
 
 On startup, configures:
-  1. Avahi hostname → "doris" so doris.local resolves to the device IP
+  1. Avahi hostname → "doris" on ALL interfaces (wired + WiFi) so
+     doris.local resolves regardless of how the client is connected.
   2. nginx redirect so http://doris.local/ → http://doris.local:8095/
 """
 
 import logging
 import re
 from pathlib import Path
-from urllib.parse import quote
 
 import httpx
 
@@ -19,9 +19,12 @@ logger = logging.getLogger(__name__)
 AVAHI_CONF = Path("/tmp/avahi/avahi-daemon.conf")
 NGINX_CONF = Path("/tmp/nginx/doris-redirect.conf")
 
+# Redirect any request to doris.local (root path) to the extension UI on
+# port 8095.  Uses $host so the browser follows the redirect with the same
+# hostname it originally used.
 NGINX_REDIRECT_CONTENT = """\
 if ($host = "doris.local") {
-    rewrite ^/$ http://doris.local:8095/ redirect;
+    rewrite ^/$ http://$host:8095/ redirect;
 }
 """
 
@@ -44,23 +47,41 @@ async def _run_host_command(command: str) -> bool:
 
 
 def _setup_avahi_hostname() -> bool:
-    """Set avahi hostname to 'doris'. Returns True if the file was changed."""
+    """Set avahi hostname to 'doris' and ensure Avahi listens on all interfaces.
+
+    BlueOS defaults may include ``allow-interfaces=eth0`` which restricts mDNS
+    to the wired interface only.  We remove any allow-interfaces / deny-interfaces
+    directives so that ``doris.local`` resolves on wired, WiFi-client, and
+    WiFi-hotspot interfaces alike.
+
+    Returns True if the file was changed.
+    """
     if not AVAHI_CONF.is_file():
         logger.info("Avahi config not found at %s, skipping", AVAHI_CONF)
         return False
 
     content = AVAHI_CONF.read_text()
-    if re.search(r"^host-name=doris\s*$", content, re.MULTILINE):
-        logger.info("Avahi hostname already set to 'doris'")
-        return False
+    new_content = content
 
-    new_content = re.sub(r"^host-name=.*$", "host-name=doris", content, flags=re.MULTILINE)
+    # Set hostname
+    new_content = re.sub(
+        r"^host-name=.*$", "host-name=doris", new_content, flags=re.MULTILINE
+    )
+
+    # Remove interface restrictions so Avahi responds on ALL interfaces.
+    new_content = re.sub(
+        r"^allow-interfaces=.*\n?", "", new_content, flags=re.MULTILINE
+    )
+    new_content = re.sub(
+        r"^deny-interfaces=.*\n?", "", new_content, flags=re.MULTILINE
+    )
+
     if new_content == content:
-        logger.warning("Could not find host-name line in avahi config")
+        logger.info("Avahi config already up to date (hostname=doris, all interfaces)")
         return False
 
     AVAHI_CONF.write_text(new_content)
-    logger.info("Avahi hostname changed to 'doris'")
+    logger.info("Avahi config updated: hostname=doris, interface restrictions removed")
     return True
 
 
