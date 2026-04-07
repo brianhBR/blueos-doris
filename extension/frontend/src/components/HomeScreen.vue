@@ -63,6 +63,7 @@ const batteryVoltage = computed(() => {
 const storageUsed = computed(() => storage.value?.used_percent ?? systemStatus.value?.storage_used_percent ?? 0)
 const storageTotal = computed(() => storage.value?.total_gb ?? systemStatus.value?.storage_total_gb ?? 100)
 const storageAvailableGb = computed(() => storage.value?.available_gb ?? (storageTotal.value - (storage.value?.used_gb ?? systemStatus.value?.storage_used_gb ?? 0)))
+const storageType = computed(() => storage.value?.storage_type ?? 'SD Card')
 const batteryTimeRemaining = computed(() => {
   const powerRPi5_W = 15
   const powerRadCAM_W = 5
@@ -842,6 +843,7 @@ const formatReleaseTime = (date: Date) => {
           <div class="flex items-center gap-2">
             <HardDrive class="w-5 h-5" style="color: #96EEF2" />
             <span class="text-white">Storage Available</span>
+            <span class="text-xs px-2 py-0.5 rounded-full" style="background-color: rgba(65, 185, 195, 0.2); color: #96EEF2">{{ storageType }}</span>
           </div>
           <span style="color: #FCD869">{{ Math.round(100 - storageUsed) }}%</span>
         </div>

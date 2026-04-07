@@ -2,10 +2,14 @@
 
 import logging
 import math
+import os
+from pathlib import Path
 
 from ..config import blueos_services
 from ..models.system import BatteryInfo, LocationInfo, StorageInfo, SystemStatus
 from .base import BlueOSClient
+from .external_storage import get_migration_status
+from .storage import DATA_ROOT
 
 logger = logging.getLogger(__name__)
 
@@ -122,33 +126,33 @@ class SystemService:
             raise
 
     async def get_storage_info(self) -> StorageInfo:
-        """Get storage information.
+        """Get storage info for the filesystem holding dive/recorder data.
 
-        Raises on failure if no cached data is available.
+        Uses os.statvfs on the recorder path so the numbers reflect the
+        actual drive (USB or SD) where large media files are stored.
         """
         try:
-            disk_info = await self.linux2rest.get("/system/disk")
+            recorder_path = DATA_ROOT / "recorder"
+            stat_path = recorder_path if recorder_path.exists() else DATA_ROOT
+            vfs = os.statvfs(str(stat_path))
+            total = vfs.f_frsize * vfs.f_blocks
+            available = vfs.f_frsize * vfs.f_bavail
+            if total <= 0:
+                raise ValueError(f"Invalid total disk space: {total}")
+            used = total - available
 
-            if isinstance(disk_info, list) and len(disk_info) > 0:
-                main_disk = disk_info[0]
-                total = main_disk.get("total_space_B", 0)
-                available = main_disk.get("available_space_B", 0)
+            migration = get_migration_status()
+            is_external = migration.get("state") == "done"
 
-                if total <= 0:
-                    raise ValueError(f"Invalid total disk space: {total}")
-
-                used = total - available
-
-                result = StorageInfo(
-                    total_gb=total / (1024**3),
-                    used_gb=used / (1024**3),
-                    available_gb=available / (1024**3),
-                    used_percent=(used / total) * 100,
-                )
-                SystemService._last_storage = result
-                return result
-
-            raise ValueError(f"No disk info available: {disk_info}")
+            result = StorageInfo(
+                total_gb=total / (1024**3),
+                used_gb=used / (1024**3),
+                available_gb=available / (1024**3),
+                used_percent=(used / total) * 100,
+                storage_type="External USB" if is_external else "SD Card",
+            )
+            SystemService._last_storage = result
+            return result
         except Exception as e:
             logger.warning(f"Failed to get storage info: {type(e).__name__}: {e}")
             if SystemService._last_storage is not None:

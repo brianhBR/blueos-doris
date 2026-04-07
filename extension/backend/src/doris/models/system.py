@@ -10,6 +10,7 @@ class StorageInfo(BaseModel):
     used_gb: float
     available_gb: float
     used_percent: float  # Frontend expects used_percent
+    storage_type: str = "SD Card"
 
 
 class BatteryInfo(BaseModel):

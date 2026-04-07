@@ -38,6 +38,7 @@ export interface StorageInfo {
   used_gb: number
   available_gb: number
   used_percent: number
+  storage_type?: string
 }
 
 export interface LocationInfo {
