@@ -356,6 +356,11 @@ function safePositiveInt(value: number, fallback: number): number {
   return Number.isFinite(n) && n >= 1 ? Math.floor(n) : fallback
 }
 
+/** input type="number" coerces refs to JS numbers; backend TimeValue.number expects str. */
+function tv(number: string | number, unit: string): { number: string; unit: 'seconds' | 'minutes' | 'hours' } {
+  return { number: String(number ?? '0'), unit: unit as 'seconds' | 'minutes' | 'hours' }
+}
+
 function buildConfigPayload(name: string): DeploymentConfiguration {
   return {
     name,
@@ -367,8 +372,8 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         camera_type: descentCameraType.value,
         capture_frequency: safePositiveInt(descentCaptureFrequency.value, 10),
         capture_frequency_unit: descentCaptureFrequencyUnit.value as 'seconds' | 'minutes' | 'hours',
-        video_record: { number: descentVideoRecordNumber.value, unit: descentVideoRecordUnit.value as 'seconds' | 'minutes' | 'hours' },
-        video_pause: { number: descentVideoPauseNumber.value, unit: descentVideoPauseUnit.value as 'seconds' | 'minutes' | 'hours' },
+        video_record: tv(descentVideoRecordNumber.value, descentVideoRecordUnit.value),
+        video_pause: tv(descentVideoPauseNumber.value, descentVideoPauseUnit.value),
         resolution: descentResolution.value,
         image_type: descentImageType.value,
         file_format: descentFileFormat.value,
@@ -380,15 +385,15 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         exposure: descentExposure.value,
         sharpness: descentSharpness.value,
         sleep_timer_enabled: descentSleepTimerEnabled.value,
-        sleep_timer: { number: descentSleepTimerNumber.value, unit: descentSleepTimerUnit.value as 'seconds' | 'minutes' | 'hours' },
+        sleep_timer: tv(descentSleepTimerNumber.value, descentSleepTimerUnit.value),
       },
       light: {
         enabled: descentLightOn.value,
         mode: descentLightMode.value,
         brightness: descentLightBrightness.value,
         match_camera_interval: descentMatchCameraInterval.value,
-        on_time: { number: descentLightOnNumber.value, unit: descentLightOnUnit.value as 'seconds' | 'minutes' | 'hours' },
-        off_time: { number: descentLightOffNumber.value, unit: descentLightOffUnit.value as 'seconds' | 'minutes' | 'hours' },
+        on_time: tv(descentLightOnNumber.value, descentLightOnUnit.value),
+        off_time: tv(descentLightOffNumber.value, descentLightOffUnit.value),
       },
     },
     bottom: {
@@ -397,8 +402,8 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         camera_type: bottomCameraType.value,
         capture_frequency: safePositiveInt(bottomCaptureFrequency.value, 10),
         capture_frequency_unit: bottomCaptureFrequencyUnit.value as 'seconds' | 'minutes' | 'hours',
-        video_record: { number: bottomVideoRecordNumber.value, unit: bottomVideoRecordUnit.value as 'seconds' | 'minutes' | 'hours' },
-        video_pause: { number: bottomVideoPauseNumber.value, unit: bottomVideoPauseUnit.value as 'seconds' | 'minutes' | 'hours' },
+        video_record: tv(bottomVideoRecordNumber.value, bottomVideoRecordUnit.value),
+        video_pause: tv(bottomVideoPauseNumber.value, bottomVideoPauseUnit.value),
         resolution: bottomResolution.value,
         image_type: bottomImageType.value,
         file_format: bottomFileFormat.value,
@@ -410,18 +415,18 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         exposure: bottomExposure.value,
         sharpness: bottomSharpness.value,
         sleep_timer_enabled: bottomSleepTimerEnabled.value,
-        sleep_timer: { number: bottomSleepTimerNumber.value, unit: bottomSleepTimerUnit.value as 'seconds' | 'minutes' | 'hours' },
+        sleep_timer: tv(bottomSleepTimerNumber.value, bottomSleepTimerUnit.value),
       },
-      camera_delay: { number: bottomCameraDelayNumber.value, unit: bottomCameraDelayUnit.value as 'seconds' | 'minutes' | 'hours' },
+      camera_delay: tv(bottomCameraDelayNumber.value, bottomCameraDelayUnit.value),
       light: {
         enabled: bottomLightOn.value,
         mode: bottomLightMode.value,
         brightness: bottomLightBrightness.value,
         match_camera_interval: bottomMatchCameraInterval.value,
-        on_time: { number: bottomLightOnNumber.value, unit: bottomLightOnUnit.value as 'seconds' | 'minutes' | 'hours' },
-        off_time: { number: bottomLightOffNumber.value, unit: bottomLightOffUnit.value as 'seconds' | 'minutes' | 'hours' },
+        on_time: tv(bottomLightOnNumber.value, bottomLightOnUnit.value),
+        off_time: tv(bottomLightOffNumber.value, bottomLightOffUnit.value),
       },
-      light_delay: { number: bottomLightDelayNumber.value, unit: bottomLightDelayUnit.value as 'seconds' | 'minutes' | 'hours' },
+      light_delay: tv(bottomLightDelayNumber.value, bottomLightDelayUnit.value),
     },
     ascent: {
       same_as_descent: ascentSameAsDescent.value,
@@ -430,8 +435,8 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         camera_type: ascentCameraType.value,
         capture_frequency: safePositiveInt(ascentCaptureFrequency.value, 10),
         capture_frequency_unit: ascentCaptureFrequencyUnit.value as 'seconds' | 'minutes' | 'hours',
-        video_record: { number: ascentVideoRecordNumber.value, unit: ascentVideoRecordUnit.value as 'seconds' | 'minutes' | 'hours' },
-        video_pause: { number: ascentVideoPauseNumber.value, unit: ascentVideoPauseUnit.value as 'seconds' | 'minutes' | 'hours' },
+        video_record: tv(ascentVideoRecordNumber.value, ascentVideoRecordUnit.value),
+        video_pause: tv(ascentVideoPauseNumber.value, ascentVideoPauseUnit.value),
         resolution: ascentResolution.value,
         image_type: ascentImageType.value,
         file_format: ascentFileFormat.value,
@@ -443,19 +448,19 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         exposure: ascentExposure.value,
         sharpness: ascentSharpness.value,
         sleep_timer_enabled: ascentSleepTimerEnabled.value,
-        sleep_timer: { number: ascentSleepTimerNumber.value, unit: ascentSleepTimerUnit.value as 'seconds' | 'minutes' | 'hours' },
+        sleep_timer: tv(ascentSleepTimerNumber.value, ascentSleepTimerUnit.value),
       },
       light: {
         enabled: ascentLightOn.value,
         mode: ascentLightMode.value,
         brightness: ascentLightBrightness.value,
         match_camera_interval: ascentMatchCameraInterval.value,
-        on_time: { number: ascentLightOnNumber.value, unit: ascentLightOnUnit.value as 'seconds' | 'minutes' | 'hours' },
-        off_time: { number: ascentLightOffNumber.value, unit: ascentLightOffUnit.value as 'seconds' | 'minutes' | 'hours' },
+        on_time: tv(ascentLightOnNumber.value, ascentLightOnUnit.value),
+        off_time: tv(ascentLightOffNumber.value, ascentLightOffUnit.value),
       },
       release_weight: {
         method: props.releaseWeightBy,
-        elapsed: { number: releaseWeightElapsedNumber.value, unit: releaseWeightElapsedUnit.value as 'seconds' | 'minutes' | 'hours' },
+        elapsed: tv(releaseWeightElapsedNumber.value, releaseWeightElapsedUnit.value),
         release_date: releaseWeightDate.value,
         release_time: releaseWeightTime.value,
       },
