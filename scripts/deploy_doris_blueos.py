@@ -122,16 +122,27 @@ rm -f {remote_tgz}
 
     print("Replacing container...")
     stop_script = f"""
-set -e
-# Match sudo used for docker build (pi often needs sudo for docker)
-# Stop and remove; retry rm in case BlueOS respawns the container
-sudo docker stop {CONTAINER_NAME} 2>/dev/null || true
-sudo docker rm -f {CONTAINER_NAME} 2>/dev/null || true
-sleep 1
-sudo docker rm -f {CONTAINER_NAME} 2>/dev/null || true
-# Run new container immediately
-sudo docker run -d \\
-  --name {CONTAINER_NAME} \\
+set +e
+# BlueOS often sets --restart on extension containers; without docker update
+# --restart=no, the daemon can resurrect the old container between rm and run,
+# causing "Conflict. The container name is already in use".
+NM='{CONTAINER_NAME}'
+for _ in 1 2 3 4 5 6 7 8 9 10 11 12; do
+  ids=$(sudo docker ps -aq -f "name=$NM")
+  if [ -z "$ids" ]; then
+    break
+  fi
+  for id in $ids; do
+    sudo docker update --restart=no "$id" 2>/dev/null
+    sudo docker rm -f "$id" 2>/dev/null
+  done
+  sleep 1
+done
+RUN_RC=1
+for _ in 1 2 3 4 5; do
+  sudo docker run -d \\
+  --restart unless-stopped \\
+  --name "$NM" \\
   -p 8095:8095 \\
   --privileged \\
   -v /dev:/dev:rw \\
@@ -146,8 +157,20 @@ sudo docker run -d \\
   -e MAV_SYSTEM_ID=1 \\
   -e DORIS_BLUEOS_ADDRESS=http://host.docker.internal \\
   {IMAGE_TAG}
+  RUN_RC=$?
+  if [ "$RUN_RC" -eq 0 ]; then
+    break
+  fi
+  echo "docker run failed ($RUN_RC), clearing name and retrying..."
+  for id in $(sudo docker ps -aq -f "name=$NM"); do
+    sudo docker update --restart=no "$id" 2>/dev/null
+    sudo docker rm -f "$id" 2>/dev/null
+  done
+  sleep 2
+done
+exit $RUN_RC
 """
-    rc, out, err = ssh_exec(client, stop_script, timeout=120)
+    rc, out, err = ssh_exec(client, stop_script, timeout=240)
     print(out)
     if err.strip():
         print(err, file=sys.stderr)
