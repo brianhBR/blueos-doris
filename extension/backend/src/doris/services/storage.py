@@ -10,7 +10,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ..models.configuration import (
@@ -39,6 +39,68 @@ def _detect_media_type(filename: str) -> MediaType:
     return MediaType.DATA
 
 
+def _parse_datetime_from_filename(filename: str) -> datetime | None:
+    """Infer capture time from common DORIS / recorder filename patterns."""
+    # recorder_20260404_074153.mcap
+    m = re.search(r"recorder_(\d{8})_(\d{6})(?=[_.]|\b)", filename, re.IGNORECASE)
+    if m:
+        d, t = m.group(1), m.group(2)
+        try:
+            return datetime(
+                int(d[:4]),
+                int(d[4:6]),
+                int(d[6:8]),
+                int(t[:2]),
+                int(t[2:4]),
+                int(t[4:6]),
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            pass
+    # Loose YYYYMMDD_HHMMSS anywhere in stem
+    m2 = re.search(r"(20\d{2})(\d{2})(\d{2})[_-](\d{2})(\d{2})(\d{2})", filename)
+    if m2:
+        try:
+            return datetime(
+                int(m2.group(1)),
+                int(m2.group(2)),
+                int(m2.group(3)),
+                int(m2.group(4)),
+                int(m2.group(5)),
+                int(m2.group(6)),
+                tzinfo=timezone.utc,
+            )
+        except ValueError:
+            pass
+    return None
+
+
+def _effective_created_at(path: Path, mtime_ts: float) -> datetime:
+    """Use mtime when plausible; otherwise parse filename or clamp bogus mtimes.
+
+    Some mounts (or flight-controller exports) report impossible mtimes (e.g. year 2073).
+    Recorder files embed the real time in the name.
+    """
+    now = datetime.now(timezone.utc)
+    lo = datetime(2000, 1, 1, tzinfo=timezone.utc)
+    hi = now + timedelta(days=2)
+    mtime_dt = datetime.fromtimestamp(mtime_ts, tz=timezone.utc)
+
+    if lo <= mtime_dt <= hi:
+        return mtime_dt
+
+    parsed = _parse_datetime_from_filename(path.name)
+    if parsed is not None and lo <= parsed <= hi + timedelta(days=7):
+        return parsed
+
+    # No filename hint: clamp insane mtimes so the Data page stays usable
+    if mtime_dt > hi:
+        return hi
+    if mtime_dt < lo:
+        return lo
+    return mtime_dt
+
+
 def _file_to_media(path: Path, root: Path) -> MediaFile:
     """Convert a filesystem path to a MediaFile model."""
     stat = path.stat()
@@ -48,7 +110,7 @@ def _file_to_media(path: Path, root: Path) -> MediaFile:
         filename=path.name,
         media_type=_detect_media_type(path.name),
         size_bytes=stat.st_size,
-        created_at=datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc),
+        created_at=_effective_created_at(path, stat.st_mtime),
         mission_id=rel.parts[0] if len(rel.parts) > 1 else None,
         download_url=f"/api/v1/media/download/{rel}",
     )
@@ -120,7 +182,7 @@ class StorageService:
 
                 images = videos = data_files = 0
                 total_size = 0
-                latest_mtime = 0.0
+                latest_date: datetime | None = None
 
                 for path in entry.rglob("*"):
                     try:
@@ -131,7 +193,9 @@ class StorageService:
                             continue
                         stat = path.stat()
                         total_size += stat.st_size
-                        latest_mtime = max(latest_mtime, stat.st_mtime)
+                        eff = _effective_created_at(path, stat.st_mtime)
+                        if latest_date is None or eff > latest_date:
+                            latest_date = eff
                         mt = _detect_media_type(path.name)
                         if mt == MediaType.IMAGE:
                             images += 1
@@ -149,7 +213,7 @@ class StorageService:
                     MediaMission(
                         mission_id=entry.name,
                         mission_name=entry.name,
-                        date=datetime.fromtimestamp(latest_mtime, tz=timezone.utc) if latest_mtime else datetime.now(tz=timezone.utc),
+                        date=latest_date or datetime.now(tz=timezone.utc),
                         image_count=images,
                         video_count=videos,
                         data_file_count=data_files,

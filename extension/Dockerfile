@@ -40,6 +40,7 @@ RUN python -m pip install --extra-index-url https://www.piwheels.org/simple -e .
 # NOW copy the actual source code (changes here don't invalidate dependency cache)
 COPY backend/src ./src
 COPY backend/scripts ./scripts
+COPY backend/frames ./frames
 
 # Copy WiFi driver (out-of-tree 88x2bu for USB WiFi adapter)
 COPY driver/ ./driver/
