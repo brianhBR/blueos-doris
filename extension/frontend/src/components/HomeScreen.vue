@@ -40,9 +40,7 @@ const {
   mission: diveMission,
   startDive,
   stopDive,
-  sitlSimulateWaterDrop,
   loading: diveLoading,
-  sitlDropLoading,
   fetchDiveStatus,
   fetchDiveMission,
 } = useDiveControl()
@@ -123,7 +121,22 @@ const modules = computed<{ id: string; name: string; status: 'connected' | 'disc
   return []
 })
 
+const currentUtcTimeLabel = ref('')
+
+function refreshCurrentUtcTime() {
+  const d = new Date()
+  currentUtcTimeLabel.value =
+    d.toLocaleTimeString(undefined, {
+      timeZone: 'UTC',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hour12: false,
+    }) + ' UTC'
+}
+
 let pollInterval: number | undefined
+let utcClockInterval: number | undefined
 
 onMounted(() => {
   fetchStatus()
@@ -134,6 +147,7 @@ onMounted(() => {
   fetchConfigurations()
   fetchDiveStatus()
   fetchDiveMission()
+  refreshCurrentUtcTime()
   pollInterval = setInterval(() => {
     fetchStatus()
     fetchBattery()
@@ -143,10 +157,12 @@ onMounted(() => {
     fetchDiveStatus()
     fetchDiveMission()
   }, 5000) as unknown as number
+  utcClockInterval = setInterval(refreshCurrentUtcTime, 1000) as unknown as number
 })
 
 onUnmounted(() => {
   if (pollInterval) clearInterval(pollInterval)
+  if (utcClockInterval) clearInterval(utcClockInterval)
 })
 
 const diveName = ref('')
@@ -321,6 +337,20 @@ const releaseWeightUtcFieldsReady = computed(
     Boolean(releaseWeightTime.value.trim()),
 )
 
+/** Clamp release time to 24-hour HH:MM (avoids native time picker 12-hour locale quirks). */
+function normalizeReleaseWeightTime() {
+  const raw = releaseWeightTime.value.trim()
+  if (!raw) return
+  const parts = raw.split(':').map((p) => p.trim())
+  if (parts.length < 2) return
+  let h = parseInt(parts[0], 10)
+  let min = parseInt(parts[1], 10)
+  if (Number.isNaN(h) || Number.isNaN(min)) return
+  h = Math.min(23, Math.max(0, h))
+  min = Math.min(59, Math.max(0, min))
+  releaseWeightTime.value = `${String(h).padStart(2, '0')}:${String(min).padStart(2, '0')}`
+}
+
 function computeReleaseDateTimeFromElapsed(elapsedNumber: number, elapsedUnit: string) {
   const now = new Date()
   let offsetMs = 0
@@ -368,6 +398,7 @@ const handleConfigurationChange = async () => {
       if (rw.method === 'datetime') {
         releaseWeightDate.value = rw.release_date
         releaseWeightTime.value = rw.release_time
+        normalizeReleaseWeightTime()
       }
     }
     emit('configurationSelect', selectedConfiguration.value)
@@ -385,10 +416,6 @@ async function handleStartDive() {
     release_weight_time: releaseWeightTime.value,
   }
   await startDive(selectedConfiguration.value, diveData)
-}
-
-async function handleSitlSimulateDrop() {
-  await sitlSimulateWaterDrop(-19.6)
 }
 
 const formatReleaseTime = (date: Date) => {
@@ -510,15 +537,44 @@ const formatReleaseTime = (date: Date) => {
         </div>
 
         <div>
-          <label class="block text-sm mb-2" :style="{ color: releaseWeightBy === 'datetime' ? '#96EEF2' : 'rgba(150, 238, 242, 0.5)' }">Release weight time (UTC)</label>
+          <div
+            class="flex flex-wrap items-baseline justify-between gap-x-3 gap-y-1 mb-2"
+          >
+            <label
+              class="text-sm"
+              :style="{ color: releaseWeightBy === 'datetime' ? '#96EEF2' : 'rgba(150, 238, 242, 0.5)' }"
+            >
+              Release weight time (24-hour UTC)
+            </label>
+            <span
+              class="text-xs font-mono tabular-nums whitespace-nowrap"
+              style="color: #FCD869"
+              title="Current time in UTC (updates every second)"
+            >
+              Now: {{ currentUtcTimeLabel }}
+            </span>
+          </div>
           <input
             v-if="releaseWeightUtcFieldsReady"
             v-model="releaseWeightTime"
-            type="time"
-            step="60"
-            class="w-full rounded-lg px-4 py-3 text-white outline-none"
-            style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.3); color-scheme: dark"
+            type="text"
+            inputmode="numeric"
+            placeholder="14:30"
+            maxlength="5"
+            autocomplete="off"
+            spellcheck="false"
+            class="w-full rounded-lg px-4 py-3 text-white outline-none font-mono tabular-nums"
+            style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.3)"
+            title="24-hour UTC, format HH:MM"
+            @blur="normalizeReleaseWeightTime"
           />
+          <p
+            v-if="releaseWeightUtcFieldsReady"
+            class="text-xs mt-1"
+            style="color: rgba(150, 238, 242, 0.65)"
+          >
+            Enter 24-hour UTC time (HH:MM), e.g. 09:05 or 21:30.
+          </p>
           <div
             v-else
             class="w-full rounded-lg px-4 py-3 select-none"
@@ -582,20 +638,6 @@ const formatReleaseTime = (date: Date) => {
       >
         Mission loaded — ready for deployment.
       </p>
-      <div v-if="isDiving" class="mt-3 flex flex-wrap items-center gap-2">
-        <button
-          type="button"
-          @click="handleSitlSimulateDrop"
-          :disabled="sitlDropLoading || diveLoading"
-          class="px-4 py-2 rounded-lg text-sm text-white transition-all disabled:cursor-not-allowed disabled:opacity-50"
-          style="background-color: rgba(65, 185, 195, 0.35); border: 1px solid rgba(65, 185, 195, 0.6)"
-        >
-          {{ sitlDropLoading ? 'Applying…' : 'SITL: simulate water drop' }}
-        </button>
-        <span class="text-xs" style="color: rgba(150, 238, 242, 0.75)">
-          ArduSub SITL only — sets negative SIM_BUOYANCY so depth passes the gate after pre-arm.
-        </span>
-      </div>
       <p
         v-if="missionPersistedLine"
         class="text-sm mt-1"
@@ -604,7 +646,7 @@ const formatReleaseTime = (date: Date) => {
         {{ missionPersistedLine }}
       </p>
       <p class="text-sm" :class="isDiving || missionPersistedLine ? 'mt-2' : 'mt-0'" style="color: #96EEF2">
-        Mission begins automatically after pre-arm checks pass (GPS, battery, leak, profile), the vehicle is armed, and DORIS descends below the depth gate (default 3&nbsp;m).
+        Mission begins automatically after pre-arm checks pass (GPS, battery, leak, profile) and DORIS descends below the depth gate (default 3&nbsp;m).
       </p>
     </div>
 
