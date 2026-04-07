@@ -27,12 +27,12 @@ DNSMASQ_SHARED_DIR = "/etc/NetworkManager/dnsmasq-shared.d"
 DNSMASQ_CONF = f"{DNSMASQ_SHARED_DIR}/doris-local.conf"
 HOTSPOT_GATEWAY = "10.42.0.1"
 
-# Redirect any request to doris.local (root path) to the extension UI on
-# port 8095.  Uses $host so the browser follows the redirect with the same
-# hostname it originally used.
+# Redirect any request to doris.local to the extension UI on port 8095.
+# Uses `return 302` (not `rewrite`) because BlueOS's nginx has multiple
+# `location /` blocks that interfere with server-level rewrites.
 NGINX_REDIRECT_CONTENT = """\
 if ($host = "doris.local") {
-    rewrite ^/$ http://$host:8095/ redirect;
+    return 302 http://$host:8095$request_uri;
 }
 """
 
