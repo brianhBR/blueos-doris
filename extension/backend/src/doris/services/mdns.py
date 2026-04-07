@@ -57,11 +57,16 @@ async def _run_host_command(command: str) -> bool:
 def _setup_avahi_hostname() -> bool:
     """Set avahi hostname to 'doris' on all physical network interfaces.
 
-    BlueOS defaults to ``allow-interfaces=eth0`` which restricts mDNS to
-    the wired interface.  We replace that with ``deny-interfaces=lo,docker0``
-    so Avahi advertises on every real interface (eth0, wlan0, wlan1, uap0, …)
-    while excluding Docker bridges and loopback — those cause Avahi to
-    respond with unreachable internal IPs.
+    Three config changes:
+
+    1. ``host-name=doris`` — advertise as doris.local
+    2. ``deny-interfaces=lo,docker0`` — skip Docker bridges and loopback
+       (they cause Avahi to respond with unreachable internal IPs)
+    3. ``disallow-other-stacks=yes`` — take exclusive ownership of port 5353.
+       BlueOS's Beacon service runs a second mDNS stack (Python zeroconf)
+       on the same host.  Without this flag Avahi prints "Detected another
+       IPv4 mDNS stack … this makes mDNS unreliable" and Windows clients
+       fail to resolve doris.local.
 
     Returns True if the file was changed.
     """
@@ -72,26 +77,28 @@ def _setup_avahi_hostname() -> bool:
     content = AVAHI_CONF.read_text()
     new_content = content
 
-    # Set hostname
-    new_content = re.sub(
-        r"^host-name=.*$", "host-name=doris", new_content, flags=re.MULTILINE
-    )
+    SETTINGS = {
+        "host-name": "doris",
+        "deny-interfaces": "lo,docker0",
+        "disallow-other-stacks": "yes",
+    }
 
-    # Replace any allow/deny-interfaces with a deny-list that blocks only
-    # virtual interfaces.  This lets Avahi respond on all physical interfaces.
+    for key, value in SETTINGS.items():
+        target = f"{key}={value}"
+        # Replace existing (commented or uncommented) line
+        new_content, n = re.subn(
+            rf"^#?{key}=.*$", target, new_content, flags=re.MULTILINE,
+        )
+        # If no existing line was found, insert after [server]
+        if n == 0 and target not in new_content:
+            new_content = new_content.replace(
+                "[server]", f"[server]\n{target}", 1,
+            )
+
+    # Remove allow-interfaces (BlueOS defaults to eth0-only)
     new_content = re.sub(
         r"^allow-interfaces=.*\n?", "", new_content, flags=re.MULTILINE
     )
-    new_content = re.sub(
-        r"^deny-interfaces=.*\n?", "deny-interfaces=lo,docker0\n",
-        new_content, flags=re.MULTILINE, count=1,
-    )
-    # If there was no deny-interfaces line to replace, insert one after [server]
-    if "deny-interfaces=" not in new_content:
-        new_content = new_content.replace(
-            "host-name=doris",
-            "host-name=doris\ndeny-interfaces=lo,docker0",
-        )
 
     if new_content == content:
         logger.info("Avahi config already up to date (hostname=doris, all interfaces)")
