@@ -8,6 +8,7 @@ the container.
 
 import json
 import logging
+import math
 import os
 import re
 from dataclasses import dataclass
@@ -185,9 +186,23 @@ def _optional_depth_m(value: object) -> float | None:
         return None
 
 
+def _optional_log_max_depth_m(data: dict) -> float | None:
+    """Max depth from logs if persisted on the dive record (not read from MCAP here)."""
+    v = data.get("log_max_depth_m")
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(x) or x <= 0:
+        return None
+    return x
+
+
 def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
     """Load dives/dive_*.json newest first with recorder media counts."""
-    from .mcap_telemetry import McapSummary, map_dive_stem_to_largest_mcap, summarize_mcap
+    from .mcap_telemetry import map_dive_stem_to_largest_mcap
 
     ddir = root / "dives"
     if not ddir.is_dir():
@@ -196,7 +211,6 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
     windows = _load_dive_windows(root)
     counts = aggregate_recorder_media_counts_by_dive_stem(root, windows)
     mcap_by_stem = map_dive_stem_to_largest_mcap(root, windows)
-    mcap_parse_cache: dict[Path, McapSummary] = {}
     now = datetime.now(timezone.utc)
     entries: list[DiveHistoryEntry] = []
 
@@ -239,21 +253,17 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
                 pass
 
         est_depth = _optional_depth_m(data.get("estimated_depth"))
+        log_max = _optional_log_max_depth_m(data)
+        display_depth = log_max if log_max is not None else est_depth
         mcap_path = mcap_by_stem.get(stem)
         rel_mcap: str | None = None
-        log_max: float | None = None
-        display_depth = est_depth
         if mcap_path is not None:
             try:
                 rel_mcap = str(mcap_path.relative_to(root))
             except ValueError:
                 rel_mcap = None
-            if mcap_path not in mcap_parse_cache:
-                mcap_parse_cache[mcap_path] = summarize_mcap(mcap_path)
-            summ = mcap_parse_cache[mcap_path]
-            log_max = summ.max_depth_m
-            if log_max is not None and log_max > 0:
-                display_depth = log_max
+        # Do not call summarize_mcap() here: full MCAP scans block the whole API process
+        # (Robyn) and stall every concurrent request including /media/files.
 
         entries.append(
             DiveHistoryEntry(
