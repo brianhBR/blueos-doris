@@ -104,6 +104,7 @@ const storageAvailableGb = computed(() => storage.value?.available_gb ?? 0)
 const storageUsedPercent = computed(() => storage.value?.used_percent ?? 0)
 const storageAvailablePercent = computed(() => storageTotalGb.value > 0 ? Math.round(100 - storageUsedPercent.value) : 0)
 const hasStorageData = computed(() => storage.value !== null)
+const storageType = computed(() => storage.value?.storage_type ?? 'SD Card')
 
 let pollInterval: number | undefined
 
@@ -305,6 +306,7 @@ const handlePageChange = (page: number) => {
           <div>
             <p class="text-sm md:text-base" style="color: #96EEF2">
               Total Storage: {{ hasStorageData ? storageTotalGb.toFixed(1) + ' GB' : 'Unavailable' }}
+              <span v-if="hasStorageData" class="text-xs px-2 py-0.5 rounded-full ml-1" style="background-color: rgba(65, 185, 195, 0.2); color: #96EEF2">{{ storageType }}</span>
             </p>
             <p class="text-sm md:text-base" style="color: #41B9C3">
               Available: {{ hasStorageData ? storageAvailableGb.toFixed(1) + ' GB (' + storageAvailablePercent + '%)' : 'Unavailable' }}
