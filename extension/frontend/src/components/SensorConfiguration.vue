@@ -1,6 +1,6 @@
 <script setup lang="ts">
-import { ref, watch, nextTick, onMounted, onUnmounted } from 'vue'
-import { Wifi, WifiOff, Upload, RefreshCw, Loader2 } from 'lucide-vue-next'
+import { ref, watch, nextTick, onMounted, onUnmounted, computed } from 'vue'
+import { Wifi, WifiOff, Upload, RefreshCw, Loader2, Camera, AlertCircle } from 'lucide-vue-next'
 import {
   mdiCameraOutline,
   mdiVideoOutline,
@@ -147,6 +147,47 @@ const getStatusColor = (moduleStatus: string) => {
   if (moduleStatus.includes('Disconnected')) return '#DD2C1D'
   return '#FCD869'
 }
+
+const snapshotUrl = ref<string | null>(null)
+const snapshotLoading = ref(false)
+const snapshotError = ref(false)
+let snapshotInterval: number | undefined
+
+const selectedIsCamera = computed(() =>
+  selectedModule.value?.type === 'camera' && selectedModule.value?.connected
+)
+
+async function refreshSnapshot() {
+  if (!selectedIsCamera.value) return
+  snapshotLoading.value = !snapshotUrl.value
+  snapshotError.value = false
+  try {
+    const resp = await fetch(`/api/v1/sensors/camera/snapshot?_t=${Date.now()}`)
+    if (!resp.ok) throw new Error(resp.statusText)
+    const blob = await resp.blob()
+    if (snapshotUrl.value) URL.revokeObjectURL(snapshotUrl.value)
+    snapshotUrl.value = URL.createObjectURL(blob)
+  } catch {
+    snapshotError.value = true
+  } finally {
+    snapshotLoading.value = false
+  }
+}
+
+watch(selectedIsCamera, (isCamera) => {
+  if (snapshotInterval) { clearInterval(snapshotInterval); snapshotInterval = undefined }
+  if (snapshotUrl.value) { URL.revokeObjectURL(snapshotUrl.value); snapshotUrl.value = null }
+  snapshotError.value = false
+  if (isCamera) {
+    refreshSnapshot()
+    snapshotInterval = setInterval(refreshSnapshot, 5000) as unknown as number
+  }
+})
+
+onUnmounted(() => {
+  if (snapshotInterval) clearInterval(snapshotInterval)
+  if (snapshotUrl.value) URL.revokeObjectURL(snapshotUrl.value)
+})
 </script>
 
 <template>
@@ -309,7 +350,59 @@ const getStatusColor = (moduleStatus: string) => {
 
             <!-- Camera type config -->
             <div v-if="selectedModule.type === 'camera'" class="space-y-4">
-              <p style="color: #96EEF2">Camera-specific settings are available in the Configuration section.</p>
+              <!-- Live snapshot preview -->
+              <div
+                class="rounded-lg overflow-hidden border"
+                style="border-color: rgba(65, 185, 195, 0.3); background-color: rgba(14, 36, 70, 0.5)"
+              >
+                <div class="flex items-center gap-2 px-3 py-2" style="border-bottom: 1px solid rgba(65, 185, 195, 0.2)">
+                  <Camera class="w-4 h-4" style="color: #96EEF2" />
+                  <span class="text-sm font-medium" style="color: #96EEF2">Live Preview</span>
+                  <span
+                    v-if="snapshotUrl && !snapshotError"
+                    class="ml-auto text-xs px-1.5 py-0.5 rounded"
+                    style="background-color: rgba(252, 216, 105, 0.2); color: #FCD869"
+                  >Live</span>
+                </div>
+
+                <div
+                  v-if="snapshotLoading && !snapshotUrl"
+                  class="flex items-center justify-center py-16"
+                  style="color: #96EEF2"
+                >
+                  <Loader2 class="w-6 h-6 animate-spin mr-2" />
+                  <span class="text-sm">Loading camera preview…</span>
+                </div>
+
+                <div
+                  v-else-if="snapshotError && !snapshotUrl"
+                  class="flex flex-col items-center justify-center py-12 gap-2"
+                >
+                  <AlertCircle class="w-8 h-8" style="color: rgba(150, 238, 242, 0.4)" />
+                  <p class="text-sm" style="color: rgba(150, 238, 242, 0.6)">
+                    Camera preview unavailable
+                  </p>
+                  <button
+                    @click="refreshSnapshot"
+                    class="text-xs px-3 py-1 rounded transition-all hover:opacity-80"
+                    style="background-color: rgba(65, 185, 195, 0.2); color: #96EEF2; border: 1px solid rgba(65, 185, 195, 0.3)"
+                  >
+                    Retry
+                  </button>
+                </div>
+
+                <img
+                  v-else-if="snapshotUrl"
+                  :src="snapshotUrl"
+                  alt="Camera preview"
+                  class="w-full object-contain"
+                  style="max-height: 320px; background-color: #000"
+                />
+              </div>
+
+              <p class="text-sm" style="color: rgba(150, 238, 242, 0.6)">
+                Snapshot refreshes every 5 seconds. Camera-specific settings are available in the Configuration section.
+              </p>
               <button
                 @click="emit('navigate', 'dives')"
                 class="px-4 py-2 text-white rounded-lg transition-all hover:opacity-90"
