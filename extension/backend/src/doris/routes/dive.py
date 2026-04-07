@@ -68,6 +68,10 @@ def _sync_mission_state_from_vehicle(status_dict: dict) -> None:
         ms["status"] = "completed"
         ms["completed_at"] = datetime.now(tz=timezone.utc).isoformat()
         changed = True
+        try:
+            _update_active_dive_record("completed")
+        except Exception as e:
+            logger.warning("Failed to mark dive record completed: %s", e)
     if changed:
         try:
             MISSION_STATE_PATH.write_text(json.dumps(ms, indent=2, default=str))
@@ -134,6 +138,28 @@ def _update_active_dive_record(new_status: str) -> None:
             logger.warning(f"Error reading {dive_file.name}: {e}")
 
 
+def _close_all_active_dive_records(new_status: str = "completed") -> int:
+    """Close every dive record still marked 'active'. Returns count closed."""
+    DIVES_DIR.mkdir(parents=True, exist_ok=True)
+    pattern = re.compile(r"^dive_(\d{4})\.json$")
+    now = datetime.now(tz=timezone.utc).isoformat()
+    closed = 0
+    for f in DIVES_DIR.iterdir():
+        if not pattern.match(f.name):
+            continue
+        try:
+            record = json.loads(f.read_text())
+            if record.get("status") == "active":
+                record["status"] = new_status
+                record["ended_at"] = now
+                f.write_text(json.dumps(record, indent=2, default=str))
+                logger.info(f"Stale dive closed: {f.name} -> {new_status}")
+                closed += 1
+        except Exception as e:
+            logger.warning(f"Error closing {f.name}: {e}")
+    return closed
+
+
 def register_dive_routes(app: Robyn) -> None:
     @app.post("/api/v1/dive/start")
     async def start_dive(request):
@@ -166,6 +192,10 @@ def register_dive_routes(app: Robyn) -> None:
         )
         if not ok:
             return json.dumps({"success": False, "message": "Failed to set parameter"})
+
+        stale = _close_all_active_dive_records("completed")
+        if stale:
+            logger.info(f"Closed {stale} stale active dive record(s) before new dive")
 
         dive_file = _next_dive_filename()
         dive_record = {

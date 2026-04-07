@@ -10,6 +10,7 @@ state machine uses the correct durations and light settings.
 
 import asyncio
 import logging
+import time
 from datetime import datetime, timezone
 
 import httpx
@@ -55,6 +56,7 @@ class DiveService:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
         self._last_known_value: float = 0.0
+        self._started_at: float = 0.0
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -145,6 +147,7 @@ class DiveService:
         ok = await self._set_param(PARAM_NAME, 1.0)
         if ok:
             self._last_known_value = 1.0
+            self._started_at = time.monotonic()
         return ok
 
     async def set_sim_buoyancy(self, newtons: float) -> bool:
@@ -156,7 +159,26 @@ class DiveService:
         ok = await self._set_param(PARAM_NAME, 0.0)
         if ok:
             self._last_known_value = 0.0
+            self._started_at = 0.0
         return ok
+
+    def _is_active(self, start_val: float, state_int: int | None) -> bool:
+        """Determine whether a dive is active.
+
+        DORIS_START is a one-shot trigger that the Lua script clears after
+        processing, so reading it back is unreliable.  Instead we check:
+        1. DORIS_STATE 0-3 (MISSION_START … ASCENT) — Lua is running.
+        2. DORIS_START >= 1 — trigger just set, Lua hasn't consumed it yet.
+        3. Cooldown — brief window after start_dive() to cover the race
+           between PARAM_SET and the Lua script's first update cycle.
+        """
+        if state_int is not None and 0 <= state_int <= 3:
+            return True
+        if start_val >= 1.0:
+            return True
+        if self._started_at and (time.monotonic() - self._started_at) < 15.0:
+            return True
+        return False
 
     async def get_status(self) -> dict:
         """Read DORIS_START and DORIS_STATE from the PARAM_VALUE cache."""
@@ -167,8 +189,8 @@ class DiveService:
 
             state_val = await self._read_param_float(STATE_PARAM)
             value = self._last_known_value
-            active = value >= 1.0
             state_int = int(state_val) if state_val is not None else None
+            active = self._is_active(value, state_int)
             out: dict = {
                 "param": PARAM_NAME,
                 "value": value,
@@ -184,7 +206,7 @@ class DiveService:
             return {
                 "param": PARAM_NAME,
                 "value": self._last_known_value,
-                "active": self._last_known_value >= 1.0,
+                "active": self._is_active(self._last_known_value, None),
                 "doris_script_state": None,
                 "doris_script_state_name": None,
             }
