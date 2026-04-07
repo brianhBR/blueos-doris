@@ -124,6 +124,35 @@ class CameraService:
             pass
         return None
 
+    async def get_snapshot(self, source: str | None = None) -> bytes | None:
+        """Grab a single JPEG frame from the Camera Manager's thumbnail endpoint.
+
+        Camera Manager exposes GET /thumbnail?source=<device>&quality=70 which
+        returns a JPEG snapshot from the first available video source when
+        ``source`` is omitted.
+        """
+        import httpx as _httpx
+
+        params: dict[str, str] = {"quality": "70"}
+        if source:
+            params["source"] = source
+        try:
+            resp = await self.camera_manager.client.get("/thumbnail", params=params)
+            if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
+                return resp.content
+        except Exception:
+            pass
+
+        # Fallback: try the /snapshot endpoint (some MCM builds use this)
+        try:
+            resp = await self.camera_manager.client.get("/snapshot", params=params)
+            if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
+                return resp.content
+        except Exception:
+            pass
+
+        return None
+
     async def close(self) -> None:
         """Close HTTP clients."""
         await self.camera_manager.close()

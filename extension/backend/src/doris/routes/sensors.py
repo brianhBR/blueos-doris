@@ -5,6 +5,7 @@ import json
 from robyn import Response, Robyn
 
 from ..models.sensors import SensorConfig
+from ..services.camera import CameraService
 from ..services.sensors import SensorService
 
 
@@ -12,6 +13,7 @@ def register_sensor_routes(app: Robyn) -> None:
     """Register sensor-related API routes."""
 
     sensor_service = SensorService()
+    camera_service = CameraService()
 
     @app.get("/api/v1/sensors/modules")
     async def get_connected_modules(request):
@@ -38,6 +40,30 @@ def register_sensor_routes(app: Robyn) -> None:
                 description=json.dumps({"error": str(e)}),
                 headers={"Content-Type": "application/json"},
             )
+
+    @app.get("/api/v1/sensors/camera/snapshot")
+    async def camera_snapshot(request):
+        """Proxy a JPEG snapshot from the Camera Manager for the sensor page preview."""
+        source = request.query_params.get("source", None)
+        try:
+            data = await camera_service.get_snapshot(source=source)
+        except Exception:
+            data = None
+        if data is None:
+            return Response(
+                status_code=502,
+                description=json.dumps({"error": "No snapshot available from camera"}),
+                headers={"Content-Type": "application/json"},
+            )
+        return Response(
+            status_code=200,
+            description=data,
+            headers={
+                "Content-Type": "image/jpeg",
+                "Cache-Control": "no-cache",
+                "Content-Length": str(len(data)),
+            },
+        )
 
     @app.get("/api/v1/sensors/:sensor_id/readings")
     async def get_sensor_readings(request):
