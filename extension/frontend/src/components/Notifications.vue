@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted } from 'vue'
 import { Bell, CheckCircle, AlertTriangle, AlertCircle, Info, X } from 'lucide-vue-next'
 import type { Screen } from '../types'
 import { useNotifications } from '../composables/useApi'
+import { parseBackendDateTime } from '../parseBackendTime'
 import type { NotificationItemApi, NotificationSettingsApi } from '../composables/useApi'
 
 const emit = defineEmits<{
@@ -55,7 +56,7 @@ const getIcon = (type: string) => {
 }
 
 function formatTimestamp(ts: string): string {
-  const date = new Date(ts)
+  const date = parseBackendDateTime(ts)
   const now = new Date()
   const diffMs = now.getTime() - date.getTime()
   const diffMin = Math.floor(diffMs / 60000)

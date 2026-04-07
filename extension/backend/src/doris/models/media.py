@@ -11,6 +11,7 @@ class MediaType(StrEnum):
     IMAGE = "image"
     VIDEO = "video"
     DATA = "data"  # sensor data files
+    SYSTEM = "system"  # configs, notifications, dive records, unassigned recorder data, etc.
 
 
 class MediaFile(BaseModel):
@@ -24,6 +25,7 @@ class MediaFile(BaseModel):
     resolution: str | None = None
     created_at: datetime
     mission_id: str | None = None
+    dive_name: str | None = None
     thumbnail_url: str | None = None
     download_url: str
     is_synced: bool = False

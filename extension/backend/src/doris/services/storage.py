@@ -10,6 +10,7 @@ import json
 import logging
 import os
 import re
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -17,6 +18,7 @@ from ..models.configuration import (
     ConfigurationSummary,
     DeploymentConfiguration,
 )
+from ..models.dive_history import DiveHistoryEntry
 from ..models.media import MediaFile, MediaMission, MediaType, SyncStatus
 
 logger = logging.getLogger(__name__)
@@ -27,6 +29,239 @@ DATA_EXTENSIONS = frozenset(("csv", "json", "bin", "log", "txt", "bag", "mcap", 
 ALL_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | DATA_EXTENSIONS
 
 DATA_ROOT = Path(os.environ.get("DORIS_DATA_ROOT", "/tmp/storage"))
+
+# BlueOS bind-mount folders under DATA_ROOT — not user dive names.
+SYSTEM_TOP_LEVEL = frozenset(
+    {"configurations", "notifications", "nginx", "dives"},
+)
+RECORDER_DIR = "recorder"
+
+
+@dataclass(frozen=True)
+class _DiveWindow:
+    stem: str
+    start: datetime
+    end: datetime
+    display_name: str
+
+
+def _parse_iso_to_utc(value: object) -> datetime | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    s = s.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def _load_dive_windows(root: Path) -> list[_DiveWindow]:
+    """Build time windows from dives/dive_*.json for matching recorder files."""
+    ddir = root / "dives"
+    if not ddir.is_dir():
+        return []
+
+    now = datetime.now(timezone.utc)
+    windows: list[_DiveWindow] = []
+
+    for f in sorted(ddir.glob("dive_*.json")):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+
+        start = _parse_iso_to_utc(data.get("started_at"))
+        if start is None:
+            continue
+
+        ended = _parse_iso_to_utc(data.get("ended_at"))
+        status = str(data.get("status") or "").lower()
+
+        if ended is None:
+            if status in ("completed", "cancelled"):
+                try:
+                    ended = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
+                except OSError:
+                    ended = start + timedelta(hours=6)
+            else:
+                ended = now + timedelta(days=3650)
+
+        name = str(data.get("dive_name") or "").strip()
+        if not name:
+            cfg = str(data.get("configuration") or "").strip()
+            name = cfg or f.stem.replace("_", " ").title()
+
+        windows.append(
+            _DiveWindow(stem=f.stem, start=start, end=ended, display_name=name)
+        )
+
+    return windows
+
+
+def _match_dive_window(windows: list[_DiveWindow], t: datetime) -> _DiveWindow | None:
+    if not windows:
+        return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    else:
+        t = t.astimezone(timezone.utc)
+
+    candidates = [w for w in windows if w.start <= t <= w.end]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda w: w.start, reverse=True)
+    return candidates[0]
+
+
+def aggregate_recorder_media_counts_by_dive_stem(
+    root: Path, windows: list[_DiveWindow]
+) -> dict[str, tuple[int, int]]:
+    """Count image/video files under recorder/ whose timestamp falls in a dive window."""
+    result: dict[str, tuple[int, int]] = {w.stem: (0, 0) for w in windows}
+    if not windows:
+        return result
+    rec = root / RECORDER_DIR
+    if not rec.is_dir():
+        return result
+    for path in rec.rglob("*"):
+        if not path.is_file():
+            continue
+        ext = path.suffix.lstrip(".").lower()
+        if ext not in ALL_EXTENSIONS:
+            continue
+        try:
+            st = path.stat()
+        except OSError:
+            continue
+        eff = _effective_created_at(path, st.st_mtime)
+        eff_u = eff if eff.tzinfo else eff.replace(tzinfo=timezone.utc)
+        wn = _match_dive_window(windows, eff_u)
+        if wn is None:
+            continue
+        mt = _detect_media_type(path.name)
+        img, vid = result[wn.stem]
+        if mt == MediaType.IMAGE:
+            result[wn.stem] = (img + 1, vid)
+        elif mt == MediaType.VIDEO:
+            result[wn.stem] = (img, vid + 1)
+    return result
+
+
+def _format_dive_duration(start: datetime, end: datetime) -> str:
+    sec = int((end - start).total_seconds())
+    if sec < 0:
+        return "—"
+    h, rem = sec // 3600, sec % 3600
+    m = rem // 60
+    if h:
+        return f"{h}h {m}m"
+    return f"{m}m"
+
+
+def _format_lat_lon_display(lat: float, lon: float) -> str:
+    def half(v: float, pos: str, neg: str) -> str:
+        hem = pos if v >= 0 else neg
+        return f"{abs(v):.4f}° {hem}"
+
+    return f"{half(lat, 'N', 'S')}, {half(lon, 'E', 'W')}"
+
+
+def _optional_depth_m(value: object) -> float | None:
+    if value is None:
+        return None
+    s = str(value).strip()
+    if not s:
+        return None
+    s = s.lower().replace("m", "", 1).strip()
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
+    """Load dives/dive_*.json newest first with recorder media counts."""
+    ddir = root / "dives"
+    if not ddir.is_dir():
+        return []
+
+    windows = _load_dive_windows(root)
+    counts = aggregate_recorder_media_counts_by_dive_stem(root, windows)
+    now = datetime.now(timezone.utc)
+    entries: list[DiveHistoryEntry] = []
+
+    for f in sorted(ddir.glob("dive_*.json"), reverse=True):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        started = _parse_iso_to_utc(data.get("started_at"))
+        if started is None:
+            continue
+        stem = f.stem
+        ended = _parse_iso_to_utc(data.get("ended_at"))
+        status = str(data.get("status") or "unknown").lower()
+
+        if ended:
+            duration = _format_dive_duration(started, ended)
+        elif status == "active":
+            duration = _format_dive_duration(started, now) + " (ongoing)"
+        else:
+            duration = "—"
+
+        name = str(data.get("dive_name") or "").strip()
+        if not name:
+            cfg = str(data.get("configuration") or "").strip()
+            name = cfg or stem.replace("_", " ").title()
+
+        img, vid = counts.get(stem, (0, 0))
+
+        loc: str | None = None
+        raw_loc = data.get("location")
+        if isinstance(raw_loc, str) and raw_loc.strip():
+            loc = raw_loc.strip()
+        elif "latitude" in data and "longitude" in data:
+            try:
+                loc = _format_lat_lon_display(
+                    float(data["latitude"]), float(data["longitude"])
+                )
+            except (TypeError, ValueError):
+                pass
+
+        entries.append(
+            DiveHistoryEntry(
+                id=stem,
+                name=name,
+                status=status,
+                date=started,
+                duration=duration,
+                location=loc,
+                max_depth=_optional_depth_m(data.get("estimated_depth")),
+                image_count=img,
+                video_count=vid,
+                configuration=str(data.get("configuration") or ""),
+            )
+        )
+    return entries
+
+
+def delete_dive_record_file(root: Path, dive_id: str) -> bool:
+    if not re.fullmatch(r"dive_\d{4}", dive_id):
+        return False
+    path = root / "dives" / f"{dive_id}.json"
+    if not path.is_file():
+        return False
+    try:
+        path.unlink()
+        return True
+    except OSError:
+        return False
 
 
 def _detect_media_type(filename: str) -> MediaType:
@@ -100,17 +335,70 @@ def _effective_created_at(path: Path, mtime_ts: float) -> datetime:
     return mtime_dt
 
 
-def _file_to_media(path: Path, root: Path) -> MediaFile:
+def _file_to_media(
+    path: Path, root: Path, dive_windows: list[_DiveWindow]
+) -> MediaFile:
     """Convert a filesystem path to a MediaFile model."""
     stat = path.stat()
     rel = path.relative_to(root)
+    parts = rel.parts
+    mission_id = parts[0] if len(parts) > 1 else None
+    eff = _effective_created_at(path, stat.st_mtime)
+    eff_utc = eff if eff.tzinfo else eff.replace(tzinfo=timezone.utc)
+    top = parts[0].lower() if parts else ""
+
+    # State files stored at DATA_ROOT root (not under a dive folder)
+    if len(parts) == 1 and top in (
+        "mission_state.json",
+        "doris_profile_seq.txt",
+    ):
+        return MediaFile(
+            id=str(rel),
+            filename=path.name,
+            media_type=MediaType.SYSTEM,
+            size_bytes=stat.st_size,
+            created_at=eff,
+            mission_id=None,
+            dive_name=None,
+            download_url=f"/api/v1/media/download/{rel}",
+        )
+
+    if top in SYSTEM_TOP_LEVEL:
+        return MediaFile(
+            id=str(rel),
+            filename=path.name,
+            media_type=MediaType.SYSTEM,
+            size_bytes=stat.st_size,
+            created_at=eff,
+            mission_id=mission_id,
+            dive_name=None,
+            download_url=f"/api/v1/media/download/{rel}",
+        )
+
+    content_kind = _detect_media_type(path.name)
+    dive_name: str | None = None
+    media_type = content_kind
+
+    if top == RECORDER_DIR:
+        wn = _match_dive_window(dive_windows, eff_utc)
+        dive_name = wn.display_name if wn else None
+        if dive_name is None and content_kind == MediaType.DATA:
+            media_type = MediaType.SYSTEM
+    else:
+        wn = _match_dive_window(dive_windows, eff_utc)
+        if wn:
+            dive_name = wn.display_name
+        elif len(parts) > 1:
+            dive_name = parts[0]
+
     return MediaFile(
         id=str(rel),
         filename=path.name,
-        media_type=_detect_media_type(path.name),
+        media_type=media_type,
         size_bytes=stat.st_size,
-        created_at=_effective_created_at(path, stat.st_mtime),
-        mission_id=rel.parts[0] if len(rel.parts) > 1 else None,
+        created_at=eff,
+        mission_id=mission_id,
+        dive_name=dive_name,
         download_url=f"/api/v1/media/download/{rel}",
     )
 
@@ -122,6 +410,20 @@ class StorageService:
         self.root = root or DATA_ROOT
         if not self.root.exists():
             self.root.mkdir(parents=True, exist_ok=True)
+        self._dive_windows_cache: list[_DiveWindow] | None = None
+        self._dives_dir_mtime: float | None = None
+
+    def _get_dive_windows(self) -> list[_DiveWindow]:
+        ddir = self.root / "dives"
+        mtime = ddir.stat().st_mtime if ddir.is_dir() else 0.0
+        if (
+            self._dive_windows_cache is not None
+            and self._dives_dir_mtime == mtime
+        ):
+            return self._dive_windows_cache
+        self._dive_windows_cache = _load_dive_windows(self.root)
+        self._dives_dir_mtime = mtime
+        return self._dive_windows_cache
 
     async def get_media_files(
         self,
@@ -136,6 +438,7 @@ class StorageService:
             if not search_root.exists():
                 return []
 
+            dive_windows = self._get_dive_windows()
             files: list[MediaFile] = []
             for path in search_root.rglob("*"):
                 try:
@@ -144,7 +447,7 @@ class StorageService:
                     ext = path.suffix.lstrip(".").lower()
                     if ext not in ALL_EXTENSIONS:
                         continue
-                    mf = _file_to_media(path, self.root)
+                    mf = _file_to_media(path, self.root, dive_windows)
                     if media_type and mf.media_type != media_type:
                         continue
                     files.append(mf)
@@ -168,6 +471,8 @@ class StorageService:
             missions: list[MediaMission] = []
             for entry in sorted(self.root.iterdir(), reverse=True):
                 if not entry.is_dir():
+                    continue
+                if entry.name.lower() in SYSTEM_TOP_LEVEL:
                     continue
 
                 images = videos = data_files = 0
@@ -199,10 +504,15 @@ class StorageService:
                 if images + videos + data_files == 0:
                     continue
 
+                display_name = (
+                    "Recorder"
+                    if entry.name.lower() == RECORDER_DIR
+                    else entry.name
+                )
                 missions.append(
                     MediaMission(
                         mission_id=entry.name,
-                        mission_name=entry.name,
+                        mission_name=display_name,
                         date=latest_date or datetime.now(tz=timezone.utc),
                         image_count=images,
                         video_count=videos,
@@ -216,6 +526,17 @@ class StorageService:
         except Exception as e:
             logger.warning(f"Failed to scan missions: {e}")
             raise
+
+    async def list_dive_history(self) -> list[DiveHistoryEntry]:
+        """Persisted dive records under dives/ (for Previous Dives UI)."""
+        return build_dive_history_list(self.root)
+
+    async def delete_dive_record(self, dive_id: str) -> bool:
+        ok = delete_dive_record_file(self.root, dive_id)
+        if ok:
+            self._dive_windows_cache = None
+            self._dives_dir_mtime = None
+        return ok
 
     async def get_file(self, file_path: str) -> bytes | None:
         """Read a file from disk."""
@@ -270,7 +591,7 @@ class StorageService:
 
     async def save_configuration(self, config: DeploymentConfiguration) -> DeploymentConfiguration:
         """Persist a configuration as JSON. Overwrites if name already exists."""
-        config.updated_at = datetime.now()
+        config.updated_at = datetime.now(timezone.utc)
         path = self._config_dir / f"{self._slug(config.name)}.json"
         path.write_text(config.model_dump_json(indent=2))
         logger.info(f"Configuration saved: {config.name} -> {path}")
@@ -296,8 +617,12 @@ class StorageService:
                 summaries.append(
                     ConfigurationSummary(
                         name=data["name"],
-                        created_at=data.get("created_at", datetime.now().isoformat()),
-                        updated_at=data.get("updated_at", datetime.now().isoformat()),
+                        created_at=data.get(
+                            "created_at", datetime.now(timezone.utc).isoformat()
+                        ),
+                        updated_at=data.get(
+                            "updated_at", datetime.now(timezone.utc).isoformat()
+                        ),
                     )
                 )
             except Exception as e:

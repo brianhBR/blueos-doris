@@ -6,11 +6,15 @@ Each configuration is persisted as a JSON file in DATA_ROOT/configurations/.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import StrEnum
 from typing import Literal
 
 from pydantic import BaseModel, Field
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class CameraType(StrEnum):
@@ -109,8 +113,8 @@ class DeploymentConfiguration(BaseModel):
     bottom: BottomPhase = Field(default_factory=BottomPhase)
     ascent: AscentPhase = Field(default_factory=AscentPhase)
     recovery: RecoverySettings = Field(default_factory=RecoverySettings)
-    created_at: datetime = Field(default_factory=datetime.now)
-    updated_at: datetime = Field(default_factory=datetime.now)
+    created_at: datetime = Field(default_factory=_utc_now)
+    updated_at: datetime = Field(default_factory=_utc_now)
 
 
 class ConfigurationSummary(BaseModel):

@@ -9,7 +9,7 @@ the user.
 import json
 import logging
 import uuid
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 
 from ..models.notifications import (
@@ -140,7 +140,7 @@ class NotificationService:
             category=category,
             title=title,
             message=message,
-            timestamp=datetime.now(),
+            timestamp=datetime.now(timezone.utc),
             read=False,
             link_to=link_to,
         )

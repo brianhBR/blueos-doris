@@ -3,14 +3,15 @@ import { ref, computed, onMounted, onUnmounted } from 'vue'
 import {
   Download, FolderOpen, Image as ImageIcon, Video, FileText, Search,
   ArrowUpDown, ArrowUp, ArrowDown, Trash2, AlertTriangle, Play,
-  ChevronLeft, ChevronRight, Loader2, AlertCircle
+  ChevronLeft, ChevronRight, Loader2, AlertCircle, HardDrive,
 } from 'lucide-vue-next'
 import { useMedia, useStorage } from '../composables/useApi'
+import { parseBackendDateTime } from '../parseBackendTime'
 
 interface DisplayFile {
   id: string
   fileName: string
-  type: 'video' | 'image' | 'sensor' | 'log'
+  type: 'video' | 'image' | 'sensor' | 'log' | 'system'
   diveName: string
   /** Local calendar date (e.g. Apr 4, 2026) */
   datePart: string
@@ -47,15 +48,16 @@ function formatFileSize(bytes: number): string {
   return `${bytes} B`
 }
 
-function mapMediaType(mediaType: string): 'video' | 'image' | 'sensor' | 'log' {
+function mapMediaType(mediaType: string): DisplayFile['type'] {
   if (mediaType === 'video') return 'video'
   if (mediaType === 'image') return 'image'
   if (mediaType === 'data') return 'sensor'
+  if (mediaType === 'system') return 'system'
   return 'log'
 }
 
 function parseMediaCreatedAt(iso: string): Date {
-  const d = new Date(iso)
+  const d = parseBackendDateTime(iso)
   return Number.isNaN(d.getTime()) ? new Date(0) : d
 }
 
@@ -87,7 +89,7 @@ const mediaFiles = computed<DisplayFile[]>(() => {
       id: f.id,
       fileName: f.filename,
       type: mapMediaType(f.media_type),
-      diveName: f.mission_id ?? 'Unknown',
+      diveName: (f.dive_name && f.dive_name.trim()) ? f.dive_name.trim() : '—',
       datePart,
       timePart,
       createdMs: createdDate.getTime(),
@@ -122,6 +124,7 @@ const getFileIcon = (type: string) => {
   switch (type) {
     case 'video': return Video
     case 'image': return ImageIcon
+    case 'system': return HardDrive
     default: return FileText
   }
 }
@@ -131,6 +134,7 @@ const getFileIconColor = (type: string) => {
     case 'video': return '#c084fc'
     case 'image': return '#60a5fa'
     case 'sensor': return '#4ade80'
+    case 'system': return '#94a3b8'
     case 'log': return '#FFC107'
     default: return '#96EEF2'
   }
@@ -141,6 +145,7 @@ const getTypeLabel = (type: string) => {
     case 'video': return 'Video'
     case 'image': return 'Image'
     case 'sensor': return 'Data'
+    case 'system': return 'System'
     case 'log': return 'Log'
     default: return type
   }
@@ -151,6 +156,7 @@ const getTypeBadgeStyle = (type: string) => {
     case 'video': return { backgroundColor: 'rgba(168, 85, 247, 0.2)', color: '#c084fc' }
     case 'image': return { backgroundColor: 'rgba(59, 130, 246, 0.2)', color: '#60a5fa' }
     case 'sensor': return { backgroundColor: 'rgba(34, 197, 94, 0.2)', color: '#4ade80' }
+    case 'system': return { backgroundColor: 'rgba(148, 163, 184, 0.2)', color: '#94a3b8' }
     case 'log': return { backgroundColor: 'rgba(255, 193, 7, 0.2)', color: '#FFC107' }
     default: return { backgroundColor: 'rgba(150, 238, 242, 0.2)', color: '#96EEF2' }
   }
@@ -318,7 +324,8 @@ const handlePageChange = (page: number) => {
             <p v-if="mediaFiles.length > 0" class="text-sm md:text-base" style="color: #96EEF2">
               {{ mediaFiles.filter((f: DisplayFile) => f.type === 'video').length }} videos,
               {{ mediaFiles.filter((f: DisplayFile) => f.type === 'image').length }} images,
-              {{ mediaFiles.filter((f: DisplayFile) => f.type === 'sensor').length }} sensor files
+              {{ mediaFiles.filter((f: DisplayFile) => f.type === 'sensor').length }} sensor,
+              {{ mediaFiles.filter((f: DisplayFile) => f.type === 'system').length }} system
             </p>
           </div>
         </div>

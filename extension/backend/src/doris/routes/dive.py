@@ -16,7 +16,7 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from robyn import Robyn
+from robyn import Response, Robyn
 
 from ..services.camera import CameraService
 from ..services.dive import DiveService
@@ -179,6 +179,16 @@ def register_dive_routes(app: Robyn) -> None:
             "status": "active",
             "profile_id": profile_id,
         }
+        lat, lon = body.get("latitude"), body.get("longitude")
+        if lat is not None and lon is not None:
+            try:
+                dive_record["latitude"] = float(lat)
+                dive_record["longitude"] = float(lon)
+            except (TypeError, ValueError):
+                pass
+        loc_str = body.get("location")
+        if isinstance(loc_str, str) and loc_str.strip():
+            dive_record["location"] = loc_str.strip()
         if config:
             dive_record["configuration_snapshot"] = json.loads(
                 config.model_dump_json()
@@ -265,3 +275,38 @@ def register_dive_routes(app: Robyn) -> None:
         status = await dive_service.get_status()
         _sync_mission_state_from_vehicle(status)
         return json.dumps(status)
+
+    @app.get("/api/v1/dive/history")
+    async def dive_history_list():
+        """List persisted dives (dives/dive_*.json) for the Previous Dives page."""
+        try:
+            entries = await storage_service.list_dive_history()
+            return json.dumps([e.model_dump(mode="json") for e in entries])
+        except Exception as e:
+            logger.exception("Failed to list dive history")
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+
+    @app.delete("/api/v1/dive/history/:dive_id")
+    async def dive_history_delete(request):
+        """Remove a dive record JSON (does not delete recorder media files)."""
+        dive_id = request.path_params.get("dive_id", "").strip()
+        try:
+            ok = await storage_service.delete_dive_record(dive_id)
+        except Exception as e:
+            logger.exception("Failed to delete dive record")
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+        if not ok:
+            return Response(
+                status_code=404,
+                description=json.dumps({"error": "Dive record not found"}),
+                headers={"Content-Type": "application/json"},
+            )
+        return json.dumps({"success": True})
