@@ -7,10 +7,14 @@ dive status, network changes) and persisted to disk.
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from enum import StrEnum
 
 from pydantic import BaseModel, Field
+
+
+def _utc_now() -> datetime:
+    return datetime.now(timezone.utc)
 
 
 class NotificationType(StrEnum):
@@ -35,7 +39,7 @@ class NotificationItem(BaseModel):
     category: NotificationCategory = NotificationCategory.SYSTEM
     title: str
     message: str
-    timestamp: datetime = Field(default_factory=datetime.now)
+    timestamp: datetime = Field(default_factory=_utc_now)
     read: bool = False
     link_to: str | None = None
 

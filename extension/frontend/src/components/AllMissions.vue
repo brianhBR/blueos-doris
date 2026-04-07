@@ -4,39 +4,56 @@ import {
   Database, Calendar, Clock, MapPin, Camera, Image, FileText, Play,
   Download, Trash2, AlertTriangle, Archive, Search, X
 } from 'lucide-vue-next'
-import { useMissions } from '../composables/useApi'
-import type { MissionSummary } from '../composables/useApi'
+import { useDiveHistory } from '../composables/useApi'
+import { parseBackendDateTime } from '../parseBackendTime'
+import type { DiveHistorySummary } from '../composables/useApi'
 import type { Screen, DiveData } from '../types'
 
 const emit = defineEmits<{
   navigate: [screen: Screen, diveData?: DiveData]
 }>()
 
-const { missions: apiMissions, fetchMissions, deleteMission } = useMissions()
+const { dives: apiDives, loading, error, fetchDives, deleteDiveRecord } = useDiveHistory()
+
+function formatStatusLabel(status: string): string {
+  const s = status.toLowerCase()
+  if (s === 'active') return 'Active'
+  if (s === 'completed') return 'Completed'
+  if (s === 'cancelled') return 'Cancelled'
+  return status
+}
 
 interface DisplayMission {
   id: string
   name: string
+  configuration: string
   status: string
+  statusLabel: string
   dateDisplay: string
   /** 24-hour hh:mm UTC */
   timeDisplay: string
   dateMs: number
   duration: string
   location: string
-  maxDepth: number
+  maxDepthLabel: string
   images: number
   videos: number
 }
 
 const previousMissions = computed<DisplayMission[]>(() => {
-  return apiMissions.value.map((m: MissionSummary) => {
-    const dt = new Date(m.date)
+  return apiDives.value.map((m: DiveHistorySummary) => {
+    const dt = parseBackendDateTime(String(m.date))
     const dateMs = Number.isNaN(dt.getTime()) ? 0 : dt.getTime()
+    const md =
+      m.max_depth != null && Number.isFinite(m.max_depth) && m.max_depth > 0
+        ? `${m.max_depth}m`
+        : '—'
     return {
       id: m.id,
       name: m.name,
+      configuration: (m.configuration ?? '').trim(),
       status: m.status,
+      statusLabel: formatStatusLabel(m.status),
       dateDisplay: dt.toLocaleDateString(undefined, {
         timeZone: 'UTC',
         month: 'short',
@@ -52,8 +69,8 @@ const previousMissions = computed<DisplayMission[]>(() => {
         }) + ' UTC',
       dateMs,
       duration: m.duration,
-      location: m.location ?? 'Unknown',
-      maxDepth: m.max_depth ?? 0,
+      location: m.location?.trim() ? m.location : '—',
+      maxDepthLabel: md,
       images: m.image_count,
       videos: m.video_count,
     }
@@ -63,8 +80,8 @@ const previousMissions = computed<DisplayMission[]>(() => {
 let pollInterval: number | undefined
 
 onMounted(() => {
-  fetchMissions()
-  pollInterval = setInterval(fetchMissions, 15000) as unknown as number
+  fetchDives()
+  pollInterval = setInterval(fetchDives, 15000) as unknown as number
 })
 
 onUnmounted(() => {
@@ -89,7 +106,7 @@ const handleViewMedia = (mission: DisplayMission) => {
     name: mission.name,
     date: `${mission.dateDisplay} · ${mission.timeDisplay}`,
     duration: mission.duration,
-    maxDepth: `${mission.maxDepth}m`,
+    maxDepth: mission.maxDepthLabel,
     location: mission.location,
     images: mission.images,
     videos: mission.videos
@@ -100,8 +117,8 @@ const handleViewMedia = (mission: DisplayMission) => {
 const handleDeleteMission = async () => {
   if (!selectedMission.value) return
   isDeleting.value = true
-  await deleteMission(selectedMission.value)
-  selectedMission.value = null
+  const ok = await deleteDiveRecord(selectedMission.value)
+  if (ok) selectedMission.value = null
   isDeleting.value = false
 }
 </script>
@@ -162,39 +179,48 @@ const handleDeleteMission = async () => {
         </div>
       </div>
 
+      <div
+        v-if="error"
+        class="mb-4 rounded-lg px-4 py-3 text-sm"
+        style="background-color: rgba(221, 44, 29, 0.15); color: #FF4757; border: 1px solid rgba(221, 44, 29, 0.35)"
+      >
+        {{ error }}
+      </div>
+
       <!-- Results Count -->
       <div
-        v-if="nameFilter"
+        v-if="nameFilter && !loading"
         class="mb-4 text-sm"
         style="color: #96EEF2"
       >
         Showing {{ filteredMissions.length }} of {{ previousMissions.length }} dives
       </div>
 
-      <!-- Loading State -->
+      <!-- Loading (initial) -->
       <div
-        v-if="previousMissions.length === 0"
+        v-if="loading && previousMissions.length === 0"
         class="rounded-lg p-8 text-center"
         style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)"
       >
         <Database class="w-12 h-12 mx-auto mb-3" style="color: #41B9C3; opacity: 0.5" />
         <p class="text-white text-lg mb-2">Loading dives...</p>
-        <p class="text-sm" style="color: #96EEF2">Fetching data from the backend</p>
+        <p class="text-sm" style="color: #96EEF2">Fetching dive history</p>
       </div>
 
-      <!-- No Results -->
+      <!-- Empty / no matches (not loading) -->
       <div
-        v-if="filteredMissions.length === 0"
+        v-else-if="filteredMissions.length === 0"
         class="rounded-lg p-8 text-center"
         style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)"
       >
         <Search class="w-12 h-12 mx-auto mb-3" style="color: #41B9C3; opacity: 0.5" />
         <p class="text-white text-lg mb-2">No dives found</p>
-        <p class="text-sm" style="color: #96EEF2">Try adjusting your filters</p>
+        <p v-if="nameFilter" class="text-sm" style="color: #96EEF2">Try adjusting your filters</p>
+        <p v-else class="text-sm" style="color: #96EEF2">Start a dive from Home to create a record here.</p>
       </div>
 
       <!-- Dives List -->
-      <div class="space-y-3">
+      <div v-else class="space-y-3">
         <div
           v-for="mission in filteredMissions"
           :key="mission.id"
@@ -210,9 +236,16 @@ const handleDeleteMission = async () => {
                   class="px-2 py-1 rounded text-xs flex-shrink-0"
                   style="background-color: rgba(252, 216, 105, 0.2); color: #FCD869"
                 >
-                  {{ mission.status }}
+                  {{ mission.statusLabel }}
                 </span>
               </div>
+              <p
+                v-if="mission.configuration"
+                class="text-xs mb-3 break-all"
+                style="color: #96EEF2"
+              >
+                Configuration: {{ mission.configuration }}
+              </p>
 
               <!-- Info Grid -->
               <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mb-3">
@@ -233,7 +266,7 @@ const handleDeleteMission = async () => {
                   <span class="text-sm" style="color: #96EEF2">{{ mission.location }}</span>
                 </div>
                 <div class="flex items-center gap-2">
-                  <span class="text-sm" style="color: #96EEF2">Max Depth: {{ mission.maxDepth }}m</span>
+                  <span class="text-sm" style="color: #96EEF2">Max depth: {{ mission.maxDepthLabel }}</span>
                 </div>
               </div>
 
@@ -253,15 +286,20 @@ const handleDeleteMission = async () => {
             <!-- Action Buttons (vertical stack on right) -->
             <div class="flex flex-col gap-2 flex-shrink-0">
               <button
-                class="px-4 py-2 rounded-lg transition-all hover:opacity-90 flex items-center gap-2 text-sm whitespace-nowrap"
+                type="button"
+                disabled
+                title="Not available yet"
+                class="px-4 py-2 rounded-lg flex items-center gap-2 text-sm whitespace-nowrap opacity-45 cursor-not-allowed"
                 style="background-color: #41B9C3; color: white"
               >
                 <FileText class="w-4 h-4" />
                 View Log File
               </button>
               <button
+                type="button"
                 class="px-4 py-2 rounded-lg transition-all hover:opacity-90 flex items-center gap-2 text-sm whitespace-nowrap"
                 style="background-color: #96EEF2; color: #0E2446"
+                @click="emit('navigate', 'media')"
               >
                 <Database class="w-4 h-4" />
                 View Data Files
@@ -275,14 +313,20 @@ const handleDeleteMission = async () => {
                 View Media
               </button>
               <button
-                class="px-4 py-2 rounded-lg transition-all hover:opacity-90 flex items-center gap-2 text-sm whitespace-nowrap"
+                type="button"
+                disabled
+                title="Use the Data page to download files"
+                class="px-4 py-2 rounded-lg flex items-center gap-2 text-sm whitespace-nowrap opacity-45 cursor-not-allowed"
                 style="background-color: rgba(65, 185, 195, 0.3); border: 1px solid #41B9C3; color: #96EEF2"
               >
                 <Download class="w-4 h-4" />
                 Download Media
               </button>
               <button
-                class="px-4 py-2 rounded-lg transition-all hover:opacity-90 flex items-center gap-2 text-sm whitespace-nowrap"
+                type="button"
+                disabled
+                title="Not available yet"
+                class="px-4 py-2 rounded-lg flex items-center gap-2 text-sm whitespace-nowrap opacity-45 cursor-not-allowed"
                 style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid #41B9C3; color: #41B9C3"
               >
                 <Archive class="w-4 h-4" />

@@ -1,7 +1,7 @@
 """Mission API routes."""
 
 import json
-from datetime import datetime
+from datetime import datetime, timezone
 
 from robyn import Response, Robyn
 
@@ -135,7 +135,7 @@ def register_mission_routes(app: Robyn) -> None:
                 name=config.name,
                 status=MissionStatus.PENDING,
                 config=config,
-                created_at=datetime.now(),
+                created_at=datetime.now(timezone.utc),
             )
 
             _missions[mission_id] = mission
@@ -181,7 +181,7 @@ def register_mission_routes(app: Robyn) -> None:
                 )
 
             mission.status = MissionStatus.ACTIVE
-            mission.started_at = datetime.now()
+            mission.started_at = datetime.now(timezone.utc)
 
             return json.dumps(mission.model_dump(mode="json"))
         except Exception as e:
@@ -214,7 +214,7 @@ def register_mission_routes(app: Robyn) -> None:
                 )
 
             mission.status = MissionStatus.COMPLETED
-            mission.completed_at = datetime.now()
+            mission.completed_at = datetime.now(timezone.utc)
 
             if mission.started_at:
                 mission.duration_seconds = int(

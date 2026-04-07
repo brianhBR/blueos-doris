@@ -110,6 +110,20 @@ export interface MissionSummary {
   video_count: number
 }
 
+/** Persisted dive records from GET /dive/history (dives/dive_*.json). */
+export interface DiveHistorySummary {
+  id: string
+  name: string
+  status: string
+  date: string
+  duration: string
+  location: string | null
+  max_depth: number | null
+  image_count: number
+  video_count: number
+  configuration?: string
+}
+
 export interface MissionConfig {
   name: string
   start_trigger: {
@@ -153,12 +167,14 @@ export interface Mission {
 export interface MediaFile {
   id: string
   filename: string
-  media_type: 'image' | 'video' | 'data'
+  media_type: 'image' | 'video' | 'data' | 'system'
   size_bytes: number
   duration_seconds: number | null
   resolution: string | null
   created_at: string
   mission_id: string | null
+  /** Resolved dive label from dives/*.json or user folder name; null for system paths */
+  dive_name?: string | null
   thumbnail_url: string | null
   download_url: string
   is_synced: boolean
@@ -634,6 +650,45 @@ export function useMissions() {
     startMission,
     stopMission,
     deleteMission,
+  }
+}
+
+export function useDiveHistory() {
+  const dives = ref<DiveHistorySummary[]>([])
+  const loading = ref(false)
+  const error = ref<string | null>(null)
+
+  async function fetchDives() {
+    loading.value = true
+    error.value = null
+    try {
+      dives.value = await fetchApi<DiveHistorySummary[]>('/dive/history')
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to fetch dive history'
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function deleteDiveRecord(id: string): Promise<boolean> {
+    try {
+      await deleteApi<{ success: boolean }>(
+        `/dive/history/${encodeURIComponent(id)}`
+      )
+      dives.value = dives.value.filter(d => d.id !== id)
+      return true
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to delete dive record'
+      return false
+    }
+  }
+
+  return {
+    dives: readonly(dives),
+    loading: readonly(loading),
+    error: readonly(error),
+    fetchDives,
+    deleteDiveRecord,
   }
 }
 
