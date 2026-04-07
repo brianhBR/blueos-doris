@@ -188,12 +188,16 @@ def _optional_depth_m(value: object) -> float | None:
 
 def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
     """Load dives/dive_*.json newest first with recorder media counts."""
+    from .mcap_telemetry import McapSummary, map_dive_stem_to_largest_mcap, summarize_mcap
+
     ddir = root / "dives"
     if not ddir.is_dir():
         return []
 
     windows = _load_dive_windows(root)
     counts = aggregate_recorder_media_counts_by_dive_stem(root, windows)
+    mcap_by_stem = map_dive_stem_to_largest_mcap(root, windows)
+    mcap_parse_cache: dict[Path, McapSummary] = {}
     now = datetime.now(timezone.utc)
     entries: list[DiveHistoryEntry] = []
 
@@ -235,6 +239,23 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
             except (TypeError, ValueError):
                 pass
 
+        est_depth = _optional_depth_m(data.get("estimated_depth"))
+        mcap_path = mcap_by_stem.get(stem)
+        rel_mcap: str | None = None
+        log_max: float | None = None
+        display_depth = est_depth
+        if mcap_path is not None:
+            try:
+                rel_mcap = str(mcap_path.relative_to(root))
+            except ValueError:
+                rel_mcap = None
+            if mcap_path not in mcap_parse_cache:
+                mcap_parse_cache[mcap_path] = summarize_mcap(mcap_path)
+            summ = mcap_parse_cache[mcap_path]
+            log_max = summ.max_depth_m
+            if log_max is not None and log_max > 0:
+                display_depth = log_max
+
         entries.append(
             DiveHistoryEntry(
                 id=stem,
@@ -243,7 +264,10 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
                 date=started,
                 duration=duration,
                 location=loc,
-                max_depth=_optional_depth_m(data.get("estimated_depth")),
+                max_depth=display_depth,
+                estimated_depth_m=est_depth,
+                log_max_depth_m=log_max,
+                mcap_relative_path=rel_mcap,
                 image_count=img,
                 video_count=vid,
                 configuration=str(data.get("configuration") or ""),

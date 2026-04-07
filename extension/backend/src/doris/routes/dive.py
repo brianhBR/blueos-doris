@@ -290,6 +290,65 @@ def register_dive_routes(app: Robyn) -> None:
                 headers={"Content-Type": "application/json"},
             )
 
+    @app.get("/api/v1/dive/history/:dive_id/export/scientific.csv")
+    async def dive_history_scientific_csv(request):
+        """CSV with dive metadata and time-series samples from the dive's primary .mcap."""
+        dive_id = request.path_params.get("dive_id", "").strip()
+        if not re.fullmatch(r"dive_\d{4}", dive_id):
+            return Response(
+                status_code=400,
+                description=json.dumps({"error": "Invalid dive id"}),
+                headers={"Content-Type": "application/json"},
+            )
+        path = DIVES_DIR / f"{dive_id}.json"
+        if not path.is_file():
+            return Response(
+                status_code=404,
+                description=json.dumps({"error": "Dive record not found"}),
+                headers={"Content-Type": "application/json"},
+            )
+        try:
+            dive_data = json.loads(path.read_text())
+        except Exception as e:
+            logger.exception("Failed to read dive record")
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+
+        from ..services.mcap_telemetry import (
+            McapSummary,
+            build_scientific_csv,
+            map_dive_stem_to_largest_mcap,
+            summarize_mcap,
+        )
+        from ..services.storage import _load_dive_windows
+
+        windows = _load_dive_windows(DATA_ROOT)
+        mcap_map = map_dive_stem_to_largest_mcap(DATA_ROOT, windows)
+        mcap_path = mcap_map.get(dive_id)
+        rel: str | None = None
+        summary = McapSummary()
+        if mcap_path is not None:
+            try:
+                rel = str(mcap_path.relative_to(DATA_ROOT))
+                summary = summarize_mcap(mcap_path)
+            except Exception as e:
+                logger.warning("MCAP summarize failed for %s: %s", mcap_path, e)
+
+        csv_text = build_scientific_csv(dive_data, summary, rel)
+        raw = csv_text.encode("utf-8")
+        return Response(
+            status_code=200,
+            description=raw,
+            headers={
+                "Content-Type": "text/csv; charset=utf-8",
+                "Content-Disposition": f'attachment; filename="{dive_id}_scientific.csv"',
+                "Content-Length": str(len(raw)),
+            },
+        )
+
     @app.delete("/api/v1/dive/history/:dive_id")
     async def dive_history_delete(request):
         """Remove a dive record JSON (does not delete recorder media files)."""
