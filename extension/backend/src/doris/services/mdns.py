@@ -55,12 +55,13 @@ async def _run_host_command(command: str) -> bool:
 
 
 def _setup_avahi_hostname() -> bool:
-    """Set avahi hostname to 'doris' and ensure Avahi listens on all interfaces.
+    """Set avahi hostname to 'doris' on all physical network interfaces.
 
-    BlueOS defaults may include ``allow-interfaces=eth0`` which restricts mDNS
-    to the wired interface only.  We remove any allow-interfaces / deny-interfaces
-    directives so that ``doris.local`` resolves on wired, WiFi-client, and
-    WiFi-hotspot interfaces alike.
+    BlueOS defaults to ``allow-interfaces=eth0`` which restricts mDNS to
+    the wired interface.  We replace that with ``deny-interfaces=lo,docker0``
+    so Avahi advertises on every real interface (eth0, wlan0, wlan1, uap0, …)
+    while excluding Docker bridges and loopback — those cause Avahi to
+    respond with unreachable internal IPs.
 
     Returns True if the file was changed.
     """
@@ -76,13 +77,21 @@ def _setup_avahi_hostname() -> bool:
         r"^host-name=.*$", "host-name=doris", new_content, flags=re.MULTILINE
     )
 
-    # Remove interface restrictions so Avahi responds on ALL interfaces.
+    # Replace any allow/deny-interfaces with a deny-list that blocks only
+    # virtual interfaces.  This lets Avahi respond on all physical interfaces.
     new_content = re.sub(
         r"^allow-interfaces=.*\n?", "", new_content, flags=re.MULTILINE
     )
     new_content = re.sub(
-        r"^deny-interfaces=.*\n?", "", new_content, flags=re.MULTILINE
+        r"^deny-interfaces=.*\n?", "deny-interfaces=lo,docker0\n",
+        new_content, flags=re.MULTILINE, count=1,
     )
+    # If there was no deny-interfaces line to replace, insert one after [server]
+    if "deny-interfaces=" not in new_content:
+        new_content = new_content.replace(
+            "host-name=doris",
+            "host-name=doris\ndeny-interfaces=lo,docker0",
+        )
 
     if new_content == content:
         logger.info("Avahi config already up to date (hostname=doris, all interfaces)")
@@ -128,25 +137,35 @@ async def _setup_hotspot_dns() -> None:
         logger.warning("Failed to write dnsmasq hotspot DNS config")
 
 
+async def restart_avahi() -> None:
+    """Restart Avahi so it re-probes all interfaces.
+
+    Should be called AFTER configure_hotspot() because the hotspot setup
+    churns WiFi interfaces (wlan0/wlan1/uap0 leave and rejoin).  If Avahi
+    is running during that churn it withdraws address records and may not
+    recover.  A clean restart after the interfaces settle gives Avahi a
+    stable view of the network.
+
+    The 5-second pause between stop and start avoids hostname-probe
+    collisions with BlueOS's Beacon (zeroconf) on the same host.
+    """
+    ok = await _run_host_command(
+        "sudo systemctl stop avahi-daemon && sleep 5 && sudo systemctl start avahi-daemon"
+    )
+    if ok:
+        logger.info("avahi-daemon restarted (post-hotspot)")
+    else:
+        logger.warning("Failed to restart avahi-daemon")
+
+
 async def setup_doris_local() -> None:
     """Configure doris.local resolution (mDNS + DNS) and nginx redirect.
 
-    Called once during DORIS backend startup.  Should run BEFORE
-    configure_hotspot() so the dnsmasq config is in place when NM spawns
-    dnsmasq for the shared connection.
+    Called once during DORIS backend startup.  Writes all config files but
+    does NOT restart Avahi — call ``restart_avahi()`` separately after
+    configure_hotspot() has finished and WiFi interfaces have settled.
     """
-    avahi_changed = _setup_avahi_hostname()
-    if avahi_changed:
-        # stop/sleep/start instead of restart: BlueOS runs a second mDNS stack
-        # (Beacon's zeroconf) on the same host. An immediate restart causes avahi's
-        # hostname probe to collide with stale multicast state from zeroconf,
-        # resulting in false conflicts (doris-2, doris-3, …). The 3s pause lets
-        # the multicast group clear before avahi re-probes.
-        ok = await _run_host_command(
-            "sudo systemctl stop avahi-daemon && sleep 3 && sudo systemctl start avahi-daemon"
-        )
-        if ok:
-            logger.info("avahi-daemon restarted")
+    _setup_avahi_hostname()
 
     await _setup_hotspot_dns()
 
