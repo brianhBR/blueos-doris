@@ -142,7 +142,6 @@ def _close_all_active_dive_records(new_status: str = "completed") -> int:
     """Close every dive record still marked 'active'. Returns count closed."""
     DIVES_DIR.mkdir(parents=True, exist_ok=True)
     pattern = re.compile(r"^dive_(\d{4})\.json$")
-    now = datetime.now(tz=timezone.utc).isoformat()
     closed = 0
     for f in DIVES_DIR.iterdir():
         if not pattern.match(f.name):
@@ -151,7 +150,13 @@ def _close_all_active_dive_records(new_status: str = "completed") -> int:
             record = json.loads(f.read_text())
             if record.get("status") == "active":
                 record["status"] = new_status
-                record["ended_at"] = now
+                try:
+                    ended = datetime.fromtimestamp(
+                        f.stat().st_mtime, tz=timezone.utc
+                    ).isoformat()
+                except OSError:
+                    ended = datetime.now(tz=timezone.utc).isoformat()
+                record["ended_at"] = ended
                 f.write_text(json.dumps(record, indent=2, default=str))
                 logger.info(f"Stale dive closed: {f.name} -> {new_status}")
                 closed += 1

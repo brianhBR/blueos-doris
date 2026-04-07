@@ -70,6 +70,8 @@ def _load_dive_windows(root: Path) -> list[_DiveWindow]:
         return []
 
     now = datetime.now(timezone.utc)
+    lo = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    hi = now + timedelta(days=2)
     windows: list[_DiveWindow] = []
 
     for f in sorted(ddir.glob("dive_*.json")):
@@ -81,6 +83,11 @@ def _load_dive_windows(root: Path) -> list[_DiveWindow]:
         start = _parse_iso_to_utc(data.get("started_at"))
         if start is None:
             continue
+        if not (lo <= start <= hi):
+            try:
+                start = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
+            except OSError:
+                continue
 
         ended = _parse_iso_to_utc(data.get("ended_at"))
         status = str(data.get("status") or "").lower()
@@ -215,6 +222,9 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
     now = datetime.now(timezone.utc)
     entries: list[DiveHistoryEntry] = []
 
+    lo = datetime(2020, 1, 1, tzinfo=timezone.utc)
+    hi = now + timedelta(days=2)
+
     for f in sorted(ddir.glob("dive_*.json"), reverse=True):
         try:
             data = json.loads(f.read_text())
@@ -223,8 +233,19 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
         started = _parse_iso_to_utc(data.get("started_at"))
         if started is None:
             continue
+
+        if not (lo <= started <= hi):
+            try:
+                started = datetime.fromtimestamp(
+                    f.stat().st_mtime, tz=timezone.utc
+                )
+            except OSError:
+                started = now
+
         stem = f.stem
         ended = _parse_iso_to_utc(data.get("ended_at"))
+        if ended is not None and not (lo <= ended <= hi):
+            ended = None
         status = str(data.get("status") or "unknown").lower()
 
         if ended:
