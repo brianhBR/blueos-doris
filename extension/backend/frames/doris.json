@@ -2,14 +2,15 @@
     "name": "DORIS",
     "description": "Deep Ocean Research and Imaging System - Passive thrusterless deep-ocean lander",
     "vehicle": "ArduSub",
-    "version": 1,
+    "version": 2,
     "autopilot_orientation": "Pitch270",
     "notes": {
         "lights": "Lights 1 on SERVO13 (function 181), controlled via RC channel 9",
         "relay": "Drop-weight relay on SERVO14 via ArduPilot relay subsystem (DORIS_RELAY_CH=0)",
         "thrusters": "All thruster outputs disabled (SERVO1-8 FUNCTION=0)",
         "relay_pin": "RELAY_PIN uses standard ArduPilot pin numbering (base 50 + output - 1). Verify for your board.",
-        "orientation": "Autopilot mounted at Pitch270 (AHRS_ORIENTATION=25)"
+        "orientation": "Autopilot mounted at Pitch270 (AHRS_ORIENTATION=25)",
+        "rangefinder": "RNGFND1_TYPE=0 explicitly disables the rangefinder to prevent LASER_POSITION prearm failures"
     },
     "parameters": {
         "AHRS_ORIENTATION": 25,
@@ -40,6 +41,8 @@
         "RELAY_PIN": 63,
 
         "SCR_ENABLE": 1,
+
+        "RNGFND1_TYPE": 0,
 
         "DISARM_DELAY": 0,
         "ARMING_CHECK": 140478,
