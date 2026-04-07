@@ -41,7 +41,6 @@ import sys
 import time
 import math
 import os.path
-from sys import exit
 
 
 _verbose = False
@@ -325,7 +324,7 @@ def phase_serial_port_help( port ):
         if(dev.device.upper() == port.upper()):
             print(dev.device + " is currently open. Please close any other terminal programs that may be using " +
                   dev.device + " and try again.")
-            exit()
+            sys.exit(1)
 
     # otherwise, give user a list of possible com ports
     print(port.upper() +
@@ -360,7 +359,7 @@ def upload_firmware(binfile, port, baud, timeout=0.5):
 
         if not os.path.exists(binfile):
             print("Bin file {} does not exist.".format(binfile))
-            exit()
+            sys.exit(1)
 
         bl_success = False
         entered_bootloader = False
@@ -405,13 +404,17 @@ def upload_firmware(binfile, port, baud, timeout=0.5):
 
         if (entered_bootloader == False):
             print("Target failed to enter bootload mode. Verify the right COM port is selected and that your board has the SVL bootloader.")
+            sys.exit(1)
         elif (bl_success == False):
             print("Target entered bootloader mode but firmware upload failed. Verify the right COM port is selected and that your board has the SVL bootloader.")
+            sys.exit(1)
         else:
             print("Success!")
+            sys.exit(0)
 
     except serial.SerialException:
         phase_serial_port_help(port)
+        sys.exit(1)
 
 
 # ******************************************************************************

@@ -15,6 +15,14 @@ logger = logging.getLogger(__name__)
 FIRMWARE_UPLOAD_DIR = Path("/tmp/artemis_firmware")
 ARTEMIS_SVL_PATH = "/usr/bin/artemis_svl.py"
 
+# If an older SVL script exits 0 on failure, treat these log lines as failure.
+_ARTEMIS_FAILURE_MARKERS = (
+    "target failed to enter bootload",
+    "target entered bootloader mode but firmware upload failed",
+    "upload failed",
+    "failed to enter bootload phase",
+)
+
 
 @dataclass
 class FlashSession:
@@ -109,7 +117,9 @@ class ArtemisService:
                     session.lines.append(text)
 
             exit_code = await proc.wait()
-            session.success = exit_code == 0
+            output_lower = "\n".join(session.lines).lower()
+            failed_by_log = any(m in output_lower for m in _ARTEMIS_FAILURE_MARKERS)
+            session.success = exit_code == 0 and not failed_by_log
             session.done = True
 
             result_msg = "Upload Successful" if session.success else "Upload Failed"
