@@ -123,15 +123,13 @@ const setConnected = (connected: boolean) => {
         v-if="currentScreen === 'home'"
         :is-connected="isConnected"
         @navigate="handleNavigate"
-        :release-weight-by="releaseWeightBy"
-        @release-weight-by-change="releaseWeightBy = $event"
+        v-model:release-weight-by="releaseWeightBy"
         @configuration-select="selectedConfigFromDashboard = $event"
       />
       <MissionProgramming
         v-else-if="currentScreen === 'dives'"
         @navigate="handleSetCurrentScreen"
-        :release-weight-by="releaseWeightBy"
-        @release-weight-by-change="releaseWeightBy = $event"
+        v-model:release-weight-by="releaseWeightBy"
         :initial-configuration="selectedConfigFromDashboard"
       />
       <AllMissions

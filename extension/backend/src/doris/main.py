@@ -14,6 +14,7 @@ from .routes import (
     register_blueos_routes,
     register_configuration_routes,
     register_dive_routes,
+    register_frame_routes,
     register_media_routes,
     register_mission_routes,
     register_network_routes,
@@ -22,6 +23,7 @@ from .routes import (
     register_system_routes,
 )
 from .services.external_storage import start_external_storage_setup
+from .services.frame import FrameService
 from .services.mdns import setup_doris_local
 from .utils import deploy_artemis_svl, deploy_lua_scripts, disable_usb_autosuspend, restart_firmware
 
@@ -60,6 +62,7 @@ def create_app() -> Robyn:
     register_media_routes(app)
     register_configuration_routes(app)
     register_dive_routes(app)
+    register_frame_routes(app)
     register_notification_routes(app)
 
     # Register WebSocket routes
@@ -78,6 +81,12 @@ def create_app() -> Robyn:
 
         if lua_deployed:
             await restart_firmware(logger)
+
+        frame_service = FrameService()
+        try:
+            await frame_service.apply_frame_if_needed()
+        except Exception as e:
+            logger.warning("Frame setup skipped: %s", e)
 
         network_service = NetworkService()
         try:

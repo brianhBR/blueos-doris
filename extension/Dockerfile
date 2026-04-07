@@ -40,6 +40,7 @@ RUN python -m pip install --extra-index-url https://www.piwheels.org/simple -e .
 # NOW copy the actual source code (changes here don't invalidate dependency cache)
 COPY backend/src ./src
 COPY backend/scripts ./scripts
+COPY backend/frames ./frames
 
 # Copy built frontend to be served by backend
 COPY --from=frontend-builder /frontend/dist ./frontend/dist

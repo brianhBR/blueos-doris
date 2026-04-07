@@ -18,7 +18,10 @@ interface DisplayMission {
   id: string
   name: string
   status: string
-  date: string
+  dateDisplay: string
+  /** 24-hour hh:mm UTC */
+  timeDisplay: string
+  dateMs: number
   duration: string
   location: string
   maxDepth: number
@@ -27,17 +30,34 @@ interface DisplayMission {
 }
 
 const previousMissions = computed<DisplayMission[]>(() => {
-  return apiMissions.value.map((m: MissionSummary) => ({
-    id: m.id,
-    name: m.name,
-    status: m.status,
-    date: new Date(m.date).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' }),
-    duration: m.duration,
-    location: m.location ?? 'Unknown',
-    maxDepth: m.max_depth ?? 0,
-    images: m.image_count,
-    videos: m.video_count,
-  }))
+  return apiMissions.value.map((m: MissionSummary) => {
+    const dt = new Date(m.date)
+    const dateMs = Number.isNaN(dt.getTime()) ? 0 : dt.getTime()
+    return {
+      id: m.id,
+      name: m.name,
+      status: m.status,
+      dateDisplay: dt.toLocaleDateString(undefined, {
+        timeZone: 'UTC',
+        month: 'short',
+        day: 'numeric',
+        year: 'numeric',
+      }),
+      timeDisplay:
+        dt.toLocaleTimeString(undefined, {
+          timeZone: 'UTC',
+          hour: '2-digit',
+          minute: '2-digit',
+          hour12: false,
+        }) + ' UTC',
+      dateMs,
+      duration: m.duration,
+      location: m.location ?? 'Unknown',
+      maxDepth: m.max_depth ?? 0,
+      images: m.image_count,
+      videos: m.video_count,
+    }
+  })
 })
 
 let pollInterval: number | undefined
@@ -60,16 +80,14 @@ const filteredMissions = computed(() => {
   return previousMissions.value
     .filter(mission => mission.name.toLowerCase().includes(nameFilter.value.toLowerCase()))
     .sort((a, b) => {
-      const dateA = new Date(a.date).getTime()
-      const dateB = new Date(b.date).getTime()
-      return dateSort.value === 'recent' ? dateB - dateA : dateA - dateB
+      return dateSort.value === 'recent' ? b.dateMs - a.dateMs : a.dateMs - b.dateMs
     })
 })
 
 const handleViewMedia = (mission: DisplayMission) => {
   const diveData: DiveData = {
     name: mission.name,
-    date: mission.date,
+    date: `${mission.dateDisplay} · ${mission.timeDisplay}`,
     duration: mission.duration,
     maxDepth: `${mission.maxDepth}m`,
     location: mission.location,
@@ -199,8 +217,12 @@ const handleDeleteMission = async () => {
               <!-- Info Grid -->
               <div class="grid grid-cols-1 md:grid-cols-4 gap-3 mb-3">
                 <div class="flex items-center gap-2">
-                  <Calendar class="w-4 h-4" style="color: #96EEF2" />
-                  <span class="text-sm" style="color: #96EEF2">{{ mission.date }}</span>
+                  <Calendar class="w-4 h-4 flex-shrink-0" style="color: #96EEF2" />
+                  <span class="text-sm" style="color: #96EEF2">
+                    {{ mission.dateDisplay }}
+                    <span class="mx-1 opacity-50">·</span>
+                    <span style="color: #FCD869">{{ mission.timeDisplay }}</span>
+                  </span>
                 </div>
                 <div class="flex items-center gap-2">
                   <Clock class="w-4 h-4" style="color: #96EEF2" />

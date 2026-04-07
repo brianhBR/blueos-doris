@@ -154,8 +154,8 @@ const username = ref('')
 const selectedConfiguration = ref('')
 const estimatedDepth = ref('')
 const estimatedBottomTime = ref('')
-const releaseWeightDate = ref('2026-02-07')
-const releaseWeightTime = ref('12:00')
+const releaseWeightDate = ref('')
+const releaseWeightTime = ref('')
 const sortColumn = ref<'sensor' | 'status' | null>(null)
 const sortDirection = ref<'asc' | 'desc'>('asc')
 const leakDetected = ref(false)
@@ -313,6 +313,14 @@ const canStartDive = computed(() => {
   )
 })
 
+/** Show real date/time inputs only when configuration uses datetime release and values are loaded */
+const releaseWeightUtcFieldsReady = computed(
+  () =>
+    props.releaseWeightBy === 'datetime' &&
+    Boolean(releaseWeightDate.value.trim()) &&
+    Boolean(releaseWeightTime.value.trim()),
+)
+
 function computeReleaseDateTimeFromElapsed(elapsedNumber: number, elapsedUnit: string) {
   const now = new Date()
   let offsetMs = 0
@@ -334,6 +342,13 @@ const handleConfigurationChange = async () => {
     selectedConfiguration.value = ''
     emit('configurationSelect', 'New Configuration')
     emit('navigate', 'dives')
+    return
+  }
+  if (!selectedConfiguration.value) {
+    releaseWeightDate.value = ''
+    releaseWeightTime.value = ''
+    loadedElapsedTimeHours.value = 0
+    emit('configurationSelect', '')
     return
   }
   if (selectedConfiguration.value) {
@@ -471,41 +486,51 @@ const formatReleaseTime = (date: Date) => {
         </div>
 
         <div>
-          <label class="block text-sm mb-2" :style="{ color: releaseWeightBy === 'datetime' ? '#96EEF2' : 'rgba(150, 238, 242, 0.5)' }">Release Weight Date (DD-MM-YYYY)</label>
+          <label class="block text-sm mb-2" :style="{ color: releaseWeightBy === 'datetime' ? '#96EEF2' : 'rgba(150, 238, 242, 0.5)' }">Release weight date (UTC)</label>
           <input
+            v-if="releaseWeightUtcFieldsReady"
             v-model="releaseWeightDate"
             type="date"
-            :disabled="releaseWeightBy !== 'datetime'"
-            class="w-full rounded-lg px-4 py-3 text-white outline-none disabled:cursor-not-allowed"
-            :style="{
-              backgroundColor: releaseWeightBy === 'datetime' ? 'rgba(14, 36, 70, 0.5)' : 'rgba(14, 36, 70, 0.3)',
-              border: '1px solid rgba(65, 185, 195, 0.3)',
-              colorScheme: 'dark',
-              opacity: releaseWeightBy === 'datetime' ? 1 : 0.5
-            }"
+            class="w-full rounded-lg px-4 py-3 text-white outline-none"
+            style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.3); color-scheme: dark"
           />
+          <div
+            v-else
+            class="w-full rounded-lg px-4 py-3 select-none"
+            style="background-color: rgba(14, 36, 70, 0.35); border: 1px solid rgba(65, 185, 195, 0.25); color: rgba(150, 238, 242, 0.55)"
+          >
+            —
+          </div>
           <p v-if="releaseWeightBy !== 'datetime'" class="text-xs mt-1" style="color: rgba(150, 238, 242, 0.7)">
-            Set Release by Date/Time in Configuration
+            Not shown for elapsed-based release — set mode under Configuration.
+          </p>
+          <p v-else-if="!releaseWeightUtcFieldsReady" class="text-xs mt-1" style="color: rgba(150, 238, 242, 0.7)">
+            Load a configuration above; values appear when release is set by date and time there.
           </p>
         </div>
 
         <div>
-          <label class="block text-sm mb-2" :style="{ color: releaseWeightBy === 'datetime' ? '#96EEF2' : 'rgba(150, 238, 242, 0.5)' }">Release Weight Time (UTC)</label>
+          <label class="block text-sm mb-2" :style="{ color: releaseWeightBy === 'datetime' ? '#96EEF2' : 'rgba(150, 238, 242, 0.5)' }">Release weight time (UTC)</label>
           <input
+            v-if="releaseWeightUtcFieldsReady"
             v-model="releaseWeightTime"
             type="time"
             step="60"
-            :disabled="releaseWeightBy !== 'datetime'"
-            class="w-full rounded-lg px-4 py-3 text-white outline-none disabled:cursor-not-allowed"
-            :style="{
-              backgroundColor: releaseWeightBy === 'datetime' ? 'rgba(14, 36, 70, 0.5)' : 'rgba(14, 36, 70, 0.3)',
-              border: '1px solid rgba(65, 185, 195, 0.3)',
-              colorScheme: 'dark',
-              opacity: releaseWeightBy === 'datetime' ? 1 : 0.5
-            }"
+            class="w-full rounded-lg px-4 py-3 text-white outline-none"
+            style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.3); color-scheme: dark"
           />
+          <div
+            v-else
+            class="w-full rounded-lg px-4 py-3 select-none"
+            style="background-color: rgba(14, 36, 70, 0.35); border: 1px solid rgba(65, 185, 195, 0.25); color: rgba(150, 238, 242, 0.55)"
+          >
+            —
+          </div>
           <p v-if="releaseWeightBy !== 'datetime'" class="text-xs mt-1" style="color: rgba(150, 238, 242, 0.7)">
-            Set Release by Date/Time in Configuration
+            Not shown for elapsed-based release — set mode under Configuration.
+          </p>
+          <p v-else-if="!releaseWeightUtcFieldsReady" class="text-xs mt-1" style="color: rgba(150, 238, 242, 0.7)">
+            Load a configuration above; values appear when release is set by date and time there.
           </p>
         </div>
 

@@ -12,9 +12,13 @@ interface DisplayFile {
   fileName: string
   type: 'video' | 'image' | 'sensor' | 'log'
   diveName: string
-  date: string
+  /** Local calendar date (e.g. Apr 4, 2026) */
+  datePart: string
+  /** 24-hour hh:mm UTC */
+  timePart: string
+  /** UTC instant for sorting (ms since epoch) */
+  createdMs: number
   size: string
-  timestamp: string
   downloadUrl: string
 }
 
@@ -50,17 +54,44 @@ function mapMediaType(mediaType: string): 'video' | 'image' | 'sensor' | 'log' {
   return 'log'
 }
 
+function parseMediaCreatedAt(iso: string): Date {
+  const d = new Date(iso)
+  return Number.isNaN(d.getTime()) ? new Date(0) : d
+}
+
+/** Calendar date + 24-hour clock in UTC (backend stores UTC). */
+function formatMediaDateParts(d: Date): { datePart: string; timePart: string } {
+  const utc: Intl.DateTimeFormatOptions = { timeZone: 'UTC' }
+  return {
+    datePart: d.toLocaleDateString(undefined, {
+      ...utc,
+      year: 'numeric',
+      month: 'short',
+      day: 'numeric',
+    }),
+    timePart:
+      d.toLocaleTimeString(undefined, {
+        ...utc,
+        hour: '2-digit',
+        minute: '2-digit',
+        hour12: false,
+      }) + ' UTC',
+  }
+}
+
 const mediaFiles = computed<DisplayFile[]>(() => {
   return apiFiles.value.map((f) => {
-    const createdDate = new Date(f.created_at)
+    const createdDate = parseMediaCreatedAt(f.created_at)
+    const { datePart, timePart } = formatMediaDateParts(createdDate)
     return {
       id: f.id,
       fileName: f.filename,
       type: mapMediaType(f.media_type),
       diveName: f.mission_id ?? 'Unknown',
-      date: createdDate.toISOString().split('T')[0],
+      datePart,
+      timePart,
+      createdMs: createdDate.getTime(),
       size: formatFileSize(f.size_bytes),
-      timestamp: createdDate.toISOString().split('T')[1]?.replace('Z', ' UTC') ?? '',
       downloadUrl: f.download_url,
     }
   })
@@ -143,7 +174,7 @@ const sortedFiles = computed(() => {
     switch (sortField.value) {
       case 'diveName': aVal = a.diveName; bVal = b.diveName; break
       case 'fileName': aVal = a.fileName; bVal = b.fileName; break
-      case 'date': aVal = new Date(a.date).getTime(); bVal = new Date(b.date).getTime(); break
+      case 'date': aVal = a.createdMs; bVal = b.createdMs; break
       case 'type': aVal = a.type; bVal = b.type; break
     }
 
@@ -373,7 +404,7 @@ const handlePageChange = (page: number) => {
                   class="flex items-center gap-2 hover:opacity-80 transition-opacity"
                   :style="{ color: sortField === 'date' ? '#41B9C3' : '#96EEF2' }"
                 >
-                  Date
+                  Date &amp; time (UTC)
                   <ArrowUp v-if="sortField === 'date' && sortDirection === 'asc'" class="w-4 h-4" />
                   <ArrowDown v-else-if="sortField === 'date' && sortDirection === 'desc'" class="w-4 h-4" />
                   <ArrowUpDown v-else class="w-4 h-4" />
@@ -425,7 +456,11 @@ const handlePageChange = (page: number) => {
                   <span class="text-white">{{ file.fileName }}</span>
                 </div>
               </td>
-              <td class="p-3" style="color: #96EEF2">{{ file.date }}</td>
+              <td class="p-3 whitespace-nowrap" style="color: #96EEF2">
+                <span>{{ file.datePart }}</span>
+                <span class="mx-1 opacity-50">·</span>
+                <span style="color: #FCD869">{{ file.timePart }}</span>
+              </td>
               <td class="p-3">
                 <span
                   class="px-2 py-1 rounded text-xs"
@@ -490,7 +525,7 @@ const handlePageChange = (page: number) => {
             class="flex-1 px-3 py-2 text-sm text-white rounded-lg focus:outline-none"
             style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.3)"
           >
-            <option value="date" style="background-color: #0E2446">Date</option>
+            <option value="date" style="background-color: #0E2446">Date &amp; time (UTC)</option>
             <option value="diveName" style="background-color: #0E2446">Dive Name</option>
             <option value="fileName" style="background-color: #0E2446">File Name</option>
             <option value="type" style="background-color: #0E2446">Type</option>
@@ -557,9 +592,12 @@ const handlePageChange = (page: number) => {
               </div>
               <h3 class="text-white font-medium mb-1 text-sm break-all">{{ file.fileName }}</h3>
               <p class="text-xs mb-2 break-all" style="color: #96EEF2">{{ file.diveName }}</p>
-              <div class="flex items-center gap-3 text-xs mb-3" style="color: #41B9C3">
-                <span>{{ file.date }}</span>
-                <span>&bull;</span>
+              <div class="flex flex-col gap-0.5 text-xs mb-3" style="color: #41B9C3">
+                <span style="color: #96EEF2">
+                  {{ file.datePart }}
+                  <span class="mx-1 opacity-50">·</span>
+                  <span style="color: #FCD869">{{ file.timePart }}</span>
+                </span>
                 <span>{{ file.size }}</span>
               </div>
               <div class="flex gap-2">

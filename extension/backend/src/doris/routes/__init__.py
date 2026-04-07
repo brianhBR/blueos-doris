@@ -5,6 +5,7 @@ from .attitude import register_attitude_routes
 from .blueos import register_blueos_routes
 from .configurations import register_configuration_routes
 from .dive import register_dive_routes
+from .frame import register_frame_routes
 from .media import register_media_routes
 from .missions import register_mission_routes
 from .network import register_network_routes
@@ -23,6 +24,7 @@ __all__ = [
     "register_media_routes",
     "register_configuration_routes",
     "register_dive_routes",
+    "register_frame_routes",
     "register_notification_routes",
 ]
 
