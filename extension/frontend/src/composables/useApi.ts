@@ -118,7 +118,11 @@ export interface DiveHistorySummary {
   date: string
   duration: string
   location: string | null
+  /** Shown in UI: log-derived when available, else user estimate. */
   max_depth: number | null
+  estimated_depth_m: number | null
+  log_max_depth_m: number | null
+  mcap_relative_path: string | null
   image_count: number
   video_count: number
   configuration?: string
@@ -701,14 +705,22 @@ export function useMedia() {
   const loading = ref(false)
   const error = ref<string | null>(null)
 
-  async function fetchFiles(params?: { mission_id?: string; media_type?: string; search?: string }) {
+  async function fetchFiles(params?: {
+    mission_id?: string
+    media_type?: string
+    search?: string
+    limit?: number
+    offset?: number
+  }) {
     loading.value = true
     error.value = null
     try {
       const queryParams: Record<string, string> = {}
       if (params?.mission_id) queryParams.mission_id = params.mission_id
-      if (params?.media_type) queryParams.media_type = params.media_type
+      if (params?.media_type) queryParams.type = params.media_type
       if (params?.search) queryParams.search = params.search
+      if (params?.limit != null) queryParams.limit = String(params.limit)
+      if (params?.offset != null) queryParams.offset = String(params.offset)
       files.value = await fetchApi<MediaFile[]>('/media/files', Object.keys(queryParams).length > 0 ? queryParams : undefined)
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Failed to fetch media files'

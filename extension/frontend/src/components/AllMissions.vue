@@ -15,6 +15,14 @@ const emit = defineEmits<{
 
 const { dives: apiDives, loading, error, fetchDives, deleteDiveRecord } = useDiveHistory()
 
+function mcapDownloadHref(relativePath: string): string {
+  return `/api/v1/media/download?path=${encodeURIComponent(relativePath)}`
+}
+
+function scientificCsvHref(diveId: string): string {
+  return `/api/v1/dive/history/${encodeURIComponent(diveId)}/export/scientific.csv`
+}
+
 function formatStatusLabel(status: string): string {
   const s = status.toLowerCase()
   if (s === 'active') return 'Active'
@@ -36,6 +44,8 @@ interface DisplayMission {
   duration: string
   location: string
   maxDepthLabel: string
+  maxDepthFromLog: boolean
+  mcapRelativePath: string | null
   images: number
   videos: number
 }
@@ -48,6 +58,9 @@ const previousMissions = computed<DisplayMission[]>(() => {
       m.max_depth != null && Number.isFinite(m.max_depth) && m.max_depth > 0
         ? `${m.max_depth}m`
         : '—'
+    const logMd = m.log_max_depth_m
+    const maxDepthFromLog =
+      logMd != null && Number.isFinite(logMd) && logMd > 0
     return {
       id: m.id,
       name: m.name,
@@ -71,6 +84,8 @@ const previousMissions = computed<DisplayMission[]>(() => {
       duration: m.duration,
       location: m.location?.trim() ? m.location : '—',
       maxDepthLabel: md,
+      maxDepthFromLog,
+      mcapRelativePath: m.mcap_relative_path ?? null,
       images: m.image_count,
       videos: m.video_count,
     }
@@ -265,8 +280,14 @@ const handleDeleteMission = async () => {
                   <MapPin class="w-4 h-4" style="color: #96EEF2" />
                   <span class="text-sm" style="color: #96EEF2">{{ mission.location }}</span>
                 </div>
-                <div class="flex items-center gap-2">
-                  <span class="text-sm" style="color: #96EEF2">Max depth: {{ mission.maxDepthLabel }}</span>
+                <div class="flex items-center gap-2 flex-wrap">
+                  <span class="text-sm" style="color: #96EEF2">
+                    Max depth: {{ mission.maxDepthLabel }}
+                    <span
+                      v-if="mission.maxDepthFromLog"
+                      class="text-xs opacity-75 ml-1"
+                    >(log)</span>
+                  </span>
                 </div>
               </div>
 
@@ -285,6 +306,35 @@ const handleDeleteMission = async () => {
 
             <!-- Action Buttons (vertical stack on right) -->
             <div class="flex flex-col gap-2 flex-shrink-0">
+              <a
+                v-if="mission.mcapRelativePath"
+                :href="mcapDownloadHref(mission.mcapRelativePath)"
+                class="px-4 py-2 rounded-lg flex items-center justify-center gap-2 text-sm whitespace-nowrap transition-all hover:opacity-90 no-underline"
+                style="background-color: rgba(65, 185, 195, 0.25); border: 1px solid #41B9C3; color: #96EEF2"
+                target="_blank"
+                rel="noopener noreferrer"
+              >
+                <Archive class="w-4 h-4 flex-shrink-0" />
+                Download MCAP
+              </a>
+              <span
+                v-else
+                class="px-4 py-2 rounded-lg flex items-center justify-center gap-2 text-sm whitespace-nowrap opacity-50 cursor-not-allowed"
+                style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2); color: #96EEF2"
+                title="No recorder .mcap matched this dive’s time window"
+              >
+                <Archive class="w-4 h-4 flex-shrink-0" />
+                No MCAP linked
+              </span>
+              <a
+                :href="scientificCsvHref(mission.id)"
+                class="px-4 py-2 rounded-lg flex items-center justify-center gap-2 text-sm whitespace-nowrap transition-all hover:opacity-90 no-underline"
+                style="background-color: rgba(0, 212, 170, 0.2); border: 1px solid rgba(0, 212, 170, 0.5); color: #00D4AA"
+                :title="mission.mcapRelativePath ? 'Depth, temperature, GPS columns from recorder log where available' : 'Dive metadata and any samples we could read from the linked log'"
+              >
+                <Download class="w-4 h-4 flex-shrink-0" />
+                Export scientific CSV
+              </a>
               <button
                 type="button"
                 disabled

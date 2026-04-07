@@ -14,7 +14,11 @@ class DiveHistoryEntry(BaseModel):
     date: datetime
     duration: str
     location: str | None = None
+    # max_depth: recorder log when available, else user estimate (see storage layer).
     max_depth: float | None = None
+    estimated_depth_m: float | None = None
+    log_max_depth_m: float | None = None
+    mcap_relative_path: str | None = None
     image_count: int = 0
     video_count: int = 0
     configuration: str = ""

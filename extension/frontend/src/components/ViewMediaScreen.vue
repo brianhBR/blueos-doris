@@ -1,19 +1,24 @@
 <script setup lang="ts">
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import {
   ArrowLeft, Calendar, Clock, Gauge, MapPin, User, Download,
-  Trash2, ZoomIn, Image, Video, Play, FileText
+  Trash2, ZoomIn, Image, Video, Play, FileText, Loader2, AlertCircle
 } from 'lucide-vue-next'
 import type { Screen, DiveData } from '../types'
+import { useMedia, type MediaFile } from '../composables/useApi'
+import { parseBackendDateTime } from '../parseBackendTime'
 
-interface MediaItem {
-  id: number
+const API_V1 = '/api/v1'
+
+interface GalleryItem {
+  id: string
   type: 'image' | 'video'
   url: string
   thumbnail: string
   timestamp: string
   depth: string
   duration?: string
+  createdMs: number
 }
 
 const props = withDefaults(defineProps<{
@@ -28,40 +33,76 @@ const emit = defineEmits<{
   navigate: [screen: Screen]
 }>()
 
+const { files, loading, error, fetchFiles } = useMedia()
+
 const lightboxIndex = ref<number | null>(null)
 const showDeleteModal = ref(false)
 
 const currentDive = computed<DiveData>(() => props.diveData ?? {
-  name: 'Deep Sea Survey 2024-01',
-  date: 'Jan 5, 2026',
-  duration: '3h 45m',
-  maxDepth: '125m',
-  location: '41.7128° N, 74.0060° W',
-  operator: 'Dr. Sarah Chen',
-  images: 487,
-  videos: 3
+  name: 'Media',
+  date: '—',
+  duration: '—',
+  maxDepth: '—',
+  location: '—',
+  operator: undefined,
+  images: undefined,
+  videos: undefined
 })
 
-const mediaItems = ref<MediaItem[]>([
-  { id: 1, type: 'image', url: 'https://images.unsplash.com/photo-1682687220742-aba13b6e50ba?w=1200', thumbnail: 'https://images.unsplash.com/photo-1682687220742-aba13b6e50ba?w=400', timestamp: '14:30:22 UTC', depth: '45m' },
-  { id: 2, type: 'image', url: 'https://images.unsplash.com/photo-1544551763-46a013bb70d5?w=1200', thumbnail: 'https://images.unsplash.com/photo-1544551763-46a013bb70d5?w=400', timestamp: '14:32:15 UTC', depth: '52m' },
-  { id: 3, type: 'video', url: 'https://images.unsplash.com/photo-1559827260-dc66d52bef19?w=1200', thumbnail: 'https://images.unsplash.com/photo-1559827260-dc66d52bef19?w=400', timestamp: '14:35:30 UTC', depth: '58m', duration: '2:34' },
-  { id: 4, type: 'image', url: 'https://images.unsplash.com/photo-1583212292454-1fe6229603b7?w=1200', thumbnail: 'https://images.unsplash.com/photo-1583212292454-1fe6229603b7?w=400', timestamp: '14:38:45 UTC', depth: '63m' },
-  { id: 5, type: 'image', url: 'https://images.unsplash.com/photo-1546026423-cc4642628d2b?w=1200', thumbnail: 'https://images.unsplash.com/photo-1546026423-cc4642628d2b?w=400', timestamp: '14:42:10 UTC', depth: '71m' },
-  { id: 6, type: 'video', url: 'https://images.unsplash.com/photo-1551244072-5d12893278ab?w=1200', thumbnail: 'https://images.unsplash.com/photo-1551244072-5d12893278ab?w=400', timestamp: '14:45:00 UTC', depth: '78m', duration: '5:12' },
-  { id: 7, type: 'image', url: 'https://images.unsplash.com/photo-1571752726703-5e7d1f6a986d?w=1200', thumbnail: 'https://images.unsplash.com/photo-1571752726703-5e7d1f6a986d?w=400', timestamp: '14:50:22 UTC', depth: '85m' },
-  { id: 8, type: 'image', url: 'https://images.unsplash.com/photo-1596436889106-be35e843f974?w=1200', thumbnail: 'https://images.unsplash.com/photo-1596436889106-be35e843f974?w=400', timestamp: '14:55:30 UTC', depth: '92m' },
-  { id: 9, type: 'image', url: 'https://images.unsplash.com/photo-1582967788606-a171c7a0a87d?w=1200', thumbnail: 'https://images.unsplash.com/photo-1582967788606-a171c7a0a87d?w=400', timestamp: '15:00:45 UTC', depth: '98m' },
-  { id: 10, type: 'video', url: 'https://images.unsplash.com/photo-1437622368342-7a3d73a34c8f?w=1200', thumbnail: 'https://images.unsplash.com/photo-1437622368342-7a3d73a34c8f?w=400', timestamp: '15:05:00 UTC', depth: '105m', duration: '3:45' },
-  { id: 11, type: 'image', url: 'https://images.unsplash.com/photo-1518837695005-2083093ee35b?w=1200', thumbnail: 'https://images.unsplash.com/photo-1518837695005-2083093ee35b?w=400', timestamp: '15:10:15 UTC', depth: '110m' },
-  { id: 12, type: 'image', url: 'https://images.unsplash.com/photo-1535591273668-578e31182c4f?w=1200', thumbnail: 'https://images.unsplash.com/photo-1535591273668-578e31182c4f?w=400', timestamp: '15:15:30 UTC', depth: '115m' },
-  { id: 13, type: 'image', url: 'https://images.unsplash.com/photo-1504472478235-9bc48ba4d60f?w=1200', thumbnail: 'https://images.unsplash.com/photo-1504472478235-9bc48ba4d60f?w=400', timestamp: '15:18:00 UTC', depth: '118m' },
-  { id: 14, type: 'video', url: 'https://images.unsplash.com/photo-1560275619-4662e36fa65c?w=1200', thumbnail: 'https://images.unsplash.com/photo-1560275619-4662e36fa65c?w=400', timestamp: '15:22:10 UTC', depth: '120m', duration: '1:58' },
-  { id: 15, type: 'image', url: 'https://images.unsplash.com/photo-1497290756760-23ac55edf36f?w=1200', thumbnail: 'https://images.unsplash.com/photo-1497290756760-23ac55edf36f?w=400', timestamp: '15:25:45 UTC', depth: '122m' },
-  { id: 16, type: 'image', url: 'https://images.unsplash.com/photo-1580019542155-247062e19ce4?w=1200', thumbnail: 'https://images.unsplash.com/photo-1580019542155-247062e19ce4?w=400', timestamp: '15:30:00 UTC', depth: '124m' },
-  { id: 17, type: 'image', url: 'https://images.unsplash.com/photo-1682687982501-1e58ab814714?w=1200', thumbnail: 'https://images.unsplash.com/photo-1682687982501-1e58ab814714?w=400', timestamp: '15:32:30 UTC', depth: '125m' },
-  { id: 18, type: 'image', url: 'https://images.unsplash.com/photo-1505118380757-91f5f5632de0?w=1200', thumbnail: 'https://images.unsplash.com/photo-1505118380757-91f5f5632de0?w=400', timestamp: '15:35:00 UTC', depth: '125m' }
-])
+function mediaDownloadUrl(fileId: string): string {
+  return `${API_V1}/media/download?${new URLSearchParams({ path: fileId }).toString()}`
+}
+
+function formatVideoDuration(seconds: number | null): string | undefined {
+  if (seconds == null || seconds <= 0) return undefined
+  const s = Math.floor(seconds)
+  const m = Math.floor(s / 60)
+  const r = s % 60
+  return `${m}:${String(r).padStart(2, '0')}`
+}
+
+function fileToGalleryItem(f: MediaFile): GalleryItem | null {
+  if (f.media_type !== 'image' && f.media_type !== 'video') return null
+  const url = mediaDownloadUrl(f.id)
+  const d = parseBackendDateTime(f.created_at)
+  const createdMs = Number.isNaN(d.getTime()) ? 0 : d.getTime()
+  const ts = Number.isNaN(d.getTime())
+    ? '—'
+    : d.toLocaleTimeString(undefined, {
+        timeZone: 'UTC',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+        hour12: false,
+      }) + ' UTC'
+  return {
+    id: f.id,
+    type: f.media_type,
+    url,
+    thumbnail: url,
+    timestamp: ts,
+    depth: '—',
+    duration: f.media_type === 'video' ? formatVideoDuration(f.duration_seconds) : undefined,
+    createdMs,
+  }
+}
+
+const diveNameNorm = computed(() => props.diveData?.name?.trim().toLowerCase() ?? '')
+
+const mediaItems = computed<GalleryItem[]>(() => {
+  const want = diveNameNorm.value
+  const rows = files.value
+    .filter((f) => {
+      if (f.media_type !== 'image' && f.media_type !== 'video') return false
+      if (!want) return true
+      const dn = (f.dive_name ?? '').trim().toLowerCase()
+      return dn === want
+    })
+    .map(fileToGalleryItem)
+    .filter((x): x is GalleryItem => x != null)
+  rows.sort((a, b) => b.createdMs - a.createdMs)
+  return rows
+})
 
 const lightboxItem = computed(() => {
   if (lightboxIndex.value === null) return null
@@ -114,6 +155,10 @@ const goBack = () => {
 
 const imageCount = computed(() => mediaItems.value.filter(m => m.type === 'image').length)
 const videoCount = computed(() => mediaItems.value.filter(m => m.type === 'video').length)
+
+onMounted(() => {
+  void fetchFiles({ limit: 500 })
+})
 </script>
 
 <template>
@@ -229,7 +274,36 @@ const videoCount = computed(() => mediaItems.value.filter(m => m.type === 'video
         Media Gallery
       </h2>
 
-      <div class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-2">
+      <div
+        v-if="loading"
+        class="flex items-center justify-center gap-2 py-16"
+        style="color: #96EEF2"
+      >
+        <Loader2 class="w-6 h-6 animate-spin" />
+        <span>Loading media…</span>
+      </div>
+
+      <div
+        v-else-if="error"
+        class="flex items-center gap-2 py-8 px-2 rounded-lg"
+        style="background-color: rgba(221, 44, 29, 0.12); color: #FF6B6B"
+      >
+        <AlertCircle class="w-5 h-5 flex-shrink-0" />
+        <span>{{ error }}</span>
+      </div>
+
+      <p
+        v-else-if="mediaItems.length === 0"
+        class="py-12 text-center text-sm"
+        style="color: rgba(150, 238, 242, 0.7)"
+      >
+        No images or videos found for this dive.
+      </p>
+
+      <div
+        v-else
+        class="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-5 lg:grid-cols-6 xl:grid-cols-8 gap-2"
+      >
         <div
           v-for="(item, index) in mediaItems"
           :key="item.id"
@@ -237,7 +311,16 @@ const videoCount = computed(() => mediaItems.value.filter(m => m.type === 'video
           style="background-color: rgba(14, 36, 70, 0.5)"
           @click="openLightbox(index)"
         >
+          <video
+            v-if="item.type === 'video'"
+            :src="item.thumbnail"
+            muted
+            playsinline
+            preload="metadata"
+            class="w-full h-full object-cover transition-transform duration-300 group-hover:scale-110"
+          />
           <img
+            v-else
             :src="item.thumbnail"
             :alt="`Media ${item.id}`"
             class="w-full h-full object-cover transition-transform duration-300 group-hover:scale-110"
@@ -254,7 +337,8 @@ const videoCount = computed(() => mediaItems.value.filter(m => m.type === 'video
             style="background-color: rgba(0, 0, 0, 0.7); color: white"
           >
             <Play class="w-3 h-3" />
-            {{ item.duration }}
+            <span v-if="item.duration">{{ item.duration }}</span>
+            <span v-else>Video</span>
           </div>
           <!-- Type Icon -->
           <div
@@ -306,9 +390,17 @@ const videoCount = computed(() => mediaItems.value.filter(m => m.type === 'video
           <ArrowLeft class="w-5 h-5" />
         </button>
 
-        <!-- Image -->
+        <!-- Image / video -->
         <div class="max-w-5xl max-h-[85vh] flex flex-col items-center">
+          <video
+            v-if="lightboxItem.type === 'video'"
+            :src="lightboxItem.url"
+            controls
+            playsinline
+            class="max-w-full max-h-[75vh] object-contain rounded-lg"
+          />
           <img
+            v-else
             :src="lightboxItem.url"
             :alt="`Media ${lightboxItem.id}`"
             class="max-w-full max-h-[75vh] object-contain rounded-lg"
