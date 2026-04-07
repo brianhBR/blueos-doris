@@ -93,6 +93,11 @@ def create_app() -> Robyn:
         except Exception as e:
             logger.warning("Frame setup skipped: %s", e)
 
+        try:
+            await setup_doris_local()
+        except Exception as e:
+            logger.warning("doris.local setup skipped: %s", e)
+
         network_service = NetworkService()
         try:
             await network_service.configure_hotspot()
@@ -103,11 +108,6 @@ def create_app() -> Robyn:
             start_external_storage_setup()
         except Exception as e:
             logger.warning("External storage setup skipped: %s", e)
-
-        try:
-            await setup_doris_local()
-        except Exception as e:
-            logger.warning("doris.local setup skipped: %s", e)
 
     # Serve frontend static files if they exist
     # Check multiple possible locations for frontend dist

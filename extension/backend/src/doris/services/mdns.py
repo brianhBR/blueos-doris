@@ -1,9 +1,11 @@
-"""DORIS mDNS and nginx setup.
+"""DORIS mDNS, DNS, and nginx setup.
 
 On startup, configures:
   1. Avahi hostname → "doris" on ALL interfaces (wired + WiFi) so
-     doris.local resolves regardless of how the client is connected.
-  2. nginx redirect so http://doris.local/ → http://doris.local:8095/
+     doris.local resolves via mDNS regardless of how the client is connected.
+  2. dnsmasq address record so doris.local also resolves via standard DNS
+     for hotspot clients (Windows blocks mDNS on "public" networks).
+  3. nginx redirect so http://doris.local/ → http://doris.local:8095/
 """
 
 import logging
@@ -18,6 +20,12 @@ logger = logging.getLogger(__name__)
 
 AVAHI_CONF = Path("/tmp/avahi/avahi-daemon.conf")
 NGINX_CONF = Path("/tmp/nginx/doris-redirect.conf")
+
+# NetworkManager reads this directory when spawning dnsmasq for shared (hotspot)
+# connections — if the directory exists.
+DNSMASQ_SHARED_DIR = "/etc/NetworkManager/dnsmasq-shared.d"
+DNSMASQ_CONF = f"{DNSMASQ_SHARED_DIR}/doris-local.conf"
+HOTSPOT_GATEWAY = "10.42.0.1"
 
 # Redirect any request to doris.local (root path) to the extension UI on
 # port 8095.  Uses $host so the browser follows the redirect with the same
@@ -98,10 +106,34 @@ def _setup_nginx_conf() -> bool:
     return True
 
 
-async def setup_doris_local() -> None:
-    """Configure doris.local mDNS and nginx redirect.
+async def _setup_hotspot_dns() -> None:
+    """Add a dnsmasq address record so doris.local resolves via standard DNS.
 
-    Called once during DORIS backend startup.
+    mDNS is unreliable on WiFi — Windows blocks it on networks classified as
+    "public" (the default for a new hotspot).  Since the device IS the DNS
+    server for hotspot clients, we write a dnsmasq config that makes
+    ``doris.local`` resolve to the hotspot gateway IP through normal DNS.
+
+    The config file persists on the host, so it only needs to be written once
+    and is picked up by NM's dnsmasq whenever the hotspot (re)starts.
+    """
+    cmd = (
+        f"mkdir -p {DNSMASQ_SHARED_DIR} && "
+        f"echo 'address=/doris.local/{HOTSPOT_GATEWAY}' > {DNSMASQ_CONF}"
+    )
+    ok = await _run_host_command(cmd)
+    if ok:
+        logger.info("dnsmasq hotspot DNS configured: doris.local -> %s", HOTSPOT_GATEWAY)
+    else:
+        logger.warning("Failed to write dnsmasq hotspot DNS config")
+
+
+async def setup_doris_local() -> None:
+    """Configure doris.local resolution (mDNS + DNS) and nginx redirect.
+
+    Called once during DORIS backend startup.  Should run BEFORE
+    configure_hotspot() so the dnsmasq config is in place when NM spawns
+    dnsmasq for the shared connection.
     """
     avahi_changed = _setup_avahi_hostname()
     if avahi_changed:
@@ -115,6 +147,8 @@ async def setup_doris_local() -> None:
         )
         if ok:
             logger.info("avahi-daemon restarted")
+
+    await _setup_hotspot_dns()
 
     nginx_written = _setup_nginx_conf()
 
