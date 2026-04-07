@@ -10,6 +10,7 @@ state machine uses the correct durations and light settings.
 
 import asyncio
 import logging
+from datetime import datetime, timezone
 
 import httpx
 
@@ -19,6 +20,16 @@ from ..models.configuration import DeploymentConfiguration, TimeValue
 logger = logging.getLogger(__name__)
 
 PARAM_NAME = "DORIS_START"
+STATE_PARAM = "DORIS_STATE"
+
+_DORIS_STATE_NAMES: dict[int, str] = {
+    -1: "CONFIG",
+    0: "MISSION_START",
+    1: "DESCENT",
+    2: "ON_BOTTOM",
+    3: "ASCENT",
+    4: "RECOVERY",
+}
 
 DEFAULT_DESCENT_RATE_MPS = 0.5
 
@@ -51,7 +62,14 @@ class DiveService:
             self._client = httpx.AsyncClient(timeout=10.0, follow_redirects=True)
         return self._client
 
-    async def push_configuration_params(self, config: DeploymentConfiguration) -> bool:
+    async def push_configuration_params(
+        self,
+        config: DeploymentConfiguration,
+        *,
+        profile_id: int,
+        upload_date: float,
+        upload_time: float,
+    ) -> bool:
         """Translate a DeploymentConfiguration into DORIS_* ArduPilot parameters."""
         depth_str = config.estimated_depth.strip() if config.estimated_depth else ""
         try:
@@ -70,6 +88,9 @@ class DiveService:
             ("DORIS_BTM_LGT", 1.0 if config.bottom.light.enabled else 0.0),
             ("DORIS_ASC_LGT", 1.0 if config.ascent.light.enabled else 0.0),
             ("DORIS_LGT_BRT", float(config.bottom.light.brightness)),
+            ("DORIS_PRF_ID", float(profile_id)),
+            ("DORIS_UPL_DATE", upload_date),
+            ("DORIS_UPL_TIME", upload_time),
         ]
 
         all_ok = True
@@ -85,10 +106,38 @@ class DiveService:
         )
         return all_ok
 
-    async def start_dive(self, config: DeploymentConfiguration | None = None) -> bool:
+    async def start_dive(
+        self,
+        config: DeploymentConfiguration | None = None,
+        *,
+        profile_id: int | None = None,
+        upload_date: float | None = None,
+        upload_time: float | None = None,
+    ) -> bool:
         """Push configuration (if given), then set DORIS_START=1."""
         if config is not None:
-            params_ok = await self.push_configuration_params(config)
+            now = datetime.now(timezone.utc)
+            pid = (
+                profile_id
+                if profile_id is not None
+                else max(int(now.timestamp()) % 2_147_483_647, 1)
+            )
+            udate = (
+                upload_date
+                if upload_date is not None
+                else float(now.year * 10_000 + now.month * 100 + now.day)
+            )
+            utime = (
+                upload_time
+                if upload_time is not None
+                else float(now.hour * 100 + now.minute)
+            )
+            params_ok = await self.push_configuration_params(
+                config,
+                profile_id=pid,
+                upload_date=udate,
+                upload_time=utime,
+            )
             if not params_ok:
                 logger.warning("Some config params failed to set, proceeding anyway")
             await asyncio.sleep(0.2)
@@ -98,6 +147,10 @@ class DiveService:
             self._last_known_value = 1.0
         return ok
 
+    async def set_sim_buoyancy(self, newtons: float) -> bool:
+        """Set ArduSub SITL net buoyancy (SIM_BUOYANCY). Negative sinks, positive rises."""
+        return await self._set_param("SIM_BUOYANCY", float(newtons))
+
     async def stop_dive(self) -> bool:
         """Set DORIS_START=0 via PARAM_SET to abort/reset."""
         ok = await self._set_param(PARAM_NAME, 0.0)
@@ -106,41 +159,52 @@ class DiveService:
         return ok
 
     async def get_status(self) -> dict:
-        """Read the current value of DORIS_START.
-
-        Sends PARAM_REQUEST_READ then reads the PARAM_VALUE message cache.
-        """
-        base = _mavlink2rest_url()
+        """Read DORIS_START and DORIS_STATE from the PARAM_VALUE cache."""
         try:
-            await self._request_param(PARAM_NAME)
-            await asyncio.sleep(0.3)
+            start_val = await self._read_param_float(PARAM_NAME)
+            if start_val is not None:
+                self._last_known_value = start_val
 
-            resp = await self.client.get(
-                f"{base}/mavlink/vehicles/1/components/1/messages/PARAM_VALUE"
-            )
-            resp.raise_for_status()
-            data = resp.json()
-            message = data.get("message", {})
-            param_id = "".join(
-                c for c in message.get("param_id", []) if c != "\x00"
-            )
-            if param_id == PARAM_NAME:
-                value = message.get("param_value", 0.0)
-                self._last_known_value = value
-                return {"param": PARAM_NAME, "value": value, "active": value >= 1.0}
-
-            return {
+            state_val = await self._read_param_float(STATE_PARAM)
+            value = self._last_known_value
+            active = value >= 1.0
+            state_int = int(state_val) if state_val is not None else None
+            out: dict = {
                 "param": PARAM_NAME,
-                "value": self._last_known_value,
-                "active": self._last_known_value >= 1.0,
+                "value": value,
+                "active": active,
+                "doris_script_state": state_int,
+                "doris_script_state_name": _DORIS_STATE_NAMES.get(state_int, None)
+                if state_int is not None
+                else None,
             }
+            return out
         except Exception as e:
             logger.warning(f"Could not read {PARAM_NAME}: {e}")
             return {
                 "param": PARAM_NAME,
                 "value": self._last_known_value,
                 "active": self._last_known_value >= 1.0,
+                "doris_script_state": None,
+                "doris_script_state_name": None,
             }
+
+    async def _read_param_float(self, name: str) -> float | None:
+        """Request a parameter and read the latest PARAM_VALUE from mavlink2rest."""
+        base = _mavlink2rest_url()
+        await self._request_param(name)
+        await asyncio.sleep(0.35)
+
+        resp = await self.client.get(
+            f"{base}/mavlink/vehicles/1/components/1/messages/PARAM_VALUE"
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        message = data.get("message", {})
+        param_id = "".join(c for c in message.get("param_id", []) if c != "\x00")
+        if param_id != name:
+            return None
+        return float(message.get("param_value", 0.0))
 
     async def _request_param(self, name: str) -> None:
         """Send PARAM_REQUEST_READ so the autopilot emits a fresh PARAM_VALUE."""

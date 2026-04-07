@@ -302,7 +302,14 @@ async function postApi<T>(endpoint: string, body?: unknown): Promise<T> {
     clearTimeout(timeout)
   }
   if (!response.ok) {
-    throw new Error(`API error: ${response.status} ${response.statusText}`)
+    let detail = `${response.status} ${response.statusText}`
+    try {
+      const errBody = await response.json() as { error?: string }
+      if (errBody?.error) detail = errBody.error
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(`API error: ${detail}`)
   }
   return response.json()
 }
@@ -768,7 +775,23 @@ export function useConfigurations() {
     try {
       const saved = await postApi<DeploymentConfiguration>('/configurations', config)
       currentConfig.value = saved
-      await fetchConfigurations()
+      try {
+        await fetchConfigurations()
+      } catch (refreshErr) {
+        const summary: ConfigurationSummary = {
+          name: saved.name,
+          created_at: saved.created_at,
+          updated_at: saved.updated_at,
+        }
+        const next = configurations.value.filter(c => c.name !== saved.name)
+        next.push(summary)
+        next.sort((a, b) => a.name.localeCompare(b.name))
+        configurations.value = next
+        console.warn(
+          'Configuration saved but list refresh failed:',
+          refreshErr instanceof Error ? refreshErr.message : refreshErr,
+        )
+      }
       return saved
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Failed to save configuration'
@@ -790,6 +813,10 @@ export function useConfigurations() {
     }
   }
 
+  function clearError() {
+    error.value = null
+  }
+
   return {
     configurations: readonly(configurations),
     currentConfig: readonly(currentConfig),
@@ -800,6 +827,7 @@ export function useConfigurations() {
     loadConfiguration,
     saveConfiguration,
     deleteConfiguration,
+    clearError,
   }
 }
 
@@ -809,11 +837,26 @@ export interface DiveStatus {
   param: string
   value: number | null
   active: boolean
+  doris_script_state?: number | null
+  doris_script_state_name?: string | null
+}
+
+export interface DiveMissionState {
+  status: 'pending' | 'active' | 'completed' | 'cancelled'
+  configuration_name: string
+  loaded_at: string
+  profile_id: number
+  dive_file?: string
+  activated_at?: string
+  completed_at?: string
+  cancelled_at?: string
 }
 
 export function useDiveControl() {
   const status = ref<DiveStatus | null>(null)
+  const mission = ref<DiveMissionState | null>(null)
   const loading = ref(false)
+  const sitlDropLoading = ref(false)
   const error = ref<string | null>(null)
 
   async function startDive(configurationName?: string, diveData?: Record<string, string>): Promise<boolean> {
@@ -824,7 +867,10 @@ export function useDiveControl() {
       if (configurationName) body.configuration = configurationName
       if (diveData) Object.assign(body, diveData)
       const result = await postApi<{ success: boolean; message: string }>('/dive/start', Object.keys(body).length > 0 ? body : undefined)
-      if (result.success) await fetchDiveStatus()
+      if (result.success) {
+        await fetchDiveStatus()
+        await fetchDiveMission()
+      }
       return result.success
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Failed to start dive'
@@ -839,13 +885,36 @@ export function useDiveControl() {
     error.value = null
     try {
       const result = await postApi<{ success: boolean; message: string }>('/dive/stop')
-      if (result.success) await fetchDiveStatus()
+      if (result.success) {
+        await fetchDiveStatus()
+        await fetchDiveMission()
+      }
       return result.success
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Failed to stop dive'
       return false
     } finally {
       loading.value = false
+    }
+  }
+
+  /** ArduSub SITL: negative buoyancy so the vehicle sinks after Load Mission (SIM_BUOYANCY). */
+  async function sitlSimulateWaterDrop(buoyancyNewtons = -19.6): Promise<boolean> {
+    sitlDropLoading.value = true
+    error.value = null
+    try {
+      const result = await postApi<{ success: boolean; message: string }>('/dive/sitl/simulate_drop', {
+        buoyancy_newtons: buoyancyNewtons,
+      })
+      if (!result.success) {
+        error.value = result.message ?? 'SITL simulate drop failed'
+      }
+      return result.success
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'SITL simulate drop failed'
+      return false
+    } finally {
+      sitlDropLoading.value = false
     }
   }
 
@@ -857,13 +926,26 @@ export function useDiveControl() {
     }
   }
 
+  async function fetchDiveMission() {
+    try {
+      const res = await fetchApi<{ mission: DiveMissionState | null }>('/dive/mission')
+      mission.value = res.mission
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to fetch dive mission'
+    }
+  }
+
   return {
     status: readonly(status),
+    mission: readonly(mission),
     loading: readonly(loading),
+    sitlDropLoading: readonly(sitlDropLoading),
     error: readonly(error),
     startDive,
     stopDive,
+    sitlSimulateWaterDrop,
     fetchDiveStatus,
+    fetchDiveMission,
   }
 }
 
