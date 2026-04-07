@@ -558,17 +558,14 @@ function update()
                 arming:arm()
                 arm_start_ms = now_ms
             else
-                if now_ms - arm_start_ms > ARM_TIMEOUT_MS then
-                    gcs:send_text(MAV_SEVERITY.ERROR,
-                        "DIVE: arm timeout, aborting")
-                    state = STATE_RECOVERY
-                else
-                    if math.fmod(now_ms - arm_start_ms, ARM_RETRY_MS)
-                       < UPDATE_INTERVAL_MS then
-                        gcs:send_text(MAV_SEVERITY.INFO,
-                            "DIVE: attempting to arm")
-                        arming:arm()
-                    end
+                if math.fmod(now_ms - arm_start_ms, ARM_RETRY_MS)
+                   < UPDATE_INTERVAL_MS then
+                    arming:arm()
+                end
+                if math.fmod(now_ms - arm_start_ms, 5000)
+                   < UPDATE_INTERVAL_MS then
+                    gcs:send_text(MAV_SEVERITY.WARNING,
+                        "DIVE: waiting for arming checks to pass")
                 end
             end
         else
