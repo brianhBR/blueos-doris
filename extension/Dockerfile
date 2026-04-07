@@ -70,7 +70,8 @@ LABEL permissions='\
       "/usr/blueos/extensions/doris/dives:/tmp/storage/dives",\
       "/usr/blueos/userdata/recorder:/tmp/storage/recorder",\
       "/usr/blueos/extensions/doris/nginx:/tmp/nginx",\
-      "/etc/avahi:/tmp/avahi"\
+      "/etc/avahi:/tmp/avahi",\
+      "/sys:/sys:rw"\
     ],\
     "ExtraHosts": [\
       "host.docker.internal:host-gateway"\
