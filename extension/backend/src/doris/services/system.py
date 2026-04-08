@@ -5,6 +5,8 @@ import math
 import os
 from pathlib import Path
 
+import httpx
+
 from ..config import blueos_services
 from ..models.system import BatteryInfo, LocationInfo, StorageInfo, SystemStatus
 from .base import BlueOSClient
@@ -128,21 +130,32 @@ class SystemService:
     async def get_storage_info(self) -> StorageInfo:
         """Get storage info for the filesystem holding dive/recorder data.
 
-        Uses os.statvfs on the recorder path so the numbers reflect the
-        actual drive (USB or SD) where large media files are stored.
+        When external storage migration is done, queries the host via
+        Commander for the actual USB drive stats — the container's bind
+        mount was resolved at creation time and may still point at the
+        SD card filesystem.  Falls back to os.statvfs inside the
+        container when Commander is unavailable.
         """
         try:
-            recorder_path = DATA_ROOT / "recorder"
-            stat_path = recorder_path if recorder_path.exists() else DATA_ROOT
-            vfs = os.statvfs(str(stat_path))
-            total = vfs.f_frsize * vfs.f_blocks
-            available = vfs.f_frsize * vfs.f_bavail
+            migration = get_migration_status()
+            is_external = migration.get("state") == "done"
+
+            host_stats = None
+            if is_external:
+                host_stats = await self._get_host_storage_stats("/mnt")
+
+            if host_stats:
+                total, available = host_stats
+            else:
+                recorder_path = DATA_ROOT / "recorder"
+                stat_path = recorder_path if recorder_path.exists() else DATA_ROOT
+                vfs = os.statvfs(str(stat_path))
+                total = vfs.f_frsize * vfs.f_blocks
+                available = vfs.f_frsize * vfs.f_bavail
+
             if total <= 0:
                 raise ValueError(f"Invalid total disk space: {total}")
             used = total - available
-
-            migration = get_migration_status()
-            is_external = migration.get("state") == "done"
 
             result = StorageInfo(
                 total_gb=total / (1024**3),
@@ -159,6 +172,29 @@ class SystemService:
                 logger.info("Using cached storage info")
                 return SystemService._last_storage
             raise
+
+    async def _get_host_storage_stats(self, mount_point: str) -> tuple[int, int] | None:
+        """Query the host for filesystem stats via Commander.
+
+        Returns (total_bytes, available_bytes) or None on failure.
+        """
+        url = f"{blueos_services.commander}/v1.0/command/host"
+        cmd = f"df -B1 --output=size,avail {mount_point} | tail -1"
+        params = {"command": cmd, "i_know_what_i_am_doing": "true"}
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, params=params)
+                resp.raise_for_status()
+                data = resp.json()
+                if data.get("return_code", -1) != 0:
+                    return None
+                stdout = data.get("stdout", "").strip("'\"").replace("\\n", "\n").strip()
+                parts = stdout.split()
+                if len(parts) >= 2:
+                    return int(parts[0]), int(parts[1])
+        except Exception as e:
+            logger.debug("Host storage stats unavailable: %s", e)
+        return None
 
     async def get_location(self) -> LocationInfo:
         """Get GPS location from MAVLink.

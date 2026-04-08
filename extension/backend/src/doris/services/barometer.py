@@ -1,103 +1,93 @@
 """Barometer and thermometer detection service.
 
-Detects connected barometer and thermometer by listening for
-SCALED_PRESSURE2 MAVLink messages via the mavlink2rest WebSocket.
-If a message arrives within the timeout, the sensors are present.
+Detects connected barometer and thermometer by reading the cached
+SCALED_PRESSURE2 MAVLink message from mavlink2rest via HTTP.
+If the message exists and has a recent update frequency, the sensors
+are present.
 
 Fields used from SCALED_PRESSURE2:
   - press_abs (hPa): absolute pressure  -> Barometer
   - temperature (cdegC): temperature     -> Thermometer
 """
 
-import asyncio
-import json
 import logging
 
-import websockets
+import httpx
 
 from ..config import blueos_services
 from ..models.sensors import ModuleInfo
 
 logger = logging.getLogger(__name__)
 
-WS_TIMEOUT = 3.0
-
-
-def _ws_url() -> str:
-    """Build the WebSocket URL filtered to SCALED_PRESSURE2."""
-    base = blueos_services.mavlink2rest
-    ws_base = base.replace("http://", "ws://").replace("https://", "wss://")
-    return f"{ws_base}/ws/mavlink?filter=SCALED_PRESSURE2"
-
-
-def _parse_message(raw: str) -> dict | None:
-    """Parse a SCALED_PRESSURE2 WebSocket message."""
-    if not raw.startswith("{"):
-        return None
-    try:
-        data = json.loads(raw)
-        msg = data.get("message", {})
-        if msg.get("type") == "SCALED_PRESSURE2":
-            return msg
-        return None
-    except (json.JSONDecodeError, TypeError):
-        return None
+MIN_FREQUENCY = 0.1
 
 
 class BarometerService:
-    """Detects barometer/thermometer via SCALED_PRESSURE2 messages."""
+    """Detects barometer/thermometer via cached SCALED_PRESSURE2 message."""
+
+    def __init__(self) -> None:
+        self._client: httpx.AsyncClient | None = None
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=5.0, follow_redirects=True)
+        return self._client
 
     async def get_modules(self) -> list[ModuleInfo]:
         """Return ModuleInfo entries for barometer and thermometer if detected."""
-        msg = await self._receive_pressure()
-        if msg is None:
+        base = blueos_services.mavlink2rest
+        url = f"{base}/mavlink/vehicles/1/components/1/messages/SCALED_PRESSURE2"
+        try:
+            resp = await self.client.get(url)
+            if resp.status_code == 404:
+                return []
+            resp.raise_for_status()
+            data = resp.json()
+
+            freq = data.get("status", {}).get("time", {}).get("frequency", 0)
+            if freq < MIN_FREQUENCY:
+                return []
+
+            msg = data.get("message", {})
+            if msg.get("type") != "SCALED_PRESSURE2":
+                return []
+
+            modules: list[ModuleInfo] = []
+
+            press_abs = msg.get("press_abs")
+            if press_abs is not None:
+                modules.append(
+                    ModuleInfo(
+                        id="barometer",
+                        name="Barometer",
+                        type="sensor",
+                        status="connected",
+                        module_status=f"Ready: {press_abs:.1f} hPa",
+                    )
+                )
+
+            temp_cdeg = msg.get("temperature")
+            if temp_cdeg is not None:
+                temp_c = temp_cdeg / 100.0
+                modules.append(
+                    ModuleInfo(
+                        id="thermometer",
+                        name="Thermometer",
+                        type="sensor",
+                        status="connected",
+                        module_status=f"Ready: {temp_c:.1f} °C",
+                    )
+                )
+
+            return modules
+        except httpx.HTTPStatusError:
+            return []
+        except Exception as e:
+            logger.warning("Failed to detect barometer/thermometer: %s", e)
             return []
 
-        modules: list[ModuleInfo] = []
-
-        press_abs = msg.get("press_abs")
-        if press_abs is not None:
-            modules.append(
-                ModuleInfo(
-                    id="barometer",
-                    name="Barometer",
-                    type="sensor",
-                    status="connected",
-                    module_status=f"Ready: {press_abs:.1f} hPa",
-                )
-            )
-
-        temp_cdeg = msg.get("temperature")
-        if temp_cdeg is not None:
-            temp_c = temp_cdeg / 100.0
-            modules.append(
-                ModuleInfo(
-                    id="thermometer",
-                    name="Thermometer",
-                    type="sensor",
-                    status="connected",
-                    module_status=f"Ready: {temp_c:.1f} °C",
-                )
-            )
-
-        return modules
-
-    async def _receive_pressure(self) -> dict | None:
-        """Connect to the WebSocket and wait for one SCALED_PRESSURE2 message."""
-        try:
-            async with websockets.connect(_ws_url(), close_timeout=2) as ws:
-                try:
-                    async with asyncio.timeout(WS_TIMEOUT):
-                        while True:
-                            raw = await ws.recv()
-                            parsed = _parse_message(raw)
-                            if parsed is not None:
-                                return parsed
-                except TimeoutError:
-                    logger.debug("No SCALED_PRESSURE2 received within timeout")
-        except Exception as e:
-            logger.warning(f"Failed to detect barometer/thermometer: {e}")
-        return None
-
     async def close(self) -> None:
-        """No persistent resources to close."""
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
