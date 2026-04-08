@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, nextTick, onMounted, onUnmounted, computed } from 'vue'
-import { Wifi, WifiOff, Upload, RefreshCw, Loader2, Camera, AlertCircle } from 'lucide-vue-next'
+import { Wifi, WifiOff, Upload, RefreshCw, Loader2, AlertCircle } from 'lucide-vue-next'
 import {
   mdiCameraOutline,
   mdiVideoOutline,
@@ -47,9 +47,53 @@ const emit = defineEmits<{
 const { modules: apiModules, loading: sensorsLoading, fetchModules } = useSensors()
 
 const modules = ref<DisplayModule[]>([])
+const selectedModule = ref<DisplayModule | null>(null)
+const isDetecting = ref(false)
+const moduleRefs = ref<Record<string, HTMLDivElement | null>>({})
 
+// ── Camera snapshot state ───────────────────────────────────────────
+const snapshotUrl = ref<string | null>(null)
+const snapshotLoading = ref(false)
+const snapshotError = ref(false)
+let snapshotInterval: number | undefined
+
+const hasConnectedCamera = computed(() =>
+  modules.value.some(m => m.type === 'camera' && m.connected)
+)
+
+async function refreshSnapshot() {
+  if (!hasConnectedCamera.value) return
+  snapshotLoading.value = !snapshotUrl.value
+  snapshotError.value = false
+  try {
+    const resp = await fetch(`/api/v1/camera/snapshot?_t=${Date.now()}`)
+    if (!resp.ok) throw new Error(resp.statusText)
+    const blob = await resp.blob()
+    if (snapshotUrl.value) URL.revokeObjectURL(snapshotUrl.value)
+    snapshotUrl.value = URL.createObjectURL(blob)
+  } catch {
+    snapshotError.value = true
+  } finally {
+    snapshotLoading.value = false
+  }
+}
+
+function startSnapshotPolling() {
+  if (snapshotInterval) { clearInterval(snapshotInterval); snapshotInterval = undefined }
+  if (hasConnectedCamera.value) {
+    snapshotLoading.value = true
+    refreshSnapshot()
+    snapshotInterval = setInterval(refreshSnapshot, 10000) as unknown as number
+  } else {
+    if (snapshotUrl.value) { URL.revokeObjectURL(snapshotUrl.value); snapshotUrl.value = null }
+    snapshotError.value = false
+  }
+}
+
+// ── Module list sync ────────────────────────────────────────────────
 watch(apiModules, (newModules) => {
   if (newModules.length > 0) {
+    const hadCamera = hasConnectedCamera.value
     modules.value = newModules.map((m: ApiSensorModule) => ({
       id: m.id,
       name: m.name,
@@ -59,8 +103,13 @@ watch(apiModules, (newModules) => {
       calibrationFile: m.firmware_version ?? undefined,
       moduleStatus: m.module_status,
     }))
+    if (!hadCamera && hasConnectedCamera.value) {
+      startSnapshotPolling()
+    }
   }
 }, { immediate: true })
+
+watch(hasConnectedCamera, startSnapshotPolling)
 
 let pollInterval: number | undefined
 
@@ -71,11 +120,9 @@ onMounted(() => {
 
 onUnmounted(() => {
   if (pollInterval) clearInterval(pollInterval)
+  if (snapshotInterval) clearInterval(snapshotInterval)
+  if (snapshotUrl.value) URL.revokeObjectURL(snapshotUrl.value)
 })
-
-const selectedModule = ref<DisplayModule | null>(null)
-const isDetecting = ref(false)
-const moduleRefs = ref<Record<string, HTMLDivElement | null>>({})
 
 const sensorMapping: Record<string, string> = {
   'Camera': 'Camera',
@@ -147,47 +194,6 @@ const getStatusColor = (moduleStatus: string) => {
   if (moduleStatus.includes('Disconnected')) return '#DD2C1D'
   return '#FCD869'
 }
-
-const snapshotUrl = ref<string | null>(null)
-const snapshotLoading = ref(false)
-const snapshotError = ref(false)
-let snapshotInterval: number | undefined
-
-const selectedIsCamera = computed(() =>
-  selectedModule.value?.type === 'camera' && selectedModule.value?.connected
-)
-
-async function refreshSnapshot() {
-  if (!selectedIsCamera.value) return
-  snapshotLoading.value = !snapshotUrl.value
-  snapshotError.value = false
-  try {
-    const resp = await fetch(`/api/v1/sensors/camera/snapshot?_t=${Date.now()}`)
-    if (!resp.ok) throw new Error(resp.statusText)
-    const blob = await resp.blob()
-    if (snapshotUrl.value) URL.revokeObjectURL(snapshotUrl.value)
-    snapshotUrl.value = URL.createObjectURL(blob)
-  } catch {
-    snapshotError.value = true
-  } finally {
-    snapshotLoading.value = false
-  }
-}
-
-watch(selectedIsCamera, (isCamera) => {
-  if (snapshotInterval) { clearInterval(snapshotInterval); snapshotInterval = undefined }
-  if (snapshotUrl.value) { URL.revokeObjectURL(snapshotUrl.value); snapshotUrl.value = null }
-  snapshotError.value = false
-  if (isCamera) {
-    refreshSnapshot()
-    snapshotInterval = setInterval(refreshSnapshot, 5000) as unknown as number
-  }
-})
-
-onUnmounted(() => {
-  if (snapshotInterval) clearInterval(snapshotInterval)
-  if (snapshotUrl.value) URL.revokeObjectURL(snapshotUrl.value)
-})
 </script>
 
 <template>
@@ -258,7 +264,7 @@ onUnmounted(() => {
       </div>
 
       <!-- Module List -->
-      <div v-else class="space-y-4">
+      <div v-if="modules.length > 0" class="space-y-4">
         <div
           v-for="mod in modules"
           :key="mod.id"
@@ -309,6 +315,45 @@ onUnmounted(() => {
                 </span>
               </div>
             </div>
+
+            <!-- Inline camera preview -->
+            <div v-if="mod.type === 'camera' && mod.connected" class="mt-3 rounded-lg overflow-hidden" style="border: 1px solid rgba(65, 185, 195, 0.2)">
+              <div
+                v-if="snapshotLoading && !snapshotUrl"
+                class="flex items-center justify-center py-10"
+                style="color: #96EEF2; background-color: rgba(0,0,0,0.3)"
+              >
+                <Loader2 class="w-5 h-5 animate-spin mr-2" />
+                <span class="text-xs">Connecting to camera...</span>
+              </div>
+
+              <div
+                v-else-if="snapshotError && !snapshotUrl"
+                class="flex items-center justify-center gap-2 py-6"
+                style="background-color: rgba(0,0,0,0.3)"
+              >
+                <AlertCircle class="w-4 h-4" style="color: rgba(150, 238, 242, 0.4)" />
+                <span class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Preview unavailable</span>
+                <button
+                  @click.stop="refreshSnapshot"
+                  class="text-xs px-2 py-0.5 rounded hover:opacity-80"
+                  style="background-color: rgba(65, 185, 195, 0.2); color: #96EEF2; border: 1px solid rgba(65, 185, 195, 0.3)"
+                >Retry</button>
+              </div>
+
+              <div v-else-if="snapshotUrl" style="background-color: #000">
+                <img
+                  :src="snapshotUrl"
+                  alt="Camera preview"
+                  class="w-full object-contain"
+                  style="max-height: 300px"
+                />
+                <div class="flex items-center justify-end gap-1 px-2 py-1" style="background-color: rgba(14, 36, 70, 0.8)">
+                  <span class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Snapshot updates every 10s</span>
+                </div>
+              </div>
+
+            </div>
           </div>
 
           <!-- Expanded Configuration -->
@@ -350,58 +395,8 @@ onUnmounted(() => {
 
             <!-- Camera type config -->
             <div v-if="selectedModule.type === 'camera'" class="space-y-4">
-              <!-- Live snapshot preview -->
-              <div
-                class="rounded-lg overflow-hidden border"
-                style="border-color: rgba(65, 185, 195, 0.3); background-color: rgba(14, 36, 70, 0.5)"
-              >
-                <div class="flex items-center gap-2 px-3 py-2" style="border-bottom: 1px solid rgba(65, 185, 195, 0.2)">
-                  <Camera class="w-4 h-4" style="color: #96EEF2" />
-                  <span class="text-sm font-medium" style="color: #96EEF2">Live Preview</span>
-                  <span
-                    v-if="snapshotUrl && !snapshotError"
-                    class="ml-auto text-xs px-1.5 py-0.5 rounded"
-                    style="background-color: rgba(252, 216, 105, 0.2); color: #FCD869"
-                  >Live</span>
-                </div>
-
-                <div
-                  v-if="snapshotLoading && !snapshotUrl"
-                  class="flex items-center justify-center py-16"
-                  style="color: #96EEF2"
-                >
-                  <Loader2 class="w-6 h-6 animate-spin mr-2" />
-                  <span class="text-sm">Loading camera preview…</span>
-                </div>
-
-                <div
-                  v-else-if="snapshotError && !snapshotUrl"
-                  class="flex flex-col items-center justify-center py-12 gap-2"
-                >
-                  <AlertCircle class="w-8 h-8" style="color: rgba(150, 238, 242, 0.4)" />
-                  <p class="text-sm" style="color: rgba(150, 238, 242, 0.6)">
-                    Camera preview unavailable
-                  </p>
-                  <button
-                    @click="refreshSnapshot"
-                    class="text-xs px-3 py-1 rounded transition-all hover:opacity-80"
-                    style="background-color: rgba(65, 185, 195, 0.2); color: #96EEF2; border: 1px solid rgba(65, 185, 195, 0.3)"
-                  >
-                    Retry
-                  </button>
-                </div>
-
-                <img
-                  v-else-if="snapshotUrl"
-                  :src="snapshotUrl"
-                  alt="Camera preview"
-                  class="w-full object-contain"
-                  style="max-height: 320px; background-color: #000"
-                />
-              </div>
-
               <p class="text-sm" style="color: rgba(150, 238, 242, 0.6)">
-                Snapshot refreshes every 5 seconds. Camera-specific settings are available in the Configuration section.
+                Camera-specific settings are available in the Configuration section.
               </p>
               <button
                 @click="emit('navigate', 'dives')"

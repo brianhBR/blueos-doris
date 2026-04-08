@@ -125,32 +125,132 @@ class CameraService:
         return None
 
     async def get_snapshot(self, source: str | None = None) -> bytes | None:
-        """Grab a single JPEG frame from the Camera Manager's thumbnail endpoint.
+        """Grab a single JPEG frame from the camera.
 
-        Camera Manager exposes GET /thumbnail?source=<device>&quality=70 which
-        returns a JPEG snapshot from the first available video source when
-        ``source`` is omitted.
+        Tries (in order):
+        1. MCM /thumbnail (works for v4l2/USB cameras)
+        2. Direct HTTP snapshot from the IP camera (for RTSP/ONVIF cameras)
         """
         import httpx as _httpx
+        import logging as _logging
+        import re as _re
+        _logger = _logging.getLogger(__name__)
 
         params: dict[str, str] = {"quality": "70"}
         if source:
             params["source"] = source
+
+        # 1. Try MCM thumbnail endpoint (v4l2 cameras)
+        for path in ("/thumbnail", "/snapshot"):
+            try:
+                resp = await self.camera_manager.client.get(path, params=params)
+                if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
+                    return resp.content
+            except Exception:
+                pass
+
+        # 2. For RTSP/ONVIF cameras: discover the camera IP from MCM streams
+        #    and try common HTTP snapshot URLs on the camera itself.
+        camera_ips: list[str] = []
         try:
-            resp = await self.camera_manager.client.get("/thumbnail", params=params)
-            if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
-                return resp.content
+            streams = await self.camera_manager.client.get("/streams")
+            if streams.status_code == 200:
+                data = streams.json()
+                items = [data] if isinstance(data, dict) else (data if isinstance(data, list) else [])
+                for item in items:
+                    vs = item.get("video_and_stream", {}).get("video_source", {})
+                    onvif = vs.get("Onvif", {})
+                    src = onvif.get("source", {})
+                    rtsp_url = src.get("Onvif") or src.get("rtsp") or ""
+                    m = _re.search(r"//(\d+\.\d+\.\d+\.\d+)", rtsp_url)
+                    if m:
+                        camera_ips.append(m.group(1))
+        except Exception as e:
+            _logger.debug("Could not discover camera IPs from MCM: %s", e)
+
+        snapshot_paths = [
+            "/cgi-bin/snapshot.cgi",
+            "/webcapture.jpg?command=snap&channel=0",
+            "/ISAPI/Streaming/channels/101/picture",
+            "/onvif-http/snapshot",
+            "/snapshot.jpg",
+            "/shot.jpg",
+            "/snap.jpg",
+        ]
+        for ip in camera_ips:
+            for spath in snapshot_paths:
+                try:
+                    async with _httpx.AsyncClient(timeout=3.0) as client:
+                        resp = await client.get(f"http://{ip}{spath}")
+                    if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
+                        _logger.info("Camera snapshot from http://%s%s", ip, spath)
+                        return resp.content
+                except Exception:
+                    continue
+
+        # 3. Last resort: grab a single frame from the RTSP stream via ffmpeg
+        rtsp_urls = await self._discover_rtsp_urls()
+        for url in rtsp_urls:
+            frame = await self._ffmpeg_snapshot(url)
+            if frame:
+                return frame
+
+        return None
+
+    async def _discover_rtsp_urls(self) -> list[str]:
+        """Get RTSP source URLs from the MCM streams endpoint, preferring lower-res."""
+        import re as _re
+        urls: list[str] = []
+        try:
+            streams = await self.camera_manager.client.get("/streams")
+            if streams.status_code != 200:
+                return urls
+            data = streams.json()
+            items = [data] if isinstance(data, dict) else (data if isinstance(data, list) else [])
+            for item in items:
+                vs = item.get("video_and_stream", {}).get("video_source", {})
+                onvif = vs.get("Onvif", {})
+                src = onvif.get("source", {})
+                rtsp_url = src.get("Onvif") or src.get("rtsp") or ""
+                if rtsp_url:
+                    urls.append(rtsp_url)
+                    # Also add the alternate stream (stream_0 <-> stream_1)
+                    if "stream_0" in rtsp_url:
+                        urls.append(rtsp_url.replace("stream_0", "stream_1"))
+                    elif "stream_1" in rtsp_url:
+                        urls.append(rtsp_url.replace("stream_1", "stream_0"))
         except Exception:
             pass
+        # Prefer higher-resolution stream_0, scaled down by ffmpeg for preview
+        urls.sort(key=lambda u: (0 if "stream_0" in u else 1, u))
+        return urls
 
-        # Fallback: try the /snapshot endpoint (some MCM builds use this)
+    @staticmethod
+    async def _ffmpeg_snapshot(rtsp_url: str) -> bytes | None:
+        """Grab one JPEG frame from an RTSP URL using ffmpeg."""
+        import asyncio as _asyncio
+        import logging as _logging
+        _logger = _logging.getLogger(__name__)
         try:
-            resp = await self.camera_manager.client.get("/snapshot", params=params)
-            if resp.status_code == 200 and resp.headers.get("content-type", "").startswith("image"):
-                return resp.content
-        except Exception:
-            pass
-
+            proc = await _asyncio.create_subprocess_exec(
+                "ffmpeg", "-rtsp_transport", "tcp",
+                "-i", rtsp_url,
+                "-frames:v", "1",
+                "-vf", "scale=1280:-1",
+                "-q:v", "2",
+                "-f", "image2", "pipe:1",
+                stdout=_asyncio.subprocess.PIPE,
+                stderr=_asyncio.subprocess.PIPE,
+            )
+            stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=8.0)
+            if proc.returncode == 0 and stdout:
+                _logger.info("Camera snapshot via ffmpeg from %s (%d bytes)", rtsp_url, len(stdout))
+                return stdout
+            _logger.debug("ffmpeg failed (rc=%s): %s", proc.returncode, stderr[:200] if stderr else "")
+        except FileNotFoundError:
+            _logger.debug("ffmpeg not installed, skipping RTSP snapshot")
+        except Exception as e:
+            _logger.debug("ffmpeg snapshot error: %s", e)
         return None
 
     async def close(self) -> None:
