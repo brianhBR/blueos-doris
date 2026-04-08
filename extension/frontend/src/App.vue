@@ -22,8 +22,9 @@ const previousScreen = ref<Screen>('media')
 const isConnected = ref(false)
 const targetSensor = ref<string | null>(null)
 
-const { status: diveStatus, fetchDiveStatus } = useDiveControl()
+const { status: diveStatus, mission: diveMission, fetchDiveStatus, fetchDiveMission } = useDiveControl()
 const isDiveActive = computed(() => diveStatus.value?.active === true)
+const activeConfigName = computed(() => diveMission.value?.configuration_name?.trim() || '')
 
 const { unreadCount: notificationCount, fetchUnreadCount } = useNotifications()
 const { status: migrationStatus, isActive: migrationActive, isError: migrationError, fetchMigrationStatus } = useStorageMigration()
@@ -33,9 +34,10 @@ let notifPolling: number | undefined
 let migrationPolling: number | undefined
 onMounted(() => {
   fetchDiveStatus()
+  fetchDiveMission()
   fetchUnreadCount()
   fetchMigrationStatus()
-  divePolling = setInterval(fetchDiveStatus, 5000) as unknown as number
+  divePolling = setInterval(() => { fetchDiveStatus(); fetchDiveMission() }, 5000) as unknown as number
   notifPolling = setInterval(fetchUnreadCount, 15000) as unknown as number
   migrationPolling = setInterval(fetchMigrationStatus, 3000) as unknown as number
 })
@@ -86,7 +88,7 @@ const setConnected = (connected: boolean) => {
       class="w-full py-3 px-4 text-white text-center font-semibold"
       style="background-color: #DD2C1D; font-family: Montserrat, sans-serif"
     >
-      Active Dive
+      Active Dive<span v-if="activeConfigName"> — {{ activeConfigName }}</span>
     </div>
 
     <div
