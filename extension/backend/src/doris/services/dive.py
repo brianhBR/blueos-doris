@@ -180,6 +180,10 @@ class DiveService:
             return True
         return False
 
+    def _is_completed(self, state_int: int | None) -> bool:
+        """A dive is completed only when the Lua state machine reaches RECOVERY (4)."""
+        return state_int is not None and state_int == 4
+
     async def get_status(self) -> dict:
         """Read DORIS_START and DORIS_STATE from the PARAM_VALUE cache."""
         try:
@@ -195,6 +199,7 @@ class DiveService:
                 "param": PARAM_NAME,
                 "value": value,
                 "active": active,
+                "completed": self._is_completed(state_int),
                 "doris_script_state": state_int,
                 "doris_script_state_name": _DORIS_STATE_NAMES.get(state_int, None)
                 if state_int is not None
@@ -207,6 +212,7 @@ class DiveService:
                 "param": PARAM_NAME,
                 "value": self._last_known_value,
                 "active": self._is_active(self._last_known_value, None),
+                "completed": False,
                 "doris_script_state": None,
                 "doris_script_state_name": None,
             }
