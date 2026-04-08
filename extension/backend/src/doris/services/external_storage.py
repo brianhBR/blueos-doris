@@ -174,7 +174,7 @@ async def _do_setup() -> None:
         #  - handles a pre-existing destination directory correctly
         logger.info("Syncing %s → %s", RECORDER_SRC, RECORDER_DST)
         ok, err = await _run_host_command(
-            f"sudo rsync -a --no-perms --no-owner --no-group "
+            f"sudo rsync -a --no-perms --no-owner --no-group --no-links "
             f"{RECORDER_SRC}/ {RECORDER_DST}/",
             timeout=1800.0,
         )
