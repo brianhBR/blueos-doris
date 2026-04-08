@@ -1,24 +1,25 @@
 """Light detection service.
 
 Detects configured lights by reading SERVOx_FUNCTION MAVLink parameters
-via mavlink2rest WebSocket. Uses the ``?filter=PARAM_VALUE`` query to
-receive only PARAM_VALUE messages, avoiding polling and HTTP round-trips.
+via mavlink2rest HTTP API.  Sends individual PARAM_REQUEST_READ messages
+and polls the cached PARAM_VALUE response, using the message counter to
+detect when a fresh reply arrives.
 
-Reference: BlueOS GenericViewer.vue light detection logic.
+Falls back gracefully when the autopilot doesn't respond within the
+timeout — lights simply won't appear in the module list.
 """
 
 import asyncio
-import json
 import logging
 
-import websockets
+import httpx
 
 from ..config import blueos_services
 from ..models.sensors import ModuleInfo
 
 logger = logging.getLogger(__name__)
 
-SERVO_FUNCTION_RCIN9 = 181  # Lights 1
+SERVO_FUNCTION_RCIN9 = 181   # Lights 1
 SERVO_FUNCTION_RCIN10 = 182  # Lights 2
 
 LIGHT_FUNCTIONS: dict[int, str] = {
@@ -27,54 +28,29 @@ LIGHT_FUNCTIONS: dict[int, str] = {
 }
 
 MAX_SERVO_CHANNELS = 16
-WS_TIMEOUT = 5.0
-
-
-def _mavlink2rest_ws_url() -> str:
-    """Build the WebSocket URL for mavlink2rest with PARAM_VALUE filter."""
-    base = blueos_services.mavlink2rest
-    ws_base = base.replace("http://", "ws://").replace("https://", "wss://")
-    return f"{ws_base}/ws/mavlink?filter=PARAM_VALUE"
-
-
-def _build_param_request(param_name: str) -> str:
-    """Build a PARAM_REQUEST_READ MAVLink message as JSON."""
-    return json.dumps({
-        "header": {"system_id": 255, "component_id": 0, "sequence": 0},
-        "message": {
-            "type": "PARAM_REQUEST_READ",
-            "target_system": 1,
-            "target_component": 1,
-            "param_id": list(param_name.ljust(16, "\x00")),
-            "param_index": -1,
-        },
-    })
-
-
-def _parse_param_value(raw: str) -> tuple[str, float] | None:
-    """Extract (param_name, value) from a PARAM_VALUE WebSocket message."""
-    if not raw.startswith("{"):
-        return None
-    try:
-        data = json.loads(raw)
-        message = data.get("message", {})
-        if message.get("type") != "PARAM_VALUE":
-            return None
-        param_id = "".join(c for c in message.get("param_id", []) if c != "\x00")
-        return (param_id, message.get("param_value"))
-    except (json.JSONDecodeError, TypeError):
-        return None
+PARAM_POLL_INTERVAL = 0.05
+PARAM_POLL_TIMEOUT = 0.4
+OVERALL_TIMEOUT = 8.0
 
 
 class LightService:
-    """Detects light modules by querying MAVLink servo parameters over WebSocket."""
+    """Detects light modules by querying MAVLink servo parameters over HTTP."""
+
+    def __init__(self) -> None:
+        self._client: httpx.AsyncClient | None = None
+
+    @property
+    def client(self) -> httpx.AsyncClient:
+        if self._client is None or self._client.is_closed:
+            self._client = httpx.AsyncClient(timeout=5.0, follow_redirects=True)
+        return self._client
 
     async def get_light_modules(self) -> list[ModuleInfo]:
         """Return a ModuleInfo for each detected light output."""
         try:
             param_values = await self._fetch_servo_params()
         except Exception as e:
-            logger.warning(f"Failed to detect lights: {e}")
+            logger.warning("Failed to detect lights: %s", e)
             return []
 
         modules: list[ModuleInfo] = []
@@ -98,32 +74,90 @@ class LightService:
         return modules
 
     async def _fetch_servo_params(self) -> dict[str, float]:
-        """Open a WebSocket, request all SERVOx_FUNCTION params, collect responses."""
-        ws_url = _mavlink2rest_ws_url()
-        expected: set[str] = {f"SERVO{ch}_FUNCTION" for ch in range(1, MAX_SERVO_CHANNELS + 1)}
+        """Request all SERVOx_FUNCTION params via HTTP, one at a time."""
+        base = blueos_services.mavlink2rest
+        cache_url = f"{base}/mavlink/vehicles/1/components/1/messages/PARAM_VALUE"
+        post_url = f"{base}/mavlink"
         results: dict[str, float] = {}
 
-        async with websockets.connect(ws_url, close_timeout=2) as ws:
-            for param_name in sorted(expected):
-                await ws.send(_build_param_request(param_name))
+        baseline_counter = await self._get_param_counter(cache_url)
 
-            try:
-                async with asyncio.timeout(WS_TIMEOUT):
-                    while len(results) < len(expected):
-                        raw = await ws.recv()
-                        parsed = _parse_param_value(raw)
-                        if parsed is None:
-                            continue
-                        name, value = parsed
-                        if name in expected:
-                            results[name] = value
-            except TimeoutError:
-                logger.debug(
-                    f"WebSocket timeout after {WS_TIMEOUT}s, "
-                    f"received {len(results)}/{len(expected)} params"
-                )
+        try:
+            async with asyncio.timeout(OVERALL_TIMEOUT):
+                for ch in range(1, MAX_SERVO_CHANNELS + 1):
+                    param_name = f"SERVO{ch}_FUNCTION"
+                    result = await self._request_single_param(
+                        param_name, post_url, cache_url, baseline_counter
+                    )
+                    if result is not None:
+                        name, value = result
+                        results[name] = value
+                        baseline_counter += 1
+        except TimeoutError:
+            logger.debug(
+                "Light param fetch timed out after %.0fs, got %d/%d",
+                OVERALL_TIMEOUT, len(results), MAX_SERVO_CHANNELS,
+            )
 
         return results
 
+    async def _request_single_param(
+        self,
+        param_name: str,
+        post_url: str,
+        cache_url: str,
+        baseline_counter: int,
+    ) -> tuple[str, float] | None:
+        """Send PARAM_REQUEST_READ and poll for the response."""
+        payload = {
+            "header": {"system_id": 255, "component_id": 0, "sequence": 0},
+            "message": {
+                "type": "PARAM_REQUEST_READ",
+                "target_system": 1,
+                "target_component": 1,
+                "param_id": list(param_name.ljust(16, "\x00")),
+                "param_index": -1,
+            },
+        }
+        try:
+            await self.client.post(post_url, json=payload)
+        except Exception as e:
+            logger.debug("Failed to send PARAM_REQUEST_READ for %s: %s", param_name, e)
+            return None
+
+        elapsed = 0.0
+        while elapsed < PARAM_POLL_TIMEOUT:
+            await asyncio.sleep(PARAM_POLL_INTERVAL)
+            elapsed += PARAM_POLL_INTERVAL
+            try:
+                resp = await self.client.get(cache_url)
+                if resp.status_code != 200:
+                    continue
+                data = resp.json()
+                counter = data.get("status", {}).get("time", {}).get("counter", 0)
+                if counter <= baseline_counter:
+                    continue
+                msg = data.get("message", {})
+                if msg.get("type") != "PARAM_VALUE":
+                    continue
+                pid = "".join(c for c in msg.get("param_id", []) if c != "\x00")
+                return (pid, msg.get("param_value", 0.0))
+            except Exception:
+                continue
+        return None
+
+    async def _get_param_counter(self, cache_url: str) -> int:
+        """Read the current PARAM_VALUE message counter."""
+        try:
+            resp = await self.client.get(cache_url)
+            if resp.status_code != 200:
+                return 0
+            data = resp.json()
+            return data.get("status", {}).get("time", {}).get("counter", 0)
+        except Exception:
+            return 0
+
     async def close(self) -> None:
-        """No persistent resources to close (WebSocket is per-request)."""
+        if self._client is not None and not self._client.is_closed:
+            await self._client.aclose()
+            self._client = None
