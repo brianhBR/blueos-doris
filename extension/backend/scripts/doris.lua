@@ -156,9 +156,14 @@ DORIS_STATE:set(-1)
 param:set_and_save("DISARM_DELAY", 0)
 
 -- ArduPilot arming checks: enable only checks relevant to DORIS.
--- Baro(2) + Compass(4) + GPS(8) + INS(16) + Params(32) +
--- Board voltage(128) + Logging(1024) + System(8192) + AuxAuth(131072) = 140478
-param:set_and_save("ARMING_CHECK", 140478)
+-- Baro(2) + GPS(8) + INS(16) + Params(32) +
+-- Board voltage(128) + Logging(1024) + System(8192) + AuxAuth(131072) = 140474
+param:set_and_save("ARMING_CHECK", 140474)
+
+-- EKF source: override ArduSub defaults (ExternalNav) to use GPS at the surface.
+-- FS_EKF_ACTION=0 handles the expected GPS loss once submerged.
+param:set_and_save("EK3_SRC1_POSXY", 1)  -- GPS for horizontal position
+param:set_and_save("EK3_SRC1_VELXY", 1)  -- GPS for horizontal velocity
 
 -- ArduPilot failsafe configuration: prevent autonomous disarms.
 -- DORIS operates without GPS, GCS, or pilot input underwater,
