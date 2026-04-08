@@ -2,24 +2,26 @@ name: Deploy BlueOS Extension Image
 
 on:
   push:
+    branches:
+      - master
+    tags:
+      - '*'
   pull_request:
-  # Run manually
   workflow_dispatch:
-  # NOTE: caches may be removed if not run weekly
-  #  -> may be worth scheduling for every 6 days
 
 env:
   IMAGE_NAME: doris
   IMAGE_PREFIX: blueos-
 
 jobs:
-  deploy-dockerhub:
+  deploy-docker:
     runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
     steps:
       - name: Deploy to Docker Hub
-        uses: patrickelectric/Deploy-BlueOS-Extension@improve-docker-path
+        uses: BlueOS-community/Deploy-BlueOS-Extension@main
         with:
-          docker-username: ${{ secrets.DOCKER_USERNAME }}
+          docker-username: sailorman225
           docker-password: ${{ secrets.DOCKER_PASSWORD }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           image-name: ${{ env.IMAGE_NAME }}
