@@ -41,7 +41,7 @@ def register_sensor_routes(app: Robyn) -> None:
                 headers={"Content-Type": "application/json"},
             )
 
-    @app.get("/api/v1/sensors/camera/snapshot")
+    @app.get("/api/v1/camera/snapshot")
     async def camera_snapshot(request):
         """Proxy a JPEG snapshot from the Camera Manager for the sensor page preview."""
         source = request.query_params.get("source", None)
