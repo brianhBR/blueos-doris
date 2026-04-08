@@ -65,6 +65,22 @@ def register_sensor_routes(app: Robyn) -> None:
             },
         )
 
+    @app.post("/api/v1/lights/brightness")
+    async def set_light_brightness(request):
+        """Set light brightness (0-100). Used for momentary test button."""
+        try:
+            data = json.loads(request.body)
+            brightness = max(0, min(100, int(data.get("brightness", 0))))
+            ok = await camera_service.set_light_brightness(brightness)
+            return json.dumps({"success": ok, "brightness": brightness})
+        except Exception as e:
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+
+
     @app.get("/api/v1/sensors/:sensor_id/readings")
     async def get_sensor_readings(request):
         """Get recent readings from a specific sensor."""

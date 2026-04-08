@@ -90,6 +90,35 @@ function startSnapshotPolling() {
   }
 }
 
+// ── Light test button ───────────────────────────────────────────────
+const lightTestActive = ref(false)
+let lightKeepAlive: number | undefined
+
+async function setLightBrightness(brightness: number) {
+  try {
+    await fetch('/api/v1/lights/brightness', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ brightness }),
+    })
+  } catch { /* best effort */ }
+}
+
+function lightTestOn() {
+  if (lightTestActive.value) return
+  lightTestActive.value = true
+  setLightBrightness(10)
+  lightKeepAlive = setInterval(() => setLightBrightness(10), 1500) as unknown as number
+}
+
+function lightTestOff() {
+  if (!lightTestActive.value) return
+  lightTestActive.value = false
+  if (lightKeepAlive) { clearInterval(lightKeepAlive); lightKeepAlive = undefined }
+  setLightBrightness(0)
+  setTimeout(() => setLightBrightness(0), 300)
+}
+
 // ── Module list sync ────────────────────────────────────────────────
 watch(apiModules, (newModules) => {
   if (newModules.length > 0) {
@@ -121,6 +150,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (pollInterval) clearInterval(pollInterval)
   if (snapshotInterval) clearInterval(snapshotInterval)
+  if (lightKeepAlive) clearInterval(lightKeepAlive)
   if (snapshotUrl.value) URL.revokeObjectURL(snapshotUrl.value)
 })
 
@@ -353,6 +383,29 @@ const getStatusColor = (moduleStatus: string) => {
                 </div>
               </div>
 
+            </div>
+
+            <!-- Inline light test button -->
+            <div v-if="mod.type === 'light' && mod.connected" class="mt-3">
+              <button
+                class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm transition-all select-none"
+                :style="{
+                  backgroundColor: lightTestActive ? 'rgba(252, 216, 105, 0.3)' : 'rgba(14, 36, 70, 0.5)',
+                  border: lightTestActive ? '1px solid #FCD869' : '1px solid rgba(65, 185, 195, 0.2)',
+                  color: lightTestActive ? '#FCD869' : '#96EEF2',
+                }"
+                @mousedown.prevent="lightTestOn"
+                @mouseup.prevent="lightTestOff"
+                @mouseleave="lightTestOff"
+                @touchstart.prevent="lightTestOn"
+                @touchend.prevent="lightTestOff"
+                @touchcancel="lightTestOff"
+              >
+                <svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                  <path :d="mdiLightbulbOnOutline" />
+                </svg>
+                {{ lightTestActive ? 'Light ON (10%)' : 'Hold to Test Light' }}
+              </button>
             </div>
           </div>
 

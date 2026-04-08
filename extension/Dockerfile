@@ -8,7 +8,7 @@ WORKDIR /frontend
 
 # Install dependencies (increased timeout for slow ARM emulation)
 COPY frontend/package.json frontend/yarn.lock ./
-RUN yarn config set network-timeout 600000 && yarn install --frozen-lockfile
+RUN yarn config set network-timeout 600000 && yarn install
 
 # Copy source and build
 COPY frontend/ ./
