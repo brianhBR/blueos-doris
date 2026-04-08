@@ -237,7 +237,50 @@ async def _do_setup() -> None:
     else:
         logger.info("%s already mounted", MOUNT_POINT)
 
-    ok, err = await _run_host_command(f"sudo mkdir -p {MOUNT_POINT}/recorder")
+    # ── Already done? ────────────────────────────────────────────────
+    ok, _ = await _run_host_command(f"test -L {RECORDER_SRC}")
+    if ok:
+        logger.info("%s is already a symlink, nothing to do", RECORDER_SRC)
+        _status = MigrationStatus(MigrationState.DONE, "Already migrated")
+        return
+
+    # ── Copy data ────────────────────────────────────────────────────
+    ok, _ = await _run_host_command(f"test -d {RECORDER_SRC}")
+    if ok:
+        _status = MigrationStatus(
+            MigrationState.MIGRATING,
+            "Copying recorder data to external drive — this may take several minutes",
+        )
+        logger.info("Syncing %s → %s", RECORDER_SRC, RECORDER_DST)
+        ok, err = await _run_host_command(
+            f"sudo rsync -a --no-perms --no-owner --no-group --no-links "
+            f"{RECORDER_SRC}/ {RECORDER_DST}/",
+            timeout=1800.0,
+        )
+        if not ok:
+            logger.error("rsync failed: %s", err)
+            _status = MigrationStatus(MigrationState.ERROR, error=f"Copy failed: {err}")
+            return
+
+        ok, err = await _run_host_command(
+            f"sudo rm -rf {RECORDER_SRC}",
+            timeout=120.0,
+        )
+        if not ok:
+            logger.error("Failed to remove source: %s", err)
+            _status = MigrationStatus(MigrationState.ERROR, error=f"Remove source failed: {err}")
+            return
+    else:
+        ok, _ = await _run_host_command(f"sudo mkdir -p {RECORDER_DST}")
+        if not ok:
+            logger.error("Failed to create %s", RECORDER_DST)
+            _status = MigrationStatus(MigrationState.ERROR, error=f"Failed to create {RECORDER_DST}")
+            return
+
+    # ── Symlink ──────────────────────────────────────────────────────
+    _status = MigrationStatus(MigrationState.LINKING, "Creating symlink")
+
+    ok, err = await _run_host_command(f"sudo ln -sf {RECORDER_DST} {RECORDER_SRC}")
     if not ok:
         logger.error("Failed to create recorder dir on drive: %s", err)
         _status = MigrationStatus(MigrationState.ERROR, error=f"mkdir failed: {err}")
