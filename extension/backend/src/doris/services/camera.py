@@ -1,7 +1,11 @@
 """Camera service."""
 
+import logging
+
 from ..config import blueos_services
 from .base import BlueOSClient
+
+logger = logging.getLogger(__name__)
 
 
 class CameraSettings:
@@ -93,24 +97,34 @@ class CameraService:
             return None
 
     async def set_light_brightness(self, brightness: int) -> bool:
-        """Set light brightness (0-100)."""
-        try:
-            # Lights are typically controlled via MAVLink servo/RC override
-            # This maps 0-100% to PWM values (typically 1100-1900)
-            pwm = 1100 + (brightness / 100) * 800
+        """Set light brightness (0-100) via DORIS_LGT_TST parameter.
 
-            await self.mavlink2rest.post(
-                "/mavlink",
-                json={
-                    "header": {"system_id": 255, "component_id": 0},
-                    "message": {
-                        "type": "RC_CHANNELS_OVERRIDE",
-                        "chan9_raw": int(pwm),  # Light channel
-                    },
+        The Lua script checks this parameter each cycle and drives
+        RC9 (Lights 1) directly via set_override, which works even
+        when disarmed.  Setting to 0 turns off the test.
+        """
+        try:
+            url = f"{self.mavlink2rest.base_url}/mavlink"
+            payload = {
+                "header": {"system_id": 255, "component_id": 0, "sequence": 0},
+                "message": {
+                    "type": "PARAM_SET",
+                    "target_system": 1,
+                    "target_component": 1,
+                    "param_id": list("DORIS_LGT_TST".ljust(16, "\x00")),
+                    "param_value": float(brightness),
+                    "param_type": {"type": "MAV_PARAM_TYPE_REAL32"},
                 },
-            )
+            }
+            logger.info("Light PARAM_SET: url=%s brightness=%s", url, brightness)
+            import httpx
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(url, json=payload)
+            logger.info("Light PARAM_SET response: status=%s body=%r", resp.status_code, resp.text[:200])
+            resp.raise_for_status()
             return True
-        except Exception:
+        except Exception as e:
+            logger.error("Light PARAM_SET failed: %s", e)
             return False
 
     async def get_stream_url(self, camera_id: str = "default") -> str | None:

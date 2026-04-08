@@ -96,7 +96,7 @@ local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 local PARAM_TABLE_KEY  = 73
-local PARAM_TABLE_SIZE = 21
+local PARAM_TABLE_SIZE = 22
 
 assert(param:add_table(PARAM_TABLE_KEY, "DORIS_", PARAM_TABLE_SIZE),
        "DIVE: could not add DORIS_ param table")
@@ -124,6 +124,7 @@ assert(param:add_param(PARAM_TABLE_KEY, 18, "MIN_VOLT", 14.0), "DORIS_MIN_VOLT")
 assert(param:add_param(PARAM_TABLE_KEY, 19, "RELAY_CH", 0),    "DORIS_RELAY_CH")
 assert(param:add_param(PARAM_TABLE_KEY, 20, "INJ_LEAK", 0),    "DORIS_INJ_LEAK")
 assert(param:add_param(PARAM_TABLE_KEY, 21, "MAX_DPTH", 6100), "DORIS_MAX_DPTH")
+assert(param:add_param(PARAM_TABLE_KEY, 22, "LGT_TST", 0),    "DORIS_LGT_TST")
 
 local DORIS_START    = Parameter("DORIS_START")
 local DORIS_RLS_SEC  = Parameter("DORIS_RLS_SEC")
@@ -146,6 +147,7 @@ local DORIS_MIN_VOLT = Parameter("DORIS_MIN_VOLT")
 local DORIS_RELAY_CH = Parameter("DORIS_RELAY_CH")
 local DORIS_INJ_LEAK = Parameter("DORIS_INJ_LEAK")
 local DORIS_MAX_DPTH = Parameter("DORIS_MAX_DPTH")
+local DORIS_LGT_TST = Parameter("DORIS_LGT_TST")
 
 -- DORIS_START persists in EEPROM across reboots.
 -- Cleared only in RECOVERY after a mission completes.
@@ -232,6 +234,10 @@ local leak_detected = false
 -- light interval state
 local light_on       = true
 local light_cycle_ms = 0
+
+-- light test state (auto-clears after timeout)
+local lgt_tst_start_ms = 0
+local LGT_TST_TIMEOUT  = 3000
 
 -- snapshotted config (read once at CONFIG -> MISSION_START)
 local cfg_rls_sec_ms  = 60000
@@ -481,6 +487,26 @@ function update()
     -- read battery voltage each cycle for pre-arm and telemetry
     local v = battery:voltage(0)
     if v then batt_voltage = v end
+
+    -- light test: when DORIS_LGT_TST > 0, override lights to that % brightness.
+    -- Auto-clears after LGT_TST_TIMEOUT ms so lights don't stay stuck on
+    -- if the "off" PARAM_SET is lost.
+    local lgt_tst = DORIS_LGT_TST:get() or 0
+    if lgt_tst > 0 and RC9 then
+        if lgt_tst_start_ms == 0 then
+            lgt_tst_start_ms = now_ms
+        end
+        if now_ms - lgt_tst_start_ms > LGT_TST_TIMEOUT then
+            DORIS_LGT_TST:set(0)
+            RC9:set_override(LIGHT_PWM_MIN)
+            lgt_tst_start_ms = 0
+        else
+            RC9:set_override(brightness_to_pwm(lgt_tst))
+            return update, UPDATE_INTERVAL_MS
+        end
+    else
+        lgt_tst_start_ms = 0
+    end
 
     -- keep arming gate in sync with profile validity
     update_profile_auth(arm_auth_id)
