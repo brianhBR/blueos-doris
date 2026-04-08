@@ -96,7 +96,7 @@ local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 local PARAM_TABLE_KEY  = 73
-local PARAM_TABLE_SIZE = 22
+local PARAM_TABLE_SIZE = 23
 
 assert(param:add_table(PARAM_TABLE_KEY, "DORIS_", PARAM_TABLE_SIZE),
        "DIVE: could not add DORIS_ param table")
@@ -125,6 +125,7 @@ assert(param:add_param(PARAM_TABLE_KEY, 19, "RELAY_CH", 0),    "DORIS_RELAY_CH")
 assert(param:add_param(PARAM_TABLE_KEY, 20, "INJ_LEAK", 0),    "DORIS_INJ_LEAK")
 assert(param:add_param(PARAM_TABLE_KEY, 21, "MAX_DPTH", 6100), "DORIS_MAX_DPTH")
 assert(param:add_param(PARAM_TABLE_KEY, 22, "LGT_TST", 0),    "DORIS_LGT_TST")
+assert(param:add_param(PARAM_TABLE_KEY, 23, "LOG_INTV", 1000), "DORIS_LOG_INTV")
 
 local DORIS_START    = Parameter("DORIS_START")
 local DORIS_RLS_SEC  = Parameter("DORIS_RLS_SEC")
@@ -147,7 +148,8 @@ local DORIS_MIN_VOLT = Parameter("DORIS_MIN_VOLT")
 local DORIS_RELAY_CH = Parameter("DORIS_RELAY_CH")
 local DORIS_INJ_LEAK = Parameter("DORIS_INJ_LEAK")
 local DORIS_MAX_DPTH = Parameter("DORIS_MAX_DPTH")
-local DORIS_LGT_TST = Parameter("DORIS_LGT_TST")
+local DORIS_LGT_TST  = Parameter("DORIS_LGT_TST")
+local DORIS_LOG_INTV = Parameter("DORIS_LOG_INTV")
 
 -- DORIS_START persists in EEPROM across reboots.
 -- Cleared only in RECOVERY after a mission completes.
@@ -238,6 +240,18 @@ local light_cycle_ms = 0
 -- light test state (auto-clears after timeout)
 local lgt_tst_start_ms = 0
 local LGT_TST_TIMEOUT  = 3000
+
+-- telemetry tracking (updated every cycle by update_sensors)
+local current_depth     = 0.0
+local max_depth_reached = 0.0
+local min_temperature   = 999.0
+local descent_rate      = 0.0
+local ascent_rate       = 0.0
+local batt_pct          = 0.0
+local prev_depth        = 0.0
+local prev_depth_ms     = 0
+local last_log_ms       = 0
+local RATE_FILTER_ALPHA = 0.3
 
 -- snapshotted config (read once at CONFIG -> MISSION_START)
 local cfg_rls_sec_ms  = 60000
@@ -473,6 +487,82 @@ local function snapshot_config()
     end
 end
 
+-- ── telemetry & dataflash ──────────────────────────────────────
+
+local function update_sensors(now_ms)
+    local d = get_depth_m()
+    if d then
+        current_depth = d
+        if d > max_depth_reached then
+            max_depth_reached = d
+        end
+        if prev_depth_ms > 0 then
+            local dt = (now_ms - prev_depth_ms) / 1000.0
+            if dt > 0.01 then
+                local delta = d - prev_depth
+                local rate = delta / dt
+                if rate > 0 then
+                    descent_rate = descent_rate * (1.0 - RATE_FILTER_ALPHA) + rate * RATE_FILTER_ALPHA
+                    ascent_rate  = ascent_rate  * (1.0 - RATE_FILTER_ALPHA)
+                else
+                    ascent_rate  = ascent_rate  * (1.0 - RATE_FILTER_ALPHA) + (-rate) * RATE_FILTER_ALPHA
+                    descent_rate = descent_rate * (1.0 - RATE_FILTER_ALPHA)
+                end
+            end
+        end
+        prev_depth    = d
+        prev_depth_ms = now_ms
+    end
+
+    local temp = baro:get_temperature()
+    if temp and temp < min_temperature then
+        min_temperature = temp
+    end
+
+    local pct = battery:capacity_remaining_pct(0)
+    if pct then
+        batt_pct = pct
+    end
+end
+
+local function send_telemetry()
+    local now = millis():tofloat()
+    local mission_time_s = dive_start_ms > 0
+        and (now - dive_start_ms) / 1000.0 or 0
+    local bottom_time_s = bottom_start_ms > 0
+        and (now - bottom_start_ms) / 1000.0 or 0
+
+    gcs:send_named_float('STATE',    state)
+    gcs:send_named_float('DEPTH',    current_depth)
+    gcs:send_named_float('MAX_DPTH', max_depth_reached)
+    gcs:send_named_float('MIN_TEMP', min_temperature)
+    gcs:send_named_float('DSC_RATE', descent_rate)
+    gcs:send_named_float('ASC_RATE', ascent_rate)
+    gcs:send_named_float('BTM_TIME', bottom_time_s)
+    gcs:send_named_float('BATT_V',   batt_voltage)
+    gcs:send_named_float('BATT_PCT', batt_pct)
+    gcs:send_named_float('MSN_TIME', mission_time_s)
+    gcs:send_named_float('RELAY',    relay_active and 1 or 0)
+end
+
+local function log_data(now_ms)
+    local interval = DORIS_LOG_INTV:get() or 1000
+    if now_ms - last_log_ms < interval then
+        return
+    end
+    last_log_ms = now_ms
+
+    local mission_time_s = dive_start_ms > 0
+        and (now_ms - dive_start_ms) / 1000.0 or 0
+
+    logger:write('DORS',
+        'Sta,Dep,MaxD,Tmp,DscR,AscR,BatV,BatP,Msn,Rly',
+        'ffffffffff',
+        state, current_depth, max_depth_reached, min_temperature,
+        descent_rate, ascent_rate, batt_voltage, batt_pct,
+        mission_time_s, relay_active and 1 or 0)
+end
+
 -- ?????????? main loop ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 function update()
     local now_ms = millis():tofloat()
@@ -482,11 +572,14 @@ function update()
     end
     last_update_ms = now_ms
     DORIS_STATE:set(state)
-    gcs:send_named_float("DORIS_ST", state)
 
     -- read battery voltage each cycle for pre-arm and telemetry
     local v = battery:voltage(0)
     if v then batt_voltage = v end
+
+    update_sensors(now_ms)
+    send_telemetry()
+    log_data(now_ms)
 
     -- light test: when DORIS_LGT_TST > 0, override lights to that % brightness.
     -- Auto-clears after LGT_TST_TIMEOUT ms so lights don't stay stuck on
@@ -506,6 +599,16 @@ function update()
         end
     else
         lgt_tst_start_ms = 0
+    end
+
+    -- cancel: if DORIS_START was cleared while the mission is active, abort
+    if state >= STATE_MISSION_START and state <= STATE_ASCENT then
+        if DORIS_START:get() <= 0 then
+            gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: CANCELLED by operator")
+            if RC9 then RC9:set_override(LIGHT_PWM_MIN) end
+            state = STATE_RECOVERY
+            return update, UPDATE_INTERVAL_MS
+        end
     end
 
     -- keep arming gate in sync with profile validity
@@ -546,9 +649,15 @@ function update()
                         num_sats, batt_voltage, prf_id, surface_pressure))
                 snapshot_config()
                 vehicle:set_mode(MODE_MANUAL)
-                armed_once    = false
-                recovery_done = false
-                arm_start_ms  = now_ms
+                armed_once        = false
+                recovery_done     = false
+                arm_start_ms      = now_ms
+                max_depth_reached = 0.0
+                min_temperature   = 999.0
+                descent_rate      = 0.0
+                ascent_rate       = 0.0
+                prev_depth        = 0.0
+                prev_depth_ms     = 0
                 state = STATE_MISSION_START
             else
                 if now_ms - last_prearm_log_ms > 5000 then
