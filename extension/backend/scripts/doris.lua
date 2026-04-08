@@ -149,7 +149,6 @@ local DORIS_RELAY_CH = Parameter("DORIS_RELAY_CH")
 local DORIS_INJ_LEAK = Parameter("DORIS_INJ_LEAK")
 local DORIS_MAX_DPTH = Parameter("DORIS_MAX_DPTH")
 local DORIS_LGT_TST  = Parameter("DORIS_LGT_TST")
-local DORIS_LOG_INTV = Parameter("DORIS_LOG_INTV")
 
 -- DORIS_START persists in EEPROM across reboots.
 -- Cleared only in RECOVERY after a mission completes.
@@ -242,16 +241,13 @@ local lgt_tst_start_ms = 0
 local LGT_TST_TIMEOUT  = 3000
 
 -- telemetry tracking (updated every cycle by update_sensors)
-local current_depth     = 0.0
-local max_depth_reached = 0.0
-local min_temperature   = 999.0
-local descent_rate      = 0.0
-local ascent_rate       = 0.0
-local batt_pct          = 0.0
-local prev_depth        = 0.0
-local prev_depth_ms     = 0
-local last_log_ms       = 0
-local RATE_FILTER_ALPHA = 0.3
+-- packed into a table to stay under Lua's 200-local-variable limit
+local telem = {
+    depth = 0.0, max_depth = 0.0, min_temp = 999.0,
+    dsc_rate = 0.0, asc_rate = 0.0, batt_pct = 0.0,
+    prev_depth = 0.0, prev_depth_ms = 0, last_log_ms = 0,
+    alpha = 0.3,
+}
 
 -- snapshotted config (read once at CONFIG -> MISSION_START)
 local cfg_rls_sec_ms  = 60000
@@ -487,80 +483,74 @@ local function snapshot_config()
     end
 end
 
--- ── telemetry & dataflash ──────────────────────────────────────
+-- ── telemetry & dataflash (single function to stay under Lua's 200-local limit) ──
 
-local function update_sensors(now_ms)
+local function update_telemetry(now_ms)
+    -- sensor tracking
     local d = get_depth_m()
     if d then
-        current_depth = d
-        if d > max_depth_reached then
-            max_depth_reached = d
+        telem.depth = d
+        if d > telem.max_depth then
+            telem.max_depth = d
         end
-        if prev_depth_ms > 0 then
-            local dt = (now_ms - prev_depth_ms) / 1000.0
+        if telem.prev_depth_ms > 0 then
+            local dt = (now_ms - telem.prev_depth_ms) / 1000.0
             if dt > 0.01 then
-                local delta = d - prev_depth
+                local delta = d - telem.prev_depth
                 local rate = delta / dt
+                local a = telem.alpha
                 if rate > 0 then
-                    descent_rate = descent_rate * (1.0 - RATE_FILTER_ALPHA) + rate * RATE_FILTER_ALPHA
-                    ascent_rate  = ascent_rate  * (1.0 - RATE_FILTER_ALPHA)
+                    telem.dsc_rate = telem.dsc_rate * (1.0 - a) + rate * a
+                    telem.asc_rate = telem.asc_rate * (1.0 - a)
                 else
-                    ascent_rate  = ascent_rate  * (1.0 - RATE_FILTER_ALPHA) + (-rate) * RATE_FILTER_ALPHA
-                    descent_rate = descent_rate * (1.0 - RATE_FILTER_ALPHA)
+                    telem.asc_rate = telem.asc_rate * (1.0 - a) + (-rate) * a
+                    telem.dsc_rate = telem.dsc_rate * (1.0 - a)
                 end
             end
         end
-        prev_depth    = d
-        prev_depth_ms = now_ms
+        telem.prev_depth    = d
+        telem.prev_depth_ms = now_ms
     end
 
     local temp = baro:get_temperature()
-    if temp and temp < min_temperature then
-        min_temperature = temp
+    if temp and temp < telem.min_temp then
+        telem.min_temp = temp
     end
 
     local pct = battery:capacity_remaining_pct(0)
     if pct then
-        batt_pct = pct
+        telem.batt_pct = pct
     end
-end
 
-local function send_telemetry()
-    local now = millis():tofloat()
-    local mission_time_s = dive_start_ms > 0
-        and (now - dive_start_ms) / 1000.0 or 0
-    local bottom_time_s = bottom_start_ms > 0
-        and (now - bottom_start_ms) / 1000.0 or 0
-
-    gcs:send_named_float('STATE',    state)
-    gcs:send_named_float('DEPTH',    current_depth)
-    gcs:send_named_float('MAX_DPTH', max_depth_reached)
-    gcs:send_named_float('MIN_TEMP', min_temperature)
-    gcs:send_named_float('DSC_RATE', descent_rate)
-    gcs:send_named_float('ASC_RATE', ascent_rate)
-    gcs:send_named_float('BTM_TIME', bottom_time_s)
-    gcs:send_named_float('BATT_V',   batt_voltage)
-    gcs:send_named_float('BATT_PCT', batt_pct)
-    gcs:send_named_float('MSN_TIME', mission_time_s)
-    gcs:send_named_float('RELAY',    relay_active and 1 or 0)
-end
-
-local function log_data(now_ms)
-    local interval = DORIS_LOG_INTV:get() or 1000
-    if now_ms - last_log_ms < interval then
-        return
-    end
-    last_log_ms = now_ms
-
+    -- named floats (recorded into .mcap by BlueOS recorder)
     local mission_time_s = dive_start_ms > 0
         and (now_ms - dive_start_ms) / 1000.0 or 0
+    local bottom_time_s = bottom_start_ms > 0
+        and (now_ms - bottom_start_ms) / 1000.0 or 0
 
-    logger:write('DORS',
-        'Sta,Dep,MaxD,Tmp,DscR,AscR,BatV,BatP,Msn,Rly',
-        'ffffffffff',
-        state, current_depth, max_depth_reached, min_temperature,
-        descent_rate, ascent_rate, batt_voltage, batt_pct,
-        mission_time_s, relay_active and 1 or 0)
+    gcs:send_named_float('STATE',    state)
+    gcs:send_named_float('DEPTH',    telem.depth)
+    gcs:send_named_float('MAX_DPTH', telem.max_depth)
+    gcs:send_named_float('MIN_TEMP', telem.min_temp)
+    gcs:send_named_float('DSC_RATE', telem.dsc_rate)
+    gcs:send_named_float('ASC_RATE', telem.asc_rate)
+    gcs:send_named_float('BTM_TIME', bottom_time_s)
+    gcs:send_named_float('BATT_V',   batt_voltage)
+    gcs:send_named_float('BATT_PCT', telem.batt_pct)
+    gcs:send_named_float('MSN_TIME', mission_time_s)
+    gcs:send_named_float('RELAY',    relay_active and 1 or 0)
+
+    -- dataflash logging (written to ArduPilot .bin log)
+    local interval = param:get("DORIS_LOG_INTV") or 1000
+    if now_ms - telem.last_log_ms >= interval then
+        telem.last_log_ms = now_ms
+        logger:write('DORS',
+            'Sta,Dep,MaxD,Tmp,DscR,AscR,BatV,BatP,Msn,Rly',
+            'ffffffffff',
+            state, telem.depth, telem.max_depth, telem.min_temp,
+            telem.dsc_rate, telem.asc_rate, batt_voltage, telem.batt_pct,
+            mission_time_s, relay_active and 1 or 0)
+    end
 end
 
 -- ?????????? main loop ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
@@ -577,9 +567,7 @@ function update()
     local v = battery:voltage(0)
     if v then batt_voltage = v end
 
-    update_sensors(now_ms)
-    send_telemetry()
-    log_data(now_ms)
+    update_telemetry(now_ms)
 
     -- light test: when DORIS_LGT_TST > 0, override lights to that % brightness.
     -- Auto-clears after LGT_TST_TIMEOUT ms so lights don't stay stuck on
@@ -649,15 +637,15 @@ function update()
                         num_sats, batt_voltage, prf_id, surface_pressure))
                 snapshot_config()
                 vehicle:set_mode(MODE_MANUAL)
-                armed_once        = false
-                recovery_done     = false
-                arm_start_ms      = now_ms
-                max_depth_reached = 0.0
-                min_temperature   = 999.0
-                descent_rate      = 0.0
-                ascent_rate       = 0.0
-                prev_depth        = 0.0
-                prev_depth_ms     = 0
+                armed_once          = false
+                recovery_done       = false
+                arm_start_ms        = now_ms
+                telem.max_depth     = 0.0
+                telem.min_temp      = 999.0
+                telem.dsc_rate      = 0.0
+                telem.asc_rate      = 0.0
+                telem.prev_depth    = 0.0
+                telem.prev_depth_ms = 0
                 state = STATE_MISSION_START
             else
                 if now_ms - last_prearm_log_ms > 5000 then
@@ -892,16 +880,17 @@ if not arm_auth_id then
         "DIVE: could not get aux auth ID (profile pre-arm gate disabled)")
 end
 
-local prf_id   = DORIS_PRF_ID:get() or 0
-local upl_date = DORIS_UPL_DATE:get() or 0
-local start_v  = DORIS_START:get() or 0
-if prf_id > 0 then
-    gcs:send_text(MAV_SEVERITY.INFO,
-        string.format("DIVE: script loaded, profile #%d (uploaded %d), START=%d",
-            prf_id, upl_date, start_v))
-else
-    gcs:send_text(MAV_SEVERITY.INFO,
-        string.format("DIVE: script loaded, no profile loaded, START=%d", start_v))
+do
+    local prf = DORIS_PRF_ID:get() or 0
+    if prf > 0 then
+        gcs:send_text(MAV_SEVERITY.INFO,
+            string.format("DIVE: script loaded, profile #%d (uploaded %d), START=%d",
+                prf, DORIS_UPL_DATE:get() or 0, DORIS_START:get() or 0))
+    else
+        gcs:send_text(MAV_SEVERITY.INFO,
+            string.format("DIVE: script loaded, no profile loaded, START=%d",
+                DORIS_START:get() or 0))
+    end
 end
 
 return update()
