@@ -3,6 +3,8 @@
 Detects the SparkFun Artemis Global Tracker by checking for its
 HEARTBEAT on MAVLink component 191 (MAV_COMP_ID_ONBOARD_COMPUTER).
 Reads GPS_RAW_INT from the same component for position data.
+Supports triggering an Iridium test via COMMAND_LONG and polling
+STATUSTEXT for the result.
 """
 
 import logging
@@ -17,6 +19,8 @@ logger = logging.getLogger(__name__)
 
 ARTEMIS_COMPONENT_ID = 191
 GPS_FIX_NAMES = {0: "No GPS", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed"}
+
+MAV_CMD_USER_4 = 31013
 
 
 def _m2r_base() -> str:
@@ -138,6 +142,80 @@ class ArtemisTrackerService:
         except Exception as e:
             logger.debug("No Artemis heartbeat: %s", e)
             return None
+
+    # ── Iridium test ────────────────────────────────────────────────
+
+    async def send_iridium_test(self) -> dict:
+        """Send COMMAND_LONG (MAV_CMD_USER_4) to trigger Iridium test.
+
+        Returns {"accepted": bool, "error": str|None}.
+        """
+        base = _m2r_base()
+        post_url = f"{base}/mavlink"
+        payload = {
+            "header": {"system_id": 255, "component_id": 0, "sequence": 0},
+            "message": {
+                "type": "COMMAND_LONG",
+                "target_system": 1,
+                "target_component": ARTEMIS_COMPONENT_ID,
+                "command": MAV_CMD_USER_4,
+                "confirmation": 0,
+                "param1": 0.0,
+                "param2": 0.0,
+                "param3": 0.0,
+                "param4": 0.0,
+                "param5": 0.0,
+                "param6": 0.0,
+                "param7": 0.0,
+            },
+        }
+        try:
+            resp = await self.client.post(post_url, json=payload)
+            resp.raise_for_status()
+            logger.info("Iridium test command sent to AGT")
+            return {"accepted": True, "error": None}
+        except Exception as e:
+            logger.warning("Failed to send Iridium test command: %s", e)
+            return {"accepted": False, "error": str(e)}
+
+    async def get_iridium_status(self) -> dict:
+        """Poll STATUSTEXT from the AGT for Iridium test result.
+
+        Returns {"text": str|None, "severity": int|None, "counter": int}.
+        """
+        base = _m2r_base()
+        url = f"{base}/mavlink/vehicles/1/components/{ARTEMIS_COMPONENT_ID}/messages/STATUSTEXT"
+        try:
+            resp = await self.client.get(url)
+            if resp.status_code == 404:
+                return {"text": None, "severity": None, "counter": 0}
+            resp.raise_for_status()
+            data = resp.json()
+            msg = data.get("message", {})
+            if msg.get("type") != "STATUSTEXT":
+                return {"text": None, "severity": None, "counter": 0}
+
+            raw_text = msg.get("text", "")
+            if isinstance(raw_text, list):
+                raw_text = "".join(c for c in raw_text if c != "\x00")
+            text = raw_text.strip()
+
+            severity = msg.get("severity", {})
+            if isinstance(severity, dict):
+                sev_type = severity.get("type", "")
+                sev_map = {
+                    "MAV_SEVERITY_EMERGENCY": 0, "MAV_SEVERITY_ALERT": 1,
+                    "MAV_SEVERITY_CRITICAL": 2, "MAV_SEVERITY_ERROR": 3,
+                    "MAV_SEVERITY_WARNING": 4, "MAV_SEVERITY_NOTICE": 5,
+                    "MAV_SEVERITY_INFO": 6, "MAV_SEVERITY_DEBUG": 7,
+                }
+                severity = sev_map.get(sev_type, 6)
+
+            counter = data.get("status", {}).get("time", {}).get("counter", 0)
+            return {"text": text, "severity": severity, "counter": counter}
+        except Exception as e:
+            logger.debug("Failed to read AGT STATUSTEXT: %s", e)
+            return {"text": None, "severity": None, "counter": 0}
 
     async def close(self) -> None:
         if self._client is not None and not self._client.is_closed:
