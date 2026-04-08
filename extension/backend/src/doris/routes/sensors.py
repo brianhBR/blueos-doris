@@ -7,6 +7,7 @@ from robyn import Response, Robyn
 from ..models.sensors import SensorConfig
 from ..services.camera import CameraService
 from ..services.sensors import SensorService
+from ..services.tracker import ArtemisTrackerService
 
 
 def register_sensor_routes(app: Robyn) -> None:
@@ -14,6 +15,7 @@ def register_sensor_routes(app: Robyn) -> None:
 
     sensor_service = SensorService()
     camera_service = CameraService()
+    tracker_service = ArtemisTrackerService()
 
     @app.get("/api/v1/sensors/modules")
     async def get_connected_modules(request):
@@ -80,6 +82,25 @@ def register_sensor_routes(app: Robyn) -> None:
                 headers={"Content-Type": "application/json"},
             )
 
+
+    @app.get("/api/v1/tracker/gps")
+    async def get_tracker_gps(request):
+        """Get GPS data from the Artemis Global Tracker."""
+        try:
+            gps = await tracker_service.get_gps_data()
+            if gps is None:
+                return Response(
+                    status_code=404,
+                    description=json.dumps({"error": "Tracker not connected or no GPS data"}),
+                    headers={"Content-Type": "application/json"},
+                )
+            return json.dumps(gps)
+        except Exception as e:
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
 
     @app.get("/api/v1/sensors/:sensor_id/readings")
     async def get_sensor_readings(request):
