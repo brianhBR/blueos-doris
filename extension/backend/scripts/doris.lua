@@ -103,7 +103,7 @@ assert(param:add_table(PARAM_TABLE_KEY, "DORIS_", PARAM_TABLE_SIZE),
 
 -- mission control
 assert(param:add_param(PARAM_TABLE_KEY, 1,  "START",   0),  "DORIS_START")
-assert(param:add_param(PARAM_TABLE_KEY, 2,  "RLS_SEC", 60), "DORIS_RLS_SEC")
+assert(param:add_param(PARAM_TABLE_KEY, 2,  "RLS_SEC", 2700), "DORIS_RLS_SEC")
 assert(param:add_param(PARAM_TABLE_KEY, 3,  "DSC_LGT", 0),  "DORIS_DSC_LGT")
 assert(param:add_param(PARAM_TABLE_KEY, 4,  "BTM_LGT", 0),  "DORIS_BTM_LGT")
 assert(param:add_param(PARAM_TABLE_KEY, 5,  "ASC_LGT", 0),  "DORIS_ASC_LGT")
