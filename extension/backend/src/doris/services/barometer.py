@@ -76,7 +76,7 @@ class BarometerService:
                         name="Thermometer",
                         type="sensor",
                         status="connected",
-                        module_status=f"Ready: {temp_c:.1f} °C",
+                        module_status=f"Ready: {temp_c:.1f} \u00b0C",
                     )
                 )
 
