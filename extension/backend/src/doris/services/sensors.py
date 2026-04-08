@@ -14,6 +14,7 @@ from ..models.sensors import (
 from .barometer import BarometerService
 from .base import BlueOSClient
 from .lights import LightService
+from .tracker import ArtemisTrackerService
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +27,7 @@ class SensorService:
         self.camera_manager = BlueOSClient(blueos_services.camera_manager)
         self.light_service = LightService()
         self.barometer_service = BarometerService()
+        self.tracker_service = ArtemisTrackerService()
 
     async def get_connected_modules(self) -> list[ModuleInfo]:
         """Get all connected modules."""
@@ -46,6 +48,10 @@ class SensorService:
         # Get barometer/thermometer from SCALED_PRESSURE2
         baro_modules = await self.barometer_service.get_modules()
         modules.extend(baro_modules)
+
+        # Get Artemis Global Tracker (component 191)
+        tracker_modules = await self.tracker_service.get_modules()
+        modules.extend(tracker_modules)
 
         return modules
 
@@ -184,4 +190,5 @@ class SensorService:
         await self.camera_manager.close()
         await self.light_service.close()
         await self.barometer_service.close()
+        await self.tracker_service.close()
 

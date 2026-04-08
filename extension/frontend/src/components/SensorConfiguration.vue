@@ -90,6 +90,48 @@ function startSnapshotPolling() {
   }
 }
 
+// ── Tracker GPS data ────────────────────────────────────────────────
+interface TrackerGPS {
+  fix_type: number
+  fix_type_name: string
+  lat: number
+  lon: number
+  alt_m: number
+  satellites: number
+  hdop: number | null
+  speed_mps: number
+  course_deg: number
+  last_update: string | null
+}
+
+const trackerGps = ref<TrackerGPS | null>(null)
+let trackerInterval: number | undefined
+
+async function refreshTrackerGps() {
+  try {
+    const resp = await fetch('/api/v1/tracker/gps')
+    if (resp.ok) {
+      trackerGps.value = await resp.json()
+    }
+  } catch { /* best effort */ }
+}
+
+const hasTracker = computed(() =>
+  modules.value.some(m => m.type === 'tracker' && m.connected)
+)
+
+function startTrackerPolling() {
+  if (trackerInterval) { clearInterval(trackerInterval); trackerInterval = undefined }
+  if (hasTracker.value) {
+    refreshTrackerGps()
+    trackerInterval = setInterval(refreshTrackerGps, 5000) as unknown as number
+  } else {
+    trackerGps.value = null
+  }
+}
+
+watch(hasTracker, startTrackerPolling)
+
 // ── Light test button ───────────────────────────────────────────────
 const lightTestActive = ref(false)
 let lightKeepAlive: number | undefined
@@ -150,6 +192,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (pollInterval) clearInterval(pollInterval)
   if (snapshotInterval) clearInterval(snapshotInterval)
+  if (trackerInterval) clearInterval(trackerInterval)
   if (lightKeepAlive) clearInterval(lightKeepAlive)
   if (snapshotUrl.value) URL.revokeObjectURL(snapshotUrl.value)
 })
@@ -213,6 +256,7 @@ const getModuleIcon = (mod: DisplayModule): string => {
   if (name.includes('lora')) return mdiAccessPointNetwork
   if (name.includes('ping') || name.includes('sonar')) return mdiRadar
   if (name.includes('water') || name.includes('leak')) return mdiWaterOutline
+  if (type === 'tracker') return mdiSatelliteUplink
   if (type === 'communication') return mdiAccessPointNetwork
   if (type === 'sensor') return mdiChip
 
@@ -406,6 +450,41 @@ const getStatusColor = (moduleStatus: string) => {
                 </svg>
                 {{ lightTestActive ? 'Light ON (10%)' : 'Hold to Test Light' }}
               </button>
+            </div>
+
+            <!-- Inline tracker GPS data -->
+            <div v-if="mod.type === 'tracker' && mod.connected && trackerGps" class="mt-3 rounded-lg overflow-hidden" style="border: 1px solid rgba(65, 185, 195, 0.2)">
+              <div class="grid grid-cols-2 gap-px" style="background-color: rgba(65, 185, 195, 0.1)">
+                <div class="px-3 py-2" style="background-color: rgba(14, 36, 70, 0.7)">
+                  <div class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Fix</div>
+                  <div class="text-sm font-medium" :style="{ color: trackerGps.fix_type >= 3 ? '#96EEF2' : trackerGps.fix_type >= 2 ? '#FCD869' : 'rgba(150,238,242,0.4)' }">
+                    {{ trackerGps.fix_type_name }}
+                  </div>
+                </div>
+                <div class="px-3 py-2" style="background-color: rgba(14, 36, 70, 0.7)">
+                  <div class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Satellites</div>
+                  <div class="text-sm font-medium" style="color: #96EEF2">{{ trackerGps.satellites }}</div>
+                </div>
+                <div class="px-3 py-2" style="background-color: rgba(14, 36, 70, 0.7)">
+                  <div class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Latitude</div>
+                  <div class="text-sm font-medium" style="color: #96EEF2">{{ trackerGps.fix_type >= 2 ? trackerGps.lat.toFixed(6) + '°' : '—' }}</div>
+                </div>
+                <div class="px-3 py-2" style="background-color: rgba(14, 36, 70, 0.7)">
+                  <div class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Longitude</div>
+                  <div class="text-sm font-medium" style="color: #96EEF2">{{ trackerGps.fix_type >= 2 ? trackerGps.lon.toFixed(6) + '°' : '—' }}</div>
+                </div>
+                <div class="px-3 py-2" style="background-color: rgba(14, 36, 70, 0.7)">
+                  <div class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Altitude</div>
+                  <div class="text-sm font-medium" style="color: #96EEF2">{{ trackerGps.fix_type >= 2 ? trackerGps.alt_m.toFixed(1) + ' m' : '—' }}</div>
+                </div>
+                <div class="px-3 py-2" style="background-color: rgba(14, 36, 70, 0.7)">
+                  <div class="text-xs" style="color: rgba(150, 238, 242, 0.5)">HDOP</div>
+                  <div class="text-sm font-medium" style="color: #96EEF2">{{ trackerGps.hdop != null ? trackerGps.hdop.toFixed(1) : '—' }}</div>
+                </div>
+              </div>
+              <div class="flex items-center justify-end px-2 py-1" style="background-color: rgba(14, 36, 70, 0.8)">
+                <span class="text-xs" style="color: rgba(150, 238, 242, 0.4)">Updates every 5s</span>
+              </div>
             </div>
           </div>
 
