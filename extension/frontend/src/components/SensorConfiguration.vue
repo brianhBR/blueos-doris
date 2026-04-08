@@ -132,6 +132,79 @@ function startTrackerPolling() {
 
 watch(hasTracker, startTrackerPolling)
 
+// ── Iridium test ─────────────────────────────────────────────────────
+type IridiumState = 'idle' | 'sending' | 'running' | 'passed' | 'failed'
+const iridiumState = ref<IridiumState>('idle')
+const iridiumMessage = ref('')
+let iridiumPollInterval: number | undefined
+let iridiumBaselineCounter = -1
+
+async function triggerIridiumTest() {
+  if (iridiumState.value === 'sending' || iridiumState.value === 'running') return
+  iridiumState.value = 'sending'
+  iridiumMessage.value = ''
+
+  const baseline = await fetch('/api/v1/tracker/iridium-status')
+  if (baseline.ok) {
+    const data = await baseline.json()
+    iridiumBaselineCounter = data.counter ?? 0
+  }
+
+  try {
+    const resp = await fetch('/api/v1/tracker/iridium-test', { method: 'POST' })
+    if (!resp.ok) throw new Error('Request failed')
+    const result = await resp.json()
+    if (!result.accepted) {
+      iridiumState.value = 'failed'
+      iridiumMessage.value = result.error || 'Command rejected'
+      return
+    }
+    iridiumState.value = 'running'
+    iridiumMessage.value = 'Test starting — this may take 2–10 minutes…'
+    startIridiumPolling()
+  } catch {
+    iridiumState.value = 'failed'
+    iridiumMessage.value = 'Failed to send command'
+  }
+}
+
+function startIridiumPolling() {
+  stopIridiumPolling()
+  iridiumPollInterval = setInterval(pollIridiumStatus, 3000) as unknown as number
+}
+
+function stopIridiumPolling() {
+  if (iridiumPollInterval) { clearInterval(iridiumPollInterval); iridiumPollInterval = undefined }
+}
+
+async function pollIridiumStatus() {
+  try {
+    const resp = await fetch('/api/v1/tracker/iridium-status')
+    if (!resp.ok) return
+    const data = await resp.json()
+    if (!data.text || data.counter <= iridiumBaselineCounter) return
+
+    const text: string = data.text
+    if (text.includes('PASSED')) {
+      iridiumState.value = 'passed'
+      iridiumMessage.value = text
+      stopIridiumPolling()
+    } else if (text.includes('FAILED')) {
+      iridiumState.value = 'failed'
+      iridiumMessage.value = text
+      stopIridiumPolling()
+    } else if (text.includes('IRIDIUM')) {
+      iridiumMessage.value = text
+    }
+  } catch { /* best effort */ }
+}
+
+function resetIridiumTest() {
+  stopIridiumPolling()
+  iridiumState.value = 'idle'
+  iridiumMessage.value = ''
+}
+
 // ── Light test button ───────────────────────────────────────────────
 const lightTestActive = ref(false)
 let lightKeepAlive: number | undefined
@@ -194,6 +267,7 @@ onUnmounted(() => {
   if (snapshotInterval) clearInterval(snapshotInterval)
   if (trackerInterval) clearInterval(trackerInterval)
   if (lightKeepAlive) clearInterval(lightKeepAlive)
+  stopIridiumPolling()
   if (snapshotUrl.value) URL.revokeObjectURL(snapshotUrl.value)
 })
 
@@ -485,6 +559,43 @@ const getStatusColor = (moduleStatus: string) => {
               <div class="flex items-center justify-end px-2 py-1" style="background-color: rgba(14, 36, 70, 0.8)">
                 <span class="text-xs" style="color: rgba(150, 238, 242, 0.4)">Updates every 5s</span>
               </div>
+            </div>
+
+            <!-- Iridium test button -->
+            <div v-if="mod.type === 'tracker' && mod.connected" class="mt-3">
+              <button
+                :disabled="iridiumState === 'sending' || iridiumState === 'running'"
+                class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm transition-all"
+                :style="{
+                  backgroundColor: iridiumState === 'passed' ? 'rgba(34, 197, 94, 0.2)'
+                    : iridiumState === 'failed' ? 'rgba(239, 68, 68, 0.2)'
+                    : iridiumState === 'running' || iridiumState === 'sending' ? 'rgba(252, 216, 105, 0.15)'
+                    : 'rgba(14, 36, 70, 0.5)',
+                  border: iridiumState === 'passed' ? '1px solid rgba(34, 197, 94, 0.5)'
+                    : iridiumState === 'failed' ? '1px solid rgba(239, 68, 68, 0.5)'
+                    : iridiumState === 'running' || iridiumState === 'sending' ? '1px solid rgba(252, 216, 105, 0.4)'
+                    : '1px solid rgba(65, 185, 195, 0.2)',
+                  color: iridiumState === 'passed' ? '#22c55e'
+                    : iridiumState === 'failed' ? '#ef4444'
+                    : iridiumState === 'running' || iridiumState === 'sending' ? '#FCD869'
+                    : '#96EEF2',
+                  opacity: iridiumState === 'sending' || iridiumState === 'running' ? '0.85' : '1',
+                  cursor: iridiumState === 'sending' || iridiumState === 'running' ? 'not-allowed' : 'pointer',
+                }"
+                @click="iridiumState === 'passed' || iridiumState === 'failed' ? resetIridiumTest() : triggerIridiumTest()"
+              >
+                <Loader2 v-if="iridiumState === 'sending' || iridiumState === 'running'" class="w-4 h-4 animate-spin" />
+                <svg v-else class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                  <path :d="mdiSatelliteUplink" />
+                </svg>
+                <span v-if="iridiumState === 'idle'">Iridium Test</span>
+                <span v-else-if="iridiumState === 'sending'">Sending…</span>
+                <span v-else-if="iridiumState === 'running'">Testing…</span>
+                <span v-else-if="iridiumState === 'passed' || iridiumState === 'failed'">{{ iridiumMessage || 'Done' }} — Tap to reset</span>
+              </button>
+              <p v-if="iridiumState === 'running' && iridiumMessage" class="mt-1 text-xs text-center" style="color: rgba(252, 216, 105, 0.7)">
+                {{ iridiumMessage }}
+              </p>
             </div>
           </div>
 

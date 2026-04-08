@@ -102,6 +102,32 @@ def register_sensor_routes(app: Robyn) -> None:
                 headers={"Content-Type": "application/json"},
             )
 
+    @app.post("/api/v1/tracker/iridium-test")
+    async def trigger_iridium_test(request):
+        """Send COMMAND_LONG to AGT to trigger Iridium test."""
+        try:
+            result = await tracker_service.send_iridium_test()
+            return json.dumps(result)
+        except Exception as e:
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+
+    @app.get("/api/v1/tracker/iridium-status")
+    async def get_iridium_status(request):
+        """Poll AGT STATUSTEXT for Iridium test result."""
+        try:
+            status = await tracker_service.get_iridium_status()
+            return json.dumps(status)
+        except Exception as e:
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+
     @app.get("/api/v1/sensors/:sensor_id/readings")
     async def get_sensor_readings(request):
         """Get recent readings from a specific sensor."""
