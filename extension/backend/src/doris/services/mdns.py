@@ -21,11 +21,14 @@ logger = logging.getLogger(__name__)
 AVAHI_CONF = Path("/tmp/avahi/avahi-daemon.conf")
 NGINX_CONF = Path("/tmp/nginx/doris-redirect.conf")
 
-# NetworkManager reads this directory when spawning dnsmasq for shared (hotspot)
-# connections — if the directory exists.
-DNSMASQ_SHARED_DIR = "/etc/NetworkManager/dnsmasq-shared.d"
-DNSMASQ_CONF = f"{DNSMASQ_SHARED_DIR}/doris-local.conf"
-HOTSPOT_GATEWAY = "10.42.0.1"
+# create_ap assigns this gateway IP to the hotspot interface (wlan1).
+HOTSPOT_GATEWAY = "192.168.43.1"
+
+# Separate dnsmasq instance for standard DNS (port 53) on the hotspot.
+# create_ap's own dnsmasq only listens on port 5353 (mDNS), so clients
+# that query doris.local via normal DNS get no answer.
+HOTSPOT_DNS_CONF = "/tmp/doris-hotspot-dns.conf"
+HOTSPOT_DNS_PID = "/tmp/doris-hotspot-dns.pid"
 
 # Redirect any request to doris.local to the extension UI on port 8095.
 # Uses `return 302` (not `rewrite`) because BlueOS's nginx has multiple
@@ -57,16 +60,14 @@ async def _run_host_command(command: str) -> bool:
 def _setup_avahi_hostname() -> bool:
     """Set avahi hostname to 'doris' on all physical network interfaces.
 
-    Three config changes:
+    Two config changes:
 
     1. ``host-name=doris`` — advertise as doris.local
     2. ``deny-interfaces=lo,docker0`` — skip Docker bridges and loopback
        (they cause Avahi to respond with unreachable internal IPs)
-    3. ``disallow-other-stacks=yes`` — take exclusive ownership of port 5353.
-       BlueOS's Beacon service runs a second mDNS stack (Python zeroconf)
-       on the same host.  Without this flag Avahi prints "Detected another
-       IPv4 mDNS stack … this makes mDNS unreliable" and Windows clients
-       fail to resolve doris.local.
+
+    Note: ``disallow-other-stacks=yes`` was tried but breaks the WiFi
+    hotspot (create_ap's dnsmasq also binds port 5353).
 
     Returns True if the file was changed.
     """
@@ -80,7 +81,6 @@ def _setup_avahi_hostname() -> bool:
     SETTINGS = {
         "host-name": "doris",
         "deny-interfaces": "lo,docker0",
-        "disallow-other-stacks": "yes",
     }
 
     for key, value in SETTINGS.items():
@@ -98,6 +98,11 @@ def _setup_avahi_hostname() -> bool:
     # Remove allow-interfaces (BlueOS defaults to eth0-only)
     new_content = re.sub(
         r"^allow-interfaces=.*\n?", "", new_content, flags=re.MULTILINE
+    )
+
+    # Remove disallow-other-stacks (breaks create_ap hotspot)
+    new_content = re.sub(
+        r"^#?disallow-other-stacks=.*\n?", "", new_content, flags=re.MULTILINE
     )
 
     if new_content == content:
@@ -122,26 +127,88 @@ def _setup_nginx_conf() -> bool:
     return True
 
 
-async def _setup_hotspot_dns() -> None:
-    """Add a dnsmasq address record so doris.local resolves via standard DNS.
+async def start_hotspot_dns() -> None:
+    """Start a DNS-only dnsmasq on port 53 for the hotspot interface.
 
-    mDNS is unreliable on WiFi — Windows blocks it on networks classified as
-    "public" (the default for a new hotspot).  Since the device IS the DNS
-    server for hotspot clients, we write a dnsmasq config that makes
-    ``doris.local`` resolve to the hotspot gateway IP through normal DNS.
+    create_ap's own dnsmasq listens on port 5353 (mDNS), not 53, so
+    standard DNS queries from hotspot clients go unanswered.  This
+    starts a second, minimal dnsmasq that *only* serves DNS on port 53
+    bound to the hotspot gateway IP, resolving ``doris.local`` (and
+    ``blueos-wifi.local``) to that same gateway.
 
-    The config file persists on the host, so it only needs to be written once
-    and is picked up by NM's dnsmasq whenever the hotspot (re)starts.
+    Must be called AFTER configure_hotspot() so the hotspot interface
+    actually has the gateway IP assigned.
     """
+    conf_content = (
+        f"listen-address={HOTSPOT_GATEWAY}\n"
+        "port=53\n"
+        "bind-interfaces\n"
+        "no-dhcp-interface=wlan1\n"
+        f"address=/doris.local/{HOTSPOT_GATEWAY}\n"
+        f"address=/blueos-wifi.local/{HOTSPOT_GATEWAY}\n"
+        "no-resolv\n"
+        "no-hosts\n"
+    )
     cmd = (
-        f"mkdir -p {DNSMASQ_SHARED_DIR} && "
-        f"echo 'address=/doris.local/{HOTSPOT_GATEWAY}' > {DNSMASQ_CONF}"
+        f"echo '{conf_content}' > {HOTSPOT_DNS_CONF} && "
+        f"pkill -f 'dnsmasq.*{HOTSPOT_DNS_CONF}' 2>/dev/null; sleep 1; "
+        f"dnsmasq --conf-file={HOTSPOT_DNS_CONF} --pid-file={HOTSPOT_DNS_PID}"
     )
     ok = await _run_host_command(cmd)
     if ok:
-        logger.info("dnsmasq hotspot DNS configured: doris.local -> %s", HOTSPOT_GATEWAY)
+        logger.info("Hotspot DNS started on %s:53 (doris.local)", HOTSPOT_GATEWAY)
     else:
-        logger.warning("Failed to write dnsmasq hotspot DNS config")
+        logger.warning("Failed to start hotspot DNS server")
+
+
+DRIVER_INSTALL_SCRIPT = r"""
+set +e
+KVER=$(uname -r)
+DRIVER_REPO="https://github.com/morrownr/88x2bu-20210702.git"
+DRIVER_DIR="/opt/doris-drivers/88x2bu"
+BLACKLIST="/etc/modprobe.d/blacklist-rtw88.conf"
+
+if lsmod | grep -q 88x2bu; then exit 0; fi
+if modprobe -n 88x2bu 2>/dev/null; then
+    modprobe 88x2bu 2>/dev/null
+    grep -q 'blacklist rtw88_8822bu' "$BLACKLIST" 2>/dev/null || {
+        echo 'blacklist rtw88_8822bu' > "$BLACKLIST"
+        echo 'blacklist rtw88_8822b' >> "$BLACKLIST"
+        echo 'blacklist rtw88_usb' >> "$BLACKLIST"
+    }
+    exit 0
+fi
+command -v gcc >/dev/null && [ -d "/lib/modules/$KVER/build" ] || exit 0
+rm -rf "$DRIVER_DIR" && mkdir -p /opt/doris-drivers
+git clone --depth 1 "$DRIVER_REPO" "$DRIVER_DIR" 2>&1 | tail -2
+cd "$DRIVER_DIR" && make -j4 KSRC="/lib/modules/$KVER/build" 2>&1 | tail -3
+[ $? -eq 0 ] && make install KSRC="/lib/modules/$KVER/build" 2>&1 | tail -2
+echo 'blacklist rtw88_8822bu' > "$BLACKLIST"
+echo 'blacklist rtw88_8822b' >> "$BLACKLIST"
+echo 'blacklist rtw88_usb' >> "$BLACKLIST"
+if [ -d /sys/bus/usb/devices/1-1 ]; then
+    rmmod rtw88_8822bu 2>/dev/null
+    echo 0 > /sys/bus/usb/devices/1-1/authorized; sleep 2
+    echo 1 > /sys/bus/usb/devices/1-1/authorized; sleep 4
+fi
+"""
+
+
+async def ensure_wifi_driver() -> None:
+    """Install the out-of-tree 88x2bu driver if not already loaded.
+
+    The in-kernel ``rtw88_8822bu`` driver has a TX-queue-stall bug in AP
+    mode that makes the hotspot unusable.  The community ``88x2bu``
+    driver (morrownr fork) is stable.  This function checks if the
+    driver is already loaded and, if not, builds and installs it via
+    Commander.  The build is cached in ``/opt/doris-drivers/`` and only
+    runs once per kernel version.
+    """
+    ok = await _run_host_command(DRIVER_INSTALL_SCRIPT)
+    if ok:
+        logger.info("WiFi driver check complete (88x2bu)")
+    else:
+        logger.warning("WiFi driver install check failed (non-fatal)")
 
 
 async def restart_avahi() -> None:
@@ -166,15 +233,15 @@ async def restart_avahi() -> None:
 
 
 async def setup_doris_local() -> None:
-    """Configure doris.local resolution (mDNS + DNS) and nginx redirect.
+    """Configure doris.local resolution (mDNS) and nginx redirect.
 
-    Called once during DORIS backend startup.  Writes all config files but
-    does NOT restart Avahi — call ``restart_avahi()`` separately after
-    configure_hotspot() has finished and WiFi interfaces have settled.
+    Called once during DORIS backend startup.  Writes Avahi and nginx
+    config files but does NOT restart Avahi — call ``restart_avahi()``
+    separately after configure_hotspot() has finished.  The hotspot DNS
+    server (port 53) is started by ``start_hotspot_dns()`` after the
+    hotspot interface is up.
     """
     _setup_avahi_hostname()
-
-    await _setup_hotspot_dns()
 
     nginx_written = _setup_nginx_conf()
 
