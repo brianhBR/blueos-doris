@@ -10,7 +10,8 @@
         "thrusters": "All thruster outputs disabled (SERVO1-8 FUNCTION=0)",
         "relay_pin": "RELAY_PIN uses standard ArduPilot pin numbering (base 50 + output - 1). Verify for your board.",
         "orientation": "Autopilot mounted at Pitch270 (AHRS_ORIENTATION=25)",
-        "rangefinder": "RNGFND1_TYPE=0 explicitly disables the rangefinder to prevent LASER_POSITION prearm failures"
+        "rangefinder": "RNGFND1_TYPE=0 explicitly disables the rangefinder to prevent LASER_POSITION prearm failures",
+        "ekf_source": "ArduSub defaults EK3_SRC1 to ExternalNav (3) for DVL setups. DORIS needs GPS at the surface for pre-arm, so POSXY and VELXY are set to GPS (1). FS_EKF_ACTION=0 handles the expected GPS loss underwater."
     },
     "parameters": {
         "AHRS_ORIENTATION": 25,
@@ -44,8 +45,11 @@
 
         "RNGFND1_TYPE": 0,
 
+        "EK3_SRC1_POSXY": 1,
+        "EK3_SRC1_VELXY": 1,
+
         "DISARM_DELAY": 0,
-        "ARMING_CHECK": 140478,
+        "ARMING_CHECK": 140474,
 
         "FS_EKF_ACTION": 0,
         "FS_GCS_ENABLE": 0,
