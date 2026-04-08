@@ -20,9 +20,11 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install build dependencies for uvloop (required by Robyn on Linux)
+# ffmpeg is kept at runtime for RTSP camera snapshot capture
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     python3-dev \
+    ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy ONLY dependency files first (for better layer caching)
@@ -107,12 +109,12 @@ LABEL company='{\
 
 LABEL type="device-integration"
 
-ARG REPO=blueos-doris-extension
+ARG REPO=blueos-doris
 ARG OWNER=bluerobotics
-LABEL readme='https://raw.githubusercontent.com/bluerobotics/blueos-doris-extension/{tag}/extension/README.md'
+LABEL readme='https://raw.githubusercontent.com/brianhBR/blueos-doris/{tag}/extension/README.md'
 LABEL links='{\
     "website": "https://bluerobotics.com",\
-    "source": "https://github.com/bluerobotics/blueos-doris-extension"\
+    "source": "https://github.com/brianhBR/blueos-doris"\
 }'
 
 LABEL requirements="core >= 1.1"

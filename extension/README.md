@@ -122,12 +122,12 @@ DORIS implements the `/register_service` endpoint for BlueOS Helper discovery. T
 
 **From Docker Hub:**
 ```
-<username>/blueos-doris:latest
+sailorman225/blueos-doris:latest
 ```
 
 **From GitHub Container Registry:**
 ```
-ghcr.io/<owner>/blueos-doris:latest
+ghcr.io/brianhBR/blueos-doris:latest
 ```
 
 1. In BlueOS, go to **Extensions → Install from URL**
@@ -185,13 +185,13 @@ GHCR uses the built-in `GITHUB_TOKEN` (no additional secrets needed).
 
 ```bash
 # Build and tag
-docker build -t yourusername/blueos-doris:latest .
+docker build -t sailorman225/blueos-doris:latest .
 
 # Push to Docker Hub
-docker push yourusername/blueos-doris:latest
+docker push sailorman225/blueos-doris:latest
 
 # Push to GHCR
-docker tag yourusername/blueos-doris:latest ghcr.io/yourusername/blueos-doris:latest
-docker push ghcr.io/yourusername/blueos-doris:latest
+docker tag sailorman225/blueos-doris:latest ghcr.io/brianhBR/blueos-doris:latest
+docker push ghcr.io/brianhBR/blueos-doris:latest
 ```
 
