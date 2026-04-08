@@ -8,7 +8,8 @@ const { flashing, progress, result, error: flashError, startFlash, stopPolling }
 
 const selectedPort = ref('')
 const selectedFile = ref<File | null>(null)
-const baud = ref(115200)
+const baudOptions = [57600, 115200, 230400, 460800, 921600]
+const baud = ref(460800)
 const timeout = ref(0.5)
 const uploading = ref(false)
 const consoleEl = ref<HTMLDivElement | null>(null)
@@ -143,13 +144,14 @@ watch(progress, async () => {
       <div class="grid grid-cols-2 gap-4">
         <div class="space-y-1.5">
           <label class="block text-sm font-medium" style="color: #96EEF2">Baud Rate</label>
-          <input
+          <select
             v-model.number="baud"
-            type="number"
             :disabled="flashing"
             class="w-full rounded-lg px-3 py-2 text-sm text-white border focus:outline-none focus:ring-1"
             style="background: rgba(14,36,70,0.6); border-color: rgba(65,185,195,0.3)"
           >
+            <option v-for="b in baudOptions" :key="b" :value="b">{{ b.toLocaleString() }}</option>
+          </select>
         </div>
         <div class="space-y-1.5">
           <label class="block text-sm font-medium" style="color: #96EEF2">Timeout (s)</label>
