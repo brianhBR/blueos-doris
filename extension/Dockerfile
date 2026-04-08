@@ -53,6 +53,10 @@ COPY --from=frontend-builder /frontend/dist ./frontend/dist
 # Create data directory for persistent storage
 RUN mkdir -p /data/logs
 
+# Entrypoint script: fix recorder path before starting the app
+COPY backend/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
 # Expose the API port
 EXPOSE 8095/tcp
 
@@ -122,5 +126,5 @@ LABEL requirements="core >= 1.1"
 # Environment: BlueOS services are accessed via host.docker.internal
 ENV DORIS_BLUEOS_ADDRESS=http://host.docker.internal
 
-# Run the backend server
-ENTRYPOINT ["python", "-m", "doris.main"]
+# Run the backend server (entrypoint fixes recorder path first)
+ENTRYPOINT ["/app/entrypoint.sh"]
