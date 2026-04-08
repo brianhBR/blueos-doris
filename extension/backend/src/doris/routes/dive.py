@@ -64,14 +64,16 @@ def _sync_mission_state_from_vehicle(status_dict: dict) -> None:
         ms["status"] = "active"
         ms["activated_at"] = datetime.now(tz=timezone.utc).isoformat()
         changed = True
-    elif st == "active" and not active:
-        ms["status"] = "completed"
-        ms["completed_at"] = datetime.now(tz=timezone.utc).isoformat()
+    elif st in ("pending", "active") and not active:
+        completed = bool(status_dict.get("completed", False))
+        new_status = "completed" if completed else "cancelled"
+        ms["status"] = new_status
+        ms[f"{new_status}_at"] = datetime.now(tz=timezone.utc).isoformat()
         changed = True
         try:
-            _update_active_dive_record("completed")
+            _update_active_dive_record(new_status)
         except Exception as e:
-            logger.warning("Failed to mark dive record completed: %s", e)
+            logger.warning("Failed to mark dive record %s: %s", new_status, e)
     if changed:
         try:
             MISSION_STATE_PATH.write_text(json.dumps(ms, indent=2, default=str))
