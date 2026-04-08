@@ -20,7 +20,15 @@ logger = logging.getLogger(__name__)
 ARTEMIS_COMPONENT_ID = 191
 GPS_FIX_NAMES = {0: "No GPS", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed"}
 
-MAV_CMD_USER_4 = 31013
+GPS_FIX_TYPE_MAP: dict[str, int] = {
+    "GPS_FIX_TYPE_NO_GPS": 0,
+    "GPS_FIX_TYPE_NO_FIX": 1,
+    "GPS_FIX_TYPE_2D_FIX": 2,
+    "GPS_FIX_TYPE_3D_FIX": 3,
+    "GPS_FIX_TYPE_DGPS": 4,
+    "GPS_FIX_TYPE_RTK_FLOAT": 5,
+    "GPS_FIX_TYPE_RTK_FIXED": 6,
+}
 
 
 def _m2r_base() -> str:
@@ -83,13 +91,13 @@ class ArtemisTrackerService:
             if msg.get("type") != "GPS_RAW_INT":
                 return None
 
-            fix_type = msg.get("fix_type", 0)
-            if isinstance(fix_type, dict):
-                fix_type = fix_type.get("type", 0)
-                try:
-                    fix_type = int(str(fix_type).split("_")[-1])
-                except (ValueError, IndexError):
-                    fix_type = 0
+            raw_fix = msg.get("fix_type", 0)
+            if isinstance(raw_fix, dict):
+                fix_type = GPS_FIX_TYPE_MAP.get(raw_fix.get("type", ""), 0)
+            elif isinstance(raw_fix, int):
+                fix_type = raw_fix
+            else:
+                fix_type = 0
 
             lat = msg.get("lat", 0) / 1e7
             lon = msg.get("lon", 0) / 1e7
@@ -158,7 +166,7 @@ class ArtemisTrackerService:
                 "type": "COMMAND_LONG",
                 "target_system": 1,
                 "target_component": ARTEMIS_COMPONENT_ID,
-                "command": MAV_CMD_USER_4,
+                "command": {"type": "MAV_CMD_USER_4"},
                 "confirmation": 0,
                 "param1": 0.0,
                 "param2": 0.0,
