@@ -207,22 +207,42 @@ function resetIridiumTest() {
 
 // ── Light test button ───────────────────────────────────────────────
 const lightTestActive = ref(false)
+const lightTestError = ref('')
 let lightKeepAlive: number | undefined
 
-async function setLightBrightness(brightness: number) {
+async function setLightBrightness(brightness: number): Promise<boolean> {
   try {
-    await fetch('/api/v1/lights/brightness', {
+    const resp = await fetch('/api/v1/lights/brightness', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ brightness }),
     })
-  } catch { /* best effort */ }
+    const data = await resp.json()
+    if (!data.success) {
+      const msg = data.error || `Light test failed (HTTP ${resp.status})`
+      console.warn('[DORIS] Light test error:', msg)
+      lightTestError.value = msg
+      return false
+    }
+    lightTestError.value = ''
+    return true
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : 'Network error'
+    console.warn('[DORIS] Light test fetch failed:', msg)
+    lightTestError.value = msg
+    return false
+  }
 }
 
-function lightTestOn() {
+async function lightTestOn() {
   if (lightTestActive.value) return
   lightTestActive.value = true
-  setLightBrightness(10)
+  lightTestError.value = ''
+  const ok = await setLightBrightness(10)
+  if (!ok) {
+    lightTestActive.value = false
+    return
+  }
   lightKeepAlive = setInterval(() => setLightBrightness(10), 1500) as unknown as number
 }
 
@@ -508,9 +528,17 @@ const getStatusColor = (moduleStatus: string) => {
               <button
                 class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm transition-all select-none"
                 :style="{
-                  backgroundColor: lightTestActive ? 'rgba(252, 216, 105, 0.3)' : 'rgba(14, 36, 70, 0.5)',
-                  border: lightTestActive ? '1px solid #FCD869' : '1px solid rgba(65, 185, 195, 0.2)',
-                  color: lightTestActive ? '#FCD869' : '#96EEF2',
+                  backgroundColor: lightTestError
+                    ? 'rgba(239, 68, 68, 0.2)'
+                    : lightTestActive
+                      ? 'rgba(252, 216, 105, 0.3)'
+                      : 'rgba(14, 36, 70, 0.5)',
+                  border: lightTestError
+                    ? '1px solid rgba(239, 68, 68, 0.6)'
+                    : lightTestActive
+                      ? '1px solid #FCD869'
+                      : '1px solid rgba(65, 185, 195, 0.2)',
+                  color: lightTestError ? '#F87171' : lightTestActive ? '#FCD869' : '#96EEF2',
                 }"
                 @mousedown.prevent="lightTestOn"
                 @mouseup.prevent="lightTestOff"
@@ -524,6 +552,9 @@ const getStatusColor = (moduleStatus: string) => {
                 </svg>
                 {{ lightTestActive ? 'Light ON (10%)' : 'Hold to Test Light' }}
               </button>
+              <p v-if="lightTestError" class="mt-1.5 text-xs" style="color: #F87171">
+                {{ lightTestError }}
+              </p>
             </div>
 
             <!-- Inline tracker GPS data -->

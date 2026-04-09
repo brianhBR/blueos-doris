@@ -30,6 +30,7 @@ class CameraService:
     def __init__(self):
         self.camera_manager = BlueOSClient(blueos_services.camera_manager)
         self.mavlink2rest = BlueOSClient(blueos_services.mavlink2rest)
+        self._lgt_param_ok: bool | None = None
 
     async def get_cameras(self) -> list[dict]:
         """Get list of connected cameras."""
@@ -96,13 +97,18 @@ class CameraService:
         except Exception:
             return None
 
-    async def set_light_brightness(self, brightness: int) -> bool:
+    async def set_light_brightness(self, brightness: int) -> dict:
         """Set light brightness (0-100) via DORIS_LGT_TST parameter.
 
         The Lua script checks this parameter each cycle and drives
         RC9 (Lights 1) directly via set_override, which works even
         when disarmed.  Setting to 0 turns off the test.
+
+        Returns ``{"ok": bool, "error": str | None}``.
         """
+        import asyncio
+        import httpx
+
         try:
             url = f"{self.mavlink2rest.base_url}/mavlink"
             payload = {
@@ -117,14 +123,72 @@ class CameraService:
                 },
             }
             logger.info("Light PARAM_SET: url=%s brightness=%s", url, brightness)
-            import httpx
             async with httpx.AsyncClient(timeout=10.0) as client:
                 resp = await client.post(url, json=payload)
             logger.info("Light PARAM_SET response: status=%s body=%r", resp.status_code, resp.text[:200])
             resp.raise_for_status()
-            return True
         except Exception as e:
             logger.error("Light PARAM_SET failed: %s", e)
+            return {"ok": False, "error": f"Failed to send PARAM_SET: {e}"}
+
+        if brightness > 0 and self._lgt_param_ok is None:
+            verified = await self._verify_light_param()
+            if not verified:
+                return {
+                    "ok": False,
+                    "error": (
+                        "DORIS_LGT_TST parameter not found on the flight controller. "
+                        "Check that SCR_ENABLE=1 and doris.lua is loaded."
+                    ),
+                }
+
+        return {"ok": True, "error": None}
+
+    async def _verify_light_param(self) -> bool:
+        """Request DORIS_LGT_TST back from the autopilot to confirm it exists."""
+        import asyncio
+        import httpx
+
+        try:
+            base = self.mavlink2rest.base_url
+            req_payload = {
+                "header": {"system_id": 255, "component_id": 0, "sequence": 0},
+                "message": {
+                    "type": "PARAM_REQUEST_READ",
+                    "target_system": 1,
+                    "target_component": 1,
+                    "param_id": list("DORIS_LGT_TST".ljust(16, "\x00")),
+                    "param_index": -1,
+                },
+            }
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(f"{base}/mavlink", json=req_payload)
+                resp.raise_for_status()
+
+                await asyncio.sleep(0.4)
+
+                resp = await client.get(
+                    f"{base}/mavlink/vehicles/1/components/1/messages/PARAM_VALUE"
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            param_id = "".join(
+                c for c in data.get("message", {}).get("param_id", []) if c != "\x00"
+            )
+            if param_id == "DORIS_LGT_TST":
+                logger.info("DORIS_LGT_TST verified on flight controller")
+                self._lgt_param_ok = True
+                return True
+
+            logger.warning(
+                "DORIS_LGT_TST not found (got param_id=%r instead)", param_id
+            )
+            self._lgt_param_ok = False
+            return False
+        except Exception as e:
+            logger.warning("DORIS_LGT_TST verification failed: %s", e)
+            self._lgt_param_ok = False
             return False
 
     async def get_stream_url(self, camera_id: str = "default") -> str | None:
