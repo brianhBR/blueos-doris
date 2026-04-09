@@ -71,10 +71,19 @@ def register_sensor_routes(app: Robyn) -> None:
     async def set_light_brightness(request):
         """Set light brightness (0-100). Used for momentary test button."""
         try:
-            data = json.loads(request.body)
+            data = json.loads(request.body) if request.body else {}
             brightness = max(0, min(100, int(data.get("brightness", 0))))
-            ok = await camera_service.set_light_brightness(brightness)
-            return json.dumps({"success": ok, "brightness": brightness})
+            result = await camera_service.set_light_brightness(brightness)
+            ok = result.get("ok", False)
+            payload = {"success": ok, "brightness": brightness}
+            if not ok and result.get("error"):
+                payload["error"] = result["error"]
+            status = 200 if ok else 502
+            return Response(
+                status_code=status,
+                description=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+            )
         except Exception as e:
             return Response(
                 status_code=500,

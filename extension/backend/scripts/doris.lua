@@ -243,7 +243,7 @@ local light_cycle_ms = 0
 
 -- light test state (auto-clears after timeout)
 local lgt_tst_start_ms = 0
-local LGT_TST_TIMEOUT  = 3000
+local LGT_TST_TIMEOUT  = 10000
 
 -- telemetry tracking (updated every cycle by update_sensors)
 -- packed into a table to stay under Lua's 200-local-variable limit
