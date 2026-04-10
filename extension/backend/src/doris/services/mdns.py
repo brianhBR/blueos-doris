@@ -8,6 +8,7 @@ On startup, configures:
   3. nginx redirect so http://doris.local/ → http://doris.local:8095/
 """
 
+import asyncio
 import logging
 import re
 from pathlib import Path
@@ -232,6 +233,34 @@ async def restart_avahi() -> None:
         logger.warning("Failed to restart avahi-daemon")
 
 
+async def _ensure_nginx_redirect() -> None:
+    """Create the nginx symlink and reload, retrying until blueos-core is ready."""
+    symlink_cmd = f"docker exec blueos-core ln -sf {NGINX_SYMLINK_SRC} {NGINX_SYMLINK_DST}"
+    reload_cmd = "docker exec blueos-core nginx -s reload"
+    verify_cmd = f"docker exec blueos-core test -L {NGINX_SYMLINK_DST}"
+
+    max_attempts = 5
+    for attempt in range(1, max_attempts + 1):
+        ok = await _run_host_command(symlink_cmd)
+        if not ok:
+            logger.info("nginx symlink attempt %d/%d failed, retrying in %ds",
+                        attempt, max_attempts, attempt * 3)
+            await asyncio.sleep(attempt * 3)
+            continue
+
+        verified = await _run_host_command(verify_cmd)
+        if not verified:
+            logger.info("nginx symlink not yet visible, retrying in %ds", attempt * 3)
+            await asyncio.sleep(attempt * 3)
+            continue
+
+        await _run_host_command(reload_cmd)
+        logger.info("nginx doris.local redirect active (attempt %d)", attempt)
+        return
+
+    logger.warning("Failed to create nginx redirect after %d attempts", max_attempts)
+
+
 async def setup_doris_local() -> None:
     """Configure doris.local resolution (mDNS) and nginx redirect.
 
@@ -242,15 +271,5 @@ async def setup_doris_local() -> None:
     hotspot interface is up.
     """
     _setup_avahi_hostname()
-
-    nginx_written = _setup_nginx_conf()
-
-    symlink_cmd = f"docker exec blueos-core ln -sf {NGINX_SYMLINK_SRC} {NGINX_SYMLINK_DST}"
-    reload_cmd = "docker exec blueos-core sh -c 'kill -HUP $(cat /var/run/nginx.pid)'"
-
-    if nginx_written:
-        await _run_host_command(symlink_cmd)
-        await _run_host_command(reload_cmd)
-        logger.info("nginx symlink created and config reloaded")
-    else:
-        await _run_host_command(symlink_cmd)
+    _setup_nginx_conf()
+    await _ensure_nginx_redirect()
