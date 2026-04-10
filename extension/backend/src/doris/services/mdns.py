@@ -9,9 +9,13 @@ On startup, configures:
 """
 
 import asyncio
+import io
 import logging
+import os
 import re
+import tarfile
 from pathlib import Path
+from urllib.parse import urlparse
 
 import httpx
 
@@ -43,7 +47,28 @@ server {
 """
 
 NGINX_CONF_DST = "/etc/nginx/conf.d/doris-redirect.conf"
+NGINX_CONF_DIR = os.path.dirname(NGINX_CONF_DST)
+NGINX_CONF_NAME = os.path.basename(NGINX_CONF_DST)
 CORE_CONTAINER = "blueos-core"
+
+NGINX_WATCHDOG_INTERVAL_S = 30
+
+
+def _docker_base_url() -> str:
+    """Return the Docker API base URL derived from the BlueOS address."""
+    host = urlparse(blueos_services.base_url).hostname
+    return f"http://{host}:2375"
+
+
+async def _find_core_container_id(client: httpx.AsyncClient) -> str | None:
+    """Return the short container ID of blueos-core, or None."""
+    resp = await client.get(f"{_docker_base_url()}/containers/json")
+    resp.raise_for_status()
+    for c in resp.json():
+        for name in c.get("Names", []):
+            if CORE_CONTAINER in name:
+                return c["Id"][:12]
+    return None
 
 
 async def _run_host_command(command: str) -> bool:
@@ -223,83 +248,99 @@ async def restart_avahi() -> None:
         logger.warning("Failed to restart avahi-daemon")
 
 
-async def _ensure_nginx_redirect() -> None:
+async def _nginx_redirect_exists() -> bool:
+    """Return True if the redirect conf exists inside blueos-core."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            cid = await _find_core_container_id(client)
+            if not cid:
+                return False
+            resp = await client.head(
+                f"{_docker_base_url()}/containers/{cid}/archive",
+                params={"path": NGINX_CONF_DST},
+            )
+            return resp.status_code == 200
+    except Exception:
+        return False
+
+
+async def _upload_nginx_redirect() -> bool:
     """Upload doris-redirect.conf into blueos-core and reload nginx.
 
-    Uses the Docker API to upload a tar archive directly into the
-    container, then reloads nginx via Commander.  Retries with backoff
-    in case blueos-core isn't ready yet during early startup.
+    Returns True on success.
     """
-    import io
-    import os
-    import tarfile
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            cid = await _find_core_container_id(client)
+            if not cid:
+                raise RuntimeError(f"{CORE_CONTAINER} container not found")
 
-    dirname = os.path.dirname(NGINX_CONF_DST)
-    basename = os.path.basename(NGINX_CONF_DST)
+            tar_buf = io.BytesIO()
+            with tarfile.open(fileobj=tar_buf, mode="w") as tar:
+                data = NGINX_REDIRECT_CONTENT.encode()
+                info = tarfile.TarInfo(name=NGINX_CONF_NAME)
+                info.size = len(data)
+                tar.addfile(info, io.BytesIO(data))
+            tar_buf.seek(0)
 
-    from urllib.parse import urlparse
-    docker_host = urlparse(blueos_services.base_url).hostname
-    docker_base = f"http://{docker_host}:2375"
+            resp = await client.put(
+                f"{_docker_base_url()}/containers/{cid}/archive"
+                f"?path={NGINX_CONF_DIR}",
+                content=tar_buf.read(),
+                headers={"Content-Type": "application/x-tar"},
+            )
+            resp.raise_for_status()
 
+        await _run_host_command(
+            f"docker exec {CORE_CONTAINER} nginx -s reload"
+        )
+        return True
+    except Exception as exc:
+        logger.debug("nginx redirect upload failed: %s", exc)
+        return False
+
+
+async def _ensure_nginx_redirect() -> None:
+    """Upload the redirect conf with retries for early startup."""
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
-        try:
-            async with httpx.AsyncClient(timeout=15.0) as client:
-                # Find blueos-core container ID
-                resp = await client.get(f"{docker_base}/containers/json")
-                resp.raise_for_status()
-                cid = None
-                for c in resp.json():
-                    for name in c.get("Names", []):
-                        if CORE_CONTAINER in name:
-                            cid = c["Id"][:12]
-                            break
-                    if cid:
-                        break
-                if not cid:
-                    raise RuntimeError(f"{CORE_CONTAINER} container not found")
-
-                # Build tar archive containing the conf file
-                tar_buf = io.BytesIO()
-                with tarfile.open(fileobj=tar_buf, mode="w") as tar:
-                    data = NGINX_REDIRECT_CONTENT.encode()
-                    info = tarfile.TarInfo(name=basename)
-                    info.size = len(data)
-                    tar.addfile(info, io.BytesIO(data))
-                tar_buf.seek(0)
-
-                # Upload into the container
-                upload_url = (
-                    f"{docker_base}/containers/{cid}/archive"
-                    f"?path={dirname}"
-                )
-                resp = await client.put(
-                    upload_url,
-                    content=tar_buf.read(),
-                    headers={"Content-Type": "application/x-tar"},
-                )
-                resp.raise_for_status()
-
-            # Reload nginx via Commander
-            await _run_host_command(
-                f"docker exec {CORE_CONTAINER} nginx -s reload"
-            )
+        if await _upload_nginx_redirect():
             logger.info(
                 "nginx doris.local redirect active (attempt %d)", attempt
             )
             return
-
-        except Exception as exc:
-            delay = attempt * 3
-            logger.info(
-                "nginx redirect attempt %d/%d failed (%s), retrying in %ds",
-                attempt, max_attempts, exc, delay,
-            )
-            await asyncio.sleep(delay)
+        delay = attempt * 3
+        logger.info(
+            "nginx redirect attempt %d/%d failed, retrying in %ds",
+            attempt, max_attempts, delay,
+        )
+        await asyncio.sleep(delay)
 
     logger.warning(
         "Failed to install nginx redirect after %d attempts", max_attempts
     )
+
+
+async def _nginx_redirect_watchdog() -> None:
+    """Periodically verify the redirect conf exists; re-upload if missing.
+
+    blueos-core's container filesystem is ephemeral.  If the container
+    is recreated (BlueOS update, power cycle, manual restart) after the
+    DORIS extension has already started, the conf disappears and
+    doris.local falls through to the default BlueOS page.  This loop
+    detects that and restores the redirect within ~30 seconds.
+    """
+    while True:
+        await asyncio.sleep(NGINX_WATCHDOG_INTERVAL_S)
+        try:
+            if not await _nginx_redirect_exists():
+                logger.info("nginx redirect conf missing, re-uploading")
+                if await _upload_nginx_redirect():
+                    logger.info("nginx doris.local redirect restored")
+                else:
+                    logger.warning("nginx redirect restore failed, will retry")
+        except Exception as exc:
+            logger.debug("nginx watchdog check error: %s", exc)
 
 
 async def setup_doris_local() -> None:
@@ -310,6 +351,10 @@ async def setup_doris_local() -> None:
     separately after configure_hotspot() has finished.  The hotspot DNS
     server (port 53) is started by ``start_hotspot_dns()`` after the
     hotspot interface is up.
+
+    Also starts a background watchdog that re-uploads the nginx conf
+    if blueos-core is ever recreated while DORIS is running.
     """
     _setup_avahi_hostname()
     await _ensure_nginx_redirect()
+    asyncio.get_event_loop().create_task(_nginx_redirect_watchdog())
