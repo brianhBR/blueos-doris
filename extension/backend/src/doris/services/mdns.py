@@ -20,7 +20,6 @@ from ..config import blueos_services
 logger = logging.getLogger(__name__)
 
 AVAHI_CONF = Path("/tmp/avahi/avahi-daemon.conf")
-NGINX_CONF = Path("/tmp/nginx/doris-redirect.conf")
 
 # create_ap assigns this gateway IP to the hotspot interface (wlan1).
 HOTSPOT_GATEWAY = "192.168.43.1"
@@ -32,16 +31,19 @@ HOTSPOT_DNS_CONF = "/tmp/doris-hotspot-dns.conf"
 HOTSPOT_DNS_PID = "/tmp/doris-hotspot-dns.pid"
 
 # Redirect any request to doris.local to the extension UI on port 8095.
-# Uses `return 302` (not `rewrite`) because BlueOS's nginx has multiple
-# `location /` blocks that interfere with server-level rewrites.
+# Written as a dedicated server block in /etc/nginx/conf.d/ (which nginx
+# includes via its default config) rather than in the extensions directory
+# (which is NOT included by nginx in this BlueOS build).
 NGINX_REDIRECT_CONTENT = """\
-if ($host = "doris.local") {
-    return 302 http://$host:8095$request_uri;
+server {
+    listen 80;
+    server_name doris.local;
+    return 302 http://doris.local:8095$request_uri;
 }
 """
 
-NGINX_SYMLINK_SRC = "/usr/blueos/extensions/doris/nginx/doris-redirect.conf"
-NGINX_SYMLINK_DST = "/home/pi/tools/nginx/extensions/doris-redirect.conf"
+NGINX_CONF_DST = "/etc/nginx/conf.d/doris-redirect.conf"
+CORE_CONTAINER = "blueos-core"
 
 
 async def _run_host_command(command: str) -> bool:
@@ -114,18 +116,6 @@ def _setup_avahi_hostname() -> bool:
     logger.info("Avahi config updated: hostname=doris, interface restrictions removed")
     return True
 
-
-def _setup_nginx_conf() -> bool:
-    """Write the nginx redirect conf. Returns True if the file was written/changed."""
-    NGINX_CONF.parent.mkdir(parents=True, exist_ok=True)
-
-    if NGINX_CONF.is_file() and NGINX_CONF.read_text() == NGINX_REDIRECT_CONTENT:
-        logger.info("nginx redirect conf already up to date")
-        return False
-
-    NGINX_CONF.write_text(NGINX_REDIRECT_CONTENT)
-    logger.info("Wrote nginx redirect conf to %s", NGINX_CONF)
-    return True
 
 
 async def start_hotspot_dns() -> None:
@@ -234,31 +224,82 @@ async def restart_avahi() -> None:
 
 
 async def _ensure_nginx_redirect() -> None:
-    """Create the nginx symlink and reload, retrying until blueos-core is ready."""
-    symlink_cmd = f"docker exec blueos-core ln -sf {NGINX_SYMLINK_SRC} {NGINX_SYMLINK_DST}"
-    reload_cmd = "docker exec blueos-core nginx -s reload"
-    verify_cmd = f"docker exec blueos-core test -L {NGINX_SYMLINK_DST}"
+    """Upload doris-redirect.conf into blueos-core and reload nginx.
+
+    Uses the Docker API to upload a tar archive directly into the
+    container, then reloads nginx via Commander.  Retries with backoff
+    in case blueos-core isn't ready yet during early startup.
+    """
+    import io
+    import os
+    import tarfile
+
+    dirname = os.path.dirname(NGINX_CONF_DST)
+    basename = os.path.basename(NGINX_CONF_DST)
+
+    from urllib.parse import urlparse
+    docker_host = urlparse(blueos_services.base_url).hostname
+    docker_base = f"http://{docker_host}:2375"
 
     max_attempts = 5
     for attempt in range(1, max_attempts + 1):
-        ok = await _run_host_command(symlink_cmd)
-        if not ok:
-            logger.info("nginx symlink attempt %d/%d failed, retrying in %ds",
-                        attempt, max_attempts, attempt * 3)
-            await asyncio.sleep(attempt * 3)
-            continue
+        try:
+            async with httpx.AsyncClient(timeout=15.0) as client:
+                # Find blueos-core container ID
+                resp = await client.get(f"{docker_base}/containers/json")
+                resp.raise_for_status()
+                cid = None
+                for c in resp.json():
+                    for name in c.get("Names", []):
+                        if CORE_CONTAINER in name:
+                            cid = c["Id"][:12]
+                            break
+                    if cid:
+                        break
+                if not cid:
+                    raise RuntimeError(f"{CORE_CONTAINER} container not found")
 
-        verified = await _run_host_command(verify_cmd)
-        if not verified:
-            logger.info("nginx symlink not yet visible, retrying in %ds", attempt * 3)
-            await asyncio.sleep(attempt * 3)
-            continue
+                # Build tar archive containing the conf file
+                tar_buf = io.BytesIO()
+                with tarfile.open(fileobj=tar_buf, mode="w") as tar:
+                    data = NGINX_REDIRECT_CONTENT.encode()
+                    info = tarfile.TarInfo(name=basename)
+                    info.size = len(data)
+                    tar.addfile(info, io.BytesIO(data))
+                tar_buf.seek(0)
 
-        await _run_host_command(reload_cmd)
-        logger.info("nginx doris.local redirect active (attempt %d)", attempt)
-        return
+                # Upload into the container
+                upload_url = (
+                    f"{docker_base}/containers/{cid}/archive"
+                    f"?path={dirname}"
+                )
+                resp = await client.put(
+                    upload_url,
+                    content=tar_buf.read(),
+                    headers={"Content-Type": "application/x-tar"},
+                )
+                resp.raise_for_status()
 
-    logger.warning("Failed to create nginx redirect after %d attempts", max_attempts)
+            # Reload nginx via Commander
+            await _run_host_command(
+                f"docker exec {CORE_CONTAINER} nginx -s reload"
+            )
+            logger.info(
+                "nginx doris.local redirect active (attempt %d)", attempt
+            )
+            return
+
+        except Exception as exc:
+            delay = attempt * 3
+            logger.info(
+                "nginx redirect attempt %d/%d failed (%s), retrying in %ds",
+                attempt, max_attempts, exc, delay,
+            )
+            await asyncio.sleep(delay)
+
+    logger.warning(
+        "Failed to install nginx redirect after %d attempts", max_attempts
+    )
 
 
 async def setup_doris_local() -> None:
@@ -271,5 +312,4 @@ async def setup_doris_local() -> None:
     hotspot interface is up.
     """
     _setup_avahi_hostname()
-    _setup_nginx_conf()
     await _ensure_nginx_redirect()
