@@ -109,7 +109,12 @@ async def _install_driver() -> bool:
         return False
 
     dest = f"/lib/modules/{kver}/kernel/drivers/net/wireless/8812bu.ko"
-    copy_cmd = f"docker cp {container_name}:/app/driver/8812bu.ko {dest} && sudo depmod -a"
+    copy_cmd = (
+        f"docker cp {container_name}:/app/driver/8812bu.ko /tmp/8812bu.ko"
+        f" && sudo mkdir -p $(dirname {dest})"
+        f" && sudo mv /tmp/8812bu.ko {dest}"
+        f" && sudo depmod -a"
+    )
     ok, _ = await _run_host_command(copy_cmd, timeout=30.0)
     if not ok:
         logger.error("Failed to copy driver to host")

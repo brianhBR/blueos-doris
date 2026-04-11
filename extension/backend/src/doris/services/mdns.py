@@ -238,6 +238,22 @@ async def _upload_nginx_redirect() -> bool:
             if not cid:
                 raise RuntimeError(f"{CORE_CONTAINER} container not found")
 
+            exec_body = {
+                "Cmd": ["mkdir", "-p", NGINX_CONF_DIR],
+                "AttachStdout": False,
+                "AttachStderr": False,
+            }
+            exec_resp = await client.post(
+                f"{_docker_base_url()}/containers/{cid}/exec",
+                json=exec_body,
+            )
+            exec_resp.raise_for_status()
+            exec_id = exec_resp.json()["Id"]
+            await client.post(
+                f"{_docker_base_url()}/exec/{exec_id}/start",
+                json={"Detach": True},
+            )
+
             tar_buf = io.BytesIO()
             with tarfile.open(fileobj=tar_buf, mode="w") as tar:
                 data = NGINX_REDIRECT_CONTENT.encode()
