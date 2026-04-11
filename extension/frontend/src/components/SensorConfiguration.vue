@@ -61,8 +61,12 @@ const hasConnectedCamera = computed(() =>
   modules.value.some(m => m.type === 'camera' && m.connected)
 )
 
+/** Any camera tile from Camera Manager (running or not) — IP cam recorder does not need stream.running */
+const hasCameraModule = computed(() => modules.value.some(m => m.type === 'camera'))
+
 async function refreshSnapshot() {
   if (!hasConnectedCamera.value) return
+  if (ipcamRecording.value) return
   snapshotLoading.value = !snapshotUrl.value
   snapshotError.value = false
   try {
@@ -99,7 +103,7 @@ const IPCAM_SPLIT_SEC = 300
 let ipcamStatusInterval: number | undefined
 
 async function refreshIpcamRecordStatus() {
-  if (!hasConnectedCamera.value) return
+  if (!hasCameraModule.value) return
   try {
     const resp = await fetch(`${IPCAM_RECORD_API}/status`)
     if (!resp.ok) return
@@ -115,7 +119,7 @@ function startIpcamStatusPolling() {
     clearInterval(ipcamStatusInterval)
     ipcamStatusInterval = undefined
   }
-  if (hasConnectedCamera.value) {
+  if (hasCameraModule.value) {
     void refreshIpcamRecordStatus()
     ipcamStatusInterval = setInterval(refreshIpcamRecordStatus, 4000) as unknown as number
   } else {
@@ -123,8 +127,11 @@ function startIpcamStatusPolling() {
   }
 }
 
-function startCameraSidecars() {
+function startSnapshotSidecar() {
   startSnapshotPolling()
+}
+
+function startIpcamSidecar() {
   startIpcamStatusPolling()
 }
 
@@ -352,12 +359,13 @@ watch(apiModules, (newModules) => {
       moduleStatus: m.module_status,
     }))
     if (!hadCamera && hasConnectedCamera.value) {
-      startCameraSidecars()
+      startSnapshotSidecar()
     }
   }
 }, { immediate: true })
 
-watch(hasConnectedCamera, startCameraSidecars)
+watch(hasConnectedCamera, startSnapshotSidecar)
+watch(hasCameraModule, startIpcamSidecar)
 
 let pollInterval: number | undefined
 
@@ -569,44 +577,58 @@ const getStatusColor = (moduleStatus: string) => {
               </div>
             </div>
 
-            <!-- Inline camera preview -->
-            <div v-if="mod.type === 'camera' && mod.connected" class="mt-3 rounded-lg overflow-hidden" style="border: 1px solid rgba(65, 185, 195, 0.2)">
+            <!-- Camera: preview only when BlueOS stream is running; recorder always (RTSP path is fixed in extension) -->
+            <div v-if="mod.type === 'camera'" class="mt-3 space-y-3">
               <div
-                v-if="snapshotLoading && !snapshotUrl"
-                class="flex items-center justify-center py-10"
-                style="color: #96EEF2; background-color: rgba(0,0,0,0.3)"
+                v-if="mod.connected"
+                class="rounded-lg overflow-hidden"
+                style="border: 1px solid rgba(65, 185, 195, 0.2)"
               >
-                <Loader2 class="w-5 h-5 animate-spin mr-2" />
-                <span class="text-xs">Connecting to camera...</span>
-              </div>
+                <div
+                  v-if="snapshotLoading && !snapshotUrl"
+                  class="flex items-center justify-center py-10"
+                  style="color: #96EEF2; background-color: rgba(0,0,0,0.3)"
+                >
+                  <Loader2 class="w-5 h-5 animate-spin mr-2" />
+                  <span class="text-xs">Connecting to camera...</span>
+                </div>
 
-              <div
-                v-else-if="snapshotError && !snapshotUrl"
-                class="flex items-center justify-center gap-2 py-6"
-                style="background-color: rgba(0,0,0,0.3)"
-              >
-                <AlertCircle class="w-4 h-4" style="color: rgba(150, 238, 242, 0.4)" />
-                <span class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Preview unavailable</span>
-                <button
-                  @click.stop="refreshSnapshot"
-                  class="text-xs px-2 py-0.5 rounded hover:opacity-80"
-                  style="background-color: rgba(65, 185, 195, 0.2); color: #96EEF2; border: 1px solid rgba(65, 185, 195, 0.3)"
-                >Retry</button>
-              </div>
+                <div
+                  v-else-if="snapshotError && !snapshotUrl"
+                  class="flex items-center justify-center gap-2 py-6"
+                  style="background-color: rgba(0,0,0,0.3)"
+                >
+                  <AlertCircle class="w-4 h-4" style="color: rgba(150, 238, 242, 0.4)" />
+                  <span class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Preview unavailable</span>
+                  <button
+                    @click.stop="refreshSnapshot"
+                    class="text-xs px-2 py-0.5 rounded hover:opacity-80"
+                    style="background-color: rgba(65, 185, 195, 0.2); color: #96EEF2; border: 1px solid rgba(65, 185, 195, 0.3)"
+                  >Retry</button>
+                </div>
 
-              <div v-else-if="snapshotUrl" style="background-color: #000">
-                <img
-                  :src="snapshotUrl"
-                  alt="Camera preview"
-                  class="w-full object-contain"
-                  style="max-height: 300px"
-                />
-                <div class="flex items-center justify-end gap-1 px-2 py-1" style="background-color: rgba(14, 36, 70, 0.8)">
-                  <span class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Snapshot updates every 10s</span>
+                <div v-else-if="snapshotUrl" style="background-color: #000">
+                  <img
+                    :src="snapshotUrl"
+                    alt="Camera preview"
+                    class="w-full object-contain"
+                    style="max-height: 300px"
+                  />
+                  <div class="flex items-center justify-end gap-1 px-2 py-1" style="background-color: rgba(14, 36, 70, 0.8)">
+                    <span class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Snapshot updates every 10s</span>
+                  </div>
                 </div>
               </div>
 
-              <div class="mt-3 rounded-lg p-3 space-y-2" style="background-color: rgba(14, 36, 70, 0.6); border: 1px solid rgba(65, 185, 195, 0.25)">
+              <div
+                v-else
+                class="rounded-lg px-3 py-2.5 text-xs leading-relaxed"
+                style="background-color: rgba(14, 36, 70, 0.45); border: 1px solid rgba(65, 185, 195, 0.2); color: rgba(150, 238, 242, 0.65)"
+              >
+                Video stream is not running in Camera Manager, so the live snapshot preview is unavailable. You can still start file recording below — it uses the extension’s RTSP path and does not depend on this stream.
+              </div>
+
+              <div class="rounded-lg p-3 space-y-2" style="background-color: rgba(14, 36, 70, 0.6); border: 1px solid rgba(65, 185, 195, 0.25)">
                 <div class="flex items-center justify-between gap-2">
                   <span class="text-xs font-medium" style="color: #96EEF2">IP camera file recording</span>
                   <span
@@ -649,7 +671,6 @@ const getStatusColor = (moduleStatus: string) => {
                 </div>
                 <p v-if="ipcamRecordError" class="text-xs" style="color: #f87171">{{ ipcamRecordError }}</p>
               </div>
-
             </div>
 
             <!-- Inline light test button -->

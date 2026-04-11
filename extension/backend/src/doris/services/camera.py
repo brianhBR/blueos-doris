@@ -205,14 +205,23 @@ class CameraService:
     async def get_snapshot(self, source: str | None = None) -> bytes | None:
         """Grab a single JPEG frame from the camera.
 
+        Returns ``None`` immediately when the IP camera recorder is active
+        to avoid opening a second RTSP session (most cameras allow only one).
+
         Tries (in order):
         1. MCM /thumbnail (works for v4l2/USB cameras)
         2. Direct HTTP snapshot from the IP camera (for RTSP/ONVIF cameras)
+        3. ffmpeg RTSP single-frame grab (skipped when recorder is active)
         """
         import httpx as _httpx
         import logging as _logging
         import re as _re
         _logger = _logging.getLogger(__name__)
+
+        from . import ip_camera_recorder as _iprec
+        if _iprec._process is not None and _iprec._process.returncode is None:
+            _logger.debug("Snapshot skipped — IP camera recorder is active")
+            return None
 
         params: dict[str, str] = {"quality": "70"}
         if source:
@@ -266,12 +275,18 @@ class CameraService:
                 except Exception:
                     continue
 
-        # 3. Last resort: grab a single frame from the RTSP stream via ffmpeg
-        rtsp_urls = await self._discover_rtsp_urls()
-        for url in rtsp_urls:
-            frame = await self._ffmpeg_snapshot(url)
-            if frame:
-                return frame
+        # 3. Last resort: grab a single frame from the RTSP stream via ffmpeg.
+        #    Skip if the IP camera recorder is active — most cameras allow only
+        #    one concurrent RTSP session, so a snapshot would kill the recording.
+        from . import ip_camera_recorder as _iprec
+        if _iprec._process is not None and _iprec._process.returncode is None:
+            _logger.debug("Skipping ffmpeg snapshot — IP camera recorder is active")
+        else:
+            rtsp_urls = await self._discover_rtsp_urls()
+            for url in rtsp_urls:
+                frame = await self._ffmpeg_snapshot(url)
+                if frame:
+                    return frame
 
         return None
 

@@ -24,6 +24,7 @@ logger = logging.getLogger(__name__)
 IPCAM_RTSP_URL = "rtsp://admin:blue@192.168.2.10:554/stream_0"
 
 _process: asyncio.subprocess.Process | None = None
+_stderr_task: asyncio.Task | None = None
 _lock = asyncio.Lock()
 _last_pattern: str | None = None
 
@@ -85,8 +86,6 @@ def _build_ffmpeg_args(rtsp_url: str, segment_s: int, pattern: str) -> list[str]
         str(max(segment_s, 1)),
         "-segment_format",
         "mpegts",
-        "-strftime",
-        "1",
         "-reset_timestamps",
         "1",
         pattern,
@@ -126,7 +125,7 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
                 *cmd,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError:
             return {"success": False, "message": "ffmpeg not found", "recording": False}
@@ -136,13 +135,29 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
 
         await asyncio.sleep(0.35)
         if proc.returncode is not None:
-            logger.error("ffmpeg exited immediately rc=%s", proc.returncode)
+            err_bytes = await proc.stderr.read() if proc.stderr else b""
+            err_text = err_bytes.decode(errors="replace").strip()
+            logger.error("ffmpeg exited immediately rc=%s stderr=%s", proc.returncode, err_text)
             return {
                 "success": False,
-                "message": f"ffmpeg exited with {proc.returncode}",
+                "message": f"ffmpeg exited with {proc.returncode}: {err_text[:300]}",
                 "recording": False,
             }
 
+        async def _drain_stderr(p: asyncio.subprocess.Process) -> None:
+            """Log ffmpeg stderr lines in background; log exit when it dies."""
+            assert p.stderr is not None
+            while True:
+                line = await p.stderr.readline()
+                if not line:
+                    break
+                logger.warning("ffmpeg: %s", line.decode(errors="replace").rstrip())
+            rc = await p.wait()
+            if rc != 0 and rc != -2:
+                logger.error("ffmpeg exited unexpectedly rc=%s", rc)
+
+        global _stderr_task
+        _stderr_task = asyncio.create_task(_drain_stderr(proc))
         _process = proc
         return {
             "success": True,

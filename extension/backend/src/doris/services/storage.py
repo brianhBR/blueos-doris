@@ -617,7 +617,7 @@ class StorageService:
         self.media_root = media_root or RECORDER_ROOT
         if not self.root.exists():
             self.root.mkdir(parents=True, exist_ok=True)
-        if not self.media_root.exists():
+        if not self.media_root.exists() and not self.media_root.is_symlink():
             self.media_root.mkdir(parents=True, exist_ok=True)
         self._dive_windows_cache: list[_DiveWindow] | None = None
         self._dives_dir_mtime: float | None = None

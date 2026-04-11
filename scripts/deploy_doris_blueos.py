@@ -31,7 +31,7 @@ HOST = os.environ.get("DORIS_DEPLOY_HOST", "blueos-wifi.local")
 USER = os.environ.get("DORIS_DEPLOY_USER", "pi")
 PASSWORD = os.environ.get("DORIS_DEPLOY_PASSWORD", "raspberry")
 ENABLE_DOCKER_TCP = os.environ.get("DORIS_ENABLE_DOCKER_TCP", "").strip().lower() in ("1", "true", "yes")
-CONTAINER_NAME = "extension-blueroboticsblueosdoris0028"
+CONTAINER_NAME = "extension-sailorman225blueosdorismaster"
 IMAGE_TAG = "bluerobotics/blueos-doris:dev"
 
 
@@ -201,6 +201,14 @@ fi
     print("Replacing container...")
     stop_script = f"""
 set +e
+# Free host TCP 8095 if another container (e.g. Kraken-managed extension) still holds it.
+for id in $(sudo docker ps -aq); do
+  if sudo docker inspect "$id" --format '{{{{json .HostConfig.PortBindings}}}}' 2>/dev/null | grep -q '"8095/tcp"'; then
+    echo "Removing $id (published 8095/tcp)"
+    sudo docker update --restart=no "$id" 2>/dev/null
+    sudo docker rm -f "$id" 2>/dev/null
+  fi
+done
 # BlueOS often sets --restart on extension containers; without docker update
 # --restart=no, the daemon can resurrect the old container between rm and run,
 # causing "Conflict. The container name is already in use".
