@@ -1178,7 +1178,7 @@ export function useNotifications() {
 // ── Storage migration status ────────────────────────────────────────
 
 export interface StorageMigrationStatus {
-  state: 'idle' | 'checking' | 'mounting' | 'migrating' | 'linking' | 'done' | 'skipped' | 'error'
+  state: 'idle' | 'checking' | 'mounting' | 'configuring' | 'done' | 'skipped' | 'error'
   message: string
   error: string
 }
@@ -1196,7 +1196,7 @@ export function useStorageMigration() {
 
   const isActive = computed(() => {
     if (!status.value) return false
-    return ['checking', 'mounting', 'migrating', 'linking'].includes(status.value.state)
+    return ['checking', 'mounting', 'configuring'].includes(status.value.state)
   })
 
   const isError = computed(() => status.value?.state === 'error')
