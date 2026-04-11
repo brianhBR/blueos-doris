@@ -8,7 +8,7 @@
         "lights": "Lights 1 on SERVO13 (function 181), controlled via RC channel 9",
         "relay": "Drop-weight relay on SERVO14 via ArduPilot relay subsystem (DORIS_RELAY_CH=0)",
         "thrusters": "All thruster outputs disabled (SERVO1-8 FUNCTION=0)",
-        "relay_setup": "RELAY1_FUNCTION=1 enables relay 1 (requires reboot). RELAY1_PIN=63 assigns it to channel 14 (SERVO14) and must be set after reboot once the relay driver has initialised.",
+        "relay_setup": "RELAY1_FUNCTION=1 enables relay 1 (requires reboot). RELAY1_PIN=14 assigns it to SERVO14 and must be set after reboot once the relay driver has initialised.",
         "orientation": "Autopilot mounted at Pitch270 (AHRS_ORIENTATION=25)",
         "rangefinder": "RNGFND1_TYPE=0 explicitly disables the rangefinder to prevent LASER_POSITION prearm failures",
         "ekf_source": "ArduSub defaults EK3_SRC1 to ExternalNav (3) for DVL setups. DORIS needs GPS at the surface for pre-arm, so POSXY and VELXY are set to GPS (1). FS_EKF_ACTION=0 handles the expected GPS loss underwater."
@@ -29,7 +29,7 @@
         "SERVO10_FUNCTION": 0,
         "SERVO11_FUNCTION": 0,
         "SERVO12_FUNCTION": 0,
-        "SERVO13_FUNCTION": 181,
+        "SERVO13_FUNCTION": 59,
         "SERVO14_FUNCTION": 0,
         "SERVO15_FUNCTION": 0,
         "SERVO16_FUNCTION": 0,
@@ -63,6 +63,6 @@
         "BATT_FS_CRT_ACT": 0
     },
     "post_reboot_parameters": {
-        "RELAY1_PIN": 63
+        "RELAY1_PIN": 14
     }
 }
