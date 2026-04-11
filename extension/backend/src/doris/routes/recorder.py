@@ -72,9 +72,9 @@ async def _recorder_status_core(_request):
 
 
 def register_recorder_routes(app: Robyn) -> None:
-    """Register GET /start, /stop, /status (Lua) and /api/v1/ipcam/record/* (web UI)."""
+    """Register GET /rec/* (Lua) and /api/v1/ipcam/record/* (web UI)."""
 
-    @app.get("/start")
+    @app.get("/rec/start")
     async def recorder_start_lua(request):
         return await _recorder_start_core(request)
 
@@ -82,7 +82,7 @@ def register_recorder_routes(app: Robyn) -> None:
     async def recorder_start_api(request):
         return await _recorder_start_core(request)
 
-    @app.get("/stop")
+    @app.get("/rec/stop")
     async def recorder_stop_lua(request):
         return await _recorder_stop_core(request)
 
@@ -90,7 +90,7 @@ def register_recorder_routes(app: Robyn) -> None:
     async def recorder_stop_api(request):
         return await _recorder_stop_core(request)
 
-    @app.get("/status")
+    @app.get("/rec/status")
     async def recorder_status_lua(request):
         return await _recorder_status_core(request)
 

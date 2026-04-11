@@ -673,12 +673,12 @@ end
 
 local function ipcam_http_start(host, port, seg_s)
     local s = math.max(1, math.floor(seg_s))
-    local line = string.format("GET /start?split_duration=%d", s)
+    local line = string.format("GET /rec/start?split_duration=%d", s)
     return ipcam_http_send(line, host, port)
 end
 
 local function ipcam_http_stop(host, port)
-    return ipcam_http_send("GET /stop", host, port)
+    return ipcam_http_send("GET /rec/stop", host, port)
 end
 
 local function ipcam_start()
