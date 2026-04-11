@@ -187,6 +187,29 @@ def register_dive_routes(app: Robyn) -> None:
             logger.info(f"Starting dive with configuration: {config_name}")
 
         loaded_at = datetime.now(tz=timezone.utc)
+        clock_sane = 2024 <= loaded_at.year <= 2030
+
+        if not clock_sane:
+            rw_date = body.get("release_weight_date", "")
+            rw_time = body.get("release_weight_time", "00:00")
+            if rw_date:
+                try:
+                    loaded_at = datetime.fromisoformat(
+                        f"{rw_date}T{rw_time}:00+00:00"
+                    )
+                    logger.warning(
+                        "System clock is wrong (year %d); using user-entered "
+                        "release_weight_date %s as started_at",
+                        datetime.now(tz=timezone.utc).year,
+                        rw_date,
+                    )
+                except ValueError:
+                    logger.warning(
+                        "System clock is wrong and release_weight_date is "
+                        "unparseable (%s); timestamps will be inaccurate",
+                        rw_date,
+                    )
+
         upload_date = float(loaded_at.year * 10_000 + loaded_at.month * 100 + loaded_at.day)
         upload_time = float(loaded_at.hour * 100 + loaded_at.minute)
         profile_id = _allocate_profile_id() if config is not None else 0

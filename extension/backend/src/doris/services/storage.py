@@ -62,15 +62,64 @@ def _parse_iso_to_utc(value: object) -> datetime | None:
     return dt.astimezone(timezone.utc)
 
 
+def _sane_now() -> datetime:
+    """Return UTC now, clamped to a reasonable range if the system clock is bogus."""
+    now = datetime.now(timezone.utc)
+    if now.year < 2024 or now.year > 2030:
+        return datetime(2026, 1, 1, tzinfo=timezone.utc)
+    return now
+
+
+def _sane_bounds() -> tuple[datetime, datetime]:
+    """Reasonable time window that does not rely on a correct system clock."""
+    lo = datetime(2024, 1, 1, tzinfo=timezone.utc)
+    hi = datetime(2030, 12, 31, tzinfo=timezone.utc)
+    return lo, hi
+
+
+def _best_start_time(data: dict, file: Path) -> datetime | None:
+    """Pick the best available start time for a dive record.
+
+    Priority: started_at (if sane) > release_weight_date+time > file mtime >
+    started_at (even if bogus, so the dive still appears in the list).
+    """
+    lo, hi = _sane_bounds()
+
+    started = _parse_iso_to_utc(data.get("started_at"))
+    if started is not None and lo <= started <= hi:
+        return started
+
+    rw_date = str(data.get("release_weight_date") or "").strip()
+    rw_time = str(data.get("release_weight_time") or "00:00").strip()
+    if rw_date:
+        try:
+            combined = datetime.fromisoformat(f"{rw_date}T{rw_time}:00+00:00")
+            if lo <= combined <= hi:
+                return combined
+        except ValueError:
+            pass
+
+    try:
+        mtime = datetime.fromtimestamp(file.stat().st_mtime, tz=timezone.utc)
+        if lo <= mtime <= hi:
+            return mtime
+    except OSError:
+        pass
+
+    if started is not None:
+        return started
+
+    return None
+
+
 def _load_dive_windows(root: Path) -> list[_DiveWindow]:
     """Build time windows from dives/dive_*.json for matching recorder files."""
     ddir = root / "dives"
     if not ddir.is_dir():
         return []
 
-    now = datetime.now(timezone.utc)
-    lo = datetime(2020, 1, 1, tzinfo=timezone.utc)
-    hi = now + timedelta(days=2)
+    now = _sane_now()
+    lo, hi = _sane_bounds()
     windows: list[_DiveWindow] = []
 
     for f in sorted(ddir.glob("dive_*.json")):
@@ -79,22 +128,20 @@ def _load_dive_windows(root: Path) -> list[_DiveWindow]:
         except (json.JSONDecodeError, OSError):
             continue
 
-        start = _parse_iso_to_utc(data.get("started_at"))
+        start = _best_start_time(data, f)
         if start is None:
             continue
-        if not (lo <= start <= hi):
-            try:
-                start = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
-            except OSError:
-                continue
 
         ended = _parse_iso_to_utc(data.get("ended_at"))
+        if ended is not None and not (lo <= ended <= hi):
+            ended = None
         status = str(data.get("status") or "").lower()
 
         if ended is None:
             if status in ("completed", "cancelled"):
                 try:
-                    ended = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
+                    mtime = datetime.fromtimestamp(f.stat().st_mtime, tz=timezone.utc)
+                    ended = mtime if lo <= mtime <= hi else start + timedelta(hours=6)
                 except OSError:
                     ended = start + timedelta(hours=6)
             else:
@@ -218,28 +265,20 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
     windows = _load_dive_windows(root)
     counts = aggregate_recorder_media_counts_by_dive_stem(root, windows)
     mcap_by_stem = map_dive_stem_to_largest_mcap(root, windows)
-    now = datetime.now(timezone.utc)
+    now = _sane_now()
     entries: list[DiveHistoryEntry] = []
 
-    lo = datetime(2020, 1, 1, tzinfo=timezone.utc)
-    hi = now + timedelta(days=2)
+    lo, hi = _sane_bounds()
 
     for f in sorted(ddir.glob("dive_*.json"), reverse=True):
         try:
             data = json.loads(f.read_text())
         except (json.JSONDecodeError, OSError):
             continue
-        started = _parse_iso_to_utc(data.get("started_at"))
+
+        started = _best_start_time(data, f)
         if started is None:
             continue
-
-        if not (lo <= started <= hi):
-            try:
-                started = datetime.fromtimestamp(
-                    f.stat().st_mtime, tz=timezone.utc
-                )
-            except OSError:
-                started = now
 
         stem = f.stem
         ended = _parse_iso_to_utc(data.get("ended_at"))
@@ -252,7 +291,7 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
         elif status == "active":
             duration = _format_dive_duration(started, now) + " (ongoing)"
         else:
-            duration = "—"
+            duration = "\u2014"
 
         name = str(data.get("dive_name") or "").strip()
         if not name:
@@ -283,8 +322,6 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
                 rel_mcap = str(mcap_path.relative_to(root))
             except ValueError:
                 rel_mcap = None
-        # Do not call summarize_mcap() here: full MCAP scans block the whole API process
-        # (Robyn) and stall every concurrent request including /media/files.
 
         entries.append(
             DiveHistoryEntry(
@@ -370,9 +407,7 @@ def _effective_created_at(path: Path, mtime_ts: float) -> datetime:
     Some mounts (or flight-controller exports) report impossible mtimes (e.g. year 2073).
     Recorder files embed the real time in the name.
     """
-    now = datetime.now(timezone.utc)
-    lo = datetime(2000, 1, 1, tzinfo=timezone.utc)
-    hi = now + timedelta(days=2)
+    lo, hi = _sane_bounds()
     mtime_dt = datetime.fromtimestamp(mtime_ts, tz=timezone.utc)
 
     if lo <= mtime_dt <= hi:
@@ -382,7 +417,6 @@ def _effective_created_at(path: Path, mtime_ts: float) -> datetime:
     if parsed is not None and lo <= parsed <= hi + timedelta(days=7):
         return parsed
 
-    # No filename hint: clamp insane mtimes so the Data page stays usable
     if mtime_dt > hi:
         return hi
     if mtime_dt < lo:

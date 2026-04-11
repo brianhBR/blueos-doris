@@ -4,7 +4,6 @@ import asyncio
 import logging
 import os
 
-import httpx
 from robyn import ALLOW_CORS, Robyn
 from robyn.openapi import Contact, OpenAPI, OpenAPIInfo
 
@@ -27,43 +26,27 @@ from .routes import (
 from .services.external_storage import start_external_storage_setup
 from .services.frame import FrameService
 from .services.mdns import ensure_wifi_driver, restart_avahi, setup_doris_local, start_hotspot_dns
+from .services.timesync import timesync_service
 from .utils import deploy_artemis_svl, deploy_lua_scripts, disable_usb_autosuspend, restart_firmware
 
 
-AGT_COMPONENT_ID = 191
-AGT_REBOOT_DELAY_S = 3
+AUTOPILOT_RESTART_DELAY_S = 10
 
 
-async def _reboot_agt(logger: logging.Logger) -> None:
-    """Send MAV_CMD_USER_5 (31014) to reboot the Artemis Global Tracker."""
-    await asyncio.sleep(AGT_REBOOT_DELAY_S)
+async def _restart_autopilot(logger: logging.Logger) -> None:
+    """Restart the autopilot once after boot to reinitialise the GPS serial link.
 
-    from .config import blueos_services
-    url = f"{blueos_services.mavlink2rest}/mavlink"
-    payload = {
-        "header": {"system_id": 255, "component_id": 0, "sequence": 0},
-        "message": {
-            "type": "COMMAND_LONG",
-            "target_system": 1,
-            "target_component": AGT_COMPONENT_ID,
-            "command": {"type": "MAV_CMD_USER_5"},
-            "confirmation": 0,
-            "param1": 0.0,
-            "param2": 0.0,
-            "param3": 0.0,
-            "param4": 0.0,
-            "param5": 0.0,
-            "param6": 0.0,
-            "param7": 0.0,
-        },
-    }
+    The Artemis sends GPS_INPUT over USB-serial, but if the autopilot
+    initialises its GPS_MAV driver before the serial port is fully
+    enumerated, the driver silently stops consuming GPS data.  A single
+    deferred restart lets the driver re-probe the now-ready port.
+    """
+    await asyncio.sleep(AUTOPILOT_RESTART_DELAY_S)
     try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.post(url, json=payload)
-            resp.raise_for_status()
-        logger.info("AGT reboot command sent (MAV_CMD_USER_5)")
+        await restart_firmware(logger)
+        logger.info("Deferred autopilot restart complete (GPS serial re-init)")
     except Exception as e:
-        logger.warning("AGT reboot command failed (non-critical): %s", e)
+        logger.warning("Deferred autopilot restart failed (non-critical): %s", e)
 
 
 def create_app() -> Robyn:
@@ -117,9 +100,6 @@ def create_app() -> Robyn:
         lua_deployed = deploy_lua_scripts(logger)
         deploy_artemis_svl(logger)
 
-        if lua_deployed:
-            await restart_firmware(logger)
-
         frame_service = FrameService()
         try:
             await frame_service.apply_frame_if_needed()
@@ -157,11 +137,9 @@ def create_app() -> Robyn:
         except Exception as e:
             logger.warning("External storage setup skipped: %s", e)
 
-        # Reboot AGT after startup to fix boot-order GPS issue.
-        # When the Pi and AGT power on simultaneously, the AGT may
-        # start before the MAVLink router is ready, causing GPS data
-        # to never flow.  A deferred reboot lets it reconnect cleanly.
-        asyncio.get_event_loop().create_task(_reboot_agt(logger))
+        timesync_service.start_background_sync()
+
+        asyncio.get_event_loop().create_task(_restart_autopilot(logger))
 
     # Serve frontend static files if they exist
     # Check multiple possible locations for frontend dist

@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { HardDrive, Loader2, AlertTriangle } from 'lucide-vue-next'
+import { HardDrive, Loader2, AlertTriangle, Clock } from 'lucide-vue-next'
 import type { Screen, DiveData } from './types'
 import { useDiveControl, useNotifications, useStorageMigration } from './composables/useApi'
 import Navigation from './components/Navigation.vue'
@@ -29,10 +29,67 @@ const activeConfigName = computed(() => diveMission.value?.configuration_name?.t
 const { unreadCount: notificationCount, fetchUnreadCount } = useNotifications()
 const { status: migrationStatus, isActive: migrationActive, isError: migrationError, fetchMigrationStatus } = useStorageMigration()
 
+const clockSyncFailed = ref(false)
+const clockSyncMessage = ref('')
+
+async function syncVehicleClock() {
+  try {
+    const statusRes = await fetch('/api/v1/system/time')
+    if (!statusRes.ok) return
+    const status = await statusRes.json() as {
+      synced: boolean
+      clock_sane: boolean
+      source: string | null
+      last_drift_seconds: number | null
+    }
+
+    if (status.synced && status.clock_sane) {
+      clockSyncFailed.value = false
+      return
+    }
+
+    if (status.clock_sane) {
+      clockSyncFailed.value = false
+      return
+    }
+
+    const res = await fetch('/api/v1/system/time', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ utc: new Date().toISOString() }),
+    })
+    if (!res.ok) {
+      clockSyncFailed.value = true
+      clockSyncMessage.value = 'Vehicle clock is wrong — could not sync'
+      return
+    }
+    const data = await res.json() as {
+      synced: boolean
+      drift_seconds: number
+      clock_sane: boolean
+      reason?: string
+    }
+    if (data.synced) {
+      console.info(`Vehicle clock synced from browser (was off by ${data.drift_seconds}s)`)
+      clockSyncFailed.value = false
+    } else if (!data.clock_sane) {
+      clockSyncFailed.value = true
+      clockSyncMessage.value =
+        'Vehicle clock is wrong — waiting for Artemis GPS time sync'
+    } else {
+      clockSyncFailed.value = false
+    }
+  } catch {
+    // backend not reachable yet
+  }
+}
+
 let divePolling: number | undefined
 let notifPolling: number | undefined
 let migrationPolling: number | undefined
+let clockPolling: number | undefined
 onMounted(() => {
+  syncVehicleClock()
   fetchDiveStatus()
   fetchDiveMission()
   fetchUnreadCount()
@@ -40,11 +97,13 @@ onMounted(() => {
   divePolling = setInterval(() => { fetchDiveStatus(); fetchDiveMission() }, 5000) as unknown as number
   notifPolling = setInterval(fetchUnreadCount, 15000) as unknown as number
   migrationPolling = setInterval(fetchMigrationStatus, 3000) as unknown as number
+  clockPolling = setInterval(syncVehicleClock, 60000) as unknown as number
 })
 onUnmounted(() => {
   if (divePolling) clearInterval(divePolling)
   if (notifPolling) clearInterval(notifPolling)
   if (migrationPolling) clearInterval(migrationPolling)
+  if (clockPolling) clearInterval(clockPolling)
 })
 const selectedDiveData = ref<DiveData | null>(null)
 const releaseWeightBy = ref<'datetime' | 'elapsed'>('elapsed')
@@ -83,6 +142,17 @@ const setConnected = (connected: boolean) => {
     class="min-h-screen flex flex-col"
     style="background: linear-gradient(135deg, #0E2446 0%, #0E2446 60%, #004D64 100%)"
   >
+    <div
+      v-if="clockSyncFailed"
+      class="w-full py-2 px-4 flex items-center justify-center gap-2"
+      style="background-color: rgba(255, 165, 0, 0.2); border-bottom: 1px solid rgba(255, 165, 0, 0.5); font-family: Montserrat, sans-serif"
+    >
+      <Clock class="w-4 h-4" style="color: #FFA500" />
+      <span class="text-sm" style="color: #FFD180">
+        {{ clockSyncMessage || 'Vehicle clock is not synced — dive timestamps may be incorrect' }}
+      </span>
+    </div>
+
     <div
       v-if="isDiveActive"
       class="w-full py-3 px-4 text-white text-center font-semibold"
