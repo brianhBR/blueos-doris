@@ -134,21 +134,6 @@ assert(param:add_param(PARAM_TABLE_KEY, 27, "BTM_REC",  0),    "DORIS_BTM_REC")
 assert(param:add_param(PARAM_TABLE_KEY, 28, "ASC_REC",  0),    "DORIS_ASC_REC")
 assert(param:add_param(PARAM_TABLE_KEY, 29, "CAM_DLY",  0),    "DORIS_CAM_DLY")
 
--- One-time EEPROM cleanup: after param table was resized from 40→29, stale
--- values at indices 25-29 can contain garbage from the old layout.  Force
--- them to their defaults so the recorder doesn't trigger phantom recordings.
-do
-    local rec_en = param:get("DORIS_REC_EN")
-    if rec_en and (rec_en ~= 0 and rec_en ~= 1) then
-        gcs:send_text(MAV_SEVERITY.WARNING,
-            string.format("DIVE: Clearing stale EEPROM camera params (REC_EN was %.0f)", rec_en))
-        param:set_and_save("DORIS_REC_EN",  0)
-        param:set_and_save("DORIS_DSC_REC", 0)
-        param:set_and_save("DORIS_BTM_REC", 0)
-        param:set_and_save("DORIS_ASC_REC", 0)
-        param:set_and_save("DORIS_CAM_DLY", 0)
-    end
-end
 
 local DORIS_START    = Parameter("DORIS_START")
 local DORIS_RLS_SEC  = Parameter("DORIS_RLS_SEC")
@@ -673,12 +658,12 @@ end
 
 local function ipcam_http_start(host, port, seg_s)
     local s = math.max(1, math.floor(seg_s))
-    local line = string.format("GET /rec/start?split_duration=%d", s)
+    local line = string.format("POST /rec/start?split_duration=%d", s)
     return ipcam_http_send(line, host, port)
 end
 
 local function ipcam_http_stop(host, port)
-    return ipcam_http_send("GET /rec/stop", host, port)
+    return ipcam_http_send("POST /rec/stop", host, port)
 end
 
 local function ipcam_start()

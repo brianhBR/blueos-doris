@@ -142,6 +142,7 @@ async function startIpcamRecording() {
   try {
     const resp = await fetch(
       `${IPCAM_RECORD_API}/start?split_duration=${IPCAM_SPLIT_SEC}`,
+      { method: 'POST' },
     )
     const data = await resp.json().catch(() => ({}))
     if (!resp.ok || data.success === false) {
@@ -163,7 +164,7 @@ async function stopIpcamRecording() {
   ipcamRecordBusy.value = true
   ipcamRecordError.value = ''
   try {
-    const resp = await fetch(`${IPCAM_RECORD_API}/stop`)
+    const resp = await fetch(`${IPCAM_RECORD_API}/stop`, { method: 'POST' })
     const data = await resp.json().catch(() => ({}))
     if (!resp.ok || data.success === false) {
       ipcamRecordError.value =

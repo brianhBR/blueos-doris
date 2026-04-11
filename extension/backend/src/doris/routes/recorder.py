@@ -72,21 +72,25 @@ async def _recorder_status_core(_request):
 
 
 def register_recorder_routes(app: Robyn) -> None:
-    """Register GET /rec/* (Lua) and /api/v1/ipcam/record/* (web UI)."""
+    """Register POST /rec/* (Lua) and /api/v1/ipcam/record/* (web UI).
 
-    @app.get("/rec/start")
+    POST prevents BlueOS helper service-discovery GETs from triggering
+    start/stop as a side effect.  Status remains GET (read-only).
+    """
+
+    @app.post("/rec/start")
     async def recorder_start_lua(request):
         return await _recorder_start_core(request)
 
-    @app.get("/api/v1/ipcam/record/start")
+    @app.post("/api/v1/ipcam/record/start")
     async def recorder_start_api(request):
         return await _recorder_start_core(request)
 
-    @app.get("/rec/stop")
+    @app.post("/rec/stop")
     async def recorder_stop_lua(request):
         return await _recorder_stop_core(request)
 
-    @app.get("/api/v1/ipcam/record/stop")
+    @app.post("/api/v1/ipcam/record/stop")
     async def recorder_stop_api(request):
         return await _recorder_stop_core(request)
 
