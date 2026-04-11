@@ -39,6 +39,10 @@ AUTOPILOT_RESTART_DELAY_S = 10
 POST_REBOOT_SETTLE_S = 8
 
 
+POST_REBOOT_PARAM_RETRIES = 3
+POST_REBOOT_PARAM_RETRY_DELAY_S = 5
+
+
 async def _restart_autopilot(logger: logging.Logger) -> None:
     """Restart the autopilot once after boot, then apply post-reboot params.
 
@@ -60,15 +64,23 @@ async def _restart_autopilot(logger: logging.Logger) -> None:
         return
 
     await asyncio.sleep(POST_REBOOT_SETTLE_S)
-    try:
-        frame_service = FrameService()
-        ok = await frame_service.apply_post_reboot_params()
-        if ok:
-            logger.info("Post-reboot relay params applied (RELAY1_PIN -> channel 14)")
-        else:
-            logger.warning("Some post-reboot relay params failed to apply")
-    except Exception as e:
-        logger.warning("Post-reboot param application failed: %s", e)
+
+    frame_service = FrameService()
+    for attempt in range(1, POST_REBOOT_PARAM_RETRIES + 1):
+        try:
+            ok = await frame_service.apply_post_reboot_params()
+            if ok:
+                logger.info("Post-reboot relay params applied and verified (attempt %d)", attempt)
+                return
+            logger.warning(
+                "Post-reboot params not verified (attempt %d/%d), retrying in %ds",
+                attempt, POST_REBOOT_PARAM_RETRIES, POST_REBOOT_PARAM_RETRY_DELAY_S,
+            )
+        except Exception as e:
+            logger.warning("Post-reboot param attempt %d failed: %s", attempt, e)
+        await asyncio.sleep(POST_REBOOT_PARAM_RETRY_DELAY_S)
+
+    logger.error("Post-reboot params failed after %d attempts", POST_REBOOT_PARAM_RETRIES)
 
 
 def create_app() -> Robyn:

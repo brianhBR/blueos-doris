@@ -328,6 +328,9 @@ class FrameService:
         enables relay 1 but the driver won't create the relay object until the
         next reboot.  Only after that reboot can RELAY1_PIN be set to assign
         the relay to a physical output channel.
+
+        Each param is set and then read back to confirm the autopilot accepted
+        the value.  Returns True only when every param is verified.
         """
         frame = self.load_frame_definition(frame_name)
         if frame is None:
@@ -342,7 +345,7 @@ class FrameService:
         succeeded = []
         failed = []
         for name, value in params.items():
-            ok = await self._set_param(name, float(value))
+            ok = await self._set_and_verify_param(name, float(value))
             if ok:
                 succeeded.append(name)
             else:
@@ -356,7 +359,7 @@ class FrameService:
             )
         else:
             logger.info(
-                "Post-reboot params applied: %s",
+                "Post-reboot params applied and verified: %s",
                 ", ".join(f"{n}={params[n]}" for n in succeeded),
             )
 
@@ -387,6 +390,58 @@ class FrameService:
         except Exception as e:
             logger.error("Failed to set %s=%.1f: %s", name, value, e)
             return False
+
+    async def _read_param(self, name: str) -> float | None:
+        """Read a parameter value back from the autopilot."""
+        import httpx
+
+        base = _mavlink2rest_http_url()
+        payload = {
+            "header": {"system_id": 255, "component_id": 0, "sequence": 0},
+            "message": {
+                "type": "PARAM_REQUEST_READ",
+                "target_system": 1,
+                "target_component": 1,
+                "param_id": list(name.ljust(16, "\x00")),
+                "param_index": -1,
+            },
+        }
+        try:
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                resp = await client.post(f"{base}/mavlink", json=payload)
+                resp.raise_for_status()
+                await asyncio.sleep(0.5)
+                resp = await client.get(
+                    f"{base}/mavlink/vehicles/1/components/1/messages/PARAM_VALUE"
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            returned_name = "".join(
+                c for c in data.get("message", {}).get("param_id", [])
+                if c != "\x00"
+            )
+            if returned_name == name:
+                return float(data["message"].get("param_value", 0))
+        except Exception as e:
+            logger.debug("Failed to read %s: %s", name, e)
+        return None
+
+    async def _set_and_verify_param(self, name: str, value: float) -> bool:
+        """Set a parameter and read it back to confirm the autopilot accepted it."""
+        if not await self._set_param(name, value):
+            return False
+
+        actual = await self._read_param(name)
+        if actual is not None and int(actual) == int(value):
+            logger.debug("Verified %s=%d", name, int(value))
+            return True
+
+        logger.warning(
+            "Verification failed for %s: expected %d, got %s",
+            name, int(value), int(actual) if actual is not None else "no response",
+        )
+        return False
 
     async def close(self) -> None:
         """No persistent resources to close."""
