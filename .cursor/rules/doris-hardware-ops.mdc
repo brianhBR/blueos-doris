@@ -1,0 +1,188 @@
+---
+description: How to access, deploy to, and debug the DORIS vehicle hardware running BlueOS
+alwaysApply: true
+---
+
+# DORIS Vehicle Hardware Operations
+
+The DORIS system runs on a Raspberry Pi inside a BlueOS Docker environment. The DORIS extension is a Docker container managed by BlueOS's Extension Manager.
+
+## Network Access
+
+The vehicle is reachable when connected to its WiFi AP (SSID: `DORIS (...)`) or via Ethernet.
+
+| Method | Address | Notes |
+|--------|---------|-------|
+| HTTP (BlueOS) | `http://blueos-wifi.local` or `http://192.168.2.2` | Port 80, main BlueOS UI |
+| DORIS Extension | `http://blueos-wifi.local:8095` or `http://doris.local:8095` | Port 8095 |
+| Docker API | `http://blueos-wifi.local:2375` | Unauthenticated, full Docker control |
+| Commander API | `http://blueos-wifi.local:9100` | Run host commands |
+| mavlink2rest | `http://blueos-wifi.local:6040` | MAVLink message access |
+| WiFi Manager | `http://blueos-wifi.local:9000` | Hotspot/client config |
+| BlueOS Terminal | `http://blueos-wifi.local:8088` | Web-based shell inside blueos-core |
+
+**Important**: `blueos-wifi.local` is an mDNS name. From within Docker containers on the vehicle, use `host.docker.internal` instead.
+
+## Key Containers
+
+| Container | Name Pattern | Purpose |
+|-----------|-------------|---------|
+| BlueOS Core | `/blueos-core` | Main BlueOS system, nginx, all services |
+| DORIS Extension | `/extension-sailorman225blueosdorismaster` | DORIS backend + frontend |
+
+Container IDs change on every restart. Always look them up dynamically.
+
+## Docker API Operations
+
+All operations use the Docker Engine API at port 2375. Use Python with `urllib.request` (no external deps needed on Windows).
+
+### List Containers
+```python
+GET http://blueos-wifi.local:2375/containers/json
+```
+
+### Execute Commands Inside a Container
+```python
+# Step 1: Create exec
+POST http://blueos-wifi.local:2375/containers/{id}/exec
+Body: {"Cmd": ["sh", "-c", "your command"], "AttachStdout": true, "AttachStderr": true}
+
+# Step 2: Start exec
+POST http://blueos-wifi.local:2375/exec/{exec_id}/start
+Body: {"Detach": false, "Tty": false}
+```
+
+### Upload Files to a Container (tar archive)
+```python
+import io, tarfile
+tar_buf = io.BytesIO()
+with tarfile.open(fileobj=tar_buf, mode="w") as tar:
+    data = file_content.encode()
+    info = tarfile.TarInfo(name="filename.py")
+    info.size = len(data)
+    tar.addfile(info, io.BytesIO(data))
+tar_buf.seek(0)
+
+PUT http://blueos-wifi.local:2375/containers/{id}/archive?path=/destination/dir
+Headers: Content-Type: application/x-tar
+Body: tar_buf.read()
+```
+
+### View Container Logs
+```python
+GET http://blueos-wifi.local:2375/containers/{id}/logs?stdout=true&stderr=true&tail=200
+```
+
+## Commander API (Host Commands)
+
+Run commands on the Raspberry Pi host (outside any container):
+
+```python
+POST http://blueos-wifi.local:9100/v1.0/command/host?command={url_encoded_cmd}&i_know_what_i_am_doing=true
+```
+
+Returns JSON: `{"stdout": "...", "stderr": "...", "return_code": 0}`
+
+**Warning**: Commander returns HTTP 200 regardless of the command's exit code. Always check `return_code` in the response body.
+
+## Hot-Deploying Code Changes
+
+To test changes without a full CI build cycle:
+
+### 1. Upload Python Files to Running DORIS Container
+
+```python
+# Find DORIS container ID
+containers = GET /containers/json
+doris_id = [c for c in containers if "doris" in str(c["Names"])][0]["Id"][:12]
+
+# Upload file via tar archive
+PUT /containers/{doris_id}/archive?path=/app/src/doris/services
+# (with tar containing the updated .py file)
+```
+
+File paths inside the DORIS container:
+- Backend source: `/app/src/doris/`
+- Scripts (Lua, etc.): `/app/scripts/`
+- Frontend dist: `/app/frontend/dist/`
+
+### 2. Upload Files to blueos-core
+
+Same tar archive approach, but target the blueos-core container. Useful for nginx configs, avahi configs, etc.
+
+### 3. Restart the DORIS Container
+
+```python
+POST http://blueos-wifi.local:2375/containers/{doris_id}/restart
+```
+
+Or via Commander: `docker restart {container_name}`
+
+## Nginx Configuration (BlueOS)
+
+**Critical**: BlueOS runs nginx with a CUSTOM config file:
+```
+nginx -g "daemon off;" -c /home/pi/tools/nginx/nginx.conf
+```
+
+This is NOT `/etc/nginx/nginx.conf`. Files in `/etc/nginx/conf.d/` are NEVER loaded.
+
+Extension configs go in `/home/pi/tools/nginx/extensions/*.conf` and are included **inside** the main `server` block. They must be `location` or `if` directives, NOT separate `server` blocks.
+
+## MAVLink via mavlink2rest
+
+### Read Cached Messages
+```
+GET http://blueos-wifi.local:6040/mavlink/vehicles/1/components/{comp}/messages/{msg_type}
+```
+
+### Send MAVLink Commands
+```python
+POST http://blueos-wifi.local:6040/mavlink
+Body: {
+    "header": {"system_id": 255, "component_id": 0, "sequence": 0},
+    "message": {
+        "type": "COMMAND_LONG",
+        "target_system": 1,
+        "target_component": 1,
+        "command": {"type": "MAV_CMD_USER_4"},  # Must use enum format, not integer
+        "confirmation": 0,
+        "param1": 0.0, ...
+    }
+}
+```
+
+**Important**: mavlink2rest v0.11+ requires enum values as `{"type": "ENUM_NAME"}`, not integers.
+
+## Git & CI Workflow
+
+- **Fork remote**: `fork` (points to `github.com/brianhBR/blueos-doris`)
+- **Push to master**: `git push fork {branch}:master`
+- **Tagged releases**: `git tag -a bh-X.Y.Z -m "description" && git push fork bh-X.Y.Z`
+- CI builds trigger on `bh-*` tags and produce Docker images at `ghcr.io/brianhbr/blueos-doris`
+- **PowerShell note**: Use `-m` flags for commit messages, not heredocs. Use `;` not `&&` to chain commands.
+
+## Local Docker Builds
+
+For when WiFi is slow or CI is unavailable:
+
+```bash
+docker buildx build --platform linux/arm64 -t sailorman225/blueos-doris:master extension/ --load
+docker save sailorman225/blueos-doris:master -o blueos-doris-master.tar
+```
+
+Then on the vehicle: `docker load -i blueos-doris-master.tar`
+
+## Extension Manager Settings
+
+When installing the extension manually via BlueOS Extension Manager, the permissions JSON is needed. It lives in the Dockerfile `LABEL permissions` block. The bind mounts must match exactly or the container will fail to start. Key bind mount: `/usr/blueos/userdata:/tmp/storage/userdata` (NOT `/usr/blueos/userdata/recorder`).
+
+## Common Pitfalls
+
+1. **Container IDs change on restart** — always look up dynamically via `/containers/json`
+2. **Commander always returns HTTP 200** — check `return_code` in the JSON body
+3. **nginx uses custom config** — `/home/pi/tools/nginx/nginx.conf`, not `/etc/nginx/nginx.conf`
+4. **mavlink2rest enums** — use `{"type": "ENUM_NAME"}` not integers
+5. **Extension Manager caches settings** — if bind mounts change in Dockerfile, update "User Custom Settings" in the Extension Manager UI manually
+6. **PowerShell escaping** — for complex commands, write a Python script file instead of inline `-c` strings
+7. **`/usr/blueos/userdata/recorder` can be a file** — the entrypoint.sh handles this, but be aware
