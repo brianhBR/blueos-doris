@@ -24,29 +24,42 @@ from mcap.reader import make_reader
 
 
 def map_dive_stem_to_largest_mcap(root: Path, windows: list[Any]) -> dict[str, Path]:
-    """Pick the largest .mcap under recorder/ whose timestamp falls in each dive window."""
+    """Pick the largest .mcap per dive window from recorder/ and USB volumes."""
     from .storage import RECORDER_DIR, _effective_created_at, _match_dive_window
+    from .usb_storage import iter_media_files_on_usb, iter_media_scan_roots
 
+    trees: list[tuple[str | None, Path]] = []
     rec = root / RECORDER_DIR
-    if not rec.is_dir():
-        return {}
+    if rec.is_dir():
+        trees.append((None, rec))
+    for mount_key, base in iter_media_scan_roots():
+        if base.is_dir():
+            trees.append((mount_key, base))
+
     best: dict[str, tuple[int, Path]] = {}
-    for path in rec.rglob("*.mcap"):
-        if not path.is_file():
-            continue
-        try:
-            st = path.stat()
-        except OSError:
-            continue
-        eff = _effective_created_at(path, st.st_mtime)
-        eff_u = eff if eff.tzinfo else eff.replace(tzinfo=timezone.utc)
-        wn = _match_dive_window(windows, eff_u)
-        if wn is None:
-            continue
-        sz = st.st_size
-        prev = best.get(wn.stem)
-        if prev is None or sz > prev[0]:
-            best[wn.stem] = (sz, path)
+    for mount_key, tree in trees:
+        if mount_key is None:
+            mcap_iter = tree.rglob("*.mcap")
+        else:
+            mcap_iter = (
+                p for p in iter_media_files_on_usb(mount_key, tree) if p.suffix.lower() == ".mcap"
+            )
+        for path in mcap_iter:
+            if not path.is_file():
+                continue
+            try:
+                st = path.stat()
+            except OSError:
+                continue
+            eff = _effective_created_at(path, st.st_mtime)
+            eff_u = eff if eff.tzinfo else eff.replace(tzinfo=timezone.utc)
+            wn = _match_dive_window(windows, eff_u)
+            if wn is None:
+                continue
+            sz = st.st_size
+            prev = best.get(wn.stem)
+            if prev is None or sz > prev[0]:
+                best[wn.stem] = (sz, path)
     return {stem: p for stem, (_, p) in best.items()}
 
 

@@ -37,6 +37,7 @@ MOUNT_POINT = "/mnt"
 FSTAB = "/etc/fstab"
 
 RECORDER_HOST_DIR = "/usr/blueos/userdata/recorder"
+RECORDER_USB_DIR = f"{MOUNT_POINT}/recorder"
 RECORDER_CONTAINER_PATH = Path("/tmp/storage/userdata/recorder")
 
 
@@ -237,24 +238,50 @@ async def _do_setup() -> None:
     else:
         logger.info("%s already mounted", MOUNT_POINT)
 
-    # ── Already done? ────────────────────────────────────────────────
-    ok, _ = await _run_host_command(f"test -L {RECORDER_SRC}")
-    if ok:
-        logger.info("%s is already a symlink, nothing to do", RECORDER_SRC)
-        _status = MigrationStatus(MigrationState.DONE, "Already migrated")
+    # Tree on the USB filesystem for BlueOS recorder userdata
+    ok, err = await _run_host_command(f"sudo mkdir -p {RECORDER_USB_DIR}")
+    if not ok:
+        _status = MigrationStatus(
+            MigrationState.ERROR,
+            error=f"Failed to create {RECORDER_USB_DIR}: {err}",
+        )
         return
 
-    # ── Copy data ────────────────────────────────────────────────────
-    ok, _ = await _run_host_command(f"test -d {RECORDER_SRC}")
-    if ok:
+    # Already bind-mounted from our USB-side tree?
+    ok, src = await _run_host_command(
+        f"findmnt -n -o SOURCE --target {RECORDER_HOST_DIR} 2>/dev/null | head -1"
+    )
+    bound = (src or "").strip()
+    if ok and bound == RECORDER_USB_DIR:
+        logger.info("%s already bind-mounted from %s", RECORDER_HOST_DIR, RECORDER_USB_DIR)
+        _status = MigrationStatus(MigrationState.CONFIGURING, "Ensuring fstab entries")
+        ok, err = await _add_fstab_entries(uuid, fstype)
+        if not ok:
+            _status = MigrationStatus(MigrationState.ERROR, error=err)
+            return
+        _status = MigrationStatus(MigrationState.DONE, "External storage already active")
+        return
+
+    ok, _ = await _run_host_command(f"sudo mkdir -p {RECORDER_HOST_DIR}")
+
+    # One-time copy: internal recorder dir has data and USB tree is empty
+    ok_nonempty, _ = await _run_host_command(
+        f"test -d {RECORDER_HOST_DIR} && test -n \"$(ls -A {RECORDER_HOST_DIR} 2>/dev/null)\""
+    )
+    ok_usb_empty, _ = await _run_host_command(
+        f"test -z \"$(ls -A {RECORDER_USB_DIR} 2>/dev/null)\""
+    )
+    is_mountpoint, _ = await _run_host_command(f"mountpoint -q {RECORDER_HOST_DIR}")
+
+    if ok_nonempty and ok_usb_empty and not is_mountpoint:
         _status = MigrationStatus(
-            MigrationState.MIGRATING,
+            MigrationState.CONFIGURING,
             "Copying recorder data to external drive — this may take several minutes",
         )
-        logger.info("Syncing %s → %s", RECORDER_SRC, RECORDER_DST)
+        logger.info("Syncing %s → %s", RECORDER_HOST_DIR, RECORDER_USB_DIR)
         ok, err = await _run_host_command(
-            f"sudo rsync -a --no-perms --no-owner --no-group --no-links "
-            f"{RECORDER_SRC}/ {RECORDER_DST}/",
+            "sudo rsync -a --no-perms --no-owner --no-group --no-links "
+            f"{RECORDER_HOST_DIR}/ {RECORDER_USB_DIR}/",
             timeout=1800.0,
         )
         if not ok:
@@ -262,31 +289,6 @@ async def _do_setup() -> None:
             _status = MigrationStatus(MigrationState.ERROR, error=f"Copy failed: {err}")
             return
 
-        ok, err = await _run_host_command(
-            f"sudo rm -rf {RECORDER_SRC}",
-            timeout=120.0,
-        )
-        if not ok:
-            logger.error("Failed to remove source: %s", err)
-            _status = MigrationStatus(MigrationState.ERROR, error=f"Remove source failed: {err}")
-            return
-    else:
-        ok, _ = await _run_host_command(f"sudo mkdir -p {RECORDER_DST}")
-        if not ok:
-            logger.error("Failed to create %s", RECORDER_DST)
-            _status = MigrationStatus(MigrationState.ERROR, error=f"Failed to create {RECORDER_DST}")
-            return
-
-    # ── Symlink ──────────────────────────────────────────────────────
-    _status = MigrationStatus(MigrationState.LINKING, "Creating symlink")
-
-    ok, err = await _run_host_command(f"sudo ln -sf {RECORDER_DST} {RECORDER_SRC}")
-    if not ok:
-        logger.error("Failed to create recorder dir on drive: %s", err)
-        _status = MigrationStatus(MigrationState.ERROR, error=f"mkdir failed: {err}")
-        return
-
-    # ── Configure fstab ──────────────────────────────────────────────
     _status = MigrationStatus(MigrationState.CONFIGURING, "Configuring persistent mount")
 
     ok, err = await _add_fstab_entries(uuid, fstype)
@@ -294,15 +296,17 @@ async def _do_setup() -> None:
         _status = MigrationStatus(MigrationState.ERROR, error=err)
         return
 
-    # ── Activate bind mount ──────────────────────────────────────────
     ok, _ = await _run_host_command(f"mountpoint -q {RECORDER_HOST_DIR}")
     if not ok:
-        logger.info("Activating bind mount: %s/recorder -> %s", MOUNT_POINT, RECORDER_HOST_DIR)
+        logger.info("Activating bind mount: %s -> %s", RECORDER_USB_DIR, RECORDER_HOST_DIR)
         ok, err = await _run_host_command(
-            f"sudo mount --bind {MOUNT_POINT}/recorder {RECORDER_HOST_DIR}"
+            f"sudo mount --bind {RECORDER_USB_DIR} {RECORDER_HOST_DIR}"
         )
         if not ok:
-            logger.warning("Bind mount activation failed: %s (will take effect on reboot)", err)
+            logger.warning(
+                "Bind mount activation failed: %s (will take effect on reboot)",
+                err,
+            )
     else:
         logger.info("Bind mount already active at %s", RECORDER_HOST_DIR)
 

@@ -38,6 +38,20 @@ class Settings(BaseSettings):
     nmea_injector_port: int = 2748
     recorder_extractor_port: int = 9150
 
+    # IP camera recorder (RTSP -> segmented MPEG-TS via ffmpeg; URL is hardcoded in service)
+    ipcam_recordings_subdir: str = "userdata/ipcam_recordings"
+    ipcam_segment_seconds_default: int = 300
+    # copy = remux only (same idea as gst rtspsrc/depay/parse/mux — no re-encode, low CPU).
+    # libx264 = transcode to H.264 (heavy; only if you need H.264 in file from non-H.264 RTSP).
+    ipcam_video_codec: str = "copy"
+    ipcam_x264_preset: str = "veryfast"
+
+    # Removable USB for RTSP segments (same idea as BlueOS_videorecorder DropCam usb_storage)
+    usb_mount_point: str = "/mnt/usb"
+    usb_doris_folder: str = "DORIS"
+    ipcam_usb_min_free_mb: float = 256.0
+    usb_probe_interval_s: int = 30
+
     class Config:
         env_prefix = "DORIS_"
         env_file = ".env"
