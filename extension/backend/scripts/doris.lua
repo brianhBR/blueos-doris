@@ -65,18 +65,9 @@ local MAV_SEVERITY = {
     DEBUG     = 7,
 }
 
-local MODE_MANUAL = 19
-
 local SURFACE_DEPTH_M    = 0.5
 local UPDATE_INTERVAL_MS = 500
 local ARM_RETRY_MS       = 2000
-local ARM_TIMEOUT_MS     = 10000
-local WATER_DENSITY      = 1025.0
-local GRAVITY            = 9.80665
-local GPS_FIX_3D         = 3
-local DEPLOY_DEPTH_M     = 2.0
-local RELAY_ASC_THRS     = 0.05
-local RELAY_ASC_SAMPLES  = 6
 
 local surface_pressure = baro:get_pressure() or 101325
 
@@ -95,44 +86,41 @@ local STATE_ASCENT        = 3
 local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-local PARAM_TABLE_KEY  = 73
-local PARAM_TABLE_SIZE = 29
-
-assert(param:add_table(PARAM_TABLE_KEY, "DORIS_", PARAM_TABLE_SIZE),
+assert(param:add_table(73, "DORIS_", 29),
        "DIVE: could not add DORIS_ param table")
 
 -- mission control
-assert(param:add_param(PARAM_TABLE_KEY, 1,  "START",   0),  "DORIS_START")
-assert(param:add_param(PARAM_TABLE_KEY, 2,  "RLS_SEC", 2700), "DORIS_RLS_SEC")
-assert(param:add_param(PARAM_TABLE_KEY, 3,  "DSC_LGT", 0),  "DORIS_DSC_LGT")
-assert(param:add_param(PARAM_TABLE_KEY, 4,  "BTM_LGT", 0),  "DORIS_BTM_LGT")
-assert(param:add_param(PARAM_TABLE_KEY, 5,  "ASC_LGT", 0),  "DORIS_ASC_LGT")
-assert(param:add_param(PARAM_TABLE_KEY, 6,  "LGT_BRT", 75), "DORIS_LGT_BRT")
-assert(param:add_param(PARAM_TABLE_KEY, 7,  "STATE",  -1),  "DORIS_STATE")
-assert(param:add_param(PARAM_TABLE_KEY, 8,  "BTM_THR", 5),  "DORIS_BTM_THR")
-assert(param:add_param(PARAM_TABLE_KEY, 9,  "BTM_AVG", 30), "DORIS_BTM_AVG")
-assert(param:add_param(PARAM_TABLE_KEY, 10, "DPT_GAT", 3),  "DORIS_DPT_GAT")
-assert(param:add_param(PARAM_TABLE_KEY, 11, "LGT_MOD", 0),  "DORIS_LGT_MOD")
-assert(param:add_param(PARAM_TABLE_KEY, 12, "LGT_ON",  10), "DORIS_LGT_ON")
-assert(param:add_param(PARAM_TABLE_KEY, 13, "LGT_OFF", 5),  "DORIS_LGT_OFF")
-assert(param:add_param(PARAM_TABLE_KEY, 14, "BTM_DLY", 30), "DORIS_BTM_DLY")
+assert(param:add_param(73, 1,  "START",   0),  "DORIS_START")
+assert(param:add_param(73, 2,  "RLS_SEC", 2700), "DORIS_RLS_SEC")
+assert(param:add_param(73, 3,  "DSC_LGT", 0),  "DORIS_DSC_LGT")
+assert(param:add_param(73, 4,  "BTM_LGT", 0),  "DORIS_BTM_LGT")
+assert(param:add_param(73, 5,  "ASC_LGT", 0),  "DORIS_ASC_LGT")
+assert(param:add_param(73, 6,  "LGT_BRT", 75), "DORIS_LGT_BRT")
+assert(param:add_param(73, 7,  "STATE",  -1),  "DORIS_STATE")
+assert(param:add_param(73, 8,  "BTM_THR", 5),  "DORIS_BTM_THR")
+assert(param:add_param(73, 9,  "BTM_AVG", 30), "DORIS_BTM_AVG")
+assert(param:add_param(73, 10, "DPT_GAT", 3),  "DORIS_DPT_GAT")
+assert(param:add_param(73, 11, "LGT_MOD", 0),  "DORIS_LGT_MOD")
+assert(param:add_param(73, 12, "LGT_ON",  10), "DORIS_LGT_ON")
+assert(param:add_param(73, 13, "LGT_OFF", 5),  "DORIS_LGT_OFF")
+assert(param:add_param(73, 14, "BTM_DLY", 30), "DORIS_BTM_DLY")
 -- mission profile & safety
-assert(param:add_param(PARAM_TABLE_KEY, 15, "PRF_ID",   0),    "DORIS_PRF_ID")
-assert(param:add_param(PARAM_TABLE_KEY, 16, "UPL_DATE", 0),    "DORIS_UPL_DATE")
-assert(param:add_param(PARAM_TABLE_KEY, 17, "UPL_TIME", 0),    "DORIS_UPL_TIME")
-assert(param:add_param(PARAM_TABLE_KEY, 18, "MIN_VOLT", 14.0), "DORIS_MIN_VOLT")
-assert(param:add_param(PARAM_TABLE_KEY, 19, "RELAY_CH", 0),    "DORIS_RELAY_CH")
-assert(param:add_param(PARAM_TABLE_KEY, 20, "INJ_LEAK", 0),    "DORIS_INJ_LEAK")
-assert(param:add_param(PARAM_TABLE_KEY, 21, "MAX_DPTH", 6100), "DORIS_MAX_DPTH")
-assert(param:add_param(PARAM_TABLE_KEY, 22, "LGT_TST", 0),    "DORIS_LGT_TST")
-assert(param:add_param(PARAM_TABLE_KEY, 23, "LOG_INTV", 1000), "DORIS_LOG_INTV")
-assert(param:add_param(PARAM_TABLE_KEY, 24, "GPS_RBT",  0),    "DORIS_GPS_RBT")
+assert(param:add_param(73, 15, "PRF_ID",   0),    "DORIS_PRF_ID")
+assert(param:add_param(73, 16, "UPL_DATE", 0),    "DORIS_UPL_DATE")
+assert(param:add_param(73, 17, "UPL_TIME", 0),    "DORIS_UPL_TIME")
+assert(param:add_param(73, 18, "MIN_VOLT", 14.0), "DORIS_MIN_VOLT")
+assert(param:add_param(73, 19, "RELAY_CH", 0),    "DORIS_RELAY_CH")
+assert(param:add_param(73, 20, "INJ_LEAK", 0),    "DORIS_INJ_LEAK")
+assert(param:add_param(73, 21, "MAX_DPTH", 6100), "DORIS_MAX_DPTH")
+assert(param:add_param(73, 22, "LGT_TST", 0),    "DORIS_LGT_TST")
+assert(param:add_param(73, 23, "LOG_INTV", 1000), "DORIS_LOG_INTV")
+assert(param:add_param(73, 24, "GPS_RBT",  0),    "DORIS_GPS_RBT")
 -- IP camera recorder (HTTP to DORIS extension; per-phase continuous video)
-assert(param:add_param(PARAM_TABLE_KEY, 25, "REC_EN",   0),    "DORIS_REC_EN")
-assert(param:add_param(PARAM_TABLE_KEY, 26, "DSC_REC",  0),    "DORIS_DSC_REC")
-assert(param:add_param(PARAM_TABLE_KEY, 27, "BTM_REC",  0),    "DORIS_BTM_REC")
-assert(param:add_param(PARAM_TABLE_KEY, 28, "ASC_REC",  0),    "DORIS_ASC_REC")
-assert(param:add_param(PARAM_TABLE_KEY, 29, "CAM_DLY",  0),    "DORIS_CAM_DLY")
+assert(param:add_param(73, 25, "REC_EN",   0),    "DORIS_REC_EN")
+assert(param:add_param(73, 26, "DSC_REC",  0),    "DORIS_DSC_REC")
+assert(param:add_param(73, 27, "BTM_REC",  0),    "DORIS_BTM_REC")
+assert(param:add_param(73, 28, "ASC_REC",  0),    "DORIS_ASC_REC")
+assert(param:add_param(73, 29, "CAM_DLY",  0),    "DORIS_CAM_DLY")
 
 
 local DORIS_START    = Parameter("DORIS_START")
@@ -164,7 +152,7 @@ local DORIS_GPS_RBT  = Parameter("DORIS_GPS_RBT")
 -- the autopilot initialises before the port is enumerated the driver
 -- silently stalls.  DORIS_GPS_RBT is set to 1 before rebooting and
 -- checked on the next boot to prevent an infinite reboot loop.
-local GPS_REBOOT_GRACE_S = 30
+-- GPS reboot grace: 30s (inlined)
 local gps_reboot_attempted = false
 do
     local rbt = DORIS_GPS_RBT:get() or 0
@@ -276,7 +264,7 @@ local light_cycle_ms = 0
 
 -- light test state (auto-clears after timeout)
 local lgt_tst_start_ms = 0
-local LGT_TST_TIMEOUT  = 10000
+-- 10000 = 10000 (inlined)
 
 -- telemetry tracking (updated every cycle by update_sensors)
 -- packed into a table to stay under Lua's 200-local-variable limit
@@ -317,8 +305,7 @@ else
 end
 
 -- HTTP recorder client (Companion / BlueOS DORIS extension)
-local IPCAM_HTTP_HOST      = "127.0.0.1"
-local IPCAM_HTTP_BIND_PORT = 9979
+-- IPCAM: HOST=127.0.0.1, BIND_PORT=9979 (inlined)
 local ipcam_recording      = false
 local ipcam_btm_started    = false
 
@@ -327,7 +314,7 @@ local function get_depth_m()
     local pressure = baro:get_pressure()
     local depth_baro = nil
     if pressure then
-        depth_baro = (pressure - surface_pressure) / (WATER_DENSITY * GRAVITY)
+        depth_baro = (pressure - surface_pressure) / (1025.0 * 9.80665)
     end
     if not is_sitl then
         return depth_baro
@@ -638,7 +625,7 @@ local function ipcam_http_send(first_line, host, port)
         return true
     end
     local sock = Socket(0)
-    if not sock:bind("0.0.0.0", IPCAM_HTTP_BIND_PORT) then
+    if not sock:bind("0.0.0.0", 9979) then
         gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: IPcam bind failed")
         sock:close()
         return false
@@ -669,14 +656,14 @@ end
 local function ipcam_start()
     if ipcam_recording then return end
     if not ipcam_cfg.rec_en then return end
-    if ipcam_http_start(IPCAM_HTTP_HOST, 8095, 1800) then
+    if ipcam_http_start("127.0.0.1", 8095, 1800) then
         ipcam_recording = true
     end
 end
 
 local function ipcam_stop()
     if not ipcam_recording then return end
-    ipcam_http_stop(IPCAM_HTTP_HOST, 8095)
+    ipcam_http_stop("127.0.0.1", 8095)
     ipcam_recording = false
 end
 
@@ -697,14 +684,14 @@ function update()
     update_telemetry(now_ms)
 
     -- light test: when DORIS_LGT_TST > 0, override lights to that % brightness.
-    -- Auto-clears after LGT_TST_TIMEOUT ms so lights don't stay stuck on
+    -- Auto-clears after 10000 ms so lights don't stay stuck on
     -- if the "off" PARAM_SET is lost.
     local lgt_tst = DORIS_LGT_TST:get() or 0
     if lgt_tst > 0 and RC9 then
         if lgt_tst_start_ms == 0 then
             lgt_tst_start_ms = now_ms
         end
-        if now_ms - lgt_tst_start_ms > LGT_TST_TIMEOUT then
+        if now_ms - lgt_tst_start_ms > 10000 then
             DORIS_LGT_TST:set(0)
             RC9:set_override(LIGHT_PWM_MIN)
             lgt_tst_start_ms = 0
@@ -735,12 +722,12 @@ function update()
         -- GPS self-heal: one-time reboot if GPS has no fix after grace period
         if not gps_reboot_attempted then
             local boot_age_s = (now_ms - script_start_ms) / 1000.0
-            if boot_age_s >= GPS_REBOOT_GRACE_S then
+            if boot_age_s >= 30 then
                 local gps_stat = gps:status(0)
-                if not gps_stat or gps_stat < GPS_FIX_3D then
+                if not gps_stat or gps_stat < 3 then
                     gcs:send_text(MAV_SEVERITY.WARNING,
                         string.format("DIVE: No GPS fix after %ds, rebooting autopilot",
-                            GPS_REBOOT_GRACE_S))
+                            30))
                     DORIS_GPS_RBT:set_and_save(1)
                     vehicle:reboot(false)
                     return update, UPDATE_INTERVAL_MS
@@ -754,7 +741,7 @@ function update()
 
             -- Emergency: deployed into water before pre-arm passed
             local depth = get_depth_m()
-            if depth and depth > DEPLOY_DEPTH_M and not prearm_passed then
+            if depth and depth > 2.0 and not prearm_passed then
                 gcs:send_text(MAV_SEVERITY.CRITICAL,
                     "DIVE: DEPLOYED without pre-arm! Emergency weight release")
                 activate_relay()
@@ -767,7 +754,7 @@ function update()
             local min_volt = DORIS_MIN_VOLT:get() or 14.0
             local gps_ok = false
             local gps_stat = gps:status(0)
-            if gps_stat and gps_stat >= GPS_FIX_3D then
+            if gps_stat and gps_stat >= 3 then
                 gps_ok = true
             end
             local batt_ok = batt_voltage >= min_volt
@@ -785,7 +772,7 @@ function update()
                     string.format("DIVE: Pre-arm PASSED (GPS %d sats, %.1fV, profile #%d, Pref=%.0fPa)",
                         num_sats, batt_voltage, prf_id, surface_pressure))
                 snapshot_config()
-                vehicle:set_mode(MODE_MANUAL)
+                vehicle:set_mode(19)
                 armed_once          = false
                 recovery_done       = false
                 arm_start_ms        = now_ms
@@ -993,9 +980,9 @@ function update()
         -- Confirm ascent via sustained upward velocity, then kill relay
         if relay_active then
             local vel = ahrs:get_velocity_NED()
-            if vel and vel:z() < -RELAY_ASC_THRS then
+            if vel and vel:z() < -0.05 then
                 relay_asc_count = relay_asc_count + 1
-                if relay_asc_count >= RELAY_ASC_SAMPLES then
+                if relay_asc_count >= 6 then
                     deactivate_relay()
                 end
             else
