@@ -97,7 +97,7 @@ const setConnected = (connected: boolean) => {
       <Loader2 class="w-5 h-5 animate-spin" style="color: #96EEF2" />
       <span class="text-white text-sm font-medium">
         <HardDrive class="w-4 h-4 inline-block mr-1" style="color: #96EEF2" />
-        {{ migrationStatus?.message || 'Migrating recorder data to external drive…' }}
+        {{ migrationStatus?.message || 'Setting up external storage…' }}
       </span>
     </div>
 
@@ -108,7 +108,7 @@ const setConnected = (connected: boolean) => {
     >
       <AlertTriangle class="w-5 h-5" style="color: #DD2C1D" />
       <span class="text-sm" style="color: #FF6B6B">
-        External storage migration failed: {{ migrationStatus?.error }}
+        External storage setup failed: {{ migrationStatus?.error }}
       </span>
     </div>
 
