@@ -20,6 +20,7 @@ from robyn import Response, Robyn
 
 from ..services.camera import CameraService
 from ..services.dive import DiveService
+from ..services import ip_camera_recorder as iprec
 from ..services.storage import DATA_ROOT, StorageService
 
 logger = logging.getLogger(__name__)
@@ -280,12 +281,17 @@ def register_dive_routes(app: Robyn) -> None:
     async def stop_dive():
         ok = await dive_service.stop_dive()
 
-        # Stop video recording
+        # Stop video recording (MCM) and IP camera extension recorder
         try:
             await camera_service.stop_recording()
             logger.info("Video recording stopped")
         except Exception as e:
             logger.warning(f"Failed to stop recording: {e}")
+        try:
+            await iprec.stop_recording()
+            logger.info("IP camera extension recording stopped")
+        except Exception as e:
+            logger.warning(f"Failed to stop IP camera recorder: {e}")
 
         # Update the most recent active dive record
         try:

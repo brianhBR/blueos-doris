@@ -20,6 +20,7 @@ from .routes import (
     register_mission_routes,
     register_network_routes,
     register_notification_routes,
+    register_recorder_routes,
     register_sensor_routes,
     register_system_routes,
 )
@@ -93,6 +94,9 @@ def create_app() -> Robyn:
 
     # Register BlueOS integration routes (must be first for /register_service)
     register_blueos_routes(app)
+
+    # Lua-compatible recorder control (GET /start, /stop) — register before / static
+    register_recorder_routes(app)
 
     # Register API routes
     register_system_routes(app)

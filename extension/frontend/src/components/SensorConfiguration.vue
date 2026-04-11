@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, nextTick, onMounted, onUnmounted, computed } from 'vue'
-import { Wifi, WifiOff, Upload, RefreshCw, Loader2, AlertCircle } from 'lucide-vue-next'
+import { Wifi, WifiOff, Upload, RefreshCw, Loader2, AlertCircle, Video, Square } from 'lucide-vue-next'
 import {
   mdiCameraOutline,
   mdiVideoOutline,
@@ -87,6 +87,88 @@ function startSnapshotPolling() {
   } else {
     if (snapshotUrl.value) { URL.revokeObjectURL(snapshotUrl.value); snapshotUrl.value = null }
     snapshotError.value = false
+  }
+}
+
+// ── IP camera extension recorder (ffmpeg RTSP → TS; no Lua) ───────────
+const IPCAM_RECORD_API = '/api/v1/ipcam/record'
+const ipcamRecording = ref(false)
+const ipcamRecordBusy = ref(false)
+const ipcamRecordError = ref('')
+const IPCAM_SPLIT_SEC = 300
+let ipcamStatusInterval: number | undefined
+
+async function refreshIpcamRecordStatus() {
+  if (!hasConnectedCamera.value) return
+  try {
+    const resp = await fetch(`${IPCAM_RECORD_API}/status`)
+    if (!resp.ok) return
+    const data = await resp.json()
+    ipcamRecording.value = Boolean(data.recording)
+  } catch {
+    /* best effort */
+  }
+}
+
+function startIpcamStatusPolling() {
+  if (ipcamStatusInterval) {
+    clearInterval(ipcamStatusInterval)
+    ipcamStatusInterval = undefined
+  }
+  if (hasConnectedCamera.value) {
+    void refreshIpcamRecordStatus()
+    ipcamStatusInterval = setInterval(refreshIpcamRecordStatus, 4000) as unknown as number
+  } else {
+    ipcamRecording.value = false
+  }
+}
+
+function startCameraSidecars() {
+  startSnapshotPolling()
+  startIpcamStatusPolling()
+}
+
+async function startIpcamRecording() {
+  if (ipcamRecordBusy.value) return
+  ipcamRecordBusy.value = true
+  ipcamRecordError.value = ''
+  try {
+    const resp = await fetch(
+      `${IPCAM_RECORD_API}/start?split_duration=${IPCAM_SPLIT_SEC}`,
+    )
+    const data = await resp.json().catch(() => ({}))
+    if (!resp.ok || data.success === false) {
+      ipcamRecordError.value =
+        (data && (data.message as string)) || `Start failed (HTTP ${resp.status})`
+      return
+    }
+    ipcamRecording.value = true
+  } catch (e) {
+    ipcamRecordError.value = e instanceof Error ? e.message : 'Start failed'
+  } finally {
+    ipcamRecordBusy.value = false
+    void refreshIpcamRecordStatus()
+  }
+}
+
+async function stopIpcamRecording() {
+  if (ipcamRecordBusy.value) return
+  ipcamRecordBusy.value = true
+  ipcamRecordError.value = ''
+  try {
+    const resp = await fetch(`${IPCAM_RECORD_API}/stop`)
+    const data = await resp.json().catch(() => ({}))
+    if (!resp.ok || data.success === false) {
+      ipcamRecordError.value =
+        (data && (data.message as string)) || `Stop failed (HTTP ${resp.status})`
+      return
+    }
+    ipcamRecording.value = false
+  } catch (e) {
+    ipcamRecordError.value = e instanceof Error ? e.message : 'Stop failed'
+  } finally {
+    ipcamRecordBusy.value = false
+    void refreshIpcamRecordStatus()
   }
 }
 
@@ -268,12 +350,12 @@ watch(apiModules, (newModules) => {
       moduleStatus: m.module_status,
     }))
     if (!hadCamera && hasConnectedCamera.value) {
-      startSnapshotPolling()
+      startCameraSidecars()
     }
   }
 }, { immediate: true })
 
-watch(hasConnectedCamera, startSnapshotPolling)
+watch(hasConnectedCamera, startCameraSidecars)
 
 let pollInterval: number | undefined
 
@@ -285,6 +367,7 @@ onMounted(() => {
 onUnmounted(() => {
   if (pollInterval) clearInterval(pollInterval)
   if (snapshotInterval) clearInterval(snapshotInterval)
+  if (ipcamStatusInterval) clearInterval(ipcamStatusInterval)
   if (trackerInterval) clearInterval(trackerInterval)
   if (lightKeepAlive) clearInterval(lightKeepAlive)
   stopIridiumPolling()
@@ -519,6 +602,50 @@ const getStatusColor = (moduleStatus: string) => {
                 <div class="flex items-center justify-end gap-1 px-2 py-1" style="background-color: rgba(14, 36, 70, 0.8)">
                   <span class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Snapshot updates every 10s</span>
                 </div>
+              </div>
+
+              <div class="mt-3 rounded-lg p-3 space-y-2" style="background-color: rgba(14, 36, 70, 0.6); border: 1px solid rgba(65, 185, 195, 0.25)">
+                <div class="flex items-center justify-between gap-2">
+                  <span class="text-xs font-medium" style="color: #96EEF2">IP camera file recording</span>
+                  <span
+                    class="text-xs px-2 py-0.5 rounded"
+                    :style="{
+                      backgroundColor: ipcamRecording ? 'rgba(34, 197, 94, 0.2)' : 'rgba(14, 36, 70, 0.8)',
+                      color: ipcamRecording ? '#86efac' : 'rgba(150, 238, 242, 0.6)',
+                      border: ipcamRecording ? '1px solid rgba(34, 197, 94, 0.4)' : '1px solid rgba(65, 185, 195, 0.2)',
+                    }"
+                  >
+                    {{ ipcamRecording ? 'Recording' : 'Idle' }}
+                  </span>
+                </div>
+                <p class="text-xs leading-relaxed" style="color: rgba(150, 238, 242, 0.65)">
+                  Directly drives the DORIS extension recorder (RTSP → segmented .ts on disk). Does not use the dive Lua script.
+                </p>
+                <div class="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    :disabled="ipcamRecordBusy || ipcamRecording"
+                    class="flex-1 min-w-[8rem] flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                    style="background: linear-gradient(135deg, #41B9C3 0%, #187D8B 100%); color: #fff; border: 1px solid rgba(65, 185, 195, 0.4)"
+                    @click.stop="startIpcamRecording()"
+                  >
+                    <Loader2 v-if="ipcamRecordBusy && !ipcamRecording" class="w-4 h-4 animate-spin" />
+                    <Video v-else class="w-4 h-4" />
+                    Start recording
+                  </button>
+                  <button
+                    type="button"
+                    :disabled="ipcamRecordBusy || !ipcamRecording"
+                    class="flex-1 min-w-[8rem] flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                    style="background-color: rgba(221, 44, 29, 0.15); color: #fca5a5; border: 1px solid rgba(221, 44, 29, 0.45)"
+                    @click.stop="stopIpcamRecording()"
+                  >
+                    <Loader2 v-if="ipcamRecordBusy && ipcamRecording" class="w-4 h-4 animate-spin" />
+                    <Square v-else class="w-4 h-4" />
+                    Stop recording
+                  </button>
+                </div>
+                <p v-if="ipcamRecordError" class="text-xs" style="color: #f87171">{{ ipcamRecordError }}</p>
               </div>
 
             </div>

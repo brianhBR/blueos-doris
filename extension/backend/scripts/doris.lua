@@ -96,7 +96,7 @@ local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 local PARAM_TABLE_KEY  = 73
-local PARAM_TABLE_SIZE = 24
+local PARAM_TABLE_SIZE = 40
 
 assert(param:add_table(PARAM_TABLE_KEY, "DORIS_", PARAM_TABLE_SIZE),
        "DIVE: could not add DORIS_ param table")
@@ -127,6 +127,23 @@ assert(param:add_param(PARAM_TABLE_KEY, 21, "MAX_DPTH", 6100), "DORIS_MAX_DPTH")
 assert(param:add_param(PARAM_TABLE_KEY, 22, "LGT_TST", 0),    "DORIS_LGT_TST")
 assert(param:add_param(PARAM_TABLE_KEY, 23, "LOG_INTV", 1000), "DORIS_LOG_INTV")
 assert(param:add_param(PARAM_TABLE_KEY, 24, "GPS_RBT",  0),    "DORIS_GPS_RBT")
+-- IP camera recorder (HTTP to DORIS extension; policy from mission configuration)
+assert(param:add_param(PARAM_TABLE_KEY, 25, "REC_EN",   0),    "DORIS_REC_EN")
+assert(param:add_param(PARAM_TABLE_KEY, 26, "RECPRT",   8095), "DORIS_RECPRT")
+assert(param:add_param(PARAM_TABLE_KEY, 27, "RECSEG",   300),  "DORIS_RECSEG")
+assert(param:add_param(PARAM_TABLE_KEY, 28, "DSC_EN",   0),    "DORIS_DSC_EN")
+assert(param:add_param(PARAM_TABLE_KEY, 29, "DSC_MD",   0),    "DORIS_DSC_MD")
+assert(param:add_param(PARAM_TABLE_KEY, 30, "DSC_RC",   10),   "DORIS_DSC_RC")
+assert(param:add_param(PARAM_TABLE_KEY, 31, "DSC_PA",   5),    "DORIS_DSC_PA")
+assert(param:add_param(PARAM_TABLE_KEY, 32, "BTM_EN",   0),    "DORIS_BTM_EN")
+assert(param:add_param(PARAM_TABLE_KEY, 33, "BTM_MD",   0),    "DORIS_BTM_MD")
+assert(param:add_param(PARAM_TABLE_KEY, 34, "BTM_RC",   10),   "DORIS_BTM_RC")
+assert(param:add_param(PARAM_TABLE_KEY, 35, "BTM_PA",   5),    "DORIS_BTM_PA")
+assert(param:add_param(PARAM_TABLE_KEY, 36, "CAM_DLY",  0),    "DORIS_CAM_DLY")
+assert(param:add_param(PARAM_TABLE_KEY, 37, "ASC_EN",   0),    "DORIS_ASC_EN")
+assert(param:add_param(PARAM_TABLE_KEY, 38, "ASC_MD",   0),    "DORIS_ASC_MD")
+assert(param:add_param(PARAM_TABLE_KEY, 39, "ASC_RC",   10),   "DORIS_ASC_RC")
+assert(param:add_param(PARAM_TABLE_KEY, 40, "ASC_PA",   5),    "DORIS_ASC_PA")
 
 local DORIS_START    = Parameter("DORIS_START")
 local DORIS_RLS_SEC  = Parameter("DORIS_RLS_SEC")
@@ -290,12 +307,32 @@ local cfg_lgt_on_ms   = 10000
 local cfg_lgt_off_ms  = 5000
 local cfg_btm_dly_ms  = 30000
 
+-- snapshotted IP camera policy (set in snapshot_config from DORIS_* params)
+local ipcam_cfg = {
+    rec_en = false, rec_prt = 8095, rec_seg = 300,
+    d_en = 0, d_md = 0, d_rc_ms = 10000, d_pau_ms = 5000,
+    b_en = 0, b_md = 0, b_rc_ms = 10000, b_pau_ms = 5000,
+    a_en = 0, a_md = 0, a_rc_ms = 10000, a_pau_ms = 5000,
+    cam_btm_dly_ms = 0,
+}
+
 local RC9 = rc:get_channel(9)
 if RC9 then
     gcs:send_text(MAV_SEVERITY.INFO, "DIVE: RC9 (lights) channel acquired")
 else
     gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: RC9 channel is nil – lights will not work")
 end
+
+-- HTTP recorder client (Companion / BlueOS DORIS extension)
+local IPCAM_HTTP_HOST      = "127.0.0.1"
+local IPCAM_HTTP_BIND_PORT = 9979
+local ipcam = {
+    prev = STATE_CONFIG,
+    ext  = false,
+    ph   = 0,
+    iv   = 0,
+    dl   = 0,
+}
 
 -- ?????????? helpers ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 local function get_depth_m()
@@ -515,6 +552,37 @@ local function snapshot_config()
         gcs:send_text(MAV_SEVERITY.INFO,
             string.format("DIVE: bottom light delay=%ds", btm_dly))
     end
+
+    local function _sec_to_ms(s)
+        return math.max(0, math.floor((s or 0) * 1000.0))
+    end
+
+    ipcam_cfg.rec_en = (ipcam_pgv("DORIS_REC_EN", 0) >= 1.0)
+    ipcam_cfg.rec_prt = math.floor(ipcam_pgv("DORIS_RECPRT", 8095))
+    ipcam_cfg.rec_seg = math.max(1, math.floor(ipcam_pgv("DORIS_RECSEG", 300)))
+    ipcam_cfg.d_en = math.floor(ipcam_pgv("DORIS_DSC_EN", 0))
+    ipcam_cfg.d_md = math.floor(ipcam_pgv("DORIS_DSC_MD", 0))
+    ipcam_cfg.d_rc_ms = math.max(1000, _sec_to_ms(ipcam_pgv("DORIS_DSC_RC", 10)))
+    ipcam_cfg.d_pau_ms = math.max(0, _sec_to_ms(ipcam_pgv("DORIS_DSC_PA", 5)))
+    ipcam_cfg.b_en = math.floor(ipcam_pgv("DORIS_BTM_EN", 0))
+    ipcam_cfg.b_md = math.floor(ipcam_pgv("DORIS_BTM_MD", 0))
+    ipcam_cfg.b_rc_ms = math.max(1000, _sec_to_ms(ipcam_pgv("DORIS_BTM_RC", 10)))
+    ipcam_cfg.b_pau_ms = math.max(0, _sec_to_ms(ipcam_pgv("DORIS_BTM_PA", 5)))
+    ipcam_cfg.a_en = math.floor(ipcam_pgv("DORIS_ASC_EN", 0))
+    ipcam_cfg.a_md = math.floor(ipcam_pgv("DORIS_ASC_MD", 0))
+    ipcam_cfg.a_rc_ms = math.max(1000, _sec_to_ms(ipcam_pgv("DORIS_ASC_RC", 10)))
+    ipcam_cfg.a_pau_ms = math.max(0, _sec_to_ms(ipcam_pgv("DORIS_ASC_PA", 5)))
+    ipcam_cfg.cam_btm_dly_ms = _sec_to_ms(ipcam_pgv("DORIS_CAM_DLY", 0))
+
+    if ipcam_cfg.rec_en then
+        gcs:send_text(MAV_SEVERITY.INFO,
+            string.format("DIVE: IPcam port=%d seg=%ds dsc=%d/%d btm=%d/%d asc=%d/%d camDly=%dms",
+                ipcam_cfg.rec_prt, ipcam_cfg.rec_seg,
+                ipcam_cfg.d_en, ipcam_cfg.d_md,
+                ipcam_cfg.b_en, ipcam_cfg.b_md,
+                ipcam_cfg.a_en, ipcam_cfg.a_md,
+                ipcam_cfg.cam_btm_dly_ms))
+    end
 end
 
 -- ── telemetry & dataflash (single function to stay under Lua's 200-local limit) ──
@@ -587,6 +655,151 @@ local function update_telemetry(now_ms)
     end
 end
 
+local function ipcam_pgv(name, default)
+    local v = param:get(name)
+    if v == nil then return default end
+    return v
+end
+
+local function ipcam_http_send(first_line, host, port)
+    if is_sitl then
+        return true
+    end
+    local sock = Socket(0)
+    if not sock:bind("0.0.0.0", IPCAM_HTTP_BIND_PORT) then
+        gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: IPcam bind failed")
+        sock:close()
+        return false
+    end
+    if not sock:connect(host, port) then
+        gcs:send_text(MAV_SEVERITY.WARNING,
+            string.format("DIVE: IPcam connect failed %s:%d", host, port))
+        sock:close()
+        return false
+    end
+    local req = string.format("%s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n",
+        first_line, host)
+    sock:send(req, string.len(req))
+    sock:close()
+    return true
+end
+
+local function ipcam_http_start(host, port, seg_s)
+    local s = math.max(1, math.floor(seg_s))
+    local line = string.format("GET /start?split_duration=%d", s)
+    return ipcam_http_send(line, host, port)
+end
+
+local function ipcam_http_stop(host, port)
+    return ipcam_http_send("GET /stop", host, port)
+end
+
+local function ipcam_frame_tick(now_ms)
+    local host = IPCAM_HTTP_HOST
+    local port = math.floor(ipcam_cfg.rec_prt)
+    local seg  = math.max(1, math.floor(ipcam_cfg.rec_seg))
+
+    if not ipcam_cfg.rec_en then
+        if ipcam.ext then
+            ipcam_http_stop(host, port)
+            ipcam.ext = false
+        end
+        ipcam.iv = 0
+        ipcam.ph = 0
+        return
+    end
+
+    if state == STATE_RECOVERY then
+        if ipcam.ext then
+            ipcam_http_stop(host, port)
+            ipcam.ext = false
+        end
+        ipcam.iv = 0
+        ipcam.ph = 0
+        return
+    end
+
+    local ph = 0
+    if state == STATE_DESCENT then
+        ph = 1
+    elseif state == STATE_ON_BOTTOM then
+        ph = 2
+    elseif state == STATE_ASCENT then
+        ph = 3
+    end
+
+    local en, md, r_ms, p_ms = 0, 0, 10000, 5000
+    if ph == 1 then
+        en, md, r_ms, p_ms = ipcam_cfg.d_en, ipcam_cfg.d_md, ipcam_cfg.d_rc_ms, ipcam_cfg.d_pau_ms
+    elseif ph == 2 then
+        en, md, r_ms, p_ms = ipcam_cfg.b_en, ipcam_cfg.b_md, ipcam_cfg.b_rc_ms, ipcam_cfg.b_pau_ms
+    elseif ph == 3 then
+        en, md, r_ms, p_ms = ipcam_cfg.a_en, ipcam_cfg.a_md, ipcam_cfg.a_rc_ms, ipcam_cfg.a_pau_ms
+    end
+
+    local cam_ok = true
+    if ph == 2 and ipcam_cfg.cam_btm_dly_ms > 0 then
+        if bottom_start_ms <= 0 or (now_ms - bottom_start_ms) < ipcam_cfg.cam_btm_dly_ms then
+            cam_ok = false
+        end
+    end
+
+    if en < 1 or md < 1 or not cam_ok then
+        if ipcam.ext then
+            ipcam_http_stop(host, port)
+            ipcam.ext = false
+        end
+        ipcam.iv = 0
+    end
+
+    if ph ~= ipcam.ph then
+        if ipcam.ext then
+            ipcam_http_stop(host, port)
+            ipcam.ext = false
+        end
+        ipcam.iv = 0
+        ipcam.ph = ph
+    end
+
+    if en < 1 or md < 1 or not cam_ok then
+        return
+    end
+
+    if md == 1 then
+        if not ipcam.ext then
+            if ipcam_http_start(host, port, seg) then
+                ipcam.ext = true
+            end
+        end
+        return
+    end
+
+    if md == 2 then
+        if ipcam.iv == 0 then
+            if ipcam_http_start(host, port, seg) then
+                ipcam.ext = true
+                ipcam.iv = 1
+                ipcam.dl = now_ms + r_ms
+            end
+        elseif ipcam.iv == 1 then
+            if now_ms >= ipcam.dl then
+                ipcam_http_stop(host, port)
+                ipcam.ext = false
+                ipcam.iv = 2
+                ipcam.dl = now_ms + p_ms
+            end
+        elseif ipcam.iv == 2 then
+            if now_ms >= ipcam.dl then
+                if ipcam_http_start(host, port, seg) then
+                    ipcam.ext = true
+                    ipcam.iv = 1
+                    ipcam.dl = now_ms + r_ms
+                end
+            end
+        end
+    end
+end
+
 -- ?????????? main loop ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 function update()
     local now_ms = millis():tofloat()
@@ -596,6 +809,12 @@ function update()
     end
     last_update_ms = now_ms
     DORIS_STATE:set(state)
+
+    local function ipcam_done(period_ms)
+        ipcam_frame_tick(now_ms)
+        ipcam.prev = state
+        return update, period_ms
+    end
 
     -- read battery voltage each cycle for pre-arm and telemetry
     local v = battery:voltage(0)
@@ -617,7 +836,7 @@ function update()
             lgt_tst_start_ms = 0
         else
             RC9:set_override(brightness_to_pwm(lgt_tst))
-            return update, UPDATE_INTERVAL_MS
+            return ipcam_done(UPDATE_INTERVAL_MS)
         end
     else
         lgt_tst_start_ms = 0
@@ -629,7 +848,7 @@ function update()
             gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: CANCELLED by operator")
             if RC9 then RC9:set_override(LIGHT_PWM_MIN) end
             state = STATE_RECOVERY
-            return update, UPDATE_INTERVAL_MS
+            return ipcam_done(UPDATE_INTERVAL_MS)
         end
     end
 
@@ -665,7 +884,7 @@ function update()
                     "DIVE: DEPLOYED without pre-arm! Emergency weight release")
                 activate_relay()
                 state = STATE_RECOVERY
-                return update, UPDATE_INTERVAL_MS
+                return ipcam_done(UPDATE_INTERVAL_MS)
             end
 
             -- Surface pre-arm checks
@@ -728,7 +947,7 @@ function update()
             ascent_start_ms = now_ms
             reset_light_cycle(now_ms)
             state = STATE_ASCENT
-            return update, UPDATE_INTERVAL_MS
+            return ipcam_done(UPDATE_INTERVAL_MS)
         end
         if not arming:is_armed() then
             if armed_once then
@@ -780,7 +999,7 @@ function update()
             ascent_start_ms = now_ms
             reset_light_cycle(now_ms)
             state = STATE_ASCENT
-            return update, UPDATE_INTERVAL_MS
+            return ipcam_done(UPDATE_INTERVAL_MS)
         end
         if not arming:is_armed() then
             gcs:send_text(MAV_SEVERITY.WARNING,
@@ -823,7 +1042,7 @@ function update()
             ascent_start_ms = now_ms
             reset_light_cycle(now_ms)
             state = STATE_ASCENT
-            return update, UPDATE_INTERVAL_MS
+            return ipcam_done(UPDATE_INTERVAL_MS)
         end
         if not arming:is_armed() then
             gcs:send_text(MAV_SEVERITY.WARNING,
@@ -915,7 +1134,7 @@ function update()
         end
     end
 
-    return update, UPDATE_INTERVAL_MS
+    return ipcam_done(UPDATE_INTERVAL_MS)
 end
 
 -- ?????????? initialization ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????

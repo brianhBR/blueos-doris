@@ -11,7 +11,11 @@ export default defineConfig({
   },
   server: {
     port: 3000,
-    host: true
-  }
+    host: true,
+    proxy: {
+      // Local UI: forward API + recorder to DORIS backend (default BlueOS extension port)
+      '/api': { target: 'http://127.0.0.1:8095', changeOrigin: true },
+    },
+  },
 })
 

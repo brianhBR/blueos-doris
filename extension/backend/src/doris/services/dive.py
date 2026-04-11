@@ -15,8 +15,13 @@ from datetime import datetime, timezone
 
 import httpx
 
-from ..config import blueos_services
-from ..models.configuration import DeploymentConfiguration, TimeValue
+from ..config import blueos_services, settings
+from ..models.configuration import (
+    CameraSettings,
+    CameraType,
+    DeploymentConfiguration,
+    TimeValue,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +57,34 @@ def _time_value_to_seconds(tv: TimeValue) -> float:
     return val
 
 
+def _ipcam_phase_tuple(cam: CameraSettings) -> tuple[float, float, float, float]:
+    """Encode CameraSettings for IP video: (enabled, mode, rec_sec, pause_sec).
+
+    mode: 0 = off/timelapse, 1 = continuous-video, 2 = video-interval.
+    """
+    if not cam.enabled:
+        return (0.0, 0.0, 0.0, 0.0)
+    if cam.camera_type == CameraType.TIMELAPSE:
+        return (0.0, 0.0, 0.0, 0.0)
+    rec = max(1.0, _time_value_to_seconds(cam.video_record))
+    pau = max(0.0, _time_value_to_seconds(cam.video_pause))
+    if cam.camera_type == CameraType.CONTINUOUS_VIDEO:
+        return (1.0, 1.0, rec, pau)
+    if cam.camera_type == CameraType.VIDEO_INTERVAL:
+        return (1.0, 2.0, rec, pau)
+    return (0.0, 0.0, 0.0, 0.0)
+
+
+def _ipcam_master_enabled(
+    descent: CameraSettings, bottom: CameraSettings, ascent: CameraSettings
+) -> bool:
+    for cam in (descent, bottom, ascent):
+        en, mode, _, _ = _ipcam_phase_tuple(cam)
+        if en >= 1.0 and mode >= 1.0:
+            return True
+    return False
+
+
 class DiveService:
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
@@ -83,6 +116,20 @@ class DiveService:
         release_seconds = _time_value_to_seconds(config.ascent.release_weight.elapsed)
         release_seconds = max(release_seconds, descent_dur_s + 5)
 
+        btm_light_dly_s = max(0.0, _time_value_to_seconds(config.bottom.light_delay))
+        btm_cam_dly_s = max(0.0, _time_value_to_seconds(config.bottom.camera_delay))
+
+        ascent_cam = (
+            config.descent.camera if config.ascent.same_as_descent else config.ascent.camera
+        )
+        d_en, d_md, d_rc, d_pa = _ipcam_phase_tuple(config.descent.camera)
+        b_en, b_md, b_rc, b_pa = _ipcam_phase_tuple(config.bottom.camera)
+        a_en, a_md, a_rc, a_pa = _ipcam_phase_tuple(ascent_cam)
+        rec_master = 1.0 if _ipcam_master_enabled(
+            config.descent.camera, config.bottom.camera, ascent_cam
+        ) else 0.0
+        rec_seg = float(max(1, int(getattr(settings, "ipcam_segment_seconds_default", 300))))
+
         params: list[tuple[str, float]] = [
             ("DORIS_DSC_DUR", round(descent_dur_s)),
             ("DORIS_RLS_SEC", round(release_seconds)),
@@ -90,9 +137,26 @@ class DiveService:
             ("DORIS_BTM_LGT", 1.0 if config.bottom.light.enabled else 0.0),
             ("DORIS_ASC_LGT", 1.0 if config.ascent.light.enabled else 0.0),
             ("DORIS_LGT_BRT", float(config.bottom.light.brightness)),
+            ("DORIS_BTM_DLY", round(btm_light_dly_s)),
+            ("DORIS_CAM_DLY", round(btm_cam_dly_s)),
             ("DORIS_PRF_ID", float(profile_id)),
             ("DORIS_UPL_DATE", upload_date),
             ("DORIS_UPL_TIME", upload_time),
+            ("DORIS_REC_EN", rec_master),
+            ("DORIS_RECPRT", float(settings.port)),
+            ("DORIS_RECSEG", rec_seg),
+            ("DORIS_DSC_EN", d_en),
+            ("DORIS_DSC_MD", d_md),
+            ("DORIS_DSC_RC", d_rc),
+            ("DORIS_DSC_PA", d_pa),
+            ("DORIS_BTM_EN", b_en),
+            ("DORIS_BTM_MD", b_md),
+            ("DORIS_BTM_RC", b_rc),
+            ("DORIS_BTM_PA", b_pa),
+            ("DORIS_ASC_EN", a_en),
+            ("DORIS_ASC_MD", a_md),
+            ("DORIS_ASC_RC", a_rc),
+            ("DORIS_ASC_PA", a_pa),
         ]
 
         all_ok = True
