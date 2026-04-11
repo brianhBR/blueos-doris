@@ -71,7 +71,7 @@ LABEL permissions='\
       "/usr/blueos/extensions/doris/configurations:/tmp/storage/configurations",\
       "/usr/blueos/extensions/doris/notifications:/tmp/storage/notifications",\
       "/usr/blueos/extensions/doris/dives:/tmp/storage/dives",\
-      "/usr/blueos/userdata/recorder:/tmp/storage/recorder",\
+      "/usr/blueos/userdata:/tmp/storage/userdata",\
       "/usr/blueos/extensions/doris/nginx:/tmp/nginx",\
       "/etc/avahi:/tmp/avahi",\
       "/sys:/sys:rw"\
