@@ -28,6 +28,7 @@ from .services.external_storage import start_external_storage_setup
 from .services.usb_storage import start_usb_storage_probe
 from .services.frame import FrameService
 from .services.mdns import restart_avahi, setup_doris_local, start_hotspot_dns
+from .services.wifi_driver import setup_wifi_driver
 from .services.timesync import timesync_service
 from .utils import deploy_artemis_svl, deploy_lua_scripts, disable_usb_autosuspend, restart_firmware
 

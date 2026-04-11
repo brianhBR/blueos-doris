@@ -70,14 +70,28 @@ async def _find_core_container_id(client: httpx.AsyncClient) -> str | None:
     return None
 
 
-async def _run_host_command(command: str) -> bool:
-    """Execute a command on the host via the Commander API."""
+async def _run_host_command(command: str, timeout: float = 30.0) -> bool:
+    """Execute a command on the host via the Commander API.
+
+    Commander always returns HTTP 200; the actual exit code is in the
+    JSON body's ``return_code`` field.
+    """
     url = f"{blueos_services.commander}/v1.0/command/host"
     params = {"command": command, "i_know_what_i_am_doing": "true"}
     try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
+        async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, params=params)
             resp.raise_for_status()
+            data = resp.json()
+            rc = data.get("return_code", -1)
+            if rc != 0:
+                out = data.get("stdout", "")
+                err = data.get("stderr", "")
+                logger.warning(
+                    "Host command returned %d: %s %s",
+                    rc, out[:200], err[:200],
+                )
+                return False
         return True
     except Exception as e:
         logger.warning("Commander command failed (%s): %s", command[:60], e)
