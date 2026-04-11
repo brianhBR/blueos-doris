@@ -11,9 +11,11 @@ import logging
 import math
 import os
 import re
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import quote
 
 from ..models.configuration import (
     ConfigurationSummary,
@@ -21,6 +23,8 @@ from ..models.configuration import (
 )
 from ..models.dive_history import DiveHistoryEntry
 from ..models.media import MediaFile, MediaMission, MediaType, SyncStatus
+
+from .usb_storage import iter_media_files_on_usb, iter_media_scan_roots
 
 logger = logging.getLogger(__name__)
 
@@ -37,6 +41,53 @@ SYSTEM_TOP_LEVEL = frozenset(
     {"configurations", "notifications", "nginx", "dives"},
 )
 RECORDER_DIR = "recorder"
+
+# External USB files use this prefix on ``MediaFile.id`` / download ``path=``.
+USB_MEDIA_PREFIX = "usb:"
+
+
+def media_download_id_from_abs_path(path: Path, data_root: Path) -> str:
+    """Stable id for ``/api/v1/media/download`` (internal or USB)."""
+    pr = path.resolve()
+    dr = data_root.resolve()
+    try:
+        return str(pr.relative_to(dr)).replace("\\", "/")
+    except ValueError:
+        pass
+    for mount_key, base in iter_media_scan_roots():
+        try:
+            rel = pr.relative_to(base.resolve())
+            return f"{USB_MEDIA_PREFIX}{mount_key}:{rel.as_posix()}"
+        except ValueError:
+            continue
+    logger.warning("No stable download id for path outside DATA_ROOT/USB: %s", pr)
+    return pr.name
+
+
+def media_abs_path_from_download_id(file_path: str, data_root: Path) -> Path | None:
+    """Resolve a download id to an absolute path, or None if not allowed."""
+    if file_path.startswith(USB_MEDIA_PREFIX):
+        rest = file_path[len(USB_MEDIA_PREFIX) :]
+        idx = rest.find(":")
+        if idx < 0:
+            return None
+        key, rel_s = rest[:idx], rest[idx + 1 :]
+        mounts = dict(iter_media_scan_roots())
+        base = mounts.get(key)
+        if base is None:
+            return None
+        cand = (base / rel_s).resolve()
+        if not cand.is_file():
+            return None
+        if not cand.is_relative_to(base.resolve()):
+            return None
+        return cand
+    cand = (data_root / file_path).resolve()
+    if not cand.is_file():
+        return None
+    if not cand.is_relative_to(data_root.resolve()):
+        return None
+    return cand
 
 
 @dataclass(frozen=True)
@@ -175,17 +226,14 @@ def _match_dive_window(windows: list[_DiveWindow], t: datetime) -> _DiveWindow |
     return candidates[0]
 
 
-def aggregate_recorder_media_counts_by_dive_stem(
-    root: Path, windows: list[_DiveWindow]
+def _aggregate_media_paths(
+    paths: Iterable[Path], windows: list[_DiveWindow]
 ) -> dict[str, tuple[int, int]]:
-    """Count image/video files under recorder/ whose timestamp falls in a dive window."""
+    """Count image/video files whose timestamps fall in dive windows."""
     result: dict[str, tuple[int, int]] = {w.stem: (0, 0) for w in windows}
     if not windows:
         return result
-    rec = root / RECORDER_DIR
-    if not rec.is_dir():
-        return result
-    for path in rec.rglob("*"):
+    for path in paths:
         if not path.is_file():
             continue
         ext = path.suffix.lstrip(".").lower()
@@ -207,6 +255,34 @@ def aggregate_recorder_media_counts_by_dive_stem(
         elif mt == MediaType.VIDEO:
             result[wn.stem] = (img, vid + 1)
     return result
+
+
+def aggregate_recorder_media_counts_by_dive_stem(
+    root: Path, windows: list[_DiveWindow]
+) -> dict[str, tuple[int, int]]:
+    """Count image/video files under recorder/ whose timestamp falls in a dive window."""
+    result: dict[str, tuple[int, int]] = {w.stem: (0, 0) for w in windows}
+    if not windows:
+        return result
+    rec = root / RECORDER_DIR
+    if not rec.is_dir():
+        return result
+    return _aggregate_media_paths(rec.rglob("*"), windows)
+
+
+def aggregate_usb_media_counts_by_dive_stem(
+    windows: list[_DiveWindow],
+) -> dict[str, tuple[int, int]]:
+    """Count image/video on mounted USB roots (same windows as recorder)."""
+    merged: dict[str, tuple[int, int]] = {w.stem: (0, 0) for w in windows}
+    if not windows:
+        return merged
+    for mount_key, base in iter_media_scan_roots():
+        part = _aggregate_media_paths(iter_media_files_on_usb(mount_key, base), windows)
+        for stem, (i, v) in part.items():
+            oi, ov = merged[stem]
+            merged[stem] = (oi + i, ov + v)
+    return merged
 
 
 def _format_dive_duration(start: datetime, end: datetime) -> str:
@@ -265,6 +341,11 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
 
     windows = _load_dive_windows(root)
     counts = aggregate_recorder_media_counts_by_dive_stem(root, windows)
+    usb_counts = aggregate_usb_media_counts_by_dive_stem(windows)
+    for stem in counts:
+        i, v = counts[stem]
+        i2, v2 = usb_counts[stem]
+        counts[stem] = (i + i2, v + v2)
     mcap_by_stem = map_dive_stem_to_largest_mcap(root, windows)
     now = _sane_now()
     entries: list[DiveHistoryEntry] = []
@@ -319,10 +400,7 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
         mcap_path = mcap_by_stem.get(stem)
         rel_mcap: str | None = None
         if mcap_path is not None:
-            try:
-                rel_mcap = str(mcap_path.relative_to(root))
-            except ValueError:
-                rel_mcap = None
+            rel_mcap = media_download_id_from_abs_path(mcap_path, root)
 
         entries.append(
             DiveHistoryEntry(
@@ -423,6 +501,38 @@ def _effective_created_at(path: Path, mtime_ts: float) -> datetime:
     if mtime_dt < lo:
         return lo
     return mtime_dt
+
+
+def _usb_file_to_media(
+    full_path: Path,
+    data_root: Path,
+    dive_windows: list[_DiveWindow],
+    mount_key: str,
+    rel_under_mount: Path,
+) -> MediaFile:
+    """Build a :class:`MediaFile` for a path on an external USB root."""
+    stat = full_path.stat()
+    eff = _effective_created_at(full_path, stat.st_mtime)
+    eff_utc = eff if eff.tzinfo else eff.replace(tzinfo=timezone.utc)
+    content_kind = _detect_media_type(full_path.name)
+    dive_name: str | None = None
+    media_type = content_kind
+    wn = _match_dive_window(dive_windows, eff_utc)
+    if wn:
+        dive_name = wn.display_name
+    if dive_name is None and content_kind == MediaType.DATA:
+        media_type = MediaType.SYSTEM
+    fid = f"{USB_MEDIA_PREFIX}{mount_key}:{rel_under_mount.as_posix()}"
+    return MediaFile(
+        id=fid,
+        filename=full_path.name,
+        media_type=media_type,
+        size_bytes=stat.st_size,
+        created_at=eff,
+        mission_id=f"usb:{mount_key}",
+        dive_name=dive_name,
+        download_url=f"/api/v1/media/download?path={quote(fid, safe='')}",
+    )
 
 
 def _file_to_media(
@@ -531,27 +641,89 @@ class StorageService:
         limit: int = 50,
         offset: int = 0,
     ) -> list[MediaFile]:
-        """List media files from the recorder directory."""
+        """List media files from the recorder tree and from mounted USB volumes."""
         try:
-            search_root = self.media_root / mission_id if mission_id else self.media_root
-            if not search_root.exists():
-                return []
-
             dive_windows = self._get_dive_windows()
             files: list[MediaFile] = []
-            for path in search_root.rglob("*"):
-                try:
-                    if not path.is_file():
+
+            def _append_if_matches(mf: MediaFile) -> None:
+                if media_type and mf.media_type != media_type:
+                    return
+                files.append(mf)
+
+            if mission_id and mission_id.startswith("usb:"):
+                mount_key = mission_id[4:]
+                mounts = dict(iter_media_scan_roots())
+                usb_base = mounts.get(mount_key)
+                if usb_base is None or not usb_base.is_dir():
+                    return []
+                base_r = usb_base.resolve()
+                for path in iter_media_files_on_usb(mount_key, usb_base):
+                    try:
+                        if not path.is_file():
+                            continue
+                        ext = path.suffix.lstrip(".").lower()
+                        if ext not in ALL_EXTENSIONS:
+                            continue
+                        rel = path.resolve().relative_to(base_r)
+                        mf = _usb_file_to_media(
+                            path, self.root, dive_windows, mount_key, rel
+                        )
+                        _append_if_matches(mf)
+                    except (FileNotFoundError, PermissionError, ValueError):
                         continue
-                    ext = path.suffix.lstrip(".").lower()
-                    if ext not in ALL_EXTENSIONS:
+                files.sort(key=lambda f: f.created_at, reverse=True)
+                return files[offset : offset + limit]
+
+            if mission_id:
+                search_root = self.media_root / mission_id
+                if not search_root.exists():
+                    return []
+                for path in search_root.rglob("*"):
+                    try:
+                        if not path.is_file():
+                            continue
+                        ext = path.suffix.lstrip(".").lower()
+                        if ext not in ALL_EXTENSIONS:
+                            continue
+                        mf = _file_to_media(path, self.root, dive_windows)
+                        _append_if_matches(mf)
+                    except (FileNotFoundError, PermissionError):
                         continue
-                    mf = _file_to_media(path, self.root, dive_windows)
-                    if media_type and mf.media_type != media_type:
+            else:
+                if self.media_root.exists():
+                    for path in self.media_root.rglob("*"):
+                        try:
+                            if not path.is_file():
+                                continue
+                            ext = path.suffix.lstrip(".").lower()
+                            if ext not in ALL_EXTENSIONS:
+                                continue
+                            mf = _file_to_media(path, self.root, dive_windows)
+                            _append_if_matches(mf)
+                        except (FileNotFoundError, PermissionError):
+                            continue
+                for mount_key, usb_base in iter_media_scan_roots():
+                    if not usb_base.is_dir():
                         continue
-                    files.append(mf)
-                except (FileNotFoundError, PermissionError):
-                    continue
+                    try:
+                        base_r = usb_base.resolve()
+                    except OSError:
+                        continue
+                    for path in iter_media_files_on_usb(mount_key, usb_base):
+                        try:
+                            if not path.is_file():
+                                continue
+                            ext = path.suffix.lstrip(".").lower()
+                            if ext not in ALL_EXTENSIONS:
+                                continue
+                            rel = path.resolve().relative_to(base_r)
+                            mf = _usb_file_to_media(
+                                path, self.root, dive_windows, mount_key, rel
+                            )
+                            _append_if_matches(mf)
+                        except (FileNotFoundError, PermissionError, ValueError):
+                            continue
 
             files.sort(key=lambda f: f.created_at, reverse=True)
 
@@ -562,23 +734,74 @@ class StorageService:
             raise
 
     async def get_missions_with_media(self) -> list[MediaMission]:
-        """Discover missions by scanning top-level subdirectories of the recorder."""
+        """Discover missions from recorder folders and from USB volumes."""
         try:
-            if not self.media_root.exists():
-                return []
-
             missions: list[MediaMission] = []
-            for entry in sorted(self.media_root.iterdir(), reverse=True):
-                if not entry.is_dir():
-                    continue
-                if entry.name.lower() in SYSTEM_TOP_LEVEL:
-                    continue
 
+            if self.media_root.exists():
+                for entry in sorted(self.media_root.iterdir(), reverse=True):
+                    if not entry.is_dir():
+                        continue
+                    if entry.name.lower() in SYSTEM_TOP_LEVEL:
+                        continue
+
+                    images = videos = data_files = 0
+                    total_size = 0
+                    latest_date: datetime | None = None
+
+                    for path in entry.rglob("*"):
+                        try:
+                            if not path.is_file():
+                                continue
+                            ext = path.suffix.lstrip(".").lower()
+                            if ext not in ALL_EXTENSIONS:
+                                continue
+                            stat = path.stat()
+                            total_size += stat.st_size
+                            eff = _effective_created_at(path, stat.st_mtime)
+                            if latest_date is None or eff > latest_date:
+                                latest_date = eff
+                            mt = _detect_media_type(path.name)
+                            if mt == MediaType.IMAGE:
+                                images += 1
+                            elif mt == MediaType.VIDEO:
+                                videos += 1
+                            else:
+                                data_files += 1
+                        except (FileNotFoundError, PermissionError):
+                            continue
+
+                    if images + videos + data_files == 0:
+                        continue
+
+                    display_name = (
+                        "Recorder"
+                        if entry.name.lower() == RECORDER_DIR
+                        else entry.name
+                    )
+                    missions.append(
+                        MediaMission(
+                            mission_id=entry.name,
+                            mission_name=display_name,
+                            date=latest_date or datetime.now(tz=timezone.utc),
+                            image_count=images,
+                            video_count=videos,
+                            data_file_count=data_files,
+                            total_size_bytes=total_size,
+                        )
+                    )
+
+            usb_labels = {
+                "portable": "USB (portable)",
+                "host_mnt": "USB (host /mnt)",
+            }
+            for mount_key, base in iter_media_scan_roots():
+                if not base.is_dir():
+                    continue
                 images = videos = data_files = 0
                 total_size = 0
                 latest_date: datetime | None = None
-
-                for path in entry.rglob("*"):
+                for path in iter_media_files_on_usb(mount_key, base):
                     try:
                         if not path.is_file():
                             continue
@@ -599,19 +822,12 @@ class StorageService:
                             data_files += 1
                     except (FileNotFoundError, PermissionError):
                         continue
-
                 if images + videos + data_files == 0:
                     continue
-
-                display_name = (
-                    "Recorder"
-                    if entry.name.lower() == RECORDER_DIR
-                    else entry.name
-                )
                 missions.append(
                     MediaMission(
-                        mission_id=entry.name,
-                        mission_name=display_name,
+                        mission_id=f"usb:{mount_key}",
+                        mission_name=usb_labels.get(mount_key, f"USB ({mount_key})"),
                         date=latest_date or datetime.now(tz=timezone.utc),
                         image_count=images,
                         video_count=videos,
@@ -638,10 +854,10 @@ class StorageService:
         return ok
 
     async def get_file(self, file_path: str) -> bytes | None:
-        """Read a media file from the recorder directory."""
+        """Read a media file from ``DATA_ROOT`` or from an indexed USB volume."""
         try:
-            full = self.media_root / file_path
-            if not full.is_file() or not full.resolve().is_relative_to(self.media_root.resolve()):
+            full = media_abs_path_from_download_id(file_path, self.root)
+            if full is None:
                 return None
             return full.read_bytes()
         except Exception as e:
@@ -649,11 +865,11 @@ class StorageService:
             return None
 
     async def delete_file(self, file_path: str) -> bool:
-        """Delete a media file from the recorder directory."""
+        """Delete a media file under ``DATA_ROOT`` or on an indexed USB volume."""
         try:
-            full = self.media_root / file_path
-            if not full.resolve().is_relative_to(self.media_root.resolve()):
-                raise ValueError("Path traversal denied")
+            full = media_abs_path_from_download_id(file_path, self.root)
+            if full is None:
+                return False
             full.unlink(missing_ok=True)
             return True
         except Exception as e:

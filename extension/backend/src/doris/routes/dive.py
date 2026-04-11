@@ -21,7 +21,7 @@ from robyn import Response, Robyn
 from ..services.camera import CameraService
 from ..services.dive import DiveService
 from ..services import ip_camera_recorder as iprec
-from ..services.storage import DATA_ROOT, StorageService
+from ..services.storage import DATA_ROOT, StorageService, media_download_id_from_abs_path
 
 logger = logging.getLogger(__name__)
 
@@ -397,8 +397,8 @@ def register_dive_routes(app: Robyn) -> None:
         rel: str | None = None
         summary = McapSummary()
         if mcap_path is not None:
+            rel = media_download_id_from_abs_path(mcap_path, DATA_ROOT)
             try:
-                rel = str(mcap_path.relative_to(DATA_ROOT))
                 summary = summarize_mcap(mcap_path)
             except Exception as e:
                 logger.warning("MCAP summarize failed for %s: %s", mcap_path, e)

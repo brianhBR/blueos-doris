@@ -46,6 +46,12 @@ class Settings(BaseSettings):
     ipcam_video_codec: str = "copy"
     ipcam_x264_preset: str = "veryfast"
 
+    # Removable USB for RTSP segments (same idea as BlueOS_videorecorder DropCam usb_storage)
+    usb_mount_point: str = "/mnt/usb"
+    usb_doris_folder: str = "DORIS"
+    ipcam_usb_min_free_mb: float = 256.0
+    usb_probe_interval_s: int = 30
+
     class Config:
         env_prefix = "DORIS_"
         env_file = ".env"

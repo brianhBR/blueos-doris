@@ -16,6 +16,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from ..config import settings
+from . import usb_storage
 
 logger = logging.getLogger(__name__)
 
@@ -31,11 +32,15 @@ def _data_root() -> Path:
     return Path(os.environ.get("DORIS_DATA_ROOT", "/tmp/storage"))
 
 
-def _output_dir() -> Path:
-    sub = settings.ipcam_recordings_subdir
+def _output_dir() -> tuple[Path, str]:
+    """Return (directory, label) with ``label`` ``usb`` or ``internal``."""
+    sub = settings.ipcam_recordings_subdir.strip("/").strip()
+    usb_base = usb_storage.get_recording_dir_if_available(sub)
+    if usb_base is not None:
+        return Path(usb_base), "usb"
     out = _data_root() / sub
     out.mkdir(parents=True, exist_ok=True)
-    return out
+    return out, "internal"
 
 
 def _build_ffmpeg_args(rtsp_url: str, segment_s: int, pattern: str) -> list[str]:
@@ -104,13 +109,17 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
         if _process is not None and _process.returncode is None:
             return {"success": False, "message": "Already recording", "recording": True}
 
-        out_dir = _output_dir()
+        out_dir, storage = _output_dir()
         stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
         pattern = str(out_dir / f"ipcam_{stamp}_%03d.ts")
         _last_pattern = pattern
 
         cmd = _build_ffmpeg_args(rtsp, seg, pattern)
-        logger.info("Starting IP camera recorder: %s", " ".join(cmd[:12]) + " ... " + pattern)
+        logger.info(
+            "Starting IP camera recorder (%s): %s",
+            storage,
+            " ".join(cmd[:12]) + " ... " + pattern,
+        )
 
         try:
             proc = await asyncio.create_subprocess_exec(
@@ -139,6 +148,8 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
             "success": True,
             "recording": True,
             "output_pattern": pattern,
+            "output_directory": str(out_dir),
+            "storage": storage,
             "segment_seconds": seg,
         }
 
@@ -181,4 +192,5 @@ async def recording_status() -> dict:
             "recording": alive,
             "returncode": rc,
             "output_pattern": _last_pattern,
+            "usb": usb_storage.get_status(),
         }

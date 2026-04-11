@@ -25,6 +25,7 @@ from .routes import (
     register_system_routes,
 )
 from .services.external_storage import start_external_storage_setup
+from .services.usb_storage import start_usb_storage_probe
 from .services.frame import FrameService
 from .services.mdns import ensure_wifi_driver, restart_avahi, setup_doris_local, start_hotspot_dns
 from .services.timesync import timesync_service
@@ -166,6 +167,11 @@ def create_app() -> Robyn:
             start_external_storage_setup()
         except Exception as e:
             logger.warning("External storage setup skipped: %s", e)
+
+        try:
+            start_usb_storage_probe()
+        except Exception as e:
+            logger.warning("USB storage probe skipped: %s", e)
 
         timesync_service.start_background_sync()
 
