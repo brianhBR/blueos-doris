@@ -176,56 +176,6 @@ async def start_hotspot_dns() -> None:
         logger.warning("Failed to start hotspot DNS server")
 
 
-DRIVER_INSTALL_SCRIPT = r"""
-set +e
-KVER=$(uname -r)
-DRIVER_REPO="https://github.com/morrownr/88x2bu-20210702.git"
-DRIVER_DIR="/opt/doris-drivers/88x2bu"
-BLACKLIST="/etc/modprobe.d/blacklist-rtw88.conf"
-
-if lsmod | grep -q 88x2bu; then exit 0; fi
-if modprobe -n 88x2bu 2>/dev/null; then
-    modprobe 88x2bu 2>/dev/null
-    grep -q 'blacklist rtw88_8822bu' "$BLACKLIST" 2>/dev/null || {
-        echo 'blacklist rtw88_8822bu' > "$BLACKLIST"
-        echo 'blacklist rtw88_8822b' >> "$BLACKLIST"
-        echo 'blacklist rtw88_usb' >> "$BLACKLIST"
-    }
-    exit 0
-fi
-command -v gcc >/dev/null && [ -d "/lib/modules/$KVER/build" ] || exit 0
-rm -rf "$DRIVER_DIR" && mkdir -p /opt/doris-drivers
-git clone --depth 1 "$DRIVER_REPO" "$DRIVER_DIR" 2>&1 | tail -2
-cd "$DRIVER_DIR" && make -j4 KSRC="/lib/modules/$KVER/build" 2>&1 | tail -3
-[ $? -eq 0 ] && make install KSRC="/lib/modules/$KVER/build" 2>&1 | tail -2
-echo 'blacklist rtw88_8822bu' > "$BLACKLIST"
-echo 'blacklist rtw88_8822b' >> "$BLACKLIST"
-echo 'blacklist rtw88_usb' >> "$BLACKLIST"
-if [ -d /sys/bus/usb/devices/1-1 ]; then
-    rmmod rtw88_8822bu 2>/dev/null
-    echo 0 > /sys/bus/usb/devices/1-1/authorized; sleep 2
-    echo 1 > /sys/bus/usb/devices/1-1/authorized; sleep 4
-fi
-"""
-
-
-async def ensure_wifi_driver() -> None:
-    """Install the out-of-tree 88x2bu driver if not already loaded.
-
-    The in-kernel ``rtw88_8822bu`` driver has a TX-queue-stall bug in AP
-    mode that makes the hotspot unusable.  The community ``88x2bu``
-    driver (morrownr fork) is stable.  This function checks if the
-    driver is already loaded and, if not, builds and installs it via
-    Commander.  The build is cached in ``/opt/doris-drivers/`` and only
-    runs once per kernel version.
-    """
-    ok = await _run_host_command(DRIVER_INSTALL_SCRIPT)
-    if ok:
-        logger.info("WiFi driver check complete (88x2bu)")
-    else:
-        logger.warning("WiFi driver install check failed (non-fatal)")
-
-
 async def restart_avahi() -> None:
     """Restart Avahi so it re-probes all interfaces.
 

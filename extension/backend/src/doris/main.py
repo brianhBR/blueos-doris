@@ -27,7 +27,7 @@ from .routes import (
 from .services.external_storage import start_external_storage_setup
 from .services.usb_storage import start_usb_storage_probe
 from .services.frame import FrameService
-from .services.mdns import ensure_wifi_driver, restart_avahi, setup_doris_local, start_hotspot_dns
+from .services.mdns import restart_avahi, setup_doris_local, start_hotspot_dns
 from .services.timesync import timesync_service
 from .utils import deploy_artemis_svl, deploy_lua_scripts, disable_usb_autosuspend, restart_firmware
 
@@ -136,11 +136,6 @@ def create_app() -> Robyn:
             await frame_service.apply_frame_if_needed()
         except Exception as e:
             logger.warning("Frame setup skipped: %s", e)
-
-        try:
-            await ensure_wifi_driver()
-        except Exception as e:
-            logger.warning("WiFi driver check skipped: %s", e)
 
         try:
             await setup_doris_local()
