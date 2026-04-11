@@ -135,14 +135,14 @@ if lsmod | grep -q 88x2bu; then
 fi
 
 # Skip if the module is already installed for this kernel
-if modprobe -n 88x2bu 2>/dev/null; then
+if sudo modprobe -n 88x2bu 2>/dev/null; then
     echo "88x2bu module available for kernel $KVER, loading..."
-    modprobe 88x2bu 2>/dev/null
+    sudo modprobe 88x2bu 2>/dev/null
     # Blacklist the in-kernel driver
     grep -q 'blacklist rtw88_8822bu' "$BLACKLIST" 2>/dev/null || {
-        echo 'blacklist rtw88_8822bu' > "$BLACKLIST"
-        echo 'blacklist rtw88_8822b' >> "$BLACKLIST"
-        echo 'blacklist rtw88_usb' >> "$BLACKLIST"
+        echo 'blacklist rtw88_8822bu' | sudo tee "$BLACKLIST" > /dev/null
+        echo 'blacklist rtw88_8822b'  | sudo tee -a "$BLACKLIST" > /dev/null
+        echo 'blacklist rtw88_usb'    | sudo tee -a "$BLACKLIST" > /dev/null
     }
     echo "88x2bu loaded from installed module."
     exit 0
@@ -159,28 +159,28 @@ if [ ! -d "/lib/modules/$KVER/build" ]; then
 fi
 
 echo "Building 88x2bu driver for kernel $KVER..."
-rm -rf "$DRIVER_DIR"
-mkdir -p /opt/doris-drivers
-git clone --depth 1 "$DRIVER_REPO" "$DRIVER_DIR" 2>&1 | tail -3
+sudo rm -rf "$DRIVER_DIR"
+sudo mkdir -p /opt/doris-drivers
+sudo git clone --depth 1 "$DRIVER_REPO" "$DRIVER_DIR" 2>&1 | tail -3
 cd "$DRIVER_DIR"
-make -j4 KSRC="/lib/modules/$KVER/build" 2>&1 | tail -5
+sudo make -j4 KSRC="/lib/modules/$KVER/build" 2>&1 | tail -5
 if [ $? -ne 0 ]; then
     echo "WARN: 88x2bu build failed."
     exit 0
 fi
-make install KSRC="/lib/modules/$KVER/build" 2>&1 | tail -3
+sudo make install KSRC="/lib/modules/$KVER/build" 2>&1 | tail -3
 
 # Blacklist the in-kernel rtw88 driver
-echo 'blacklist rtw88_8822bu' > "$BLACKLIST"
-echo 'blacklist rtw88_8822b' >> "$BLACKLIST"
-echo 'blacklist rtw88_usb' >> "$BLACKLIST"
+echo 'blacklist rtw88_8822bu' | sudo tee "$BLACKLIST" > /dev/null
+echo 'blacklist rtw88_8822b'  | sudo tee -a "$BLACKLIST" > /dev/null
+echo 'blacklist rtw88_usb'    | sudo tee -a "$BLACKLIST" > /dev/null
 
 # Try to swap drivers now (if adapter is present)
 if [ -d /sys/bus/usb/devices/1-1 ]; then
-    rmmod rtw88_8822bu 2>/dev/null
-    echo 0 > /sys/bus/usb/devices/1-1/authorized
+    sudo rmmod rtw88_8822bu 2>/dev/null
+    echo 0 | sudo tee /sys/bus/usb/devices/1-1/authorized > /dev/null
     sleep 2
-    echo 1 > /sys/bus/usb/devices/1-1/authorized
+    echo 1 | sudo tee /sys/bus/usb/devices/1-1/authorized > /dev/null
     sleep 4
     if lsmod | grep -q 88x2bu; then
         echo "88x2bu driver installed and loaded successfully."
