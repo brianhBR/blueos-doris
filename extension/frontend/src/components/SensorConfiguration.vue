@@ -239,7 +239,7 @@ async function lightTestOn() {
   lightTestActive.value = true
   lightTestError.value = ''
   const ok = await setLightBrightness(10)
-  if (!ok) {
+  if (!ok || !lightTestActive.value) {
     lightTestActive.value = false
     return
   }
@@ -247,11 +247,13 @@ async function lightTestOn() {
 }
 
 function lightTestOff() {
-  if (!lightTestActive.value) return
+  const wasActive = lightTestActive.value
   lightTestActive.value = false
   if (lightKeepAlive) { clearInterval(lightKeepAlive); lightKeepAlive = undefined }
-  setLightBrightness(0)
-  setTimeout(() => setLightBrightness(0), 300)
+  if (wasActive) {
+    setLightBrightness(0)
+    setTimeout(() => setLightBrightness(0), 300)
+  }
 }
 
 // ── Module list sync ────────────────────────────────────────────────

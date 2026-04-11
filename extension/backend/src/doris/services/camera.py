@@ -131,7 +131,7 @@ class CameraService:
             logger.error("Light PARAM_SET failed: %s", e)
             return {"ok": False, "error": f"Failed to send PARAM_SET: {e}"}
 
-        if brightness > 0 and self._lgt_param_ok is None:
+        if brightness > 0 and not self._lgt_param_ok:
             verified = await self._verify_light_param()
             if not verified:
                 return {
