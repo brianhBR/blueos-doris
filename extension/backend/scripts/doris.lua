@@ -96,7 +96,7 @@ local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 local PARAM_TABLE_KEY  = 73
-local PARAM_TABLE_SIZE = 40
+local PARAM_TABLE_SIZE = 29
 
 assert(param:add_table(PARAM_TABLE_KEY, "DORIS_", PARAM_TABLE_SIZE),
        "DIVE: could not add DORIS_ param table")
@@ -127,23 +127,12 @@ assert(param:add_param(PARAM_TABLE_KEY, 21, "MAX_DPTH", 6100), "DORIS_MAX_DPTH")
 assert(param:add_param(PARAM_TABLE_KEY, 22, "LGT_TST", 0),    "DORIS_LGT_TST")
 assert(param:add_param(PARAM_TABLE_KEY, 23, "LOG_INTV", 1000), "DORIS_LOG_INTV")
 assert(param:add_param(PARAM_TABLE_KEY, 24, "GPS_RBT",  0),    "DORIS_GPS_RBT")
--- IP camera recorder (HTTP to DORIS extension; policy from mission configuration)
+-- IP camera recorder (HTTP to DORIS extension; per-phase continuous video)
 assert(param:add_param(PARAM_TABLE_KEY, 25, "REC_EN",   0),    "DORIS_REC_EN")
-assert(param:add_param(PARAM_TABLE_KEY, 26, "RECPRT",   8095), "DORIS_RECPRT")
-assert(param:add_param(PARAM_TABLE_KEY, 27, "RECSEG",   300),  "DORIS_RECSEG")
-assert(param:add_param(PARAM_TABLE_KEY, 28, "DSC_EN",   0),    "DORIS_DSC_EN")
-assert(param:add_param(PARAM_TABLE_KEY, 29, "DSC_MD",   0),    "DORIS_DSC_MD")
-assert(param:add_param(PARAM_TABLE_KEY, 30, "DSC_RC",   10),   "DORIS_DSC_RC")
-assert(param:add_param(PARAM_TABLE_KEY, 31, "DSC_PA",   5),    "DORIS_DSC_PA")
-assert(param:add_param(PARAM_TABLE_KEY, 32, "BTM_EN",   0),    "DORIS_BTM_EN")
-assert(param:add_param(PARAM_TABLE_KEY, 33, "BTM_MD",   0),    "DORIS_BTM_MD")
-assert(param:add_param(PARAM_TABLE_KEY, 34, "BTM_RC",   10),   "DORIS_BTM_RC")
-assert(param:add_param(PARAM_TABLE_KEY, 35, "BTM_PA",   5),    "DORIS_BTM_PA")
-assert(param:add_param(PARAM_TABLE_KEY, 36, "CAM_DLY",  0),    "DORIS_CAM_DLY")
-assert(param:add_param(PARAM_TABLE_KEY, 37, "ASC_EN",   0),    "DORIS_ASC_EN")
-assert(param:add_param(PARAM_TABLE_KEY, 38, "ASC_MD",   0),    "DORIS_ASC_MD")
-assert(param:add_param(PARAM_TABLE_KEY, 39, "ASC_RC",   10),   "DORIS_ASC_RC")
-assert(param:add_param(PARAM_TABLE_KEY, 40, "ASC_PA",   5),    "DORIS_ASC_PA")
+assert(param:add_param(PARAM_TABLE_KEY, 26, "DSC_REC",  0),    "DORIS_DSC_REC")
+assert(param:add_param(PARAM_TABLE_KEY, 27, "BTM_REC",  0),    "DORIS_BTM_REC")
+assert(param:add_param(PARAM_TABLE_KEY, 28, "ASC_REC",  0),    "DORIS_ASC_REC")
+assert(param:add_param(PARAM_TABLE_KEY, 29, "CAM_DLY",  0),    "DORIS_CAM_DLY")
 
 local DORIS_START    = Parameter("DORIS_START")
 local DORIS_RLS_SEC  = Parameter("DORIS_RLS_SEC")
@@ -312,10 +301,10 @@ local cfg_btm_dly_ms  = 30000
 
 -- snapshotted IP camera policy (set in snapshot_config from DORIS_* params)
 local ipcam_cfg = {
-    rec_en = false, rec_prt = 8095, rec_seg = 300,
-    d_en = 0, d_md = 0, d_rc_ms = 10000, d_pau_ms = 5000,
-    b_en = 0, b_md = 0, b_rc_ms = 10000, b_pau_ms = 5000,
-    a_en = 0, a_md = 0, a_rc_ms = 10000, a_pau_ms = 5000,
+    rec_en = false,
+    dsc_rec = false,
+    btm_rec = false,
+    asc_rec = false,
     cam_btm_dly_ms = 0,
 }
 
@@ -333,8 +322,6 @@ local ipcam = {
     prev = STATE_CONFIG,
     ext  = false,
     ph   = 0,
-    iv   = 0,
-    dl   = 0,
 }
 
 -- ?????????? helpers ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
@@ -556,34 +543,24 @@ local function snapshot_config()
             string.format("DIVE: bottom light delay=%ds", btm_dly))
     end
 
-    local function _sec_to_ms(s)
-        return math.max(0, math.floor((s or 0) * 1000.0))
+    local function _pgv(name, default)
+        local v = param:get(name)
+        if v == nil then return default end
+        return v
     end
 
-    ipcam_cfg.rec_en = (ipcam_pgv("DORIS_REC_EN", 0) >= 1.0)
-    ipcam_cfg.rec_prt = math.floor(ipcam_pgv("DORIS_RECPRT", 8095))
-    ipcam_cfg.rec_seg = math.max(1, math.floor(ipcam_pgv("DORIS_RECSEG", 300)))
-    ipcam_cfg.d_en = math.floor(ipcam_pgv("DORIS_DSC_EN", 0))
-    ipcam_cfg.d_md = math.floor(ipcam_pgv("DORIS_DSC_MD", 0))
-    ipcam_cfg.d_rc_ms = math.max(1000, _sec_to_ms(ipcam_pgv("DORIS_DSC_RC", 10)))
-    ipcam_cfg.d_pau_ms = math.max(0, _sec_to_ms(ipcam_pgv("DORIS_DSC_PA", 5)))
-    ipcam_cfg.b_en = math.floor(ipcam_pgv("DORIS_BTM_EN", 0))
-    ipcam_cfg.b_md = math.floor(ipcam_pgv("DORIS_BTM_MD", 0))
-    ipcam_cfg.b_rc_ms = math.max(1000, _sec_to_ms(ipcam_pgv("DORIS_BTM_RC", 10)))
-    ipcam_cfg.b_pau_ms = math.max(0, _sec_to_ms(ipcam_pgv("DORIS_BTM_PA", 5)))
-    ipcam_cfg.a_en = math.floor(ipcam_pgv("DORIS_ASC_EN", 0))
-    ipcam_cfg.a_md = math.floor(ipcam_pgv("DORIS_ASC_MD", 0))
-    ipcam_cfg.a_rc_ms = math.max(1000, _sec_to_ms(ipcam_pgv("DORIS_ASC_RC", 10)))
-    ipcam_cfg.a_pau_ms = math.max(0, _sec_to_ms(ipcam_pgv("DORIS_ASC_PA", 5)))
-    ipcam_cfg.cam_btm_dly_ms = _sec_to_ms(ipcam_pgv("DORIS_CAM_DLY", 0))
+    ipcam_cfg.rec_en  = (_pgv("DORIS_REC_EN", 0) >= 1.0)
+    ipcam_cfg.dsc_rec = (_pgv("DORIS_DSC_REC", 0) >= 1.0)
+    ipcam_cfg.btm_rec = (_pgv("DORIS_BTM_REC", 0) >= 1.0)
+    ipcam_cfg.asc_rec = (_pgv("DORIS_ASC_REC", 0) >= 1.0)
+    ipcam_cfg.cam_btm_dly_ms = math.max(0, math.floor((_pgv("DORIS_CAM_DLY", 0)) * 1000.0))
 
     if ipcam_cfg.rec_en then
         gcs:send_text(MAV_SEVERITY.INFO,
-            string.format("DIVE: IPcam port=%d seg=%ds dsc=%d/%d btm=%d/%d asc=%d/%d camDly=%dms",
-                ipcam_cfg.rec_prt, ipcam_cfg.rec_seg,
-                ipcam_cfg.d_en, ipcam_cfg.d_md,
-                ipcam_cfg.b_en, ipcam_cfg.b_md,
-                ipcam_cfg.a_en, ipcam_cfg.a_md,
+            string.format("DIVE: IPcam dsc=%d btm=%d asc=%d camDly=%dms",
+                ipcam_cfg.dsc_rec and 1 or 0,
+                ipcam_cfg.btm_rec and 1 or 0,
+                ipcam_cfg.asc_rec and 1 or 0,
                 ipcam_cfg.cam_btm_dly_ms))
     end
 end
@@ -658,12 +635,6 @@ local function update_telemetry(now_ms)
     end
 end
 
-local function ipcam_pgv(name, default)
-    local v = param:get(name)
-    if v == nil then return default end
-    return v
-end
-
 local function ipcam_http_send(first_line, host, port)
     if is_sitl then
         return true
@@ -699,106 +670,56 @@ end
 
 local function ipcam_frame_tick(now_ms)
     local host = IPCAM_HTTP_HOST
-    local port = math.floor(ipcam_cfg.rec_prt)
-    local seg  = math.max(1, math.floor(ipcam_cfg.rec_seg))
+    local port = 8095
+    local seg  = 300
 
-    if not ipcam_cfg.rec_en then
+    -- Master enable or recovery: stop if running
+    if not ipcam_cfg.rec_en or state == STATE_RECOVERY then
         if ipcam.ext then
             ipcam_http_stop(host, port)
             ipcam.ext = false
         end
-        ipcam.iv = 0
         ipcam.ph = 0
         return
     end
 
-    if state == STATE_RECOVERY then
-        if ipcam.ext then
-            ipcam_http_stop(host, port)
-            ipcam.ext = false
-        end
-        ipcam.iv = 0
-        ipcam.ph = 0
-        return
-    end
-
+    -- Determine current phase and whether recording is wanted
     local ph = 0
+    local want = false
     if state == STATE_DESCENT then
-        ph = 1
+        ph = 1; want = ipcam_cfg.dsc_rec
     elseif state == STATE_ON_BOTTOM then
-        ph = 2
+        ph = 2; want = ipcam_cfg.btm_rec
+        -- Bottom camera delay
+        if want and ipcam_cfg.cam_btm_dly_ms > 0 then
+            if bottom_start_ms <= 0 or (now_ms - bottom_start_ms) < ipcam_cfg.cam_btm_dly_ms then
+                want = false
+            end
+        end
     elseif state == STATE_ASCENT then
-        ph = 3
+        ph = 3; want = ipcam_cfg.asc_rec
     end
 
-    local en, md, r_ms, p_ms = 0, 0, 10000, 5000
-    if ph == 1 then
-        en, md, r_ms, p_ms = ipcam_cfg.d_en, ipcam_cfg.d_md, ipcam_cfg.d_rc_ms, ipcam_cfg.d_pau_ms
-    elseif ph == 2 then
-        en, md, r_ms, p_ms = ipcam_cfg.b_en, ipcam_cfg.b_md, ipcam_cfg.b_rc_ms, ipcam_cfg.b_pau_ms
-    elseif ph == 3 then
-        en, md, r_ms, p_ms = ipcam_cfg.a_en, ipcam_cfg.a_md, ipcam_cfg.a_rc_ms, ipcam_cfg.a_pau_ms
-    end
-
-    local cam_ok = true
-    if ph == 2 and ipcam_cfg.cam_btm_dly_ms > 0 then
-        if bottom_start_ms <= 0 or (now_ms - bottom_start_ms) < ipcam_cfg.cam_btm_dly_ms then
-            cam_ok = false
-        end
-    end
-
-    if en < 1 or md < 1 or not cam_ok then
-        if ipcam.ext then
-            ipcam_http_stop(host, port)
-            ipcam.ext = false
-        end
-        ipcam.iv = 0
-    end
-
+    -- Phase changed: stop current recording before deciding next action
     if ph ~= ipcam.ph then
         if ipcam.ext then
             ipcam_http_stop(host, port)
             ipcam.ext = false
         end
-        ipcam.iv = 0
         ipcam.ph = ph
     end
 
-    if en < 1 or md < 1 or not cam_ok then
-        return
-    end
-
-    if md == 1 then
+    -- Start or stop based on want
+    if want then
         if not ipcam.ext then
             if ipcam_http_start(host, port, seg) then
                 ipcam.ext = true
             end
         end
-        return
-    end
-
-    if md == 2 then
-        if ipcam.iv == 0 then
-            if ipcam_http_start(host, port, seg) then
-                ipcam.ext = true
-                ipcam.iv = 1
-                ipcam.dl = now_ms + r_ms
-            end
-        elseif ipcam.iv == 1 then
-            if now_ms >= ipcam.dl then
-                ipcam_http_stop(host, port)
-                ipcam.ext = false
-                ipcam.iv = 2
-                ipcam.dl = now_ms + p_ms
-            end
-        elseif ipcam.iv == 2 then
-            if now_ms >= ipcam.dl then
-                if ipcam_http_start(host, port, seg) then
-                    ipcam.ext = true
-                    ipcam.iv = 1
-                    ipcam.dl = now_ms + r_ms
-                end
-            end
+    else
+        if ipcam.ext then
+            ipcam_http_stop(host, port)
+            ipcam.ext = false
         end
     end
 end

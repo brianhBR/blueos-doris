@@ -110,7 +110,7 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
 
         out_dir, storage = _output_dir()
         stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
-        pattern = str(out_dir / f"ipcam_{stamp}_%03d.ts")
+        pattern = str(out_dir / f"radcam_{stamp}_%03d.ts")
         _last_pattern = pattern
 
         cmd = _build_ffmpeg_args(rtsp, seg, pattern)
