@@ -40,7 +40,7 @@ class Settings(BaseSettings):
 
     # IP camera recorder (RTSP -> segmented MPEG-TS via ffmpeg; URL is hardcoded in service)
     ipcam_recordings_subdir: str = "userdata/ipcam_recordings"
-    ipcam_segment_seconds_default: int = 300
+    ipcam_segment_seconds_default: int = 1800
     # copy = remux only (same idea as gst rtspsrc/depay/parse/mux — no re-encode, low CPU).
     # libx264 = transcode to H.264 (heavy; only if you need H.264 in file from non-H.264 RTSP).
     ipcam_video_codec: str = "copy"

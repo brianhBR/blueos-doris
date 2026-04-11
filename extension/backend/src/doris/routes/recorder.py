@@ -11,6 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 async def _recorder_start_core(request):
+    logger.info("RECORD /start called")
     try:
         raw = request.query_params.get("split_duration", "")
         seg = None
@@ -36,6 +37,7 @@ async def _recorder_start_core(request):
 
 
 async def _recorder_stop_core(_request):
+    logger.warning("RECORD /stop called")
     try:
         result = await iprec.stop_recording()
     except Exception as e:

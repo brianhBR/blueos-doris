@@ -134,6 +134,22 @@ assert(param:add_param(PARAM_TABLE_KEY, 27, "BTM_REC",  0),    "DORIS_BTM_REC")
 assert(param:add_param(PARAM_TABLE_KEY, 28, "ASC_REC",  0),    "DORIS_ASC_REC")
 assert(param:add_param(PARAM_TABLE_KEY, 29, "CAM_DLY",  0),    "DORIS_CAM_DLY")
 
+-- One-time EEPROM cleanup: after param table was resized from 40→29, stale
+-- values at indices 25-29 can contain garbage from the old layout.  Force
+-- them to their defaults so the recorder doesn't trigger phantom recordings.
+do
+    local rec_en = param:get("DORIS_REC_EN")
+    if rec_en and (rec_en ~= 0 and rec_en ~= 1) then
+        gcs:send_text(MAV_SEVERITY.WARNING,
+            string.format("DIVE: Clearing stale EEPROM camera params (REC_EN was %.0f)", rec_en))
+        param:set_and_save("DORIS_REC_EN",  0)
+        param:set_and_save("DORIS_DSC_REC", 0)
+        param:set_and_save("DORIS_BTM_REC", 0)
+        param:set_and_save("DORIS_ASC_REC", 0)
+        param:set_and_save("DORIS_CAM_DLY", 0)
+    end
+end
+
 local DORIS_START    = Parameter("DORIS_START")
 local DORIS_RLS_SEC  = Parameter("DORIS_RLS_SEC")
 local DORIS_DSC_LGT  = Parameter("DORIS_DSC_LGT")
@@ -318,11 +334,8 @@ end
 -- HTTP recorder client (Companion / BlueOS DORIS extension)
 local IPCAM_HTTP_HOST      = "127.0.0.1"
 local IPCAM_HTTP_BIND_PORT = 9979
-local ipcam = {
-    prev = STATE_CONFIG,
-    ext  = false,
-    ph   = 0,
-}
+local ipcam_recording      = false
+local ipcam_btm_started    = false
 
 -- ?????????? helpers ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 local function get_depth_m()
@@ -668,60 +681,18 @@ local function ipcam_http_stop(host, port)
     return ipcam_http_send("GET /stop", host, port)
 end
 
-local function ipcam_frame_tick(now_ms)
-    local host = IPCAM_HTTP_HOST
-    local port = 8095
-    local seg  = 300
-
-    -- Master enable or recovery: stop if running
-    if not ipcam_cfg.rec_en or state == STATE_RECOVERY then
-        if ipcam.ext then
-            ipcam_http_stop(host, port)
-            ipcam.ext = false
-        end
-        ipcam.ph = 0
-        return
+local function ipcam_start()
+    if ipcam_recording then return end
+    if not ipcam_cfg.rec_en then return end
+    if ipcam_http_start(IPCAM_HTTP_HOST, 8095, 1800) then
+        ipcam_recording = true
     end
+end
 
-    -- Determine current phase and whether recording is wanted
-    local ph = 0
-    local want = false
-    if state == STATE_DESCENT then
-        ph = 1; want = ipcam_cfg.dsc_rec
-    elseif state == STATE_ON_BOTTOM then
-        ph = 2; want = ipcam_cfg.btm_rec
-        -- Bottom camera delay
-        if want and ipcam_cfg.cam_btm_dly_ms > 0 then
-            if bottom_start_ms <= 0 or (now_ms - bottom_start_ms) < ipcam_cfg.cam_btm_dly_ms then
-                want = false
-            end
-        end
-    elseif state == STATE_ASCENT then
-        ph = 3; want = ipcam_cfg.asc_rec
-    end
-
-    -- Phase changed: stop current recording before deciding next action
-    if ph ~= ipcam.ph then
-        if ipcam.ext then
-            ipcam_http_stop(host, port)
-            ipcam.ext = false
-        end
-        ipcam.ph = ph
-    end
-
-    -- Start or stop based on want
-    if want then
-        if not ipcam.ext then
-            if ipcam_http_start(host, port, seg) then
-                ipcam.ext = true
-            end
-        end
-    else
-        if ipcam.ext then
-            ipcam_http_stop(host, port)
-            ipcam.ext = false
-        end
-    end
+local function ipcam_stop()
+    if not ipcam_recording then return end
+    ipcam_http_stop(IPCAM_HTTP_HOST, 8095)
+    ipcam_recording = false
 end
 
 -- ?????????? main loop ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
@@ -733,12 +704,6 @@ function update()
     end
     last_update_ms = now_ms
     DORIS_STATE:set(state)
-
-    local function ipcam_done(period_ms)
-        ipcam_frame_tick(now_ms)
-        ipcam.prev = state
-        return update, period_ms
-    end
 
     -- read battery voltage each cycle for pre-arm and telemetry
     local v = battery:voltage(0)
@@ -760,7 +725,7 @@ function update()
             lgt_tst_start_ms = 0
         else
             RC9:set_override(brightness_to_pwm(lgt_tst))
-            return ipcam_done(UPDATE_INTERVAL_MS)
+            return update, UPDATE_INTERVAL_MS
         end
     else
         lgt_tst_start_ms = 0
@@ -771,8 +736,9 @@ function update()
         if DORIS_START:get() <= 0 then
             gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: CANCELLED by operator")
             if RC9 then RC9:set_override(LIGHT_PWM_MIN) end
+            ipcam_stop()
             state = STATE_RECOVERY
-            return ipcam_done(UPDATE_INTERVAL_MS)
+            return update, UPDATE_INTERVAL_MS
         end
     end
 
@@ -807,8 +773,9 @@ function update()
                 gcs:send_text(MAV_SEVERITY.CRITICAL,
                     "DIVE: DEPLOYED without pre-arm! Emergency weight release")
                 activate_relay()
+                ipcam_stop()
                 state = STATE_RECOVERY
-                return ipcam_done(UPDATE_INTERVAL_MS)
+                return update, UPDATE_INTERVAL_MS
             end
 
             -- Surface pre-arm checks
@@ -870,8 +837,10 @@ function update()
         if check_failsafes() then
             ascent_start_ms = now_ms
             reset_light_cycle(now_ms)
+            ipcam_stop()
+            if ipcam_cfg.asc_rec then ipcam_start() end
             state = STATE_ASCENT
-            return ipcam_done(UPDATE_INTERVAL_MS)
+            return update, UPDATE_INTERVAL_MS
         end
         if not arming:is_armed() then
             if armed_once then
@@ -912,6 +881,7 @@ function update()
                     dive_start_ms = now_ms
                     init_dr_buffer(DORIS_BTM_AVG:get())
                     reset_light_cycle(now_ms)
+                    if ipcam_cfg.dsc_rec then ipcam_start() end
                     state = STATE_DESCENT
                 end
             end
@@ -922,8 +892,10 @@ function update()
         if check_failsafes() then
             ascent_start_ms = now_ms
             reset_light_cycle(now_ms)
+            ipcam_stop()
+            if ipcam_cfg.asc_rec then ipcam_start() end
             state = STATE_ASCENT
-            return ipcam_done(UPDATE_INTERVAL_MS)
+            return update, UPDATE_INTERVAL_MS
         end
         if not arming:is_armed() then
             gcs:send_text(MAV_SEVERITY.WARNING,
@@ -956,6 +928,12 @@ function update()
                 bottom_start_ms   = now_ms
                 bottom_delay_done = cfg_btm_dly_ms <= 0
                 reset_light_cycle(now_ms)
+                ipcam_stop()
+                ipcam_btm_started = false
+                if ipcam_cfg.btm_rec and ipcam_cfg.cam_btm_dly_ms <= 0 then
+                    ipcam_start()
+                    ipcam_btm_started = true
+                end
                 state = STATE_ON_BOTTOM
             end
         end
@@ -965,8 +943,10 @@ function update()
         if check_failsafes() then
             ascent_start_ms = now_ms
             reset_light_cycle(now_ms)
+            ipcam_stop()
+            if ipcam_cfg.asc_rec then ipcam_start() end
             state = STATE_ASCENT
-            return ipcam_done(UPDATE_INTERVAL_MS)
+            return update, UPDATE_INTERVAL_MS
         end
         if not arming:is_armed() then
             gcs:send_text(MAV_SEVERITY.WARNING,
@@ -989,6 +969,14 @@ function update()
             update_lights(cfg_btm_lgt, now_ms)
         end
 
+        -- Delayed bottom camera start (one-shot)
+        if ipcam_cfg.btm_rec and not ipcam_btm_started
+           and ipcam_cfg.cam_btm_dly_ms > 0
+           and bottom_elapsed >= ipcam_cfg.cam_btm_dly_ms then
+            ipcam_start()
+            ipcam_btm_started = true
+        end
+
         if math.fmod(bottom_elapsed, 30000) < UPDATE_INTERVAL_MS then
             gcs:send_text(MAV_SEVERITY.INFO,
                 string.format("DIVE: on bottom %.0fs / %ds",
@@ -1002,6 +990,8 @@ function update()
             activate_relay()
             ascent_start_ms = now_ms
             reset_light_cycle(now_ms)
+            ipcam_stop()
+            if ipcam_cfg.asc_rec then ipcam_start() end
             state = STATE_ASCENT
         end
 
@@ -1038,6 +1028,7 @@ function update()
             if depth <= SURFACE_DEPTH_M then
                 gcs:send_text(MAV_SEVERITY.INFO,
                     string.format("DIVE: surface reached (%.2fm)", depth))
+                ipcam_stop()
                 state = STATE_RECOVERY
             end
         end
@@ -1058,7 +1049,7 @@ function update()
         end
     end
 
-    return ipcam_done(UPDATE_INTERVAL_MS)
+    return update, UPDATE_INTERVAL_MS
 end
 
 -- ?????????? initialization ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
