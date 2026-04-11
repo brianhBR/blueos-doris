@@ -35,18 +35,17 @@ HOTSPOT_DNS_CONF = "/tmp/doris-hotspot-dns.conf"
 HOTSPOT_DNS_PID = "/tmp/doris-hotspot-dns.pid"
 
 # Redirect any request to doris.local to the extension UI on port 8095.
-# Written as a dedicated server block in /etc/nginx/conf.d/ (which nginx
-# includes via its default config) rather than in the extensions directory
-# (which is NOT included by nginx in this BlueOS build).
+# BlueOS runs nginx with a custom config (/home/pi/tools/nginx/nginx.conf)
+# that includes /home/pi/tools/nginx/extensions/*.conf INSIDE the main
+# server block.  So the redirect must be an `if` directive, not a separate
+# server block.
 NGINX_REDIRECT_CONTENT = """\
-server {
-    listen 80;
-    server_name doris.local;
+if ($host = "doris.local") {
     return 302 http://doris.local:8095$request_uri;
 }
 """
 
-NGINX_CONF_DST = "/etc/nginx/conf.d/doris-redirect.conf"
+NGINX_CONF_DST = "/home/pi/tools/nginx/extensions/doris-redirect.conf"
 NGINX_CONF_DIR = os.path.dirname(NGINX_CONF_DST)
 NGINX_CONF_NAME = os.path.basename(NGINX_CONF_DST)
 CORE_CONTAINER = "blueos-core"
