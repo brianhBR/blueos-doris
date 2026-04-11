@@ -298,34 +298,30 @@ class NetworkService:
 
         if primary_name:
             try:
-                await self._client.set_hotspot(False, interface=primary_name)
-                logger.info("Hotspot disabled on primary interface %s", primary_name)
-            except Exception as e:
-                logger.warning("Could not disable hotspot on %s: %s", primary_name, e)
-
-            try:
                 primary_mode = await self._client.get_interface_mode(primary_name)
-                if primary_mode:
-                    available_p = primary_mode.get("available_modes", [])
-                    current_p = primary_mode.get("current_mode")
-                    if "normal" in available_p and current_p != "normal":
-                        await self._client.set_interface_mode(
-                            primary_name, "normal"
-                        )
-                        logger.info(
-                            "Primary %s set to normal mode (client only)",
-                            primary_name,
-                        )
-                    elif current_p == "normal":
-                        logger.info(
-                            "Primary %s already in normal (client only) mode",
-                            primary_name,
-                        )
+                current_p = primary_mode.get("current_mode") if primary_mode else None
+                available_p = primary_mode.get("available_modes", []) if primary_mode else []
+
+                if current_p == "normal":
+                    logger.info(
+                        "Primary %s already in normal (client only) mode, leaving untouched",
+                        primary_name,
+                    )
+                elif "normal" in available_p:
+                    # Only disable hotspot and change mode if not already in client mode.
+                    # Calling wifi_hotspot_disable on an interface that's already in
+                    # normal mode can reset it and break autoconnect to saved networks.
+                    try:
+                        await self._client.set_hotspot(False, interface=primary_name)
+                        logger.info("Hotspot disabled on primary interface %s", primary_name)
+                    except Exception as e:
+                        logger.warning("Could not disable hotspot on %s: %s", primary_name, e)
+
+                    await self._client.set_interface_mode(primary_name, "normal")
+                    logger.info("Primary %s set to normal mode (client only)", primary_name)
             except Exception as e:
                 logger.warning(
-                    "Could not set primary %s to client-only (normal) mode: %s",
-                    primary_name,
-                    e,
+                    "Could not configure primary %s: %s", primary_name, e,
                 )
 
         try:
