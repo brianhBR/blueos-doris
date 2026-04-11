@@ -108,7 +108,7 @@ class DiveService:
 
         params: list[tuple[str, float]] = [
             ("DORIS_DSC_DUR", round(descent_dur_s)),
-            ("DORIS_RLS_SEC", round(release_seconds)),
+            ("DORIS_BTM_TIM", round(release_seconds)),
             ("DORIS_DSC_LGT", 1.0 if config.descent.light.enabled else 0.0),
             ("DORIS_BTM_LGT", 1.0 if config.bottom.light.enabled else 0.0),
             ("DORIS_ASC_LGT", 1.0 if config.ascent.light.enabled else 0.0),

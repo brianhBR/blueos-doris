@@ -86,12 +86,12 @@ local STATE_ASCENT        = 3
 local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-assert(param:add_table(73, "DORIS_", 29),
+assert(param:add_table(73, "DORIS_", 30),
        "DIVE: could not add DORIS_ param table")
 
 -- mission control
 assert(param:add_param(73, 1,  "START",   0),  "DORIS_START")
-assert(param:add_param(73, 2,  "RLS_SEC", 2700), "DORIS_RLS_SEC")
+assert(param:add_param(73, 2,  "BTM_TIM", 2700), "DORIS_BTM_TIM")
 assert(param:add_param(73, 3,  "DSC_LGT", 0),  "DORIS_DSC_LGT")
 assert(param:add_param(73, 4,  "BTM_LGT", 0),  "DORIS_BTM_LGT")
 assert(param:add_param(73, 5,  "ASC_LGT", 0),  "DORIS_ASC_LGT")
@@ -121,10 +121,12 @@ assert(param:add_param(73, 26, "DSC_REC",  0),    "DORIS_DSC_REC")
 assert(param:add_param(73, 27, "BTM_REC",  0),    "DORIS_BTM_REC")
 assert(param:add_param(73, 28, "ASC_REC",  0),    "DORIS_ASC_REC")
 assert(param:add_param(73, 29, "CAM_DLY",  0),    "DORIS_CAM_DLY")
+-- relay safety
+assert(param:add_param(73, 30, "BRN_MIN", 2700),  "DORIS_BRN_MIN")
 
 
 local DORIS_START    = Parameter("DORIS_START")
-local DORIS_RLS_SEC  = Parameter("DORIS_RLS_SEC")
+local DORIS_BTM_TIM  = Parameter("DORIS_BTM_TIM")
 local DORIS_DSC_LGT  = Parameter("DORIS_DSC_LGT")
 local DORIS_BTM_LGT  = Parameter("DORIS_BTM_LGT")
 local DORIS_ASC_LGT  = Parameter("DORIS_ASC_LGT")
@@ -146,6 +148,7 @@ local DORIS_INJ_LEAK = Parameter("DORIS_INJ_LEAK")
 local DORIS_MAX_DPTH = Parameter("DORIS_MAX_DPTH")
 local DORIS_LGT_TST  = Parameter("DORIS_LGT_TST")
 local DORIS_GPS_RBT  = Parameter("DORIS_GPS_RBT")
+local DORIS_BRN_MIN  = Parameter("DORIS_BRN_MIN")
 
 -- GPS self-heal: reboot once per power cycle if the GPS driver never
 -- receives data.  The Artemis sends GPS_INPUT over USB-serial, but if
@@ -423,9 +426,9 @@ local function validate_profile()
         return false, "no upload timestamp (UPL_DATE=0)"
     end
 
-    local rls = DORIS_RLS_SEC:get() or 0
+    local rls = DORIS_BTM_TIM:get() or 0
     if rls <= 0 then
-        return false, "RLS_SEC must be > 0"
+        return false, "BTM_TIM must be > 0"
     end
 
     local min_v = DORIS_MIN_VOLT:get() or 0
@@ -488,7 +491,7 @@ local function check_failsafes()
 end
 
 local function snapshot_config()
-    local rls_sec = DORIS_RLS_SEC:get()
+    local rls_sec = DORIS_BTM_TIM:get()
     local brt     = DORIS_LGT_BRT:get()
     local btm_thr = DORIS_BTM_THR:get()
     local btm_avg = DORIS_BTM_AVG:get()
@@ -977,16 +980,22 @@ function update()
 
         update_lights(cfg_asc_lgt, now_ms)
 
-        -- Confirm ascent via sustained upward velocity, then kill relay
+        -- Relay stays on for at least DORIS_BRN_MIN seconds (default 45 min).
+        -- After that, require 20 consecutive samples (10s) of sustained
+        -- upward velocity > 0.10 m/s before deactivating.
         if relay_active then
-            local vel = ahrs:get_velocity_NED()
-            if vel and vel:z() < -0.05 then
-                relay_asc_count = relay_asc_count + 1
-                if relay_asc_count >= 6 then
-                    deactivate_relay()
+            local burn_elapsed = now_ms - ascent_start_ms
+            local brn_min_ms = (DORIS_BRN_MIN:get() or 2700) * 1000
+            if burn_elapsed >= brn_min_ms then
+                local vel = ahrs:get_velocity_NED()
+                if vel and vel:z() < -0.10 then
+                    relay_asc_count = relay_asc_count + 1
+                    if relay_asc_count >= 20 then
+                        deactivate_relay()
+                    end
+                else
+                    relay_asc_count = 0
                 end
-            else
-                relay_asc_count = 0
             end
         end
 
