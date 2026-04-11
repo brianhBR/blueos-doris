@@ -275,24 +275,24 @@ class CameraService:
                 except Exception:
                     continue
 
-        # 3. Last resort: grab a single frame from the RTSP stream via ffmpeg.
-        #    Skip if the IP camera recorder is active — most cameras allow only
-        #    one concurrent RTSP session, so a snapshot would kill the recording.
-        from . import ip_camera_recorder as _iprec
-        if _iprec._process is not None and _iprec._process.returncode is None:
-            _logger.debug("Skipping ffmpeg snapshot — IP camera recorder is active")
-        else:
-            rtsp_urls = await self._discover_rtsp_urls()
-            for url in rtsp_urls:
-                frame = await self._ffmpeg_snapshot(url)
-                if frame:
-                    return frame
+        # 3. Last resort: grab a single frame via ffmpeg from MCM's RTSP relay.
+        #    Uses MCM relay (port 8554) so we don't open a second session on the camera.
+        rtsp_urls = await self._discover_rtsp_urls()
+        for url in rtsp_urls:
+            frame = await self._ffmpeg_snapshot(url)
+            if frame:
+                return frame
 
         return None
 
     async def _discover_rtsp_urls(self) -> list[str]:
-        """Get RTSP source URLs from the MCM streams endpoint, preferring lower-res."""
+        """Get RTSP URLs from MCM, preferring the local 8554 relay to avoid extra camera sessions."""
+        import os as _os
         import re as _re
+        host_ip = (
+            _os.environ.get("DORIS_BLUEOS_ADDRESS", "http://host.docker.internal")
+            .replace("http://", "").replace("https://", "").split(":")[0]
+        )
         urls: list[str] = []
         try:
             streams = await self.camera_manager.client.get("/streams")
@@ -301,21 +301,21 @@ class CameraService:
             data = streams.json()
             items = [data] if isinstance(data, dict) else (data if isinstance(data, list) else [])
             for item in items:
-                vs = item.get("video_and_stream", {}).get("video_source", {})
-                onvif = vs.get("Onvif", {})
-                src = onvif.get("source", {})
-                rtsp_url = src.get("Onvif") or src.get("rtsp") or ""
-                if rtsp_url:
-                    urls.append(rtsp_url)
-                    # Also add the alternate stream (stream_0 <-> stream_1)
-                    if "stream_0" in rtsp_url:
-                        urls.append(rtsp_url.replace("stream_0", "stream_1"))
-                    elif "stream_1" in rtsp_url:
-                        urls.append(rtsp_url.replace("stream_1", "stream_0"))
+                endpoints = (
+                    item.get("video_and_stream", {})
+                    .get("stream_information", {})
+                    .get("endpoints", [])
+                )
+                for ep in endpoints:
+                    if "8554" in ep:
+                        rewritten = _re.sub(
+                            r"rtsp://[^:/]+:8554",
+                            f"rtsp://{host_ip}:8554",
+                            ep,
+                        )
+                        urls.append(rewritten)
         except Exception:
             pass
-        # Prefer higher-resolution stream_0, scaled down by ffmpeg for preview
-        urls.sort(key=lambda u: (0 if "stream_0" in u else 1, u))
         return urls
 
     @staticmethod

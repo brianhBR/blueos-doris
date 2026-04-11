@@ -18,10 +18,42 @@ from pathlib import Path
 from ..config import settings
 from . import usb_storage
 
+import httpx
+
 logger = logging.getLogger(__name__)
 
-# Fixed RadCam path (same host/path as BlueOS_videorecorder hauv-v2 RTSP_H265_ENDPOINT).
-IPCAM_RTSP_URL = "rtsp://admin:blue@192.168.2.10:554/stream_0"
+# Direct camera URL (fallback only).
+IPCAM_RTSP_DIRECT = "rtsp://admin:blue@192.168.2.10:554/stream_0"
+
+# MCM re-serves the camera stream via its built-in RTSP server on port 8554.
+# Connecting here avoids stealing the camera's single RTSP session from MCM.
+_DOCKER_HOST = os.environ.get("DORIS_BLUEOS_ADDRESS", "http://host.docker.internal")
+_HOST_IP = _DOCKER_HOST.replace("http://", "").replace("https://", "").split(":")[0]
+MCM_STREAMS_URL = f"{_DOCKER_HOST.rstrip('/')}:6020/streams"
+MCM_RTSP_HOST = f"{_HOST_IP}:8554"
+
+
+async def _discover_mcm_rtsp() -> str | None:
+    """Query Mavlink Camera Manager for its local RTSP relay endpoint."""
+    try:
+        async with httpx.AsyncClient(timeout=5.0) as client:
+            resp = await client.get(MCM_STREAMS_URL)
+            resp.raise_for_status()
+            items = resp.json()
+    except Exception:
+        return None
+    for item in items:
+        endpoints = (
+            item.get("video_and_stream", {})
+            .get("stream_information", {})
+            .get("endpoints", [])
+        )
+        for ep in endpoints:
+            if "8554" in ep:
+                import re as _re
+                return _re.sub(r"rtsp://[^:/]+:8554", f"rtsp://{MCM_RTSP_HOST}", ep)
+    return None
+
 
 _process: asyncio.subprocess.Process | None = None
 _stderr_task: asyncio.Task | None = None
@@ -54,7 +86,7 @@ def _build_ffmpeg_args(rtsp_url: str, segment_s: int, pattern: str) -> list[str]
         "ffmpeg",
         "-hide_banner",
         "-loglevel",
-        "warning",
+        "info",
         "-rtsp_transport",
         "tcp",
         "-i",
@@ -102,7 +134,13 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
         seg = int(settings.ipcam_segment_seconds_default)
     seg = max(1, min(seg, 86_400))
 
-    rtsp = IPCAM_RTSP_URL
+    mcm_url = await _discover_mcm_rtsp()
+    if mcm_url:
+        rtsp = mcm_url
+        logger.info("Using MCM RTSP relay: %s", rtsp)
+    else:
+        rtsp = IPCAM_RTSP_DIRECT
+        logger.warning("MCM RTSP relay not found, falling back to direct camera URL")
 
     async with _lock:
         if _process is not None and _process.returncode is None:
