@@ -5,7 +5,7 @@ on:
     branches:
       - master
     tags:
-      - '*'
+      - 'bh-*'
   pull_request:
   workflow_dispatch:
 
@@ -57,8 +57,7 @@ jobs:
           tags: |
             type=ref,event=branch
             type=ref,event=pr
-            type=semver,pattern={{version}}
-            type=semver,pattern={{major}}.{{minor}}
+            type=match,pattern=bh-(.*),group=1
             type=raw,value=latest,enable=${{ github.ref_type == 'tag' }}
 
       - name: Build and push to GHCR

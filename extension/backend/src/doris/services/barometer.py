@@ -19,9 +19,6 @@ from ..models.sensors import ModuleInfo
 
 logger = logging.getLogger(__name__)
 
-MIN_FREQUENCY = 0.1
-
-
 class BarometerService:
     """Detects barometer/thermometer via cached SCALED_PRESSURE2 message."""
 
@@ -44,10 +41,6 @@ class BarometerService:
                 return []
             resp.raise_for_status()
             data = resp.json()
-
-            freq = data.get("status", {}).get("time", {}).get("frequency", 0)
-            if freq < MIN_FREQUENCY:
-                return []
 
             msg = data.get("message", {})
             if msg.get("type") != "SCALED_PRESSURE2":

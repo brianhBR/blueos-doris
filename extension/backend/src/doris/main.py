@@ -33,13 +33,20 @@ from .utils import deploy_artemis_svl, deploy_lua_scripts, disable_usb_autosuspe
 AUTOPILOT_RESTART_DELAY_S = 10
 
 
+POST_REBOOT_SETTLE_S = 8
+
+
 async def _restart_autopilot(logger: logging.Logger) -> None:
-    """Restart the autopilot once after boot to reinitialise the GPS serial link.
+    """Restart the autopilot once after boot, then apply post-reboot params.
 
     The Artemis sends GPS_INPUT over USB-serial, but if the autopilot
     initialises its GPS_MAV driver before the serial port is fully
     enumerated, the driver silently stops consuming GPS data.  A single
     deferred restart lets the driver re-probe the now-ready port.
+
+    After the reboot the relay driver will have initialised (RELAY1_FUNCTION
+    was set in the pre-reboot frame apply), so we can now assign the relay
+    pin to channel 14 via RELAY1_PIN.
     """
     await asyncio.sleep(AUTOPILOT_RESTART_DELAY_S)
     try:
@@ -47,6 +54,18 @@ async def _restart_autopilot(logger: logging.Logger) -> None:
         logger.info("Deferred autopilot restart complete (GPS serial re-init)")
     except Exception as e:
         logger.warning("Deferred autopilot restart failed (non-critical): %s", e)
+        return
+
+    await asyncio.sleep(POST_REBOOT_SETTLE_S)
+    try:
+        frame_service = FrameService()
+        ok = await frame_service.apply_post_reboot_params()
+        if ok:
+            logger.info("Post-reboot relay params applied (RELAY1_PIN -> channel 14)")
+        else:
+            logger.warning("Some post-reboot relay params failed to apply")
+    except Exception as e:
+        logger.warning("Post-reboot param application failed: %s", e)
 
 
 def create_app() -> Robyn:

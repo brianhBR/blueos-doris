@@ -39,7 +39,8 @@ KEY_PARAMS = [
     "AHRS_ORIENTATION",
     "FRAME_CONFIG",
     "BRD_PWM_COUNT",
-    "RELAY_PIN",
+    "RELAY1_FUNCTION",
+    "RELAY1_PIN",
     "SCR_ENABLE",
     *(f"SERVO{ch}_FUNCTION" for ch in range(1, 17)),
 ]
@@ -248,7 +249,8 @@ class FrameService:
             "orientation_raw": int(orientation_val) if orientation_val is not None else None,
             "frame_config": int(params.get("FRAME_CONFIG", -1)),
             "pwm_count": int(params.get("BRD_PWM_COUNT", -1)),
-            "relay_pin": int(params.get("RELAY_PIN", -1)),
+            "relay_enabled": int(params.get("RELAY1_FUNCTION", 0)) == 1,
+            "relay_pin": int(params.get("RELAY1_PIN", -1)),
             "scripting_enabled": int(params.get("SCR_ENABLE", 0)) == 1,
             "active_servo_outputs": active_outputs,
             "frame_applied": len(mismatches) == 0 and len(params) > 0,
@@ -318,6 +320,47 @@ class FrameService:
 
         logger.error("Frame '%s' failed after %d attempts", frame_name, STARTUP_MAX_RETRIES)
         return False
+
+    async def apply_post_reboot_params(self, frame_name: str = "doris") -> bool:
+        """Apply parameters that require a prior reboot (e.g. relay pin assignment).
+
+        ArduPilot's relay driver only initialises on boot.  RELAY1_FUNCTION=1
+        enables relay 1 but the driver won't create the relay object until the
+        next reboot.  Only after that reboot can RELAY1_PIN be set to assign
+        the relay to a physical output channel.
+        """
+        frame = self.load_frame_definition(frame_name)
+        if frame is None:
+            logger.warning("Cannot apply post-reboot params: frame '%s' not found", frame_name)
+            return False
+
+        params = frame.get("post_reboot_parameters", {})
+        if not params:
+            logger.debug("No post-reboot parameters defined for frame '%s'", frame_name)
+            return True
+
+        succeeded = []
+        failed = []
+        for name, value in params.items():
+            ok = await self._set_param(name, float(value))
+            if ok:
+                succeeded.append(name)
+            else:
+                failed.append(name)
+            await asyncio.sleep(PARAM_SET_DELAY)
+
+        if failed:
+            logger.warning(
+                "Post-reboot params: %d succeeded, %d failed (%s)",
+                len(succeeded), len(failed), ", ".join(failed),
+            )
+        else:
+            logger.info(
+                "Post-reboot params applied: %s",
+                ", ".join(f"{n}={params[n]}" for n in succeeded),
+            )
+
+        return len(failed) == 0
 
     async def _set_param(self, name: str, value: float) -> bool:
         """Send a PARAM_SET message via mavlink2rest."""
