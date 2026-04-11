@@ -1,11 +1,12 @@
 """DORIS WiFi driver setup.
 
-On startup, installs the out-of-tree 88x2bu driver for the USB WiFi adapter.
+On startup, installs the morrownr/88x2bu out-of-tree driver for the
+RTL88x2BU USB WiFi adapter.
 
 Steps:
   1. Blacklist conflicting in-kernel drivers (rtw88, rtl8xxxu, 8192cu)
   2. Unload in-kernel drivers if loaded
-  3. Install and load 8812bu.ko
+  3. Install and load 88x2bu.ko
 
 Note on sudo: the Commander API's shell PATH does not include /sbin or
 /usr/sbin, so modprobe, rmmod, depmod etc. are only reachable through
@@ -21,7 +22,8 @@ from ..config import blueos_services
 
 logger = logging.getLogger(__name__)
 
-DRIVER_SRC = Path("/app/driver/8812bu.ko")
+DRIVER_MODULE = "88x2bu"
+DRIVER_SRC = Path(f"/app/driver/{DRIVER_MODULE}.ko")
 BLACKLIST_CONF = "blacklist-rtl88x2bu.conf"
 OLD_BLACKLIST_FILES = [
     "blacklist-rtw88.conf",
@@ -36,6 +38,7 @@ CONFLICTING_MODULES = [
     "rtw88_core",
     "rtl8xxxu",
     "8192cu",
+    "8812bu",
 ]
 
 
@@ -64,8 +67,8 @@ async def _run_host_command(command: str, timeout: float = 30.0) -> tuple[bool, 
 
 
 async def _is_driver_loaded() -> bool:
-    """Check if the out-of-tree 8812bu driver is already loaded."""
-    ok, _ = await _run_host_command("lsmod | grep -q '^8812bu '")
+    """Check if the out-of-tree 88x2bu driver is already loaded."""
+    ok, _ = await _run_host_command(f"lsmod | grep -q '^{DRIVER_MODULE} '")
     return ok
 
 
@@ -97,7 +100,7 @@ async def _unload_conflicting_drivers() -> None:
 
 
 async def _install_driver() -> bool:
-    """Copy and load the out-of-tree 8812bu module on the host."""
+    """Copy and load the out-of-tree 88x2bu module on the host."""
     ok, kver = await _run_host_command("uname -r")
     if not ok:
         logger.error("Failed to get kernel version")
@@ -108,11 +111,12 @@ async def _install_driver() -> bool:
         logger.error("Could not determine DORIS container name")
         return False
 
-    dest = f"/lib/modules/{kver}/kernel/drivers/net/wireless/8812bu.ko"
+    ko = f"{DRIVER_MODULE}.ko"
+    dest = f"/lib/modules/{kver}/kernel/drivers/net/wireless/{ko}"
     copy_cmd = (
-        f"docker cp {container_name}:/app/driver/8812bu.ko /tmp/8812bu.ko"
+        f"docker cp {container_name}:/app/driver/{ko} /tmp/{ko}"
         f" && sudo mkdir -p $(dirname {dest})"
-        f" && sudo mv /tmp/8812bu.ko {dest}"
+        f" && sudo mv /tmp/{ko} {dest}"
         f" && sudo depmod -a"
     )
     ok, _ = await _run_host_command(copy_cmd, timeout=30.0)
@@ -120,12 +124,12 @@ async def _install_driver() -> bool:
         logger.error("Failed to copy driver to host")
         return False
 
-    ok, _ = await _run_host_command("sudo modprobe 8812bu")
+    ok, _ = await _run_host_command(f"sudo modprobe {DRIVER_MODULE}")
     if not ok:
-        logger.error("Failed to load 8812bu module")
+        logger.error("Failed to load %s module", DRIVER_MODULE)
         return False
 
-    logger.info("8812bu driver installed and loaded")
+    logger.info("%s driver installed and loaded", DRIVER_MODULE)
     return True
 
 
@@ -135,15 +139,15 @@ async def setup_wifi_driver() -> None:
     Called once during DORIS backend startup. Idempotent.
     """
     if not DRIVER_SRC.is_file():
-        logger.info("No 8812bu.ko found at %s, skipping driver setup", DRIVER_SRC)
+        logger.info("No %s.ko found at %s, skipping driver setup", DRIVER_MODULE, DRIVER_SRC)
         return
 
     await _blacklist_conflicting_drivers()
 
     if await _is_driver_loaded():
-        logger.info("8812bu driver already loaded, nothing to do")
+        logger.info("%s driver already loaded, nothing to do", DRIVER_MODULE)
         return
 
-    logger.info("Installing 88x2bu driver")
+    logger.info("Installing %s driver", DRIVER_MODULE)
     await _unload_conflicting_drivers()
     await _install_driver()
