@@ -136,18 +136,20 @@ async def _install_driver() -> bool:
 async def setup_wifi_driver() -> None:
     """Install the 88x2bu driver if not already loaded.
 
-    Called once during DORIS backend startup. Idempotent.
+    Called once during DORIS backend startup.  Truly idempotent: when the
+    driver is already loaded we skip *all* host modifications (blacklist
+    writes, rmmod, depmod, modprobe) to avoid unnecessary churn that
+    could briefly reset the USB WiFi adapter.
     """
     if not DRIVER_SRC.is_file():
         logger.info("No %s.ko found at %s, skipping driver setup", DRIVER_MODULE, DRIVER_SRC)
         return
 
-    await _blacklist_conflicting_drivers()
-
     if await _is_driver_loaded():
-        logger.info("%s driver already loaded, nothing to do", DRIVER_MODULE)
+        logger.info("%s driver already loaded, skipping all driver setup", DRIVER_MODULE)
         return
 
-    logger.info("Installing %s driver", DRIVER_MODULE)
+    logger.info("Installing %s driver (first boot or driver missing)", DRIVER_MODULE)
+    await _blacklist_conflicting_drivers()
     await _unload_conflicting_drivers()
     await _install_driver()

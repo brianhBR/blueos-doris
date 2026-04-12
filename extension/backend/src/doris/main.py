@@ -156,8 +156,10 @@ def create_app() -> Robyn:
             logger.warning("doris.local setup skipped: %s", e)
 
         network_service = NetworkService()
+        hotspot_changed = False
         try:
             await network_service.configure_hotspot()
+            hotspot_changed = True
         except Exception as e:
             logger.warning("Hotspot configuration skipped: %s", e)
 
@@ -167,9 +169,11 @@ def create_app() -> Robyn:
             logger.warning("Hotspot DNS skipped: %s", e)
 
         try:
-            await restart_avahi()
+            await restart_avahi(force=hotspot_changed)
         except Exception as e:
             logger.warning("Avahi restart skipped: %s", e)
+
+        asyncio.get_event_loop().create_task(network_service.start_ap_watchdog())
 
         try:
             start_external_storage_setup()

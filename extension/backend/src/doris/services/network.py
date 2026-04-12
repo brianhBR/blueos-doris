@@ -1,5 +1,6 @@
 """Network/WiFi service."""
 
+import asyncio
 import logging
 from typing import Any
 
@@ -9,6 +10,9 @@ from .base import BlueOSClient
 from .blueos.network import NetworkClient
 
 logger = logging.getLogger(__name__)
+
+AP_WATCHDOG_INTERVAL_S = 60
+AP_WATCHDOG_SETTLE_S = 15
 
 
 class NetworkService:
@@ -259,13 +263,19 @@ class NetworkService:
         ssid: str = "DORIS",
         password: str = "blueosap",
     ) -> None:
-        """Configure the secondary WiFi interface (typically wlan1) as a hotspot.
+        """Configure a single DORIS AP on the secondary WiFi interface (wlan1).
 
-        Prefers dual mode (client + hotspot) when supported, otherwise
-        hotspot-only. Forces the primary (typically wlan0) to normal/client-only
-        mode: disables smart-hotspot, turns off any AP on that radio, and sets
-        mode to ``normal`` when the API allows — avoids two APs and NM fighting
-        the DORIS AP (often mistaken for RF interference).
+        The v2 per-interface hotspot APIs (enable/disable/credentials) hang on
+        current BlueOS builds, so this method uses a two-step approach:
+
+        1. Kill all APs via the global (legacy) ``hotspot?enable=false``.
+           This removes both the undesired uap0 virtual AP on wlan0 and any
+           existing wlan1 AP.
+        2. Set global hotspot credentials to the DORIS SSID/password.
+        3. Bring up only wlan1 as a hotspot via the v2 mode API
+           (``POST /wifi/mode``), which works reliably.
+
+        Result: wlan0 stays in client-only mode, wlan1 runs the sole AP.
         """
         if ssid == "DORIS":
             serial = await self._get_serial_number()
@@ -278,87 +288,141 @@ class NetworkService:
 
         interfaces = interfaces_data.get("interfaces", [])
         if len(interfaces) < 2:
-            logger.info("Only %d WiFi interface(s) found, skipping hotspot config", len(interfaces))
+            logger.info(
+                "Only %d WiFi interface(s) found, skipping hotspot config",
+                len(interfaces),
+            )
             return
 
-        primary = interfaces[0]
-        secondary = interfaces[1]
-        primary_name = primary.get("name") or ""
-        iface_name = secondary["name"]
-        logger.info("Configuring secondary WiFi interface: %s", iface_name)
+        primary_name = interfaces[0].get("name") or ""
+        iface_name = interfaces[1]["name"]
+        logger.info(
+            "Configuring hotspot: primary=%s (client), secondary=%s (AP)",
+            primary_name,
+            iface_name,
+        )
 
-        # BlueOS often keeps a default "BlueOS" AP on the primary radio and/or uses
-        # smart-hotspot to toggle it — that yields two SSIDs and can look like the
-        # hotspot is constantly restarting. Prefer a single DORIS AP on wlan1.
+        # -- smart-hotspot: only touch if currently enabled --
         try:
-            await self._client.set_smart_hotspot(False)
-            logger.info("Smart hotspot disabled (avoids fighting DORIS wlan1 AP)")
+            if await self._client.get_smart_hotspot():
+                await self._client.set_smart_hotspot(False)
+                logger.info("Smart hotspot disabled")
+            else:
+                logger.info("Smart hotspot already disabled")
         except Exception as e:
-            logger.warning("Could not disable smart hotspot: %s", e)
+            logger.warning("Could not check/disable smart hotspot: %s", e)
 
-        if primary_name:
-            try:
-                primary_mode = await self._client.get_interface_mode(primary_name)
-                current_p = primary_mode.get("current_mode") if primary_mode else None
-                available_p = primary_mode.get("available_modes", []) if primary_mode else []
-
-                if current_p == "normal":
-                    logger.info(
-                        "Primary %s already in normal (client only) mode, leaving untouched",
-                        primary_name,
-                    )
-                elif "normal" in available_p:
-                    # Only disable hotspot and change mode if not already in client mode.
-                    # Calling wifi_hotspot_disable on an interface that's already in
-                    # normal mode can reset it and break autoconnect to saved networks.
-                    try:
-                        await self._client.set_hotspot(False, interface=primary_name)
-                        logger.info("Hotspot disabled on primary interface %s", primary_name)
-                    except Exception as e:
-                        logger.warning("Could not disable hotspot on %s: %s", primary_name, e)
-
-                    await self._client.set_interface_mode(primary_name, "normal")
-                    logger.info("Primary %s set to normal mode (client only)", primary_name)
-            except Exception as e:
-                logger.warning(
-                    "Could not configure primary %s: %s", primary_name, e,
-                )
-
+        # -- check whether the primary interface has an unwanted AP --
+        primary_hotspot_active = False
         try:
-            await self._client.set_hotspot_credentials(ssid, password, interface=iface_name)
-            logger.info("Hotspot credentials set: SSID=%s on %s", ssid, iface_name)
+            hs = await self._client._v2.wifi_hotspot_status(primary_name)
+            primary_hotspot_active = hs.get("enabled", False)
+        except Exception:
+            pass
+
+        if primary_hotspot_active:
+            logger.info(
+                "Primary %s has an active hotspot (uap0); disabling all APs first",
+                primary_name,
+            )
+            try:
+                await self._client.set_hotspot(False)
+                logger.info("All hotspots disabled via global API")
+            except Exception as e:
+                logger.warning("Global hotspot disable failed: %s", e)
+
+        # -- set credentials via the legacy (global) endpoint --
+        try:
+            await self._client.set_hotspot_credentials(ssid, password)
+            logger.info("Hotspot credentials set: SSID=%s", ssid)
         except Exception as e:
             logger.warning("Failed to set hotspot credentials: %s", e)
 
+        # -- ensure the secondary is in hotspot (or dual) mode --
+        await self._ensure_secondary_hotspot(iface_name)
+
+    async def _ensure_secondary_hotspot(self, iface_name: str) -> bool:
+        """Ensure *iface_name* is running as a hotspot. Returns True on success.
+
+        Uses the v2 mode API with a generous timeout (create_ap takes ~15s).
+        """
         try:
             mode_info = await self._client.get_interface_mode(iface_name)
             if not mode_info:
                 logger.warning("Could not query mode for %s", iface_name)
-                return
+                return False
 
             available = mode_info.get("available_modes", [])
             current = mode_info.get("current_mode")
 
-            # Build ordered list of modes to try: prefer dual, fall back to hotspot
-            modes_to_try = [m for m in ("dual", "hotspot") if m in available]
+            modes_to_try = [m for m in ("hotspot", "dual") if m in available]
             if not modes_to_try:
-                logger.warning("Interface %s supports neither dual nor hotspot mode (available: %s)", iface_name, available)
-                return
+                logger.warning(
+                    "Interface %s supports neither hotspot nor dual mode (available: %s)",
+                    iface_name,
+                    available,
+                )
+                return False
 
             for mode in modes_to_try:
                 if current == mode:
                     logger.info("Interface %s already in %s mode", iface_name, mode)
-                    return
+                    return True
                 try:
-                    await self._client.set_interface_mode(iface_name, mode)
+                    await self._client.set_interface_mode(
+                        iface_name, mode, timeout=30.0,
+                    )
                     logger.info("Interface %s set to %s mode", iface_name, mode)
-                    return
+                    return True
                 except Exception as e:
-                    logger.warning("Failed to set %s mode on %s: %s", mode, iface_name, e)
+                    logger.warning(
+                        "Failed to set %s mode on %s: %s", mode, iface_name, e,
+                    )
 
             logger.warning("All mode attempts failed for %s", iface_name)
         except Exception as e:
             logger.warning("Failed to configure mode for %s: %s", iface_name, e)
+        return False
+
+    async def _get_secondary_interface_name(self) -> str | None:
+        """Return the name of the secondary (AP) WiFi interface, or None."""
+        try:
+            data = await self._client.list_interfaces()
+            if not data:
+                return None
+            interfaces = data.get("interfaces", [])
+            if len(interfaces) >= 2:
+                return interfaces[1].get("name")
+        except Exception:
+            pass
+        return None
+
+    async def start_ap_watchdog(self) -> None:
+        """Background loop that re-asserts the wlan1 hotspot if it drops.
+
+        After a dive the vehicle loses all WiFi connections.  BlueOS /
+        NetworkManager may not automatically restart the AP on wlan1.
+        This watchdog detects that and brings it back.
+        """
+        await asyncio.sleep(AP_WATCHDOG_SETTLE_S)
+        while True:
+            await asyncio.sleep(AP_WATCHDOG_INTERVAL_S)
+            try:
+                iface = await self._get_secondary_interface_name()
+                if not iface:
+                    continue
+                hs = await self._client._v2.wifi_hotspot_status(iface)
+                if hs.get("enabled"):
+                    continue
+                logger.warning(
+                    "AP on %s is down, re-asserting hotspot mode", iface,
+                )
+                if await self._ensure_secondary_hotspot(iface):
+                    logger.info("AP on %s recovered by watchdog", iface)
+                else:
+                    logger.warning("AP watchdog: failed to recover %s", iface)
+            except Exception as e:
+                logger.debug("AP watchdog check error: %s", e)
 
     async def close(self) -> None:
         """Close HTTP clients."""

@@ -241,14 +241,20 @@ class NetworkClient:
             return await self._v2.wifi_get_mode(interface_name)
         return None
 
-    async def set_interface_mode(self, interface: str, mode: str) -> Any:
+    async def set_interface_mode(
+        self, interface: str, mode: str, timeout: float | None = None,
+    ) -> Any:
         """Set interface mode: 'normal', 'hotspot', or 'dual' (v2 only).
+
+        Args:
+            timeout: Per-request timeout (seconds). Hotspot mode changes
+                     can take 15+ seconds due to create_ap startup.
 
         Raises RuntimeError if v2 is not available.
         """
         if not await self._detect_version():
             raise RuntimeError("Interface mode requires WiFi Manager v2.0")
-        return await self._v2.wifi_set_mode(interface, mode)
+        return await self._v2.wifi_set_mode(interface, mode, timeout=timeout)
 
     # ── Lifecycle ────────────────────────────────────────────────────
 

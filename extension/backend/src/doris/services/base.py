@@ -37,10 +37,26 @@ class BlueOSClient:
         return response.json()
 
     async def post(
-        self, path: str, data: dict | None = None, json: dict | None = None
+        self,
+        path: str,
+        data: dict | None = None,
+        json: dict | None = None,
+        timeout: float | None = None,
     ) -> dict[str, Any]:
-        """Make a POST request."""
-        response = await self.client.post(path, data=data, json=json)
+        """Make a POST request.
+
+        Args:
+            timeout: Per-request timeout override (seconds). Uses the
+                     client default when ``None``.
+        """
+        kwargs: dict[str, Any] = {}
+        if data is not None:
+            kwargs["data"] = data
+        if json is not None:
+            kwargs["json"] = json
+        if timeout is not None:
+            kwargs["timeout"] = timeout
+        response = await self.client.post(path, **kwargs)
         response.raise_for_status()
         return response.json()
 
