@@ -65,7 +65,6 @@ local MAV_SEVERITY = {
     DEBUG     = 7,
 }
 
-local SURFACE_DEPTH_M    = 0.5
 local UPDATE_INTERVAL_MS = 500
 local ARM_RETRY_MS       = 2000
 
@@ -86,7 +85,7 @@ local STATE_ASCENT        = 3
 local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-assert(param:add_table(73, "DORIS_", 30),
+assert(param:add_table(73, "DORIS_", 31),
        "DIVE: could not add DORIS_ param table")
 
 -- mission control
@@ -123,6 +122,7 @@ assert(param:add_param(73, 28, "ASC_REC",  0),    "DORIS_ASC_REC")
 assert(param:add_param(73, 29, "CAM_DLY",  0),    "DORIS_CAM_DLY")
 -- relay safety
 assert(param:add_param(73, 30, "BRN_MIN", 2700),  "DORIS_BRN_MIN")
+assert(param:add_param(73, 31, "ASC_DPT", 10),    "DORIS_ASC_DPT")
 
 
 local DORIS_START    = Parameter("DORIS_START")
@@ -149,6 +149,7 @@ local DORIS_MAX_DPTH = Parameter("DORIS_MAX_DPTH")
 local DORIS_LGT_TST  = Parameter("DORIS_LGT_TST")
 local DORIS_GPS_RBT  = Parameter("DORIS_GPS_RBT")
 local DORIS_BRN_MIN  = Parameter("DORIS_BRN_MIN")
+local DORIS_ASC_DPT  = Parameter("DORIS_ASC_DPT")
 
 -- GPS self-heal: reboot up to 2 times if the GPS driver never receives
 -- data.  DORIS_GPS_RBT counts reboots and persists in EEPROM so the
@@ -255,7 +256,6 @@ local batt_voltage       = 0.0
 
 -- relay state
 local relay_active       = false
-local relay_asc_count    = 0
 
 -- in-mission failsafe state
 local leak_detected = false
@@ -384,7 +384,6 @@ local function activate_relay()
     if ch < 0 then return end
     relay:on(ch)
     relay_active = true
-    relay_asc_count = 0
     if is_sitl then
         -- ~2 kg net positive buoyancy for ascent after weight drop in SITL
         param:set_and_save("SIM_BUOYANCY", 19.6)
@@ -981,20 +980,19 @@ function update()
         update_lights(cfg_asc_lgt, now_ms)
 
         -- Relay stays on for at least DORIS_BRN_MIN seconds (default 45 min).
-        -- After that, require 20 consecutive samples (10s) of sustained
-        -- upward velocity > 0.10 m/s before deactivating.
+        -- After that, deactivate once DORIS has risen DORIS_ASC_DPT metres
+        -- above the deepest depth recorded during the dive (telem.max_depth).
         if relay_active then
             local burn_elapsed = now_ms - ascent_start_ms
             local brn_min_ms = (DORIS_BRN_MIN:get() or 2700) * 1000
             if burn_elapsed >= brn_min_ms then
-                local vel = ahrs:get_velocity_NED()
-                if vel and vel:z() < -0.10 then
-                    relay_asc_count = relay_asc_count + 1
-                    if relay_asc_count >= 20 then
-                        deactivate_relay()
-                    end
-                else
-                    relay_asc_count = 0
+                local depth = get_depth_m()
+                local threshold = telem.max_depth - (DORIS_ASC_DPT:get() or 10)
+                if depth and depth <= threshold then
+                    gcs:send_text(MAV_SEVERITY.INFO,
+                        string.format("DIVE: ascended %.1fm above bottom (%.1fm), relay off",
+                            telem.max_depth - depth, telem.max_depth))
+                    deactivate_relay()
                 end
             end
         end
@@ -1006,9 +1004,11 @@ function update()
                 gcs:send_text(MAV_SEVERITY.INFO,
                     string.format("DIVE: ascending, depth=%.2fm", depth))
             end
-            if depth <= SURFACE_DEPTH_M then
+            local gps_stat = gps:status(0)
+            if gps_stat and gps_stat >= 3 then
                 gcs:send_text(MAV_SEVERITY.INFO,
-                    string.format("DIVE: surface reached (%.2fm)", depth))
+                    string.format("DIVE: surface reached (GPS fix, depth=%.2fm)", depth))
+                deactivate_relay()
                 ipcam_stop()
                 state = STATE_RECOVERY
             end
