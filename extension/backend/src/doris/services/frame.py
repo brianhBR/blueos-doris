@@ -35,14 +35,25 @@ PARAM_SET_DELAY = 0.05
 STARTUP_RETRY_DELAY = 3.0
 STARTUP_MAX_RETRIES = 10
 
-KEY_PARAMS = [
+DEFAULT_KEY_PARAMS = [
     "AHRS_ORIENTATION",
     "FRAME_CONFIG",
-    "BRD_PWM_COUNT",
     "RELAY1_FUNCTION",
     "RELAY1_PIN",
     "SCR_ENABLE",
+    "BATT_CAPACITY",
+    "BATT_MONITOR",
+    "BATT_VOLT_PIN",
+    "BATT_CURR_PIN",
+    "FS_LEAK_ENABLE",
+    "FS_PRESS_ENABLE",
+    "FS_TEMP_ENABLE",
     *(f"SERVO{ch}_FUNCTION" for ch in range(1, 17)),
+    "SERVO13_MIN",
+    "SERVO13_MAX",
+    "SERVO13_TRIM",
+    "SERVO14_MIN",
+    "SERVO14_MAX",
 ]
 
 
@@ -134,11 +145,19 @@ class FrameService:
         logger.info("Fetched %d vehicle parameters", len(results))
         return results
 
+    def _get_critical_param_names(self) -> set[str]:
+        """Build the set of parameter names to check from frame definition + defaults."""
+        frame = self.load_frame_definition()
+        critical = set(DEFAULT_KEY_PARAMS)
+        if frame:
+            critical.update(frame.get("critical_params", []))
+        return critical
+
     async def fetch_key_params(self) -> dict[str, float]:
         """Fetch only the key frame-related parameters from the vehicle."""
         ws_url = _mavlink2rest_ws_url()
         results: dict[str, float] = {}
-        expected = set(KEY_PARAMS)
+        expected = self._get_critical_param_names()
 
         try:
             async with websockets.connect(ws_url, close_timeout=5) as ws:
@@ -216,10 +235,22 @@ class FrameService:
             "failed_params": failed,
         }
 
+    def _compare_param(self, actual: float, expected: float) -> bool:
+        """Compare a vehicle param against expected value, tolerant of float precision."""
+        if isinstance(expected, int) or expected == int(expected):
+            return int(actual) == int(expected)
+        return abs(actual - expected) < 0.01
+
     async def get_frame_status(self) -> dict:
-        """Read key frame parameters and report current vehicle frame state."""
+        """Read key frame parameters and report current vehicle frame state.
+
+        Returns detailed status for critical subsystems (lights, relay, battery)
+        and reports any mismatches against the frame definition.
+        """
         params = await self.fetch_key_params()
         frame = self.load_frame_definition()
+        frame_params = frame.get("parameters", {}) if frame else {}
+        critical_names = set(frame.get("critical_params", [])) if frame else set()
 
         orientation_val = params.get("AHRS_ORIENTATION")
         orientation_map = {0: "None", 24: "Pitch90", 25: "Pitch270"}
@@ -235,12 +266,37 @@ class FrameService:
             k: v for k, v in servo_functions.items() if v != 0
         }
 
-        frame_params = frame.get("parameters", {}) if frame else {}
-        mismatches = {}
-        for name, expected in frame_params.items():
-            actual = params.get(name)
-            if actual is not None and int(actual) != int(expected):
-                mismatches[name] = {"expected": expected, "actual": actual}
+        # Build mismatch report for all fetched critical params
+        critical_mismatches = {}
+        other_mismatches = {}
+        for name in params:
+            expected = frame_params.get(name)
+            if expected is None:
+                continue
+            actual = params[name]
+            if not self._compare_param(actual, expected):
+                entry = {"expected": expected, "actual": actual}
+                if name in critical_names:
+                    critical_mismatches[name] = entry
+                else:
+                    other_mismatches[name] = entry
+
+        # Subsystem-specific status
+        lights_ok = all(
+            self._compare_param(params.get(p, -999), frame_params.get(p, -998))
+            for p in ("SERVO13_FUNCTION", "SERVO13_MIN", "SERVO13_MAX", "SERVO13_TRIM")
+            if p in frame_params
+        )
+        relay_ok = all(
+            self._compare_param(params.get(p, -999), frame_params.get(p, -998))
+            for p in ("SERVO14_FUNCTION", "RELAY1_FUNCTION")
+            if p in frame_params
+        )
+        battery_ok = all(
+            self._compare_param(params.get(p, -999), frame_params.get(p, -998))
+            for p in ("BATT_CAPACITY", "BATT_MONITOR", "BATT_VOLT_PIN", "BATT_CURR_PIN")
+            if p in frame_params
+        )
 
         return {
             "orientation": orientation_map.get(
@@ -248,20 +304,45 @@ class FrameService:
             ) if orientation_val is not None else None,
             "orientation_raw": int(orientation_val) if orientation_val is not None else None,
             "frame_config": int(params.get("FRAME_CONFIG", -1)),
-            "pwm_count": int(params.get("BRD_PWM_COUNT", -1)),
             "relay_enabled": int(params.get("RELAY1_FUNCTION", 0)) == 1,
             "relay_pin": int(params.get("RELAY1_PIN", -1)),
             "scripting_enabled": int(params.get("SCR_ENABLE", 0)) == 1,
             "active_servo_outputs": active_outputs,
-            "frame_applied": len(mismatches) == 0 and len(params) > 0,
-            "mismatches": mismatches,
+            "lights": {
+                "ok": lights_ok,
+                "servo13_function": int(params.get("SERVO13_FUNCTION", -1)),
+                "expected_function": int(frame_params.get("SERVO13_FUNCTION", -1)),
+                "servo13_min": int(params.get("SERVO13_MIN", -1)),
+                "servo13_max": int(params.get("SERVO13_MAX", -1)),
+                "servo13_trim": int(params.get("SERVO13_TRIM", -1)),
+            },
+            "relay": {
+                "ok": relay_ok,
+                "servo14_function": int(params.get("SERVO14_FUNCTION", -1)),
+                "expected_function": int(frame_params.get("SERVO14_FUNCTION", -1)),
+                "relay1_function": int(params.get("RELAY1_FUNCTION", -1)),
+                "relay1_pin": int(params.get("RELAY1_PIN", -1)),
+            },
+            "battery": {
+                "ok": battery_ok,
+                "capacity": int(params.get("BATT_CAPACITY", -1)),
+                "expected_capacity": int(frame_params.get("BATT_CAPACITY", -1)),
+                "monitor": int(params.get("BATT_MONITOR", -1)),
+                "volt_pin": int(params.get("BATT_VOLT_PIN", -1)),
+                "curr_pin": int(params.get("BATT_CURR_PIN", -1)),
+            },
+            "frame_applied": len(critical_mismatches) == 0 and len(params) > 0,
+            "critical_mismatches": critical_mismatches,
+            "other_mismatches": other_mismatches,
         }
 
     async def apply_frame_if_needed(self, frame_name: str = "doris") -> bool:
-        """Apply the frame only if it hasn't been applied before.
+        """Apply the frame on first install only.
 
-        Uses a sentinel file in the persistent configurations directory.
-        Returns True if the frame was applied (or was already applied).
+        Uses a sentinel file in persistent storage to record that the frame
+        has been applied.  Once the sentinel exists the frame is never
+        re-applied automatically — use the /api/v1/frame/apply endpoint or
+        the status check to verify params after that.
         """
         frame = self.load_frame_definition(frame_name)
         if frame is None:
@@ -273,25 +354,20 @@ class FrameService:
         if FRAME_SENTINEL.exists():
             try:
                 sentinel = json.loads(FRAME_SENTINEL.read_text())
-                if sentinel.get("version") == frame_version:
-                    logger.info(
-                        "Frame '%s' v%s already applied on %s, skipping",
-                        frame_name,
-                        frame_version,
-                        sentinel.get("applied_at", "?"),
-                    )
-                    return True
                 logger.info(
-                    "Frame version changed (%s -> %s), re-applying",
-                    sentinel.get("version"),
-                    frame_version,
+                    "Frame '%s' was applied on %s (v%s), skipping — "
+                    "use /api/v1/frame/apply to re-apply manually",
+                    frame_name,
+                    sentinel.get("applied_at", "?"),
+                    sentinel.get("version", "?"),
                 )
+                return True
             except (json.JSONDecodeError, OSError):
                 pass
 
         for attempt in range(1, STARTUP_MAX_RETRIES + 1):
             logger.info(
-                "Applying frame '%s' (attempt %d/%d)",
+                "First install: applying frame '%s' (attempt %d/%d)",
                 frame_name,
                 attempt,
                 STARTUP_MAX_RETRIES,
