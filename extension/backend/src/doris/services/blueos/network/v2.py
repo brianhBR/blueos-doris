@@ -241,11 +241,18 @@ class NetworkV2Client:
         """
         return await self._client.get(self._path(f"/wifi/mode/{interface_name}"))
 
-    async def wifi_set_mode(self, interface: str, mode: str) -> Any:
-        """Set interface mode (normal, hotspot, or dual)."""
+    async def wifi_set_mode(
+        self, interface: str, mode: str, timeout: float | None = None,
+    ) -> Any:
+        """Set interface mode (normal, hotspot, or dual).
+
+        Starting a hotspot via create_ap can take 15+ seconds; callers
+        should pass a generous ``timeout`` when switching to hotspot mode.
+        """
         return await self._client.post(
             self._path("/wifi/mode"),
             json={"interface": interface, "mode": mode},
+            timeout=timeout,
         )
 
     async def close(self) -> None:

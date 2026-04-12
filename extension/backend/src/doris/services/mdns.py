@@ -52,6 +52,8 @@ CORE_CONTAINER = "blueos-core"
 
 NGINX_WATCHDOG_INTERVAL_S = 30
 
+_avahi_config_changed: bool = False
+
 
 def _docker_base_url() -> str:
     """Return the Docker API base URL derived from the BlueOS address."""
@@ -167,6 +169,9 @@ async def start_hotspot_dns() -> None:
 
     Must be called AFTER configure_hotspot() so the hotspot interface
     actually has the gateway IP assigned.
+
+    Uses ``sudo`` so that /usr/sbin is in the PATH (Commander's default
+    shell PATH omits /usr/sbin where dnsmasq lives).
     """
     conf_content = (
         f"listen-address={HOTSPOT_GATEWAY}\n"
@@ -179,9 +184,10 @@ async def start_hotspot_dns() -> None:
         "no-hosts\n"
     )
     cmd = (
-        f"echo '{conf_content}' > {HOTSPOT_DNS_CONF} && "
-        f"pkill -f 'dnsmasq.*{HOTSPOT_DNS_CONF}' 2>/dev/null; sleep 1; "
-        f"dnsmasq --conf-file={HOTSPOT_DNS_CONF} --pid-file={HOTSPOT_DNS_PID}"
+        f"echo '{conf_content}' | sudo tee {HOTSPOT_DNS_CONF} > /dev/null && "
+        f"sudo pkill -f 'dnsmasq.*{HOTSPOT_DNS_CONF}' 2>/dev/null; sleep 1; "
+        f"sudo /usr/sbin/dnsmasq --conf-file={HOTSPOT_DNS_CONF} "
+        f"--pid-file={HOTSPOT_DNS_PID}"
     )
     ok = await _run_host_command(cmd)
     if ok:
@@ -190,7 +196,7 @@ async def start_hotspot_dns() -> None:
         logger.warning("Failed to start hotspot DNS server")
 
 
-async def restart_avahi() -> None:
+async def restart_avahi(force: bool = False) -> None:
     """Restart Avahi so it re-probes all interfaces.
 
     Should be called AFTER configure_hotspot() because the hotspot setup
@@ -201,7 +207,15 @@ async def restart_avahi() -> None:
 
     The 5-second pause between stop and start avoids hostname-probe
     collisions with BlueOS's Beacon (zeroconf) on the same host.
+
+    When *force* is False (the default) and the Avahi config was not
+    changed by ``_setup_avahi_hostname()``, the restart is skipped to
+    avoid unnecessary mDNS downtime.
     """
+    if not force and not _avahi_config_changed:
+        logger.info("Avahi config unchanged, skipping restart")
+        return
+
     ok = await _run_host_command(
         "sudo systemctl stop avahi-daemon && sleep 5 && sudo systemctl start avahi-daemon"
     )
@@ -334,6 +348,7 @@ async def setup_doris_local() -> None:
     Also starts a background watchdog that re-uploads the nginx conf
     if blueos-core is ever recreated while DORIS is running.
     """
-    _setup_avahi_hostname()
+    global _avahi_config_changed
+    _avahi_config_changed = _setup_avahi_hostname()
     await _ensure_nginx_redirect()
     asyncio.get_event_loop().create_task(_nginx_redirect_watchdog())
