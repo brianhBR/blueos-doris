@@ -318,33 +318,58 @@ class CameraService:
             pass
         return urls
 
+    _ffmpeg_lock = __import__("asyncio").Lock()
+
     @staticmethod
     async def _ffmpeg_snapshot(rtsp_url: str) -> bytes | None:
-        """Grab one JPEG frame from an RTSP URL using ffmpeg."""
+        """Grab one JPEG frame from an RTSP URL using ffmpeg.
+
+        Guards against process leaks: the subprocess is always killed on
+        timeout or error, and a lock prevents concurrent ffmpeg spawns.
+        """
         import asyncio as _asyncio
         import logging as _logging
         _logger = _logging.getLogger(__name__)
-        try:
-            proc = await _asyncio.create_subprocess_exec(
-                "ffmpeg", "-rtsp_transport", "tcp",
-                "-i", rtsp_url,
-                "-frames:v", "1",
-                "-vf", "scale=1280:-1",
-                "-q:v", "2",
-                "-f", "image2", "pipe:1",
-                stdout=_asyncio.subprocess.PIPE,
-                stderr=_asyncio.subprocess.PIPE,
-            )
-            stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=8.0)
-            if proc.returncode == 0 and stdout:
-                _logger.info("Camera snapshot via ffmpeg from %s (%d bytes)", rtsp_url, len(stdout))
-                return stdout
-            _logger.debug("ffmpeg failed (rc=%s): %s", proc.returncode, stderr[:200] if stderr else "")
-        except FileNotFoundError:
-            _logger.debug("ffmpeg not installed, skipping RTSP snapshot")
-        except Exception as e:
-            _logger.debug("ffmpeg snapshot error: %s", e)
-        return None
+
+        if CameraService._ffmpeg_lock.locked():
+            _logger.debug("ffmpeg snapshot already in flight, skipping")
+            return None
+
+        async with CameraService._ffmpeg_lock:
+            proc: _asyncio.subprocess.Process | None = None
+            try:
+                proc = await _asyncio.create_subprocess_exec(
+                    "ffmpeg",
+                    "-rtsp_transport", "tcp",
+                    "-stimeout", "5000000",
+                    "-timeout", "5000000",
+                    "-i", rtsp_url,
+                    "-frames:v", "1",
+                    "-vf", "scale=1280:-1",
+                    "-q:v", "2",
+                    "-f", "image2", "pipe:1",
+                    stdout=_asyncio.subprocess.PIPE,
+                    stderr=_asyncio.subprocess.PIPE,
+                )
+                stdout, stderr = await _asyncio.wait_for(proc.communicate(), timeout=8.0)
+                if proc.returncode == 0 and stdout:
+                    _logger.info("Camera snapshot via ffmpeg from %s (%d bytes)", rtsp_url, len(stdout))
+                    return stdout
+                _logger.debug("ffmpeg failed (rc=%s): %s", proc.returncode, stderr[:200] if stderr else "")
+            except FileNotFoundError:
+                _logger.debug("ffmpeg not installed, skipping RTSP snapshot")
+            except _asyncio.TimeoutError:
+                _logger.warning("ffmpeg snapshot timed out for %s, killing process", rtsp_url)
+            except Exception as e:
+                _logger.debug("ffmpeg snapshot error: %s", e)
+            finally:
+                if proc is not None and proc.returncode is None:
+                    try:
+                        proc.kill()
+                        await proc.wait()
+                    except ProcessLookupError:
+                        pass
+            return None
 
     async def close(self) -> None:
         """Close HTTP clients."""
