@@ -1,0 +1,42 @@
+Doris Setup
+
+Flash patrickelectric/blueos-core, “doris” BlueOS
+Autopilot firmware / pirate mode / serial 6 to USB device (not ACM)
+Install DORIS extension:
+br.doris
+Doris
+sailorman225/blueos-doris
+master
+{
+ "ExposedPorts": {
+  "8095/tcp": {}
+ },
+ "HostConfig": {
+  "Privileged": true,
+  "Binds": [
+   "/dev:/dev:rw",
+   "/root/.config/blueos/ardupilot-manager/firmware:/tmp/storage/firmware",
+   "/usr/blueos/extensions/doris/configurations:/tmp/storage/configurations",
+   "/usr/blueos/extensions/doris/notifications:/tmp/storage/notifications",
+   "/usr/blueos/extensions/doris/dives:/tmp/storage/dives",
+   "/usr/blueos/userdata:/tmp/storage/userdata",
+   "/usr/blueos/extensions/doris/nginx:/tmp/nginx",
+   "/etc/avahi:/tmp/avahi",
+   "/sys:/sys:rw"
+  ],
+  "ExtraHosts": [
+   "host.docker.internal:host-gateway"
+  ],
+  "PortBindings": {
+   "8095/tcp": [
+    {
+     "HostPort": "8095"
+    }
+   ]
+  }
+ }
+}
+Autopilot firmware / stop autopilot / navigate to Doris extension / Artemis / flash doris-agt-no-relays.bin (USB device, don’t change other settings -> flash)
+Verify autopilot parameters - Servo13Function - RCIN9, Relay function 1, Relay 1 pin 14
+Video streams page - add stream_0, RTSP
+AI change flash drive from fat32 to exFAT
