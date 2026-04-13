@@ -8,11 +8,16 @@ Steps:
   2. Unload in-kernel drivers if loaded
   3. Install and load 88x2bu.ko
 
+The driver .ko is fingerprinted by SHA-256 hash.  If a loaded driver
+does not match the bundled version, it is replaced and reloaded so that
+field devices pick up fixes (e.g. WPA2 AP-mode beacon fix).
+
 Note on sudo: the Commander API's shell PATH does not include /sbin or
 /usr/sbin, so modprobe, rmmod, depmod etc. are only reachable through
 sudo (which resets the PATH).
 """
 
+import hashlib
 import logging
 from pathlib import Path
 
@@ -25,6 +30,11 @@ logger = logging.getLogger(__name__)
 DRIVER_MODULE = "88x2bu"
 DRIVER_SRC = Path(f"/app/driver/{DRIVER_MODULE}.ko")
 BLACKLIST_CONF = "blacklist-rtl88x2bu.conf"
+
+# SHA-256 of the bundled 88x2bu.ko.  Built from morrownr/88x2bu-20210702
+# (commit fecac34, 2026-01-08) against kernel 6.6.31+rpt-rpi-2712.
+# Fixes: WPA2 RSN IE in AP-mode beacons (clients no longer see WEP).
+DRIVER_SHA256 = "ce336377e9834b765c0f3255cf51d189b8ee80273ff75996dcd3b47db82f8b81"
 OLD_BLACKLIST_FILES = [
     "blacklist-rtw88.conf",
     "blacklist-8192cu.conf",
@@ -70,6 +80,26 @@ async def _is_driver_loaded() -> bool:
     """Check if the out-of-tree 88x2bu driver is already loaded."""
     ok, _ = await _run_host_command(f"lsmod | grep -q '^{DRIVER_MODULE} '")
     return ok
+
+
+async def _installed_driver_hash() -> str | None:
+    """Return the SHA-256 of the installed .ko on the host, or None."""
+    ok, kver = await _run_host_command("uname -r")
+    if not ok:
+        return None
+    dest = f"/lib/modules/{kver}/kernel/drivers/net/wireless/{DRIVER_MODULE}.ko"
+    ok, out = await _run_host_command(f"sha256sum {dest} 2>/dev/null | awk '{{print $1}}'")
+    if ok and out:
+        return out.strip()
+    return None
+
+
+def _bundled_driver_hash() -> str | None:
+    """Return the SHA-256 of the .ko bundled inside the container."""
+    if not DRIVER_SRC.is_file():
+        return None
+    h = hashlib.sha256(DRIVER_SRC.read_bytes()).hexdigest()
+    return h
 
 
 async def _get_doris_container_name() -> str | None:
@@ -133,20 +163,51 @@ async def _install_driver() -> bool:
     return True
 
 
-async def setup_wifi_driver() -> None:
-    """Install the 88x2bu driver if not already loaded.
+async def _upgrade_driver() -> bool:
+    """Replace the installed driver with the bundled version and reload."""
+    logger.info("Upgrading %s driver to bundled version (hash %s…)", DRIVER_MODULE, DRIVER_SHA256[:12])
 
-    Called once during DORIS backend startup.  Truly idempotent: when the
-    driver is already loaded we skip *all* host modifications (blacklist
-    writes, rmmod, depmod, modprobe) to avoid unnecessary churn that
-    could briefly reset the USB WiFi adapter.
+    ok, _ = await _run_host_command(
+        f"sudo pkill -f 'create_ap.*wlan1' 2>/dev/null; sleep 1; sudo rmmod {DRIVER_MODULE} 2>/dev/null; true"
+    )
+
+    if not await _install_driver():
+        return False
+
+    logger.info("%s driver upgraded and reloaded", DRIVER_MODULE)
+    return True
+
+
+async def setup_wifi_driver() -> None:
+    """Install or upgrade the 88x2bu driver as needed.
+
+    Called once during DORIS backend startup.
+
+    - If the driver is not loaded at all, do a fresh install (blacklist
+      conflicting modules, copy .ko, modprobe).
+    - If the driver IS loaded but its SHA-256 doesn't match the bundled
+      .ko, replace and reload it so field devices pick up fixes.
+    - If the driver is loaded AND matches, skip everything.
     """
     if not DRIVER_SRC.is_file():
         logger.info("No %s.ko found at %s, skipping driver setup", DRIVER_MODULE, DRIVER_SRC)
         return
 
     if await _is_driver_loaded():
-        logger.info("%s driver already loaded, skipping all driver setup", DRIVER_MODULE)
+        installed = await _installed_driver_hash()
+        bundled = _bundled_driver_hash()
+        if installed and bundled and installed == bundled:
+            logger.info(
+                "%s driver loaded and up-to-date (hash %s…)", DRIVER_MODULE, installed[:12],
+            )
+            return
+        logger.info(
+            "%s driver loaded but outdated (installed=%s… bundled=%s…), upgrading",
+            DRIVER_MODULE,
+            (installed or "?")[:12],
+            (bundled or "?")[:12],
+        )
+        await _upgrade_driver()
         return
 
     logger.info("Installing %s driver (first boot or driver missing)", DRIVER_MODULE)
