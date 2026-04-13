@@ -422,8 +422,11 @@ class NetworkService:
 
         After a dive the vehicle loses all WiFi connections.  BlueOS /
         NetworkManager may not automatically restart the AP on wlan1.
-        This watchdog detects that and brings it back.
+        This watchdog detects that and brings it back.  It also ensures
+        the hotspot DNS server (dnsmasq) is running when the AP is up.
         """
+        from .mdns import start_hotspot_dns, is_hotspot_dns_running
+
         await asyncio.sleep(AP_WATCHDOG_SETTLE_S)
         while True:
             await asyncio.sleep(AP_WATCHDOG_INTERVAL_S)
@@ -433,6 +436,9 @@ class NetworkService:
                     continue
                 hs = await self._client._v2.wifi_hotspot_status(iface)
                 if hs.get("enabled"):
+                    if not await is_hotspot_dns_running():
+                        logger.info("AP is up but hotspot DNS is not running, starting it")
+                        await start_hotspot_dns()
                     continue
                 logger.warning(
                     "AP on %s is down, re-asserting hotspot mode", iface,

@@ -100,6 +100,13 @@ async def _run_host_command(command: str, timeout: float = 30.0) -> bool:
         return False
 
 
+async def is_hotspot_dns_running() -> bool:
+    """Check if our dnsmasq instance is listening on the hotspot gateway."""
+    return await _run_host_command(
+        f"sudo ss -tlnp | grep -q '{HOTSPOT_GATEWAY}:53 '"
+    )
+
+
 def _setup_avahi_hostname() -> bool:
     """Set avahi hostname to 'doris' on all physical network interfaces.
 
@@ -159,7 +166,7 @@ def _setup_avahi_hostname() -> bool:
 
 
 _HOTSPOT_DNS_WAIT_S = 5
-_HOTSPOT_DNS_RETRIES = 6
+_HOTSPOT_DNS_RETRIES = 12
 
 
 async def start_hotspot_dns() -> None:
