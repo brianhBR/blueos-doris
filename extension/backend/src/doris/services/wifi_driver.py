@@ -154,6 +154,12 @@ async def _install_driver() -> bool:
         logger.error("Failed to copy driver to host")
         return False
 
+    await _run_host_command(
+        f"echo 'options {DRIVER_MODULE} rtw_drv_log_level=0 rtw_led_ctrl=0"
+        f" rtw_vht_enable=1 rtw_power_mgnt=1 rtw_switch_usb_mode=1'"
+        f" | sudo tee /etc/modprobe.d/{DRIVER_MODULE}.conf > /dev/null"
+    )
+
     ok, _ = await _run_host_command(f"sudo modprobe {DRIVER_MODULE}")
     if not ok:
         logger.error("Failed to load %s module", DRIVER_MODULE)
