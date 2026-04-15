@@ -145,14 +145,22 @@ def create_app() -> Robyn:
         if lua_deployed:
             await restart_firmware(logger)
 
-        # WiFi driver must be loaded before the hotspot can be configured
-        # (wlan1 USB dongle is invisible to WiFi Manager without it).
         try:
             await setup_wifi_driver()
         except Exception as e:
             logger.warning("WiFi driver setup skipped: %s", e)
 
-        # --- Hotspot first: get the AP up as fast as possible -------------
+        frame_service = FrameService()
+        try:
+            await frame_service.apply_frame_if_needed()
+        except Exception as e:
+            logger.warning("Frame setup skipped: %s", e)
+
+        try:
+            await setup_doris_local()
+        except Exception as e:
+            logger.warning("doris.local setup skipped: %s", e)
+
         network_service = NetworkService()
         hotspot_changed = False
         try:
@@ -172,18 +180,6 @@ def create_app() -> Robyn:
             logger.warning("Avahi restart skipped: %s", e)
 
         asyncio.get_event_loop().create_task(network_service.start_ap_watchdog())
-
-        # --- Non-hotspot setup runs after the AP is up --------------------
-        frame_service = FrameService()
-        try:
-            await frame_service.apply_frame_if_needed()
-        except Exception as e:
-            logger.warning("Frame setup skipped: %s", e)
-
-        try:
-            await setup_doris_local()
-        except Exception as e:
-            logger.warning("doris.local setup skipped: %s", e)
 
         try:
             start_external_storage_setup()
