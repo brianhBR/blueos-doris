@@ -59,6 +59,11 @@ _process: asyncio.subprocess.Process | None = None
 _stderr_task: asyncio.Task | None = None
 _lock = asyncio.Lock()
 _last_pattern: str | None = None
+_active_segment_seconds: int | None = None
+_intentional_stop = False
+
+MAX_AUTO_RESTARTS = 3
+AUTO_RESTART_DELAY_S = 5
 
 
 def _data_root() -> Path:
@@ -127,12 +132,13 @@ def _build_ffmpeg_args(rtsp_url: str, segment_s: int, pattern: str) -> list[str]
 
 async def start_recording(segment_seconds: int | None = None) -> dict:
     """Start ffmpeg segment recording. Each /start after /stop uses a new basename."""
-    global _process, _last_pattern
+    global _process, _last_pattern, _active_segment_seconds, _intentional_stop
 
     seg = segment_seconds
     if seg is None:
         seg = int(settings.ipcam_segment_seconds_default)
     seg = max(1, min(seg, 86_400))
+    _intentional_stop = False
 
     mcm_url = await _discover_mcm_rtsp()
     if mcm_url:
@@ -201,7 +207,7 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
             }
 
         async def _drain_stderr(p: asyncio.subprocess.Process) -> None:
-            """Log ffmpeg stderr lines in background; log exit when it dies."""
+            """Log ffmpeg stderr; auto-restart on unexpected exit."""
             assert p.stderr is not None
             while True:
                 line = await p.stderr.readline()
@@ -214,12 +220,15 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
                 else:
                     logger.debug("[VIDEO] ffmpeg: %s", decoded)
             rc = await p.wait()
-            if rc != 0 and rc != -2:
-                logger.error("[VIDEO] ffmpeg exited unexpectedly rc=%s (pattern=%s)", rc, pattern)
+            if rc == 0 or rc == -2 or _intentional_stop:
+                return
+            logger.error("[VIDEO] ffmpeg exited unexpectedly rc=%s (pattern=%s)", rc, pattern)
+            asyncio.get_event_loop().create_task(_auto_restart())
 
         global _stderr_task
         _stderr_task = asyncio.create_task(_drain_stderr(proc))
         _process = proc
+        _active_segment_seconds = seg
         return {
             "success": True,
             "recording": True,
@@ -230,10 +239,31 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
         }
 
 
+async def _auto_restart() -> None:
+    """Automatically restart recording after an unexpected ffmpeg exit."""
+    for attempt in range(1, MAX_AUTO_RESTARTS + 1):
+        if _intentional_stop:
+            return
+        logger.warning(
+            "[VIDEO] auto-restart attempt %d/%d in %ds",
+            attempt, MAX_AUTO_RESTARTS, AUTO_RESTART_DELAY_S,
+        )
+        await asyncio.sleep(AUTO_RESTART_DELAY_S)
+        if _intentional_stop:
+            return
+        result = await start_recording(segment_seconds=_active_segment_seconds)
+        if result.get("success"):
+            logger.info("[VIDEO] auto-restart succeeded on attempt %d", attempt)
+            return
+        logger.warning("[VIDEO] auto-restart attempt %d failed: %s", attempt, result.get("message"))
+    logger.error("[VIDEO] auto-restart exhausted %d attempts — recording is DOWN", MAX_AUTO_RESTARTS)
+
+
 async def stop_recording() -> dict:
     """Signal ffmpeg to finalize segments (SIGINT), then kill if needed."""
-    global _process
+    global _process, _intentional_stop
 
+    _intentional_stop = True
     async with _lock:
         proc = _process
         _process = None

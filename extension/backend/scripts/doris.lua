@@ -406,20 +406,17 @@ end
 
 local function deactivate_relay()
     if not relay_active then return end
-    local brn_min_ms = (DORIS_BRN_MIN:get() or 2700) * 1000
-    if relay_burn_elapsed_ms() < brn_min_ms then
-        return
-    end
     local ch = DORIS_RELAY_CH:get()
     if not ch then return end
     ch = math.floor(ch)
     if ch < 0 then return end
+    local burn_s = relay_burn_elapsed_ms() / 1000.0
     relay:off(ch)
     relay_active = false
     relay_on_ms = 0
     gcs:send_text(MAV_SEVERITY.INFO,
         string.format("DIVE: Relay CH%d OFF at %.1fm (burn %.0fs)",
-            ch, get_depth_m() or 0, relay_burn_elapsed_ms() / 1000.0))
+            ch, get_depth_m() or 0, burn_s))
 end
 
 local function check_leak()
@@ -1083,9 +1080,11 @@ function update()
                     string.format("DIVE: ascending, depth=%.2fm", depth))
             end
             local gps_stat = gps:status(0)
-            if gps_stat and gps_stat >= 3 then
+            local gps_sats = gps:num_sats(0) or 0
+            if gps_stat and gps_stat >= 2 and gps_sats >= 4 then
                 gcs:send_text(MAV_SEVERITY.INFO,
-                    string.format("DIVE: surface reached (GPS fix, depth=%.2fm)", depth))
+                    string.format("DIVE: surface reached (GPS %dD %d sats, depth=%.2fm)",
+                        gps_stat, gps_sats, depth))
                 ipcam_stop()
                 state = STATE_RECOVERY
             end
@@ -1096,8 +1095,6 @@ function update()
         if RC9 then RC9:set_override(LIGHT_PWM_MIN) end
         arming:disarm()
         DORIS_START:set_and_save(0)
-        -- deactivate_relay() respects DORIS_BRN_MIN; it is a no-op until
-        -- the minimum burn time has elapsed.
         deactivate_relay()
         if not recovery_done and not arming:is_armed() and not relay_active then
             local total = dive_start_ms > 0
