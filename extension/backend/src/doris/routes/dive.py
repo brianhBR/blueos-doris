@@ -66,8 +66,15 @@ def _sync_mission_state_from_vehicle(status_dict: dict) -> None:
         ms["activated_at"] = datetime.now(tz=timezone.utc).isoformat()
         changed = True
     elif st in ("pending", "active") and not active:
-        completed = bool(status_dict.get("completed", False))
-        new_status = "completed" if completed else "cancelled"
+        if ds is not None and int(ds) == -1:
+            new_status = "cancelled"
+            logger.info(
+                "Vehicle returned to CONFIG (state -1) while mission was '%s'; marking cancelled",
+                st,
+            )
+        else:
+            completed = bool(status_dict.get("completed", False))
+            new_status = "completed" if completed else "cancelled"
         ms["status"] = new_status
         ms[f"{new_status}_at"] = datetime.now(tz=timezone.utc).isoformat()
         changed = True
@@ -279,6 +286,10 @@ def register_dive_routes(app: Robyn) -> None:
 
     @app.post("/api/v1/dive/stop")
     async def stop_dive():
+        pre_status = await dive_service.get_status()
+        pre_state = pre_status.get("doris_script_state")
+        was_diving = pre_state is not None and int(pre_state) >= 1
+
         ok = await dive_service.stop_dive()
 
         # Stop video recording (MCM) and IP camera extension recorder
@@ -304,7 +315,12 @@ def register_dive_routes(app: Robyn) -> None:
         except Exception as e:
             logger.warning(f"Failed to update mission state: {e}")
 
-        return json.dumps({"success": ok, "message": "Dive cancelled" if ok else "Failed to set parameter"})
+        result = {
+            "success": ok,
+            "message": "Dive cancelled" if ok else "Failed to set parameter",
+            "was_diving": was_diving,
+        }
+        return json.dumps(result)
 
     @app.post("/api/v1/dive/sitl/simulate_drop")
     async def sitl_simulate_drop(request):

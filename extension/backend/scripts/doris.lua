@@ -256,6 +256,7 @@ local batt_voltage       = 0.0
 
 -- relay state
 local relay_active       = false
+local relay_on_ms        = 0
 
 -- in-mission failsafe state
 local leak_detected = false
@@ -278,17 +279,20 @@ local telem = {
 }
 
 -- snapshotted config (read once at CONFIG -> MISSION_START)
-local cfg_rls_sec_ms  = 60000
-local cfg_dsc_lgt     = false
-local cfg_btm_lgt     = false
-local cfg_asc_lgt     = false
-local cfg_lgt_pwm     = LIGHT_PWM_MIN
-local cfg_btm_thr_mps = 0.05
-local cfg_dpt_gat_m   = 5.0
-local cfg_lgt_mod     = 0
-local cfg_lgt_on_ms   = 10000
-local cfg_lgt_off_ms  = 5000
-local cfg_btm_dly_ms  = 30000
+-- packed into a table to stay under Lua's 200-local-variable limit
+local cfg = {
+    rls_sec_ms  = 60000,
+    dsc_lgt     = false,
+    btm_lgt     = false,
+    asc_lgt     = false,
+    lgt_pwm     = LIGHT_PWM_MIN,
+    btm_thr_mps = 0.05,
+    dpt_gat_m   = 5.0,
+    lgt_mod     = 0,
+    lgt_on_ms   = 10000,
+    lgt_off_ms  = 5000,
+    btm_dly_ms  = 30000,
+}
 
 -- snapshotted IP camera policy (set in snapshot_config from DORIS_* params)
 local ipcam_cfg = {
@@ -352,25 +356,25 @@ local function update_lights(enabled, now_ms)
         RC9:set_override(LIGHT_PWM_MIN)
         return
     end
-    if cfg_lgt_mod == 0 then
-        RC9:set_override(cfg_lgt_pwm)
+    if cfg.lgt_mod == 0 then
+        RC9:set_override(cfg.lgt_pwm)
         return
     end
     -- interval mode
     local elapsed = now_ms - light_cycle_ms
     if light_on then
-        if elapsed >= cfg_lgt_on_ms then
+        if elapsed >= cfg.lgt_on_ms then
             light_on = false
             light_cycle_ms = now_ms
             RC9:set_override(LIGHT_PWM_MIN)
         else
-            RC9:set_override(cfg_lgt_pwm)
+            RC9:set_override(cfg.lgt_pwm)
         end
     else
-        if elapsed >= cfg_lgt_off_ms then
+        if elapsed >= cfg.lgt_off_ms then
             light_on = true
             light_cycle_ms = now_ms
-            RC9:set_override(cfg_lgt_pwm)
+            RC9:set_override(cfg.lgt_pwm)
         else
             RC9:set_override(LIGHT_PWM_MIN)
         end
@@ -384,6 +388,9 @@ local function activate_relay()
     if ch < 0 then return end
     relay:on(ch)
     relay_active = true
+    if relay_on_ms == 0 then
+        relay_on_ms = millis():tofloat()
+    end
     if is_sitl then
         -- ~2 kg net positive buoyancy for ascent after weight drop in SITL
         param:set_and_save("SIM_BUOYANCY", 19.6)
@@ -393,16 +400,27 @@ local function activate_relay()
         string.format("DIVE: Relay CH%d ON at %.1fm", ch, get_depth_m() or 0))
 end
 
+local function relay_burn_elapsed_ms()
+    if relay_on_ms == 0 then return 0 end
+    return millis():tofloat() - relay_on_ms
+end
+
 local function deactivate_relay()
     if not relay_active then return end
+    local brn_min_ms = (DORIS_BRN_MIN:get() or 2700) * 1000
+    if relay_burn_elapsed_ms() < brn_min_ms then
+        return
+    end
     local ch = DORIS_RELAY_CH:get()
     if not ch then return end
     ch = math.floor(ch)
     if ch < 0 then return end
     relay:off(ch)
     relay_active = false
+    relay_on_ms = 0
     gcs:send_text(MAV_SEVERITY.INFO,
-        string.format("DIVE: Relay CH%d OFF at %.1fm", ch, get_depth_m() or 0))
+        string.format("DIVE: Relay CH%d OFF at %.1fm (burn %.0fs)",
+            ch, get_depth_m() or 0, relay_burn_elapsed_ms() / 1000.0))
 end
 
 local function check_leak()
@@ -499,32 +517,32 @@ local function snapshot_config()
     local lgt_off = DORIS_LGT_OFF:get()
     local btm_dly = DORIS_BTM_DLY:get()
 
-    cfg_rls_sec_ms  = math.max(rls_sec, 1) * 1000
-    cfg_dsc_lgt     = DORIS_DSC_LGT:get() >= 1
-    cfg_btm_lgt     = DORIS_BTM_LGT:get() >= 1
-    cfg_asc_lgt     = DORIS_ASC_LGT:get() >= 1
-    cfg_lgt_pwm     = brightness_to_pwm(brt)
-    cfg_btm_thr_mps = math.max(btm_thr, 0.1) / 100.0
-    cfg_dpt_gat_m   = math.max(dpt_gat, 2.0)
-    cfg_lgt_mod     = lgt_mod >= 1 and 1 or 0
-    cfg_lgt_on_ms   = math.max(lgt_on, 1) * 1000
-    cfg_lgt_off_ms  = math.max(lgt_off, 1) * 1000
-    cfg_btm_dly_ms  = math.max(btm_dly, 0) * 1000
+    cfg.rls_sec_ms  = math.max(rls_sec, 1) * 1000
+    cfg.dsc_lgt     = DORIS_DSC_LGT:get() >= 1
+    cfg.btm_lgt     = DORIS_BTM_LGT:get() >= 1
+    cfg.asc_lgt     = DORIS_ASC_LGT:get() >= 1
+    cfg.lgt_pwm     = brightness_to_pwm(brt)
+    cfg.btm_thr_mps = math.max(btm_thr, 0.1) / 100.0
+    cfg.dpt_gat_m   = math.max(dpt_gat, 2.0)
+    cfg.lgt_mod     = lgt_mod >= 1 and 1 or 0
+    cfg.lgt_on_ms   = math.max(lgt_on, 1) * 1000
+    cfg.lgt_off_ms  = math.max(lgt_off, 1) * 1000
+    cfg.btm_dly_ms  = math.max(btm_dly, 0) * 1000
 
     gcs:send_text(MAV_SEVERITY.INFO,
         string.format("DIVE: gate=%.1fm rls=%ds thr=%.1fcm/s avg=%ds",
-            cfg_dpt_gat_m, rls_sec, btm_thr, btm_avg))
+            cfg.dpt_gat_m, rls_sec, btm_thr, btm_avg))
     gcs:send_text(MAV_SEVERITY.INFO,
         string.format("DIVE: lights dsc=%d btm=%d asc=%d brt=%d%% pwm=%d mode=%s RC9=%s",
-            cfg_dsc_lgt and 1 or 0, cfg_btm_lgt and 1 or 0,
-            cfg_asc_lgt and 1 or 0, brt, cfg_lgt_pwm,
-            cfg_lgt_mod == 1 and "interval" or "continuous",
+            cfg.dsc_lgt and 1 or 0, cfg.btm_lgt and 1 or 0,
+            cfg.asc_lgt and 1 or 0, brt, cfg.lgt_pwm,
+            cfg.lgt_mod == 1 and "interval" or "continuous",
             RC9 and "ok" or "NIL"))
-    if cfg_lgt_mod == 1 then
+    if cfg.lgt_mod == 1 then
         gcs:send_text(MAV_SEVERITY.INFO,
             string.format("DIVE: interval on=%ds off=%ds", lgt_on, lgt_off))
     end
-    if cfg_btm_dly_ms > 0 then
+    if cfg.btm_dly_ms > 0 then
         gcs:send_text(MAV_SEVERITY.INFO,
             string.format("DIVE: bottom light delay=%ds", btm_dly))
     end
@@ -596,7 +614,24 @@ local function update_telemetry(now_ms)
     local bottom_time_s = bottom_start_ms > 0
         and (now_ms - bottom_start_ms) / 1000.0 or 0
 
+    -- PREARM substatus for AGT LED control:
+    -- 0=waiting, 1=GPS ok, 2=GPS+batt ok, 3=all checks passed (prearm_passed)
+    local prearm_status = 0
+    if prearm_passed then
+        prearm_status = 3
+    elseif state == STATE_CONFIG then
+        local gs = gps:status(0)
+        local gps_good = gs and gs >= 3
+        local batt_good = batt_voltage >= (DORIS_MIN_VOLT:get() or 14.0)
+        if gps_good and batt_good then
+            prearm_status = 2
+        elseif gps_good then
+            prearm_status = 1
+        end
+    end
+
     gcs:send_named_float('STATE',    state)
+    gcs:send_named_float('PREARM',   prearm_status)
     gcs:send_named_float('DEPTH',    telem.depth)
     gcs:send_named_float('MAX_DPTH', telem.max_depth)
     gcs:send_named_float('MIN_TEMP', telem.min_temp)
@@ -704,13 +739,19 @@ function update()
         lgt_tst_start_ms = 0
     end
 
-    -- cancel: if DORIS_START was cleared while the mission is active, abort
-    if state >= STATE_MISSION_START and state <= STATE_ASCENT then
+    -- Cancel: only valid during MISSION_START (vehicle still at surface).
+    -- Underwater states (DESCENT/ON_BOTTOM/ASCENT) ignore DORIS_START=0
+    -- because the operator has no comms once submerged; a zero read
+    -- would be a parameter glitch and must not abort the mission.
+    if state == STATE_MISSION_START then
         if DORIS_START:get() <= 0 then
-            gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: CANCELLED by operator")
+            gcs:send_text(MAV_SEVERITY.WARNING,
+                "DIVE: CANCELLED by operator, returning to CONFIG")
             if RC9 then RC9:set_override(LIGHT_PWM_MIN) end
+            arming:disarm()
             ipcam_stop()
-            state = STATE_RECOVERY
+            prearm_passed = false
+            state = STATE_CONFIG
             return update, UPDATE_INTERVAL_MS
         end
     end
@@ -720,35 +761,51 @@ function update()
 
     -- ??????????????? CONFIG ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
     if state == STATE_CONFIG then
-        -- GPS self-heal: reboot if GPS has no fix after 30s (max 2 attempts)
+        -- GPS self-heal: reboot if GPS has no fix after 30s (max 2 attempts).
+        -- Suppressed when underwater on an active mission — rebooting
+        -- ArduPilot underwater resets the state machine and makes things worse.
         if not gps_reboot_attempted then
-            local boot_age_s = (now_ms - script_start_ms) / 1000.0
-            if boot_age_s >= 30 then
-                local gps_stat = gps:status(0)
-                if not gps_stat or gps_stat < 3 then
-                    local rbt = (DORIS_GPS_RBT:get() or 0) + 1
-                    gcs:send_text(MAV_SEVERITY.WARNING,
-                        string.format("DIVE: No GPS fix after 30s, reboot %d/2",
-                            rbt))
-                    DORIS_GPS_RBT:set_and_save(rbt)
-                    vehicle:reboot(false)
-                    return update, UPDATE_INTERVAL_MS
-                else
-                    gps_reboot_attempted = true
+            local depth = get_depth_m()
+            local gate  = DORIS_DPT_GAT:get() or 3.0
+            local underwater_mission = DORIS_START:get() >= 1 and depth and depth > gate
+            if underwater_mission then
+                gps_reboot_attempted = true
+                gcs:send_text(MAV_SEVERITY.WARNING,
+                    "DIVE: GPS reboot suppressed (underwater, DORIS_START=1)")
+            else
+                local boot_age_s = (now_ms - script_start_ms) / 1000.0
+                if boot_age_s >= 30 then
+                    local gps_stat = gps:status(0)
+                    if not gps_stat or gps_stat < 3 then
+                        local rbt = (DORIS_GPS_RBT:get() or 0) + 1
+                        gcs:send_text(MAV_SEVERITY.WARNING,
+                            string.format("DIVE: No GPS fix after 30s, reboot %d/2",
+                                rbt))
+                        DORIS_GPS_RBT:set_and_save(rbt)
+                        vehicle:reboot(false)
+                        return update, UPDATE_INTERVAL_MS
+                    else
+                        gps_reboot_attempted = true
+                    end
                 end
             end
         end
 
         if DORIS_START:get() >= 1 then
 
-            -- Emergency: deployed into water before pre-arm passed
+            -- Emergency: deployed into water before pre-arm passed.
+            -- Go to ASCENT (not RECOVERY) so the relay stays on for
+            -- DORIS_BRN_MIN and the vehicle is properly monitored.
             local depth = get_depth_m()
             if depth and depth > 2.0 and not prearm_passed then
                 gcs:send_text(MAV_SEVERITY.CRITICAL,
-                    "DIVE: DEPLOYED without pre-arm! Emergency weight release")
+                    "DIVE: DEPLOYED without pre-arm! Emergency weight release + ASCENT")
                 activate_relay()
+                ascent_start_ms = now_ms
+                reset_light_cycle(now_ms)
                 ipcam_stop()
-                state = STATE_RECOVERY
+                recovery_done = false
+                state = STATE_ASCENT
                 return update, UPDATE_INTERVAL_MS
             end
 
@@ -838,7 +895,7 @@ function update()
                 armed_once = true
                 gcs:send_text(MAV_SEVERITY.INFO,
                     string.format("DIVE: armed, sinking to gate (%.1fm)",
-                        cfg_dpt_gat_m))
+                        cfg.dpt_gat_m))
             end
             local depth = get_depth_m()
             if depth then
@@ -846,9 +903,9 @@ function update()
                    < UPDATE_INTERVAL_MS then
                     gcs:send_text(MAV_SEVERITY.INFO,
                         string.format("DIVE: depth=%.2fm / gate=%.1fm",
-                            depth, cfg_dpt_gat_m))
+                            depth, cfg.dpt_gat_m))
                 end
-                if depth >= cfg_dpt_gat_m then
+                if depth >= cfg.dpt_gat_m then
                     gcs:send_text(MAV_SEVERITY.INFO,
                         string.format("DIVE: gate crossed (%.2fm), mission started",
                             depth))
@@ -877,7 +934,7 @@ function update()
             arming:arm()
         end
 
-        update_lights(cfg_dsc_lgt, now_ms)
+        update_lights(cfg.dsc_lgt, now_ms)
 
         local elapsed = now_ms - dive_start_ms
         local vel = ahrs:get_velocity_NED()
@@ -894,13 +951,13 @@ function update()
                         get_depth_m() or 0, dr_count, dr_buf_size))
             end
 
-            if avg and dr_count >= dr_buf_size and avg < cfg_btm_thr_mps then
+            if avg and dr_count >= dr_buf_size and avg < cfg.btm_thr_mps then
                 gcs:send_text(MAV_SEVERITY.INFO,
                     string.format(
                         "DIVE: bottom detected! avg=%.4f m/s depth=%.1fm t=%.0fs",
                         avg, get_depth_m() or 0, elapsed / 1000.0))
                 bottom_start_ms   = now_ms
-                bottom_delay_done = cfg_btm_dly_ms <= 0
+                bottom_delay_done = cfg.btm_dly_ms <= 0
                 reset_light_cycle(now_ms)
                 ipcam_stop()
                 ipcam_btm_started = false
@@ -932,15 +989,15 @@ function update()
 
         if not bottom_delay_done then
             update_lights(false, now_ms)
-            if bottom_elapsed >= cfg_btm_dly_ms then
+            if bottom_elapsed >= cfg.btm_dly_ms then
                 bottom_delay_done = true
                 reset_light_cycle(now_ms)
                 gcs:send_text(MAV_SEVERITY.INFO,
                     string.format("DIVE: settling delay done (%.0fs), lights active",
-                        cfg_btm_dly_ms / 1000.0))
+                        cfg.btm_dly_ms / 1000.0))
             end
         else
-            update_lights(cfg_btm_lgt, now_ms)
+            update_lights(cfg.btm_lgt, now_ms)
         end
 
         -- Delayed bottom camera start (one-shot)
@@ -954,10 +1011,10 @@ function update()
         if math.fmod(bottom_elapsed, 30000) < UPDATE_INTERVAL_MS then
             gcs:send_text(MAV_SEVERITY.INFO,
                 string.format("DIVE: on bottom %.0fs / %ds",
-                    bottom_elapsed / 1000.0, cfg_rls_sec_ms / 1000))
+                    bottom_elapsed / 1000.0, cfg.rls_sec_ms / 1000))
         end
 
-        if bottom_elapsed >= cfg_rls_sec_ms then
+        if bottom_elapsed >= cfg.rls_sec_ms then
             gcs:send_text(MAV_SEVERITY.INFO,
                 string.format("DIVE: release triggered (%.1fs on bottom)",
                     bottom_elapsed / 1000.0))
@@ -977,7 +1034,7 @@ function update()
             arming:arm()
         end
 
-        update_lights(cfg_asc_lgt, now_ms)
+        update_lights(cfg.asc_lgt, now_ms)
 
         -- Relay stays on for at least DORIS_BRN_MIN seconds (default 45 min).
         -- After that, deactivate once DORIS has risen DORIS_ASC_DPT metres
@@ -1008,7 +1065,6 @@ function update()
             if gps_stat and gps_stat >= 3 then
                 gcs:send_text(MAV_SEVERITY.INFO,
                     string.format("DIVE: surface reached (GPS fix, depth=%.2fm)", depth))
-                deactivate_relay()
                 ipcam_stop()
                 state = STATE_RECOVERY
             end
@@ -1019,8 +1075,10 @@ function update()
         if RC9 then RC9:set_override(LIGHT_PWM_MIN) end
         arming:disarm()
         DORIS_START:set_and_save(0)
-        if not recovery_done and not arming:is_armed() then
-            deactivate_relay()
+        -- deactivate_relay() respects DORIS_BRN_MIN; it is a no-op until
+        -- the minimum burn time has elapsed.
+        deactivate_relay()
+        if not recovery_done and not arming:is_armed() and not relay_active then
             local total = dive_start_ms > 0
                 and (now_ms - dive_start_ms) / 1000.0 or 0
             gcs:send_text(MAV_SEVERITY.INFO,
@@ -1061,6 +1119,27 @@ do
         gcs:send_text(MAV_SEVERITY.INFO,
             string.format("DIVE: script loaded, no profile loaded, START=%d",
                 DORIS_START:get() or 0))
+    end
+end
+
+-- Reboot recovery: if DORIS_START is persisted as >=1 and we are already
+-- past the depth gate, a reboot happened mid-mission.  Skip CONFIG entirely,
+-- activate the release relay, and go straight to ASCENT.
+do
+    local start_val = DORIS_START:get() or 0
+    if start_val >= 1 then
+        local depth = get_depth_m()
+        local gate  = DORIS_DPT_GAT:get() or 3.0
+        if depth and depth > gate then
+            gcs:send_text(MAV_SEVERITY.CRITICAL,
+                string.format(
+                    "DIVE: REBOOT RECOVERY — depth %.1fm > gate %.1fm, emergency ASCENT",
+                    depth, gate))
+            activate_relay()
+            ascent_start_ms = millis():tofloat()
+            recovery_done   = false
+            state = STATE_ASCENT
+        end
     end
 end
 
