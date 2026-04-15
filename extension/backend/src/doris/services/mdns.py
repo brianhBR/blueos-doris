@@ -100,13 +100,6 @@ async def _run_host_command(command: str, timeout: float = 30.0) -> bool:
         return False
 
 
-async def is_hotspot_dns_running() -> bool:
-    """Check if our dnsmasq instance is listening on the hotspot gateway."""
-    return await _run_host_command(
-        f"sudo ss -tlnp | grep -q '{HOTSPOT_GATEWAY}:53 '"
-    )
-
-
 def _setup_avahi_hostname() -> bool:
     """Set avahi hostname to 'doris' on all physical network interfaces.
 
@@ -165,10 +158,6 @@ def _setup_avahi_hostname() -> bool:
 
 
 
-_HOTSPOT_DNS_WAIT_S = 5
-_HOTSPOT_DNS_RETRIES = 12
-
-
 async def start_hotspot_dns() -> None:
     """Start a DNS-only dnsmasq on port 53 for the hotspot interface.
 
@@ -178,9 +167,8 @@ async def start_hotspot_dns() -> None:
     bound to the hotspot gateway IP, resolving ``doris.local`` (and
     ``blueos-wifi.local``) to that same gateway.
 
-    Retries with a delay because create_ap may still be bringing up
-    the interface when this is called — dnsmasq cannot bind to the
-    gateway IP until it is actually assigned.
+    Must be called AFTER configure_hotspot() so the hotspot interface
+    actually has the gateway IP assigned.
 
     Uses ``sudo`` so that /usr/sbin is in the PATH (Commander's default
     shell PATH omits /usr/sbin where dnsmasq lives).
@@ -195,28 +183,17 @@ async def start_hotspot_dns() -> None:
         "no-resolv\n"
         "no-hosts\n"
     )
-    write_cmd = f"echo '{conf_content}' | sudo tee {HOTSPOT_DNS_CONF} > /dev/null"
-    start_cmd = (
+    cmd = (
+        f"echo '{conf_content}' | sudo tee {HOTSPOT_DNS_CONF} > /dev/null && "
         f"sudo pkill -f 'dnsmasq.*{HOTSPOT_DNS_CONF}' 2>/dev/null; sleep 1; "
         f"sudo /usr/sbin/dnsmasq --conf-file={HOTSPOT_DNS_CONF} "
         f"--pid-file={HOTSPOT_DNS_PID}"
     )
-
-    await _run_host_command(write_cmd)
-
-    for attempt in range(1, _HOTSPOT_DNS_RETRIES + 1):
-        ok = await _run_host_command(start_cmd)
-        if ok:
-            logger.info("Hotspot DNS started on %s:53 (doris.local)", HOTSPOT_GATEWAY)
-            return
-        if attempt < _HOTSPOT_DNS_RETRIES:
-            logger.info(
-                "Hotspot DNS attempt %d/%d failed (gateway IP may not be ready), retrying in %ds",
-                attempt, _HOTSPOT_DNS_RETRIES, _HOTSPOT_DNS_WAIT_S,
-            )
-            await asyncio.sleep(_HOTSPOT_DNS_WAIT_S)
-
-    logger.warning("Failed to start hotspot DNS server after %d attempts", _HOTSPOT_DNS_RETRIES)
+    ok = await _run_host_command(cmd)
+    if ok:
+        logger.info("Hotspot DNS started on %s:53 (doris.local)", HOTSPOT_GATEWAY)
+    else:
+        logger.warning("Failed to start hotspot DNS server")
 
 
 async def restart_avahi(force: bool = False) -> None:

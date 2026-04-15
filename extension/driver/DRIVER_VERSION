@@ -1,7 +1,0 @@
-driver: 88x2bu (RTL8812BU / RTL8822BU)
-source: https://github.com/morrownr/88x2bu-20210702
-commit: fecac340fb117eb979f4bb6d28e29730384c382b
-date: 2026-01-08
-kernel: 6.6.31+rpt-rpi-2712 (arm64)
-sha256: ce336377e9834b765c0f3255cf51d189b8ee80273ff75996dcd3b47db82f8b81
-fixes: WPA2 RSN IE in AP-mode beacons (clients no longer see WEP)

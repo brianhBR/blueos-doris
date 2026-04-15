@@ -320,13 +320,6 @@ class NetworkService:
         except Exception:
             pass
 
-        # -- set credentials BEFORE disabling (API rejects creds when hotspot is off) --
-        try:
-            await self._client.set_hotspot_credentials(ssid, password)
-            logger.info("Hotspot credentials set: SSID=%s", ssid)
-        except Exception as e:
-            logger.warning("Failed to set hotspot credentials: %s", e)
-
         if primary_hotspot_active:
             logger.info(
                 "Primary %s has an active hotspot (uap0); disabling all APs first",
@@ -338,24 +331,20 @@ class NetworkService:
             except Exception as e:
                 logger.warning("Global hotspot disable failed: %s", e)
 
+        # -- set credentials via the legacy (global) endpoint --
+        try:
+            await self._client.set_hotspot_credentials(ssid, password)
+            logger.info("Hotspot credentials set: SSID=%s", ssid)
+        except Exception as e:
+            logger.warning("Failed to set hotspot credentials: %s", e)
+
         # -- ensure the secondary is in hotspot (or dual) mode --
         await self._ensure_secondary_hotspot(iface_name)
-
-    async def _is_hotspot_actually_running(self, iface_name: str) -> bool:
-        """Check if the AP is genuinely serving, not just labelled 'hotspot'."""
-        try:
-            hs = await self._client._v2.wifi_hotspot_status(iface_name)
-            return bool(hs.get("enabled"))
-        except Exception:
-            return False
 
     async def _ensure_secondary_hotspot(self, iface_name: str) -> bool:
         """Ensure *iface_name* is running as a hotspot. Returns True on success.
 
         Uses the v2 mode API with a generous timeout (create_ap takes ~15s).
-        If the WiFi Manager reports the mode as "hotspot" but the AP isn't
-        actually running (no hostapd / no IP), cycles through normal first
-        to force create_ap to restart.
         """
         try:
             mode_info = await self._client.get_interface_mode(iface_name)
@@ -375,29 +364,20 @@ class NetworkService:
                 )
                 return False
 
-            target = modes_to_try[0]
-
-            if current == target and await self._is_hotspot_actually_running(iface_name):
-                logger.info("Interface %s already in %s mode and AP is running", iface_name, target)
-                return True
-
-            if current == target:
-                logger.info(
-                    "Interface %s reports %s mode but AP is not running, cycling via normal",
-                    iface_name, target,
-                )
+            for mode in modes_to_try:
+                if current == mode:
+                    logger.info("Interface %s already in %s mode", iface_name, mode)
+                    return True
                 try:
-                    await self._client.set_interface_mode(iface_name, "normal", timeout=15.0)
-                    await asyncio.sleep(2)
+                    await self._client.set_interface_mode(
+                        iface_name, mode, timeout=30.0,
+                    )
+                    logger.info("Interface %s set to %s mode", iface_name, mode)
+                    return True
                 except Exception as e:
-                    logger.warning("Failed to set normal mode on %s: %s", iface_name, e)
-
-            try:
-                await self._client.set_interface_mode(iface_name, target, timeout=30.0)
-                logger.info("Interface %s set to %s mode", iface_name, target)
-                return True
-            except Exception as e:
-                logger.warning("Failed to set %s mode on %s: %s", target, iface_name, e)
+                    logger.warning(
+                        "Failed to set %s mode on %s: %s", mode, iface_name, e,
+                    )
 
             logger.warning("All mode attempts failed for %s", iface_name)
         except Exception as e:
@@ -422,11 +402,8 @@ class NetworkService:
 
         After a dive the vehicle loses all WiFi connections.  BlueOS /
         NetworkManager may not automatically restart the AP on wlan1.
-        This watchdog detects that and brings it back.  It also ensures
-        the hotspot DNS server (dnsmasq) is running when the AP is up.
+        This watchdog detects that and brings it back.
         """
-        from .mdns import start_hotspot_dns, is_hotspot_dns_running
-
         await asyncio.sleep(AP_WATCHDOG_SETTLE_S)
         while True:
             await asyncio.sleep(AP_WATCHDOG_INTERVAL_S)
@@ -436,17 +413,14 @@ class NetworkService:
                     continue
                 hs = await self._client._v2.wifi_hotspot_status(iface)
                 if hs.get("enabled"):
-                    if not await is_hotspot_dns_running():
-                        logger.info("AP is up but hotspot DNS is not running, starting it")
-                        await start_hotspot_dns()
                     continue
                 logger.warning(
-                    "[HOTSPOT] AP on %s is down, re-asserting hotspot mode", iface,
+                    "AP on %s is down, re-asserting hotspot mode", iface,
                 )
                 if await self._ensure_secondary_hotspot(iface):
-                    logger.info("[HOTSPOT] AP on %s recovered by watchdog", iface)
+                    logger.info("AP on %s recovered by watchdog", iface)
                 else:
-                    logger.error("[HOTSPOT] watchdog failed to recover AP on %s", iface)
+                    logger.warning("AP watchdog: failed to recover %s", iface)
             except Exception as e:
                 logger.debug("AP watchdog check error: %s", e)
 
