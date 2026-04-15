@@ -320,6 +320,13 @@ class NetworkService:
         except Exception:
             pass
 
+        # -- set credentials BEFORE disabling (API rejects creds when hotspot is off) --
+        try:
+            await self._client.set_hotspot_credentials(ssid, password)
+            logger.info("Hotspot credentials set: SSID=%s", ssid)
+        except Exception as e:
+            logger.warning("Failed to set hotspot credentials: %s", e)
+
         if primary_hotspot_active:
             logger.info(
                 "Primary %s has an active hotspot (uap0); disabling all APs first",
@@ -330,13 +337,6 @@ class NetworkService:
                 logger.info("All hotspots disabled via global API")
             except Exception as e:
                 logger.warning("Global hotspot disable failed: %s", e)
-
-        # -- set credentials via the legacy (global) endpoint --
-        try:
-            await self._client.set_hotspot_credentials(ssid, password)
-            logger.info("Hotspot credentials set: SSID=%s", ssid)
-        except Exception as e:
-            logger.warning("Failed to set hotspot credentials: %s", e)
 
         # -- ensure the secondary is in hotspot (or dual) mode --
         await self._ensure_secondary_hotspot(iface_name)
@@ -402,8 +402,11 @@ class NetworkService:
 
         After a dive the vehicle loses all WiFi connections.  BlueOS /
         NetworkManager may not automatically restart the AP on wlan1.
-        This watchdog detects that and brings it back.
+        This watchdog detects that and brings it back.  It also ensures
+        the hotspot DNS server (dnsmasq) is running when the AP is up.
         """
+        from .mdns import start_hotspot_dns, is_hotspot_dns_running
+
         await asyncio.sleep(AP_WATCHDOG_SETTLE_S)
         while True:
             await asyncio.sleep(AP_WATCHDOG_INTERVAL_S)
@@ -413,14 +416,17 @@ class NetworkService:
                     continue
                 hs = await self._client._v2.wifi_hotspot_status(iface)
                 if hs.get("enabled"):
+                    if not await is_hotspot_dns_running():
+                        logger.info("[HOTSPOT] AP is up but hotspot DNS is not running, starting it")
+                        await start_hotspot_dns()
                     continue
                 logger.warning(
-                    "AP on %s is down, re-asserting hotspot mode", iface,
+                    "[HOTSPOT] AP on %s is down, re-asserting hotspot mode", iface,
                 )
                 if await self._ensure_secondary_hotspot(iface):
-                    logger.info("AP on %s recovered by watchdog", iface)
+                    logger.info("[HOTSPOT] AP on %s recovered by watchdog", iface)
                 else:
-                    logger.warning("AP watchdog: failed to recover %s", iface)
+                    logger.error("[HOTSPOT] watchdog failed to recover AP on %s", iface)
             except Exception as e:
                 logger.debug("AP watchdog check error: %s", e)
 

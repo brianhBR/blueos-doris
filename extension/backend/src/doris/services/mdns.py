@@ -25,8 +25,10 @@ logger = logging.getLogger(__name__)
 
 AVAHI_CONF = Path("/tmp/avahi/avahi-daemon.conf")
 
-# create_ap assigns this gateway IP to the hotspot interface (wlan1).
-HOTSPOT_GATEWAY = "192.168.43.1"
+# create_ap assigns a gateway IP to the hotspot interface (wlan1).
+# It's usually 192.168.43.1 but can be 192.168.42.1 on some setups.
+HOTSPOT_GATEWAYS = ["192.168.43.1", "192.168.42.1"]
+HOTSPOT_GATEWAY = HOTSPOT_GATEWAYS[0]  # default, updated at runtime
 
 # Separate dnsmasq instance for standard DNS (port 53) on the hotspot.
 # create_ap's own dnsmasq only listens on port 5353 (mDNS), so clients
@@ -107,6 +109,19 @@ async def is_hotspot_dns_running() -> bool:
     )
 
 
+async def _detect_gateway_ip() -> str | None:
+    """Find which hotspot gateway IP is assigned, if any.
+
+    Updates the module-level HOTSPOT_GATEWAY when found.
+    """
+    global HOTSPOT_GATEWAY
+    for gw in HOTSPOT_GATEWAYS:
+        if await _run_host_command(f"ip addr show | grep -q '{gw}'"):
+            HOTSPOT_GATEWAY = gw
+            return gw
+    return None
+
+
 def _setup_avahi_hostname() -> bool:
     """Set avahi hostname to 'doris' on all physical network interfaces.
 
@@ -185,33 +200,49 @@ async def start_hotspot_dns() -> None:
     Uses ``sudo`` so that /usr/sbin is in the PATH (Commander's default
     shell PATH omits /usr/sbin where dnsmasq lives).
     """
-    conf_content = (
-        f"listen-address={HOTSPOT_GATEWAY}\n"
-        "port=53\n"
-        "bind-interfaces\n"
-        "no-dhcp-interface=wlan1\n"
-        f"address=/doris.local/{HOTSPOT_GATEWAY}\n"
-        f"address=/blueos-wifi.local/{HOTSPOT_GATEWAY}\n"
-        "no-resolv\n"
-        "no-hosts\n"
-    )
-    write_cmd = f"echo '{conf_content}' | sudo tee {HOTSPOT_DNS_CONF} > /dev/null"
-    start_cmd = (
-        f"sudo pkill -f 'dnsmasq.*{HOTSPOT_DNS_CONF}' 2>/dev/null; sleep 1; "
-        f"sudo /usr/sbin/dnsmasq --conf-file={HOTSPOT_DNS_CONF} "
-        f"--pid-file={HOTSPOT_DNS_PID}"
-    )
-
-    await _run_host_command(write_cmd)
-
     for attempt in range(1, _HOTSPOT_DNS_RETRIES + 1):
+        gw = await _detect_gateway_ip()
+        if not gw:
+            if attempt < _HOTSPOT_DNS_RETRIES:
+                logger.info(
+                    "Hotspot DNS attempt %d/%d: no gateway IP (%s) assigned yet, retrying in %ds",
+                    attempt, _HOTSPOT_DNS_RETRIES,
+                    "/".join(HOTSPOT_GATEWAYS), _HOTSPOT_DNS_WAIT_S,
+                )
+                await asyncio.sleep(_HOTSPOT_DNS_WAIT_S)
+                continue
+            logger.warning(
+                "Hotspot DNS: no gateway IP appeared after %d attempts; "
+                "AP watchdog will retry later when the AP comes up",
+                _HOTSPOT_DNS_RETRIES,
+            )
+            return
+
+        conf_content = (
+            f"listen-address={gw}\n"
+            "port=53\n"
+            "bind-interfaces\n"
+            "no-dhcp-interface=wlan1\n"
+            f"address=/doris.local/{gw}\n"
+            f"address=/blueos-wifi.local/{gw}\n"
+            "no-resolv\n"
+            "no-hosts\n"
+        )
+        write_cmd = f"echo '{conf_content}' | sudo tee {HOTSPOT_DNS_CONF} > /dev/null"
+        start_cmd = (
+            f"sudo pkill -f 'dnsmasq.*{HOTSPOT_DNS_CONF}' 2>/dev/null; sleep 1; "
+            f"sudo /usr/sbin/dnsmasq --conf-file={HOTSPOT_DNS_CONF} "
+            f"--pid-file={HOTSPOT_DNS_PID}"
+        )
+        await _run_host_command(write_cmd)
+
         ok = await _run_host_command(start_cmd)
         if ok:
-            logger.info("Hotspot DNS started on %s:53 (doris.local)", HOTSPOT_GATEWAY)
+            logger.info("Hotspot DNS started on %s:53 (doris.local)", gw)
             return
         if attempt < _HOTSPOT_DNS_RETRIES:
             logger.info(
-                "Hotspot DNS attempt %d/%d failed (gateway IP may not be ready), retrying in %ds",
+                "Hotspot DNS attempt %d/%d failed (port 53 may be in use), retrying in %ds",
                 attempt, _HOTSPOT_DNS_RETRIES, _HOTSPOT_DNS_WAIT_S,
             )
             await asyncio.sleep(_HOTSPOT_DNS_WAIT_S)
