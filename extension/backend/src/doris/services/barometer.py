@@ -80,6 +80,36 @@ class BarometerService:
             logger.warning("Failed to detect barometer/thermometer: %s", e)
             return []
 
+    async def calibrate_surface(self) -> dict:
+        """Trigger a surface pressure calibration via MAV_CMD_PREFLIGHT_CALIBRATION (param3=3)."""
+        base = blueos_services.mavlink2rest
+        url = f"{base}/mavlink"
+        payload = {
+            "header": {"system_id": 255, "component_id": 0, "sequence": 0},
+            "message": {
+                "type": "COMMAND_LONG",
+                "param1": 0.0,
+                "param2": 0.0,
+                "param3": 3.0,
+                "param4": 0.0,
+                "param5": 0.0,
+                "param6": 0.0,
+                "param7": 0.0,
+                "command": {"type": "MAV_CMD_PREFLIGHT_CALIBRATION"},
+                "target_system": 1,
+                "target_component": 1,
+                "confirmation": 0,
+            },
+        }
+        try:
+            resp = await self.client.post(url, json=payload)
+            resp.raise_for_status()
+            logger.info("Surface pressure calibration command sent")
+            return {"success": True, "message": "Surface calibration triggered"}
+        except Exception as e:
+            logger.warning("Failed to send surface calibration command: %s", e)
+            return {"success": False, "error": str(e)}
+
     async def close(self) -> None:
         if self._client is not None and not self._client.is_closed:
             await self._client.aclose()
