@@ -9,6 +9,7 @@ from robyn.openapi import Contact, OpenAPI, OpenAPIInfo
 
 from .config import settings
 from .services.network import NetworkService
+from .services.persistent_log import setup_persistent_logging, start_dmesg_capture
 from .routes import (
     register_artemis_routes,
     register_attitude_routes,
@@ -16,6 +17,7 @@ from .routes import (
     register_configuration_routes,
     register_dive_routes,
     register_frame_routes,
+    register_log_routes,
     register_media_routes,
     register_mission_routes,
     register_network_routes,
@@ -86,6 +88,8 @@ async def _restart_autopilot(logger: logging.Logger) -> None:
 def create_app() -> Robyn:
     """Create and configure the Robyn application."""
 
+    setup_persistent_logging()
+
     # Create app with OpenAPI documentation
     app = Robyn(
         file_object=__file__,
@@ -122,6 +126,8 @@ def create_app() -> Robyn:
     register_dive_routes(app)
     register_frame_routes(app)
     register_notification_routes(app)
+
+    register_log_routes(app)
 
     # Register WebSocket routes
     register_attitude_routes(app)
@@ -190,7 +196,9 @@ def create_app() -> Robyn:
             logger.warning("USB storage probe skipped: %s", e)
 
         timesync_service.start_background_sync()
+        start_dmesg_capture()
 
+        logger.info("DORIS backend startup complete")
         asyncio.get_event_loop().create_task(_restart_autopilot(logger))
 
     # Serve frontend static files if they exist

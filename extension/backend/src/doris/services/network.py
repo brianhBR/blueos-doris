@@ -441,12 +441,12 @@ class NetworkService:
                         await start_hotspot_dns()
                     continue
                 logger.warning(
-                    "AP on %s is down, re-asserting hotspot mode", iface,
+                    "[HOTSPOT] AP on %s is down, re-asserting hotspot mode", iface,
                 )
                 if await self._ensure_secondary_hotspot(iface):
-                    logger.info("AP on %s recovered by watchdog", iface)
+                    logger.info("[HOTSPOT] AP on %s recovered by watchdog", iface)
                 else:
-                    logger.warning("AP watchdog: failed to recover %s", iface)
+                    logger.error("[HOTSPOT] watchdog failed to recover AP on %s", iface)
             except Exception as e:
                 logger.debug("AP watchdog check error: %s", e)
 

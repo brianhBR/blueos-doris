@@ -111,10 +111,10 @@ def try_mount() -> bool:
             if result.returncode == 0:
                 _mounted = True
                 _device = dev
-                logger.info("USB mounted: %s -> %s", dev, mp)
+                logger.info("[USB] mounted: %s -> %s", dev, mp)
                 return True
             err = (result.stderr or b"").decode(errors="replace").strip()
-            logger.debug("mount %s failed: %s", dev, err)
+            logger.warning("[USB] mount %s failed (rc=%d): %s", dev, result.returncode, err)
 
         _mounted = False
         _device = None
@@ -128,7 +128,7 @@ def unmount() -> None:
         mp = _mount_point()
         if is_mounted():
             subprocess.run(["umount", mp], capture_output=True, timeout=10, check=False)
-            logger.info("USB unmounted from %s", mp)
+            logger.info("[USB] unmounted from %s", mp)
         _mounted = False
         _device = None
 
@@ -297,7 +297,7 @@ def _probe_loop() -> None:
             try:
                 try_mount()
             except Exception as e:
-                logger.debug("USB probe error: %s", e)
+                logger.warning("[USB] probe error: %s", e)
         _stop_probe.wait(_probe_interval_s())
 
 

@@ -311,7 +311,6 @@ else
 end
 
 -- HTTP recorder client (Companion / BlueOS DORIS extension)
--- IPCAM: HOST=127.0.0.1, BIND_PORT=9979 (inlined)
 local ipcam_recording      = false
 local ipcam_btm_started    = false
 
@@ -661,7 +660,7 @@ local function ipcam_http_send(first_line, host, port)
         return true
     end
     local sock = Socket(0)
-    if not sock:bind("0.0.0.0", 9979) then
+    if not sock:bind("0.0.0.0", 0) then
         gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: IPcam bind failed")
         sock:close()
         return false
@@ -694,6 +693,9 @@ local function ipcam_start()
     if not ipcam_cfg.rec_en then return end
     if ipcam_http_start("127.0.0.1", 8095, 1800) then
         ipcam_recording = true
+        gcs:send_text(MAV_SEVERITY.INFO, "DIVE: IPcam recording started")
+    else
+        gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: IPcam recording start FAILED")
     end
 end
 
@@ -701,6 +703,7 @@ local function ipcam_stop()
     if not ipcam_recording then return end
     ipcam_http_stop("127.0.0.1", 8095)
     ipcam_recording = false
+    gcs:send_text(MAV_SEVERITY.INFO, "DIVE: IPcam recording stopped")
 end
 
 -- ?????????? main loop ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
@@ -868,8 +871,12 @@ function update()
         if check_failsafes() then
             ascent_start_ms = now_ms
             reset_light_cycle(now_ms)
-            ipcam_stop()
-            if ipcam_cfg.asc_rec then ipcam_start() end
+            if ipcam_cfg.asc_rec then
+                ipcam_recording = false
+                ipcam_start()
+            else
+                ipcam_stop()
+            end
             state = STATE_ASCENT
             return update, UPDATE_INTERVAL_MS
         end
@@ -923,8 +930,12 @@ function update()
         if check_failsafes() then
             ascent_start_ms = now_ms
             reset_light_cycle(now_ms)
-            ipcam_stop()
-            if ipcam_cfg.asc_rec then ipcam_start() end
+            if ipcam_cfg.asc_rec then
+                ipcam_recording = false
+                ipcam_start()
+            else
+                ipcam_stop()
+            end
             state = STATE_ASCENT
             return update, UPDATE_INTERVAL_MS
         end
@@ -959,11 +970,13 @@ function update()
                 bottom_start_ms   = now_ms
                 bottom_delay_done = cfg.btm_dly_ms <= 0
                 reset_light_cycle(now_ms)
-                ipcam_stop()
                 ipcam_btm_started = false
                 if ipcam_cfg.btm_rec and ipcam_cfg.cam_btm_dly_ms <= 0 then
+                    ipcam_recording = false
                     ipcam_start()
-                    ipcam_btm_started = true
+                    ipcam_btm_started = ipcam_recording
+                elseif ipcam_recording then
+                    ipcam_stop()
                 end
                 state = STATE_ON_BOTTOM
             end
@@ -974,8 +987,12 @@ function update()
         if check_failsafes() then
             ascent_start_ms = now_ms
             reset_light_cycle(now_ms)
-            ipcam_stop()
-            if ipcam_cfg.asc_rec then ipcam_start() end
+            if ipcam_cfg.asc_rec then
+                ipcam_recording = false
+                ipcam_start()
+            else
+                ipcam_stop()
+            end
             state = STATE_ASCENT
             return update, UPDATE_INTERVAL_MS
         end
@@ -1000,12 +1017,12 @@ function update()
             update_lights(cfg.btm_lgt, now_ms)
         end
 
-        -- Delayed bottom camera start (one-shot)
-        if ipcam_cfg.btm_rec and not ipcam_btm_started
-           and ipcam_cfg.cam_btm_dly_ms > 0
-           and bottom_elapsed >= ipcam_cfg.cam_btm_dly_ms then
+        -- Bottom camera start: handles both delayed first attempt and retries
+        if ipcam_cfg.btm_rec and not ipcam_recording
+           and (ipcam_cfg.cam_btm_dly_ms <= 0
+                or bottom_elapsed >= ipcam_cfg.cam_btm_dly_ms) then
             ipcam_start()
-            ipcam_btm_started = true
+            ipcam_btm_started = ipcam_recording
         end
 
         if math.fmod(bottom_elapsed, 30000) < UPDATE_INTERVAL_MS then
@@ -1021,8 +1038,12 @@ function update()
             activate_relay()
             ascent_start_ms = now_ms
             reset_light_cycle(now_ms)
-            ipcam_stop()
-            if ipcam_cfg.asc_rec then ipcam_start() end
+            if ipcam_cfg.asc_rec then
+                ipcam_recording = false
+                ipcam_start()
+            else
+                ipcam_stop()
+            end
             state = STATE_ASCENT
         end
 

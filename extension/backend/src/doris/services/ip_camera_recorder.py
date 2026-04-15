@@ -144,7 +144,21 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
 
     async with _lock:
         if _process is not None and _process.returncode is None:
-            return {"success": False, "message": "Already recording", "recording": True}
+            logger.info("Auto-stopping previous recording before starting new segment")
+            try:
+                _process.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(_process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("Previous ffmpeg did not exit after SIGINT, killing")
+                try:
+                    _process.kill()
+                    await _process.wait()
+                except ProcessLookupError:
+                    pass
+            _process = None
 
         out_dir, storage = _output_dir()
         stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -166,16 +180,20 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
                 stderr=asyncio.subprocess.PIPE,
             )
         except FileNotFoundError:
+            logger.error("[VIDEO] ffmpeg binary not found — recording unavailable")
             return {"success": False, "message": "ffmpeg not found", "recording": False}
         except Exception as e:
-            logger.exception("ffmpeg start failed")
+            logger.exception("[VIDEO] ffmpeg start failed")
             return {"success": False, "message": str(e), "recording": False}
 
         await asyncio.sleep(0.35)
         if proc.returncode is not None:
             err_bytes = await proc.stderr.read() if proc.stderr else b""
             err_text = err_bytes.decode(errors="replace").strip()
-            logger.error("ffmpeg exited immediately rc=%s stderr=%s", proc.returncode, err_text)
+            logger.error(
+                "[VIDEO] ffmpeg exited immediately rc=%s rtsp=%s stderr=%s",
+                proc.returncode, rtsp, err_text[:500],
+            )
             return {
                 "success": False,
                 "message": f"ffmpeg exited with {proc.returncode}: {err_text[:300]}",
@@ -189,10 +207,15 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
                 line = await p.stderr.readline()
                 if not line:
                     break
-                logger.warning("ffmpeg: %s", line.decode(errors="replace").rstrip())
+                decoded = line.decode(errors="replace").rstrip()
+                lower = decoded.lower()
+                if any(w in lower for w in ("error", "fail", "broken", "timeout", "refused")):
+                    logger.error("[VIDEO] ffmpeg: %s", decoded)
+                else:
+                    logger.debug("[VIDEO] ffmpeg: %s", decoded)
             rc = await p.wait()
             if rc != 0 and rc != -2:
-                logger.error("ffmpeg exited unexpectedly rc=%s", rc)
+                logger.error("[VIDEO] ffmpeg exited unexpectedly rc=%s (pattern=%s)", rc, pattern)
 
         global _stderr_task
         _stderr_task = asyncio.create_task(_drain_stderr(proc))

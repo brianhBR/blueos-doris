@@ -68,11 +68,11 @@ async def _run_host_command(command: str, timeout: float = 30.0) -> tuple[bool, 
             out = data.get("stdout", "").strip("'\"").replace("\\n", "\n").strip()
             err = data.get("stderr", "").strip("'\"").replace("\\n", "\n").strip()
             if rc != 0:
-                logger.warning("Command returned %d: %s %s", rc, out, err)
+                logger.warning("[WIFI] host command returned %d: cmd=%s out=%s err=%s", rc, command[:80], out[:200], err[:200])
                 return False, err or out
             return True, out
     except Exception as e:
-        logger.warning("Commander command failed (%s): %s", command[:60], e)
+        logger.warning("[WIFI] Commander command failed (%s): %s", command[:80], e)
         return False, str(e)
 
 
@@ -196,7 +196,7 @@ async def setup_wifi_driver() -> None:
     - If the driver is loaded AND matches, skip everything.
     """
     if not DRIVER_SRC.is_file():
-        logger.info("No %s.ko found at %s, skipping driver setup", DRIVER_MODULE, DRIVER_SRC)
+        logger.info("[WIFI] No %s.ko found at %s, skipping driver setup", DRIVER_MODULE, DRIVER_SRC)
         return
 
     if await _is_driver_loaded():
@@ -204,11 +204,11 @@ async def setup_wifi_driver() -> None:
         bundled = _bundled_driver_hash()
         if installed and bundled and installed == bundled:
             logger.info(
-                "%s driver loaded and up-to-date (hash %s…)", DRIVER_MODULE, installed[:12],
+                "[WIFI] %s driver loaded and up-to-date (hash %s…)", DRIVER_MODULE, installed[:12],
             )
             return
         logger.info(
-            "%s driver loaded but outdated (installed=%s… bundled=%s…), upgrading",
+            "[WIFI] %s driver loaded but outdated (installed=%s… bundled=%s…), upgrading",
             DRIVER_MODULE,
             (installed or "?")[:12],
             (bundled or "?")[:12],
@@ -216,7 +216,11 @@ async def setup_wifi_driver() -> None:
         await _upgrade_driver()
         return
 
-    logger.info("Installing %s driver (first boot or driver missing)", DRIVER_MODULE)
+    logger.info("[WIFI] Installing %s driver (first boot or driver missing)", DRIVER_MODULE)
     await _blacklist_conflicting_drivers()
     await _unload_conflicting_drivers()
-    await _install_driver()
+    ok = await _install_driver()
+    if ok:
+        logger.info("[WIFI] driver setup completed successfully")
+    else:
+        logger.error("[WIFI] driver setup FAILED — WiFi adapter may not work")
