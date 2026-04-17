@@ -121,7 +121,7 @@ assert(param:add_param(73, 27, "BTM_REC",  0),    "DORIS_BTM_REC")
 assert(param:add_param(73, 28, "ASC_REC",  0),    "DORIS_ASC_REC")
 assert(param:add_param(73, 29, "CAM_DLY",  0),    "DORIS_CAM_DLY")
 -- relay safety
-assert(param:add_param(73, 30, "BRN_MIN", 2700),  "DORIS_BRN_MIN")
+assert(param:add_param(73, 30, "BRN_MIN", 7200),  "DORIS_BRN_MIN")
 assert(param:add_param(73, 31, "ASC_DPT", 10),    "DORIS_ASC_DPT")
 
 
@@ -1001,12 +1001,12 @@ function update()
 
         update_lights(cfg_asc_lgt, now_ms)
 
-        -- Relay stays on for at least DORIS_BRN_MIN seconds (default 45 min).
+        -- Relay stays on for at least DORIS_BRN_MIN seconds (default 2 hrs).
         -- After that, deactivate once DORIS has risen DORIS_ASC_DPT metres
         -- above the deepest depth recorded during the dive (telem.max_depth).
         if relay_active then
             local burn_elapsed = now_ms - ascent_start_ms
-            local brn_min_ms = (DORIS_BRN_MIN:get() or 2700) * 1000
+            local brn_min_ms = (DORIS_BRN_MIN:get() or 7200) * 1000
             if burn_elapsed >= brn_min_ms then
                 local depth = get_depth_m()
                 local threshold = telem.max_depth - (DORIS_ASC_DPT:get() or 10)
