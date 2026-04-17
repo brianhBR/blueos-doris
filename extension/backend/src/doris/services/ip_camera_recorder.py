@@ -125,6 +125,39 @@ def _build_ffmpeg_args(rtsp_url: str, segment_s: int, pattern: str) -> list[str]
     return args
 
 
+async def _try_launch_ffmpeg(
+    rtsp_url: str, seg: int, pattern: str, label: str,
+) -> tuple[asyncio.subprocess.Process | None, str]:
+    """Spawn ffmpeg and wait briefly to confirm it stays alive.
+
+    Returns ``(process, "")`` on success, or ``(None, error_text)`` on failure.
+    """
+    cmd = _build_ffmpeg_args(rtsp_url, seg, pattern)
+    logger.info("Starting IP camera recorder (%s): %s", label, " ".join(cmd[:12]) + " ... " + pattern)
+
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        return None, "ffmpeg not found"
+    except Exception as e:
+        logger.exception("ffmpeg start failed")
+        return None, str(e)
+
+    await asyncio.sleep(0.35)
+    if proc.returncode is not None:
+        err_bytes = await proc.stderr.read() if proc.stderr else b""
+        err_text = err_bytes.decode(errors="replace").strip()
+        logger.error("ffmpeg exited immediately rc=%s url=%s stderr=%s", proc.returncode, rtsp_url, err_text[:500])
+        return None, f"ffmpeg exited with {proc.returncode}: {err_text[:300]}"
+
+    return proc, ""
+
+
 async def start_recording(segment_seconds: int | None = None) -> dict:
     """Start ffmpeg segment recording. Each /start after /stop uses a new basename."""
     global _process, _last_pattern
@@ -135,12 +168,10 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
     seg = max(1, min(seg, 86_400))
 
     mcm_url = await _discover_mcm_rtsp()
+    rtsp_candidates: list[tuple[str, str]] = []
     if mcm_url:
-        rtsp = mcm_url
-        logger.info("Using MCM RTSP relay: %s", rtsp)
-    else:
-        rtsp = IPCAM_RTSP_DIRECT
-        logger.warning("MCM RTSP relay not found, falling back to direct camera URL")
+        rtsp_candidates.append((mcm_url, "mcm-relay"))
+    rtsp_candidates.append((IPCAM_RTSP_DIRECT, "direct"))
 
     async with _lock:
         if _process is not None and _process.returncode is None:
@@ -165,36 +196,17 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
         pattern = str(out_dir / f"radcam_{stamp}_%03d.ts")
         _last_pattern = pattern
 
-        cmd = _build_ffmpeg_args(rtsp, seg, pattern)
-        logger.info(
-            "Starting IP camera recorder (%s): %s",
-            storage,
-            " ".join(cmd[:12]) + " ... " + pattern,
-        )
-
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-            )
-        except FileNotFoundError:
-            return {"success": False, "message": "ffmpeg not found", "recording": False}
-        except Exception as e:
-            logger.exception("ffmpeg start failed")
-            return {"success": False, "message": str(e), "recording": False}
-
-        await asyncio.sleep(0.35)
-        if proc.returncode is not None:
-            err_bytes = await proc.stderr.read() if proc.stderr else b""
-            err_text = err_bytes.decode(errors="replace").strip()
-            logger.error("ffmpeg exited immediately rc=%s stderr=%s", proc.returncode, err_text)
-            return {
-                "success": False,
-                "message": f"ffmpeg exited with {proc.returncode}: {err_text[:300]}",
-                "recording": False,
-            }
+        last_err = ""
+        for rtsp_url, source in rtsp_candidates:
+            logger.info("Trying RTSP source: %s (%s)", source, rtsp_url)
+            proc, err = await _try_launch_ffmpeg(rtsp_url, seg, pattern, f"{storage}/{source}")
+            if proc is not None:
+                break
+            last_err = err
+            if len(rtsp_candidates) > 1:
+                logger.warning("RTSP source %s failed (%s), trying next", source, err[:200])
+        else:
+            return {"success": False, "message": last_err, "recording": False}
 
         async def _drain_stderr(p: asyncio.subprocess.Process) -> None:
             """Log ffmpeg stderr lines in background; log exit when it dies."""
@@ -218,6 +230,7 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
             "output_directory": str(out_dir),
             "storage": storage,
             "segment_seconds": seg,
+            "rtsp_source": source,
         }
 
 
