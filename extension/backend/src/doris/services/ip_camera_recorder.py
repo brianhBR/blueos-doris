@@ -144,7 +144,21 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
 
     async with _lock:
         if _process is not None and _process.returncode is None:
-            return {"success": False, "message": "Already recording", "recording": True}
+            logger.info("Auto-stopping previous recording before starting new segment")
+            try:
+                _process.send_signal(signal.SIGINT)
+            except ProcessLookupError:
+                pass
+            try:
+                await asyncio.wait_for(_process.wait(), timeout=5.0)
+            except asyncio.TimeoutError:
+                logger.warning("Previous ffmpeg did not exit after SIGINT, killing")
+                try:
+                    _process.kill()
+                    await _process.wait()
+                except ProcessLookupError:
+                    pass
+            _process = None
 
         out_dir, storage = _output_dir()
         stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
