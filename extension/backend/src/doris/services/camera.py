@@ -219,7 +219,7 @@ class CameraService:
         _logger = _logging.getLogger(__name__)
 
         from . import ip_camera_recorder as _iprec
-        if _iprec._process is not None and _iprec._process.returncode is None:
+        if _iprec.is_recording():
             _logger.debug("Snapshot skipped — IP camera recorder is active")
             return None
 

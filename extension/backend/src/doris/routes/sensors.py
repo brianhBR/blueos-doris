@@ -47,7 +47,7 @@ def register_sensor_routes(app: Robyn) -> None:
     async def camera_snapshot(request):
         """Proxy a JPEG snapshot from the Camera Manager for the sensor page preview."""
         from doris.services import ip_camera_recorder as _iprec
-        if _iprec._process is not None and _iprec._process.returncode is None:
+        if _iprec.is_recording():
             return Response(
                 status_code=409,
                 description=json.dumps({"error": "Snapshot disabled while IP camera recorder is active"}),

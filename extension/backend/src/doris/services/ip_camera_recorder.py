@@ -59,6 +59,12 @@ _process: asyncio.subprocess.Process | None = None
 _stderr_task: asyncio.Task | None = None
 _lock = asyncio.Lock()
 _last_pattern: str | None = None
+_recording_active: bool = False
+
+
+def is_recording() -> bool:
+    """Thread/task-safe flag — no lock needed. Use this instead of poking _process."""
+    return _recording_active
 
 
 def _data_root() -> Path:
@@ -220,9 +226,10 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
             if rc != 0 and rc != -2:
                 logger.error("ffmpeg exited unexpectedly rc=%s", rc)
 
-        global _stderr_task
+        global _stderr_task, _recording_active
         _stderr_task = asyncio.create_task(_drain_stderr(proc))
         _process = proc
+        _recording_active = True
         return {
             "success": True,
             "recording": True,
@@ -236,9 +243,10 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
 
 async def stop_recording() -> dict:
     """Signal ffmpeg to finalize segments (SIGINT), then kill if needed."""
-    global _process
+    global _process, _recording_active
 
     async with _lock:
+        _recording_active = False
         proc = _process
         _process = None
         if proc is None or proc.returncode is not None:
