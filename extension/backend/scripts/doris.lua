@@ -748,13 +748,19 @@ function update()
         lgt_tst_start_ms = 0
     end
 
-    -- cancel: if DORIS_START was cleared while the mission is active, abort
+    -- cancel: if DORIS_START was cleared while the mission is active, abort.
+    -- Returns to CONFIG so the vehicle can be re-armed for another dive
+    -- without a script restart.
     if state >= STATE_MISSION_START and state <= STATE_ASCENT then
         if DORIS_START:get() <= 0 then
             gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: CANCELLED by operator")
+            deactivate_relay()
             if RC9 then RC9:set_override(LIGHT_PWM_MIN) end
             ipcam_stop()
-            state = STATE_RECOVERY
+            arming:disarm()
+            prearm_passed = false
+            armed_once = false
+            state = STATE_CONFIG
             return update, UPDATE_INTERVAL_MS
         end
     end
