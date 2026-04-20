@@ -122,7 +122,10 @@ assert(param:add_param(73, 28, "ASC_REC",  0),    "DORIS_ASC_REC")
 assert(param:add_param(73, 29, "CAM_DLY",  0),    "DORIS_CAM_DLY")
 -- relay safety
 assert(param:add_param(73, 30, "BRN_MIN", 7200),  "DORIS_BRN_MIN")
-assert(param:add_param(73, 31, "ASC_DPT", 10),    "DORIS_ASC_DPT")
+assert(param:add_param(73, 31, "ASC_DPT", 10),    "DORIS_ASC_DPT")  -- deprecated: kept for param-file compat
+-- ascent confirmation (velocity-based relay deactivation)
+assert(param:add_param(73, 32, "ASC_THR", 10),    "DORIS_ASC_THR")  -- cm/s sustained upward velocity
+assert(param:add_param(73, 33, "ASC_AVG", 120),   "DORIS_ASC_AVG")  -- averaging window in seconds
 
 
 local DORIS_START    = Parameter("DORIS_START")
@@ -149,7 +152,9 @@ local DORIS_MAX_DPTH = Parameter("DORIS_MAX_DPTH")
 local DORIS_LGT_TST  = Parameter("DORIS_LGT_TST")
 local DORIS_GPS_RBT  = Parameter("DORIS_GPS_RBT")
 local DORIS_BRN_MIN  = Parameter("DORIS_BRN_MIN")
-local DORIS_ASC_DPT  = Parameter("DORIS_ASC_DPT")
+local DORIS_ASC_DPT  = Parameter("DORIS_ASC_DPT")  -- deprecated
+local DORIS_ASC_THR  = Parameter("DORIS_ASC_THR")
+local DORIS_ASC_AVG  = Parameter("DORIS_ASC_AVG")
 
 -- GPS self-heal: reboot up to 2 times if the GPS driver never receives
 -- data.  DORIS_GPS_RBT counts reboots and persists in EEPROM so the
@@ -235,6 +240,39 @@ local function get_avg_dr()
         sum = sum + dr_buffer[i]
     end
     return sum / dr_count
+end
+
+-- ?????????? ascent-rate circular buffer (relay deactivation confirmation) ?????????????????????????????????
+local ar_buffer   = {}
+local ar_idx      = 0
+local ar_count    = 0
+local ar_buf_size = 240
+
+local function init_ar_buffer(window_sec)
+    ar_buf_size = math.max(math.ceil(window_sec / (UPDATE_INTERVAL_MS / 1000.0)), 10)
+    ar_buffer = {}
+    ar_idx    = 0
+    ar_count  = 0
+    for i = 1, ar_buf_size do
+        ar_buffer[i] = 0
+    end
+end
+
+local function add_ar_sample(rate)
+    ar_idx = (ar_idx % ar_buf_size) + 1
+    ar_buffer[ar_idx] = rate
+    if ar_count < ar_buf_size then
+        ar_count = ar_count + 1
+    end
+end
+
+local function get_avg_ar()
+    if ar_count == 0 then return nil end
+    local sum = 0
+    for i = 1, ar_count do
+        sum = sum + ar_buffer[i]
+    end
+    return sum / ar_count
 end
 
 -- ?????????? runtime state ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
@@ -607,17 +645,19 @@ local function update_telemetry(now_ms)
     gcs:send_named_float('BATT_PCT', telem.batt_pct)
     gcs:send_named_float('MSN_TIME', mission_time_s)
     gcs:send_named_float('RELAY',    relay_active and 1 or 0)
+    local ar_avg = get_avg_ar() or 0
+    gcs:send_named_float('ASC_VEL',  ar_avg)
 
     -- dataflash logging (written to ArduPilot .bin log)
     local interval = param:get("DORIS_LOG_INTV") or 1000
     if now_ms - telem.last_log_ms >= interval then
         telem.last_log_ms = now_ms
         logger:write('DORS',
-            'Sta,Dep,MaxD,Tmp,DscR,AscR,BatV,BatP,Msn,Rly',
-            'ffffffffff',
+            'Sta,Dep,MaxD,Tmp,DscR,AscR,BatV,BatP,Msn,Rly,AscV',
+            'fffffffffff',
             state, telem.depth, telem.max_depth, telem.min_temp,
             telem.dsc_rate, telem.asc_rate, batt_voltage, telem.batt_pct,
-            mission_time_s, relay_active and 1 or 0)
+            mission_time_s, relay_active and 1 or 0, ar_avg)
     end
 end
 
@@ -745,14 +785,20 @@ function update()
 
         if DORIS_START:get() >= 1 then
 
-            -- Emergency: deployed into water before pre-arm passed
+            -- Emergency: deployed into water before pre-arm passed.
+            -- Go to ASCENT (not RECOVERY) so the relay stays on for
+            -- BRN_MIN and the vehicle is properly monitored.
             local depth = get_depth_m()
             if depth and depth > 2.0 and not prearm_passed then
                 gcs:send_text(MAV_SEVERITY.CRITICAL,
-                    "DIVE: DEPLOYED without pre-arm! Emergency weight release")
+                    "DIVE: DEPLOYED without pre-arm! Emergency weight release + ASCENT")
                 activate_relay()
+                ascent_start_ms = now_ms
+                init_ar_buffer(DORIS_ASC_AVG:get() or 120)
+                reset_light_cycle(now_ms)
                 ipcam_stop()
-                state = STATE_RECOVERY
+                recovery_done = false
+                state = STATE_ASCENT
                 return update, UPDATE_INTERVAL_MS
             end
 
@@ -814,6 +860,7 @@ function update()
     elseif state == STATE_MISSION_START then
         if check_failsafes() then
             ascent_start_ms = now_ms
+            init_ar_buffer(DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
             if ipcam_cfg.asc_rec then
                 ipcam_recording = false
@@ -873,6 +920,7 @@ function update()
     elseif state == STATE_DESCENT then
         if check_failsafes() then
             ascent_start_ms = now_ms
+            init_ar_buffer(DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
             if ipcam_cfg.asc_rec then
                 ipcam_recording = false
@@ -930,6 +978,7 @@ function update()
     elseif state == STATE_ON_BOTTOM then
         if check_failsafes() then
             ascent_start_ms = now_ms
+            init_ar_buffer(DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
             if ipcam_cfg.asc_rec then
                 ipcam_recording = false
@@ -981,6 +1030,7 @@ function update()
                     bottom_elapsed / 1000.0))
             activate_relay()
             ascent_start_ms = now_ms
+            init_ar_buffer(DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
             if ipcam_cfg.asc_rec then
                 ipcam_recording = false
@@ -1002,18 +1052,26 @@ function update()
         update_lights(cfg_asc_lgt, now_ms)
 
         -- Relay stays on for at least DORIS_BRN_MIN seconds (default 2 hrs).
-        -- After that, deactivate once DORIS has risen DORIS_ASC_DPT metres
-        -- above the deepest depth recorded during the dive (telem.max_depth).
+        -- After that, deactivate only when EKF-filtered vertical velocity
+        -- confirms sustained ascent over DORIS_ASC_AVG seconds (default 120s).
+        -- This replaces the old depth-based check which was vulnerable to
+        -- single-sample baro glitches that caused premature relay deactivation.
         if relay_active then
+            local vel = ahrs:get_velocity_NED()
+            if vel then
+                add_ar_sample(-vel:z())
+            end
+
             local burn_elapsed = now_ms - ascent_start_ms
             local brn_min_ms = (DORIS_BRN_MIN:get() or 7200) * 1000
             if burn_elapsed >= brn_min_ms then
-                local depth = get_depth_m()
-                local threshold = telem.max_depth - (DORIS_ASC_DPT:get() or 10)
-                if depth and depth <= threshold then
+                local avg = get_avg_ar()
+                local thr = (DORIS_ASC_THR:get() or 10) / 100.0
+                if avg and ar_count >= ar_buf_size and avg >= thr then
                     gcs:send_text(MAV_SEVERITY.INFO,
-                        string.format("DIVE: ascended %.1fm above bottom (%.1fm), relay off",
-                            telem.max_depth - depth, telem.max_depth))
+                        string.format(
+                            "DIVE: sustained ascent %.3f m/s > %.3f thr (%ds window), relay off",
+                            avg, thr, ar_buf_size * UPDATE_INTERVAL_MS / 1000))
                     deactivate_relay()
                 end
             end
