@@ -210,69 +210,30 @@ param:set_and_save("SERVO13_FUNCTION", 59) -- 59 = RCIN9
 param:set_and_save("BARO_SPEC_GRAV", 1.025)
 
 -- ?????????? descent-rate circular buffer ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-local dr_buffer   = {}
-local dr_idx      = 0
-local dr_count    = 0
-local dr_buf_size = 60
-
-local function init_dr_buffer(window_sec)
-    dr_buf_size = math.max(math.ceil(window_sec / (UPDATE_INTERVAL_MS / 1000.0)), 10)
-    dr_buffer = {}
-    dr_idx    = 0
-    dr_count  = 0
-    for i = 1, dr_buf_size do
-        dr_buffer[i] = 0
-    end
-end
-
-local function add_dr_sample(rate)
-    dr_idx = (dr_idx % dr_buf_size) + 1
-    dr_buffer[dr_idx] = rate
-    if dr_count < dr_buf_size then
-        dr_count = dr_count + 1
-    end
-end
-
-local function get_avg_dr()
-    if dr_count == 0 then return nil end
-    local sum = 0
-    for i = 1, dr_count do
-        sum = sum + dr_buffer[i]
-    end
-    return sum / dr_count
-end
+local dr = { buf = {}, idx = 0, count = 0, size = 60 }
 
 -- ?????????? ascent-rate circular buffer (relay deactivation confirmation) ?????????????????????????????????
-local ar_buffer   = {}
-local ar_idx      = 0
-local ar_count    = 0
-local ar_buf_size = 240
+local ar = { buf = {}, idx = 0, count = 0, size = 240 }
 
-local function init_ar_buffer(window_sec)
-    ar_buf_size = math.max(math.ceil(window_sec / (UPDATE_INTERVAL_MS / 1000.0)), 10)
-    ar_buffer = {}
-    ar_idx    = 0
-    ar_count  = 0
-    for i = 1, ar_buf_size do
-        ar_buffer[i] = 0
-    end
+local function init_ring(r, window_sec)
+    r.size  = math.max(math.ceil(window_sec / (UPDATE_INTERVAL_MS / 1000.0)), 10)
+    r.buf   = {}
+    r.idx   = 0
+    r.count = 0
+    for i = 1, r.size do r.buf[i] = 0 end
 end
 
-local function add_ar_sample(rate)
-    ar_idx = (ar_idx % ar_buf_size) + 1
-    ar_buffer[ar_idx] = rate
-    if ar_count < ar_buf_size then
-        ar_count = ar_count + 1
-    end
+local function add_ring_sample(r, val)
+    r.idx = (r.idx % r.size) + 1
+    r.buf[r.idx] = val
+    if r.count < r.size then r.count = r.count + 1 end
 end
 
-local function get_avg_ar()
-    if ar_count == 0 then return nil end
+local function get_ring_avg(r)
+    if r.count == 0 then return nil end
     local sum = 0
-    for i = 1, ar_count do
-        sum = sum + ar_buffer[i]
-    end
-    return sum / ar_count
+    for i = 1, r.count do sum = sum + r.buf[i] end
+    return sum / r.count
 end
 
 -- ?????????? runtime state ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
@@ -316,17 +277,20 @@ local telem = {
 }
 
 -- snapshotted config (read once at CONFIG -> MISSION_START)
-local cfg_rls_sec_ms  = 60000
-local cfg_dsc_lgt     = false
-local cfg_btm_lgt     = false
-local cfg_asc_lgt     = false
-local cfg_lgt_pwm     = LIGHT_PWM_MIN
-local cfg_btm_thr_mps = 0.05
-local cfg_dpt_gat_m   = 5.0
-local cfg_lgt_mod     = 0
-local cfg_lgt_on_ms   = 10000
-local cfg_lgt_off_ms  = 5000
-local cfg_btm_dly_ms  = 30000
+-- packed into a table to stay under Lua's 100-local limit
+local cfg = {
+    rls_sec_ms  = 60000,
+    dsc_lgt     = false,
+    btm_lgt     = false,
+    asc_lgt     = false,
+    lgt_pwm     = LIGHT_PWM_MIN,
+    btm_thr_mps = 0.05,
+    dpt_gat_m   = 5.0,
+    lgt_mod     = 0,
+    lgt_on_ms   = 10000,
+    lgt_off_ms  = 5000,
+    btm_dly_ms  = 30000,
+}
 
 -- snapshotted IP camera policy (set in snapshot_config from DORIS_* params)
 local ipcam_cfg = {
@@ -390,25 +354,25 @@ local function update_lights(enabled, now_ms)
         RC9:set_override(LIGHT_PWM_MIN)
         return
     end
-    if cfg_lgt_mod == 0 then
-        RC9:set_override(cfg_lgt_pwm)
+    if cfg.lgt_mod == 0 then
+        RC9:set_override(cfg.lgt_pwm)
         return
     end
     -- interval mode
     local elapsed = now_ms - light_cycle_ms
     if light_on then
-        if elapsed >= cfg_lgt_on_ms then
+        if elapsed >= cfg.lgt_on_ms then
             light_on = false
             light_cycle_ms = now_ms
             RC9:set_override(LIGHT_PWM_MIN)
         else
-            RC9:set_override(cfg_lgt_pwm)
+            RC9:set_override(cfg.lgt_pwm)
         end
     else
-        if elapsed >= cfg_lgt_off_ms then
+        if elapsed >= cfg.lgt_off_ms then
             light_on = true
             light_cycle_ms = now_ms
-            RC9:set_override(cfg_lgt_pwm)
+            RC9:set_override(cfg.lgt_pwm)
         else
             RC9:set_override(LIGHT_PWM_MIN)
         end
@@ -537,32 +501,32 @@ local function snapshot_config()
     local lgt_off = DORIS_LGT_OFF:get()
     local btm_dly = DORIS_BTM_DLY:get()
 
-    cfg_rls_sec_ms  = math.max(rls_sec, 1) * 1000
-    cfg_dsc_lgt     = DORIS_DSC_LGT:get() >= 1
-    cfg_btm_lgt     = DORIS_BTM_LGT:get() >= 1
-    cfg_asc_lgt     = DORIS_ASC_LGT:get() >= 1
-    cfg_lgt_pwm     = brightness_to_pwm(brt)
-    cfg_btm_thr_mps = math.max(btm_thr, 0.1) / 100.0
-    cfg_dpt_gat_m   = math.max(dpt_gat, 2.0)
-    cfg_lgt_mod     = lgt_mod >= 1 and 1 or 0
-    cfg_lgt_on_ms   = math.max(lgt_on, 1) * 1000
-    cfg_lgt_off_ms  = math.max(lgt_off, 1) * 1000
-    cfg_btm_dly_ms  = math.max(btm_dly, 0) * 1000
+    cfg.rls_sec_ms  = math.max(rls_sec, 1) * 1000
+    cfg.dsc_lgt     = DORIS_DSC_LGT:get() >= 1
+    cfg.btm_lgt     = DORIS_BTM_LGT:get() >= 1
+    cfg.asc_lgt     = DORIS_ASC_LGT:get() >= 1
+    cfg.lgt_pwm     = brightness_to_pwm(brt)
+    cfg.btm_thr_mps = math.max(btm_thr, 0.1) / 100.0
+    cfg.dpt_gat_m   = math.max(dpt_gat, 2.0)
+    cfg.lgt_mod     = lgt_mod >= 1 and 1 or 0
+    cfg.lgt_on_ms   = math.max(lgt_on, 1) * 1000
+    cfg.lgt_off_ms  = math.max(lgt_off, 1) * 1000
+    cfg.btm_dly_ms  = math.max(btm_dly, 0) * 1000
 
     gcs:send_text(MAV_SEVERITY.INFO,
         string.format("DIVE: gate=%.1fm rls=%ds thr=%.1fcm/s avg=%ds",
-            cfg_dpt_gat_m, rls_sec, btm_thr, btm_avg))
+            cfg.dpt_gat_m, rls_sec, btm_thr, btm_avg))
     gcs:send_text(MAV_SEVERITY.INFO,
         string.format("DIVE: lights dsc=%d btm=%d asc=%d brt=%d%% pwm=%d mode=%s RC9=%s",
-            cfg_dsc_lgt and 1 or 0, cfg_btm_lgt and 1 or 0,
-            cfg_asc_lgt and 1 or 0, brt, cfg_lgt_pwm,
-            cfg_lgt_mod == 1 and "interval" or "continuous",
+            cfg.dsc_lgt and 1 or 0, cfg.btm_lgt and 1 or 0,
+            cfg.asc_lgt and 1 or 0, brt, cfg.lgt_pwm,
+            cfg.lgt_mod == 1 and "interval" or "continuous",
             RC9 and "ok" or "NIL"))
-    if cfg_lgt_mod == 1 then
+    if cfg.lgt_mod == 1 then
         gcs:send_text(MAV_SEVERITY.INFO,
             string.format("DIVE: interval on=%ds off=%ds", lgt_on, lgt_off))
     end
-    if cfg_btm_dly_ms > 0 then
+    if cfg.btm_dly_ms > 0 then
         gcs:send_text(MAV_SEVERITY.INFO,
             string.format("DIVE: bottom light delay=%ds", btm_dly))
     end
@@ -645,7 +609,7 @@ local function update_telemetry(now_ms)
     gcs:send_named_float('BATT_PCT', telem.batt_pct)
     gcs:send_named_float('MSN_TIME', mission_time_s)
     gcs:send_named_float('RELAY',    relay_active and 1 or 0)
-    local ar_avg = get_avg_ar() or 0
+    local ar_avg = get_ring_avg(ar) or 0
     gcs:send_named_float('ASC_VEL',  ar_avg)
 
     -- dataflash logging (written to ArduPilot .bin log)
@@ -800,7 +764,7 @@ function update()
                     "DIVE: DEPLOYED without pre-arm! Emergency weight release + ASCENT")
                 activate_relay()
                 ascent_start_ms = now_ms
-                init_ar_buffer(DORIS_ASC_AVG:get() or 120)
+                init_ring(ar, DORIS_ASC_AVG:get() or 120)
                 reset_light_cycle(now_ms)
                 ipcam_stop()
                 recovery_done = false
@@ -866,7 +830,7 @@ function update()
     elseif state == STATE_MISSION_START then
         if check_failsafes() then
             ascent_start_ms = now_ms
-            init_ar_buffer(DORIS_ASC_AVG:get() or 120)
+            init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
             if ipcam_cfg.asc_rec then
                 ipcam_recording = false
@@ -899,7 +863,7 @@ function update()
                 armed_once = true
                 gcs:send_text(MAV_SEVERITY.INFO,
                     string.format("DIVE: armed, sinking to gate (%.1fm)",
-                        cfg_dpt_gat_m))
+                        cfg.dpt_gat_m))
             end
             local depth = get_depth_m()
             if depth then
@@ -907,14 +871,14 @@ function update()
                    < UPDATE_INTERVAL_MS then
                     gcs:send_text(MAV_SEVERITY.INFO,
                         string.format("DIVE: depth=%.2fm / gate=%.1fm",
-                            depth, cfg_dpt_gat_m))
+                            depth, cfg.dpt_gat_m))
                 end
-                if depth >= cfg_dpt_gat_m then
+                if depth >= cfg.dpt_gat_m then
                     gcs:send_text(MAV_SEVERITY.INFO,
                         string.format("DIVE: gate crossed (%.2fm), mission started",
                             depth))
                     dive_start_ms = now_ms
-                    init_dr_buffer(DORIS_BTM_AVG:get())
+                    init_ring(dr, DORIS_BTM_AVG:get())
                     reset_light_cycle(now_ms)
                     if ipcam_cfg.dsc_rec then ipcam_start() end
                     state = STATE_DESCENT
@@ -926,7 +890,7 @@ function update()
     elseif state == STATE_DESCENT then
         if check_failsafes() then
             ascent_start_ms = now_ms
-            init_ar_buffer(DORIS_ASC_AVG:get() or 120)
+            init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
             if ipcam_cfg.asc_rec then
                 ipcam_recording = false
@@ -943,30 +907,30 @@ function update()
             arming:arm()
         end
 
-        update_lights(cfg_dsc_lgt, now_ms)
+        update_lights(cfg.dsc_lgt, now_ms)
 
         local elapsed = now_ms - dive_start_ms
         local vel = ahrs:get_velocity_NED()
         if vel then
             local drate = vel:z()
-            add_dr_sample(drate)
-            local avg = get_avg_dr()
+            add_ring_sample(dr, drate)
+            local avg = get_ring_avg(dr)
 
             if math.fmod(elapsed, 5000) < UPDATE_INTERVAL_MS then
                 gcs:send_text(MAV_SEVERITY.INFO,
                     string.format(
                         "DIVE: dsc %.0fs rate=%.3f avg=%.3f m/s depth=%.1fm [%d/%d]",
                         elapsed / 1000.0, drate, avg or 0,
-                        get_depth_m() or 0, dr_count, dr_buf_size))
+                        get_depth_m() or 0, dr.count, dr.size))
             end
 
-            if avg and dr_count >= dr_buf_size and avg < cfg_btm_thr_mps then
+            if avg and dr.count >= dr.size and avg < cfg.btm_thr_mps then
                 gcs:send_text(MAV_SEVERITY.INFO,
                     string.format(
                         "DIVE: bottom detected! avg=%.4f m/s depth=%.1fm t=%.0fs",
                         avg, get_depth_m() or 0, elapsed / 1000.0))
                 bottom_start_ms   = now_ms
-                bottom_delay_done = cfg_btm_dly_ms <= 0
+                bottom_delay_done = cfg.btm_dly_ms <= 0
                 reset_light_cycle(now_ms)
                 ipcam_btm_started = false
                 if ipcam_cfg.btm_rec and ipcam_cfg.cam_btm_dly_ms <= 0 then
@@ -984,7 +948,7 @@ function update()
     elseif state == STATE_ON_BOTTOM then
         if check_failsafes() then
             ascent_start_ms = now_ms
-            init_ar_buffer(DORIS_ASC_AVG:get() or 120)
+            init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
             if ipcam_cfg.asc_rec then
                 ipcam_recording = false
@@ -1005,15 +969,15 @@ function update()
 
         if not bottom_delay_done then
             update_lights(false, now_ms)
-            if bottom_elapsed >= cfg_btm_dly_ms then
+            if bottom_elapsed >= cfg.btm_dly_ms then
                 bottom_delay_done = true
                 reset_light_cycle(now_ms)
                 gcs:send_text(MAV_SEVERITY.INFO,
                     string.format("DIVE: settling delay done (%.0fs), lights active",
-                        cfg_btm_dly_ms / 1000.0))
+                        cfg.btm_dly_ms / 1000.0))
             end
         else
-            update_lights(cfg_btm_lgt, now_ms)
+            update_lights(cfg.btm_lgt, now_ms)
         end
 
         -- Bottom camera start: handles both delayed first attempt and retries
@@ -1027,16 +991,16 @@ function update()
         if math.fmod(bottom_elapsed, 30000) < UPDATE_INTERVAL_MS then
             gcs:send_text(MAV_SEVERITY.INFO,
                 string.format("DIVE: on bottom %.0fs / %ds",
-                    bottom_elapsed / 1000.0, cfg_rls_sec_ms / 1000))
+                    bottom_elapsed / 1000.0, cfg.rls_sec_ms / 1000))
         end
 
-        if bottom_elapsed >= cfg_rls_sec_ms then
+        if bottom_elapsed >= cfg.rls_sec_ms then
             gcs:send_text(MAV_SEVERITY.INFO,
                 string.format("DIVE: release triggered (%.1fs on bottom)",
                     bottom_elapsed / 1000.0))
             activate_relay()
             ascent_start_ms = now_ms
-            init_ar_buffer(DORIS_ASC_AVG:get() or 120)
+            init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
             if ipcam_cfg.asc_rec then
                 ipcam_recording = false
@@ -1055,7 +1019,7 @@ function update()
             arming:arm()
         end
 
-        update_lights(cfg_asc_lgt, now_ms)
+        update_lights(cfg.asc_lgt, now_ms)
 
         -- Relay stays on for at least DORIS_BRN_MIN seconds (default 2 hrs).
         -- After that, deactivate only when EKF-filtered vertical velocity
@@ -1065,19 +1029,19 @@ function update()
         if relay_active then
             local vel = ahrs:get_velocity_NED()
             if vel then
-                add_ar_sample(-vel:z())
+                add_ring_sample(ar, -vel:z())
             end
 
             local burn_elapsed = now_ms - ascent_start_ms
             local brn_min_ms = (DORIS_BRN_MIN:get() or 7200) * 1000
             if burn_elapsed >= brn_min_ms then
-                local avg = get_avg_ar()
+                local avg = get_ring_avg(ar)
                 local thr = (DORIS_ASC_THR:get() or 10) / 100.0
-                if avg and ar_count >= ar_buf_size and avg >= thr then
+                if avg and ar.count >= ar.size and avg >= thr then
                     gcs:send_text(MAV_SEVERITY.INFO,
                         string.format(
                             "DIVE: sustained ascent %.3f m/s > %.3f thr (%ds window), relay off",
-                            avg, thr, ar_buf_size * UPDATE_INTERVAL_MS / 1000))
+                            avg, thr, ar.size * UPDATE_INTERVAL_MS / 1000))
                     deactivate_relay()
                 end
             end
