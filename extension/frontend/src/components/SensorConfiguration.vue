@@ -44,7 +44,7 @@ const emit = defineEmits<{
   navigate: [screen: Screen]
 }>()
 
-const { modules: apiModules, loading: sensorsLoading, fetchModules } = useSensors()
+const { modules: apiModules, loading: sensorsLoading, fetchModules, calibrateBarometer } = useSensors()
 
 const modules = ref<DisplayModule[]>([])
 const selectedModule = ref<DisplayModule | null>(null)
@@ -344,6 +344,36 @@ function lightTestOff() {
     setLightBrightness(0)
     setTimeout(() => setLightBrightness(0), 300)
   }
+}
+
+// ── Barometer surface calibration ────────────────────────────────────
+type BaroCalState = 'idle' | 'calibrating' | 'done' | 'error'
+const baroCalState = ref<BaroCalState>('idle')
+const baroCalMessage = ref('')
+
+async function triggerBaroCalibration() {
+  if (baroCalState.value === 'calibrating') return
+  baroCalState.value = 'calibrating'
+  baroCalMessage.value = ''
+  try {
+    const result = await calibrateBarometer()
+    if (result.success) {
+      baroCalState.value = 'done'
+      baroCalMessage.value = result.message || 'Calibration done'
+    } else {
+      baroCalState.value = 'error'
+      baroCalMessage.value = result.error || 'Calibration failed'
+    }
+  } catch (e) {
+    baroCalState.value = 'error'
+    baroCalMessage.value = e instanceof Error ? e.message : 'Calibration failed'
+  }
+  setTimeout(() => {
+    if (baroCalState.value === 'done' || baroCalState.value === 'error') {
+      baroCalState.value = 'idle'
+      baroCalMessage.value = ''
+    }
+  }, 5000)
 }
 
 // ── Module list sync ────────────────────────────────────────────────
@@ -794,8 +824,55 @@ const getStatusColor = (moduleStatus: string) => {
               {{ selectedModule.name }} Configuration
             </h2>
 
-            <!-- Sensor type config -->
-            <div v-if="selectedModule.type === 'sensor'" class="space-y-4">
+            <!-- Barometer: surface calibration -->
+            <div v-if="selectedModule.id === 'barometer'" class="space-y-4">
+              <p class="text-sm" style="color: rgba(150, 238, 242, 0.6)">
+                Perform a surface calibration to set the current pressure reading as the reference. Ensure the vehicle is at the surface before calibrating.
+              </p>
+              <button
+                :disabled="baroCalState === 'calibrating'"
+                class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm transition-all"
+                :style="{
+                  backgroundColor: baroCalState === 'done' ? 'rgba(34, 197, 94, 0.2)'
+                    : baroCalState === 'error' ? 'rgba(239, 68, 68, 0.2)'
+                    : baroCalState === 'calibrating' ? 'rgba(252, 216, 105, 0.15)'
+                    : 'rgba(14, 36, 70, 0.5)',
+                  border: baroCalState === 'done' ? '1px solid rgba(34, 197, 94, 0.5)'
+                    : baroCalState === 'error' ? '1px solid rgba(239, 68, 68, 0.5)'
+                    : baroCalState === 'calibrating' ? '1px solid rgba(252, 216, 105, 0.4)'
+                    : '1px solid rgba(65, 185, 195, 0.2)',
+                  color: baroCalState === 'done' ? '#22c55e'
+                    : baroCalState === 'error' ? '#ef4444'
+                    : baroCalState === 'calibrating' ? '#FCD869'
+                    : '#96EEF2',
+                  opacity: baroCalState === 'calibrating' ? '0.85' : '1',
+                  cursor: baroCalState === 'calibrating' ? 'not-allowed' : 'pointer',
+                }"
+                @click="triggerBaroCalibration"
+              >
+                <Loader2 v-if="baroCalState === 'calibrating'" class="w-4 h-4 animate-spin" />
+                <svg v-else class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                  <path :d="mdiGauge" />
+                </svg>
+                <span v-if="baroCalState === 'idle'">Surface Calibrate</span>
+                <span v-else-if="baroCalState === 'calibrating'">Calibrating…</span>
+                <span v-else-if="baroCalState === 'done'">Calibration done</span>
+                <span v-else-if="baroCalState === 'error'">Calibration failed</span>
+              </button>
+              <p v-if="baroCalMessage" class="text-xs text-center" :style="{ color: baroCalState === 'error' ? '#f87171' : 'rgba(150, 238, 242, 0.6)' }">
+                {{ baroCalMessage }}
+              </p>
+            </div>
+
+            <!-- Thermometer: no calibration -->
+            <div v-else-if="selectedModule.id === 'thermometer'" class="space-y-4">
+              <p class="text-sm" style="color: rgba(150, 238, 242, 0.6)">
+                No calibration options available for this sensor.
+              </p>
+            </div>
+
+            <!-- Other sensor types: calibration file upload -->
+            <div v-else-if="selectedModule.type === 'sensor'" class="space-y-4">
               <div>
                 <label class="block text-sm mb-2" style="color: #96EEF2">Calibration File</label>
                 <div class="flex gap-2">

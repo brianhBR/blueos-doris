@@ -458,7 +458,12 @@ export function useSensors() {
     return response.json()
   }
 
-  return { modules: readonly(modules), loading: readonly(loading), error: readonly(error), fetchModules, fetchReadings, updateConfig }
+  async function calibrateBarometer(): Promise<{ success: boolean; message?: string; error?: string }> {
+    const response = await fetch(`${API_BASE}/sensors/barometer/calibrate`, { method: 'POST' })
+    return response.json()
+  }
+
+  return { modules: readonly(modules), loading: readonly(loading), error: readonly(error), fetchModules, fetchReadings, updateConfig, calibrateBarometer }
 }
 
 // ── Network composables ─────────────────────────────────────────────

@@ -5,6 +5,7 @@ import json
 from robyn import Response, Robyn
 
 from ..models.sensors import SensorConfig
+from ..services.barometer import BarometerService
 from ..services.camera import CameraService
 from ..services.sensors import SensorService
 from ..services.tracker import ArtemisTrackerService
@@ -16,6 +17,7 @@ def register_sensor_routes(app: Robyn) -> None:
     sensor_service = SensorService()
     camera_service = CameraService()
     tracker_service = ArtemisTrackerService()
+    barometer_service = BarometerService()
 
     @app.get("/api/v1/sensors/modules")
     async def get_connected_modules(request):
@@ -98,6 +100,24 @@ def register_sensor_routes(app: Robyn) -> None:
                 headers={"Content-Type": "application/json"},
             )
 
+
+    @app.post("/api/v1/sensors/barometer/calibrate")
+    async def calibrate_barometer(request):
+        """Trigger a surface pressure calibration via MAVLink."""
+        try:
+            result = await barometer_service.calibrate_surface()
+            status = 200 if result.get("success") else 502
+            return Response(
+                status_code=status,
+                description=json.dumps(result),
+                headers={"Content-Type": "application/json"},
+            )
+        except Exception as e:
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
 
     @app.get("/api/v1/tracker/gps")
     async def get_tracker_gps(request):
