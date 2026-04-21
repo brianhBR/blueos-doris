@@ -1,0 +1,93 @@
+# DORIS Drop Camera - ArduSub Parameter File
+# For use with standard ArduSub binary on Blue Robotics Navigator
+# Load via: sim_vehicle.py --add-param-file doris.parm
+# Or upload via: python tools/configure_doris.py --upload
+
+# === Frame Configuration ===
+# Custom frame - no motors (passive drop camera)
+FRAME_CONFIG     7
+
+# Disable all motor servo outputs
+SERVO1_FUNCTION  0
+SERVO2_FUNCTION  0
+SERVO3_FUNCTION  0
+SERVO4_FUNCTION  0
+SERVO5_FUNCTION  0
+SERVO6_FUNCTION  0
+SERVO7_FUNCTION  0
+SERVO8_FUNCTION  0
+
+# === Depth Sensor (Keller 6HPLD) ===
+# Natively supported via AP_Baro_KellerLD driver
+# Auto-probes I2C address 0x40, reads calibration from ROM
+BARO_SPEC_GRAV   1.025
+BARO_EXT_BUS     1
+BARO_PROBE_EXT   256
+
+# === Battery Monitoring ===
+# 4S LiPo, ~300 Wh (~20 Ah at 14.8V nominal)
+# Typical system draw: 30W (~2A at nominal voltage)
+# Mission endurance: ~10 hours
+BATT_MONITOR     4
+BATT_CAPACITY    20000
+BATT_LOW_VOLT    14.0
+BATT_CRT_VOLT    13.0
+BATT_FS_LOW_ACT  0
+BATT_FS_CRT_ACT  0
+
+# === Failsafes ===
+# Lua script handles failsafe actions directly
+FS_LEAK_ENABLE   1
+FS_PRESS_ENABLE  1
+FS_PRESS_MAX     100000
+FS_TEMP_ENABLE   1
+FS_TEMP_MAX      60
+FS_PILOT_INPUT   0
+FS_GCS_ENABLE    0
+
+# === Relay (Weight Release) ===
+RELAY1_PIN       -1
+RELAY1_DEFAULT   0
+
+# === Scripting (Lua) ===
+SCR_ENABLE       1
+SCR_HEAP_SIZE    200000
+SCR_VM_I_COUNT   50000
+
+# === GPS (via AGT MAVLink) ===
+# GPS_INPUT messages from SparkFun Artemis Global Tracker
+GPS1_TYPE        14
+
+# === Serial Port for AGT MAVLink ===
+SERIAL1_PROTOCOL 2
+SERIAL1_BAUD     115
+
+# === Logging ===
+LOG_BITMASK      65535
+LOG_DISARMED     1
+
+# === Surface Detection ===
+SURFACE_DEPTH    -10
+
+# === Compass ===
+COMPASS_OFS_X    5
+COMPASS_OFS_Y    13
+COMPASS_OFS_Z    -18
+
+# === INS Calibration ===
+INS_ACCOFFS_X    0.001
+INS_ACCOFFS_Y    0.001
+INS_ACCOFFS_Z    0.001
+INS_ACCSCAL_X    1.001
+INS_ACCSCAL_Y    1.001
+INS_ACCSCAL_Z    1.001
+
+# === RC (not used - autonomous) ===
+RC3_TRIM         1500
+RC_OPTIONS       0
+RC_PROTOCOLS     1
+
+# === Position Controller (not actively used) ===
+PILOT_SPEED_UP   200
+PILOT_SPEED_DN   200
+PILOT_ACCEL_Z    200

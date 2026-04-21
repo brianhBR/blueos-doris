@@ -1,0 +1,37 @@
+services:
+
+  # ── mavlink2rest ──────────────────────────────────────────────────────────
+  # Bridges the DORIS backend REST API to the ArduSub SITL MAVLink stream.
+  # Connects to MAVProxy's TCP listener on the host at :5772.
+  mavlink2rest:
+    build:
+      context: .
+      dockerfile: Dockerfile.mavlink2rest
+    command: >
+      --connect=tcpout:host.docker.internal:5772
+      --server 0.0.0.0:6040
+    ports:
+      - "6040:6040"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    restart: unless-stopped
+
+  # ── DORIS extension ───────────────────────────────────────────────────────
+  # Full BlueOS extension backend + Vue frontend.
+  doris:
+    build:
+      context: ../extension
+      dockerfile: Dockerfile
+    ports:
+      - "8095:8095"
+    environment:
+      - DORIS_BLUEOS_ADDRESS=http://mavlink2rest
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./data/configurations:/tmp/storage/configurations
+      - ./data/dives:/tmp/storage/dives
+      - ./data/userdata:/tmp/storage/userdata
+    depends_on:
+      - mavlink2rest
+    restart: unless-stopped

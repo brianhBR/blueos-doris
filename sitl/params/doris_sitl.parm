@@ -1,0 +1,83 @@
+# DORIS Drop Camera - SITL-Specific Parameter Overrides
+# Load via: sim_vehicle.py --add-param-file doris_sitl.parm
+# These override doris.parm values for SITL testing
+
+# === SITL Buoyancy ===
+# SIM_BUOYANCY is a force in Newtons applied via SIM_Submarine.cpp:
+#   net_accel = -SIM_BUOYANCY / frame_mass  (frame_mass ~16.8 kg)
+# Start neutral (0) so vehicle stays on surface while Lua pre-arm checks
+# run.  sitl_monitor.py (or manual `param set SIM_BUOYANCY -19.6`) sets
+# negative buoyancy after PRE_DIVE to simulate deployment.
+# Lua script sets positive when weight release relay fires.
+SIM_BUOYANCY     0
+
+# === Reduced Depths for SITL (50m floor) ===
+# Override the DORIS_ custom params for testing
+# DORIS_TGT_DPTH will be set to 40 via Lua param defaults or MAVProxy
+# DORIS_BTM_TIME will be set to 30 for quick testing
+
+# === SITL Battery ===
+# ArduSub SITL has a hardcoded battery model (SITL_State_common.cpp:440-451)
+# that loops over 6 servo channels and subtracts up to 0.5V per channel based
+# on PWM deviation from 1500.  Even with all SERVO_FUNCTION=0, the motor
+# mixer outputs non-neutral PWM, causing a constant ~4V parasitic sag.
+# Set SIM_BATT_VOLTAGE = desired_reported_voltage + 4.0 to compensate.
+# Real battery: 4S LiPo 16.8V (4.2V/cell).  20.8 - 4.0 ≈ 16.8V reported.
+SIM_BATT_VOLTAGE 20.8
+BATT_CAPACITY    20270  # 300 Wh at 14.8V nominal
+
+# === SITL Servo Neutralization ===
+# SITL battery model drains based on PWM deviation from 1500 across all
+# servo channels.  With SERVO_FUNCTION=0 and no RC input, channels output 0
+# (maximum drain).  Set trims to 1500 so outputs stay neutral — DORIS has
+# no thrusters and should draw no motor power.
+SERVO1_TRIM      1500
+SERVO2_TRIM      1500
+SERVO3_TRIM      1500
+SERVO4_TRIM      1500
+SERVO5_TRIM      1500
+SERVO6_TRIM      1500
+SERVO7_TRIM      1500
+SERVO8_TRIM      1500
+
+# === SITL Barometer ===
+# Disable external baro probing in SITL; use simulated/internal baro path.
+BARO_EXT_BUS     -1
+BARO_PROBE_EXT   0
+SIM_BARO_RND     0.02
+
+# === SITL Initialization (deterministic startup) ===
+# OPOS_* sets the startup geodetic reference only; it does not set depth.
+SIM_OPOS_LAT     33.810313
+SIM_OPOS_LNG     -118.393867
+SIM_OPOS_ALT     0.0
+SIM_OPOS_HDG     270
+# No startup shove; begin naturally at configured surface position.
+SIM_SHOVE_Z      0
+SIM_SHOVE_TIME   0
+
+# === SITL Failsafe Overrides ===
+# Internal pressure failsafe fires in SITL because the simulated baro
+# tracks depth (water pressure) rather than enclosure pressure.
+FS_PRESS_ENABLE  0
+# Let the DORIS Lua script handle battery failsafes (weight release)
+# rather than ArduSub's built-in actions which try to surface with thrusters.
+BATT_FS_LOW_ACT  0
+BATT_FS_CRT_ACT  0
+# With the +4V SIM_BATT_VOLTAGE compensation above, reported voltage
+# matches real hardware.  Use production thresholds from doris.parm.
+BATT_LOW_VOLT    14.0
+BATT_CRT_VOLT    13.0
+# Disable all pre-arm checks for SITL (SITL voltages and sensors are
+# unreliable for a thrusterless vehicle).
+ARMING_CHECK     0
+
+# === SITL GPS ===
+# Production doris.parm sets GPS1_TYPE=14 (MAV) for AGT GPS_INPUT messages.
+# In SITL there is no AGT simulator, so override to auto-detect (1) to use
+# the built-in SITL GPS driver.
+GPS1_TYPE        1
+
+# === Shorter Timers for Testing ===
+# (These are set via DORIS_ custom params in the Lua script,
+#  not standard ArduSub params. Adjust after script loads.)
