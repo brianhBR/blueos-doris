@@ -15,9 +15,11 @@
    Only after all checks pass does it transition to MISSION_START.
 
    An ArduPilot arming gate (aux auth) prevents arming without a valid
-   mission profile.  If the vehicle is deployed into water before
-   pre-arm passes, an emergency failsafe releases the drop-weight
-   for recovery.
+   mission profile.  If the vehicle is deployed into water while still
+   in CONFIG (no mission loaded, or pre-arm not yet passed), a depth-
+   based deadman releases the drop-weight and transitions to ASCENT
+   for recovery.  This fires regardless of DORIS_START, so a splash
+   without ever pressing "Load Mission" still recovers the vehicle.
 
    After pre-arm the script arms the autopilot, then waits for DORIS
    to passively sink past a configurable depth gate (DORIS_DPT_GAT
@@ -753,25 +755,29 @@ function update()
             end
         end
 
+        -- Deadman: deployed into water while still in CONFIG.  Fires
+        -- regardless of DORIS_START so an unstarted vehicle (operator
+        -- never pressed "Load Mission") still drops its weight.  Goes
+        -- to ASCENT (not RECOVERY) so the relay stays on for BRN_MIN
+        -- and the vehicle is properly monitored to the surface.
+        local cfg_depth = get_depth_m()
+        if cfg_depth and cfg_depth > 2.0 and not prearm_passed then
+            local start_val = DORIS_START:get() or 0
+            gcs:send_text(MAV_SEVERITY.CRITICAL,
+                string.format(
+                    "DIVE: DEPLOYED in CONFIG (START=%d, depth=%.1fm)! Emergency weight release + ASCENT",
+                    start_val, cfg_depth))
+            activate_relay()
+            ascent_start_ms = now_ms
+            init_ring(ar, DORIS_ASC_AVG:get() or 120)
+            reset_light_cycle(now_ms)
+            ipcam_stop()
+            recovery_done = false
+            state = STATE_ASCENT
+            return update, UPDATE_INTERVAL_MS
+        end
+
         if DORIS_START:get() >= 1 then
-
-            -- Emergency: deployed into water before pre-arm passed.
-            -- Go to ASCENT (not RECOVERY) so the relay stays on for
-            -- BRN_MIN and the vehicle is properly monitored.
-            local depth = get_depth_m()
-            if depth and depth > 2.0 and not prearm_passed then
-                gcs:send_text(MAV_SEVERITY.CRITICAL,
-                    "DIVE: DEPLOYED without pre-arm! Emergency weight release + ASCENT")
-                activate_relay()
-                ascent_start_ms = now_ms
-                init_ring(ar, DORIS_ASC_AVG:get() or 120)
-                reset_light_cycle(now_ms)
-                ipcam_stop()
-                recovery_done = false
-                state = STATE_ASCENT
-                return update, UPDATE_INTERVAL_MS
-            end
-
             -- Surface pre-arm checks
             local min_volt = DORIS_MIN_VOLT:get() or 14.0
             local gps_ok = false
