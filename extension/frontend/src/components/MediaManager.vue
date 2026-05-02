@@ -23,7 +23,7 @@ interface DisplayFile {
   downloadUrl: string
 }
 
-const { files: apiFiles, loading: mediaLoading, error: mediaError, fetchFiles, deleteFile, downloadFile } = useMedia()
+const { files: apiFiles, loading: mediaLoading, error: mediaError, fetchFiles, deleteFile, downloadFile, downloadFiles } = useMedia()
 const { storage, loading: storageLoading, error: storageError, fetchStorage } = useStorage()
 
 type SortField = 'diveName' | 'fileName' | 'date' | 'type'
@@ -234,10 +234,14 @@ const confirmDelete = async () => {
 }
 
 const handleDownloadSelected = () => {
-  for (const fileId of selectedFiles.value) {
-    const file = mediaFiles.value.find(f => f.id === fileId)
-    if (file) downloadFile(fileId, file.fileName)
-  }
+  if (selectedFiles.value.length === 0) return
+  // Serial bulk download via the shared queue. Triggering N hidden-<a>
+  // clicks in a tight loop has the browser cancelling all but the last
+  // one (it treats them as overlapping navigations), and even when it
+  // doesn't cancel them the backend would have to read N files into RAM
+  // simultaneously. The queue spaces the saves out so each gets its own
+  // visible progress entry in the corner toast.
+  downloadFiles(selectedFiles.value.slice())
 }
 
 const handleDownloadSingle = (file: DisplayFile) => {
