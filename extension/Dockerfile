@@ -19,12 +19,20 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-# Install build dependencies for uvloop (required by Robyn on Linux)
-# ffmpeg is kept at runtime for RTSP camera snapshot capture
+# Install build dependencies for uvloop (required by Robyn on Linux),
+# ffmpeg for RTSP snapshot capture, and GStreamer for IP camera
+# recording. ffmpeg's RTSP demuxer is incompatible with the RadCam
+# camera (camera tears down the session right after the first IDR
+# burst, leaving truncated stub files); GStreamer's rtspsrc keeps the
+# session running and is auto-restarted on disconnect by the recorder.
 RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     python3-dev \
     ffmpeg \
+    gstreamer1.0-tools \
+    gstreamer1.0-plugins-base \
+    gstreamer1.0-plugins-good \
+    gstreamer1.0-plugins-bad \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy ONLY dependency files first (for better layer caching)
