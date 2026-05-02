@@ -839,7 +839,6 @@ function update()
             init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
             if ipcam_cfg.asc_rec then
-                ipcam_recording = false
                 ipcam_start()
             else
                 ipcam_stop()
@@ -899,7 +898,6 @@ function update()
             init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
             if ipcam_cfg.asc_rec then
-                ipcam_recording = false
                 ipcam_start()
             else
                 ipcam_stop()
@@ -940,7 +938,6 @@ function update()
                 reset_light_cycle(now_ms)
                 ipcam_btm_started = false
                 if ipcam_cfg.btm_rec and ipcam_cfg.cam_btm_dly_ms <= 0 then
-                    ipcam_recording = false
                     ipcam_start()
                     ipcam_btm_started = ipcam_recording
                 elseif ipcam_recording then
@@ -957,7 +954,6 @@ function update()
             init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
             if ipcam_cfg.asc_rec then
-                ipcam_recording = false
                 ipcam_start()
             else
                 ipcam_stop()
@@ -1009,7 +1005,6 @@ function update()
             init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
             if ipcam_cfg.asc_rec then
-                ipcam_recording = false
                 ipcam_start()
             else
                 ipcam_stop()
@@ -1060,10 +1055,18 @@ function update()
                 gcs:send_text(MAV_SEVERITY.INFO,
                     string.format("DIVE: ascending, depth=%.2fm", depth))
             end
+            -- Surface arrival requires BOTH a GPS fix AND a shallow depth.
+            -- GPS fix alone is not enough: a transient sat acquisition at
+            -- mid-water (e.g. while the antenna briefly clears, or a cached
+            -- fix) would otherwise prematurely deactivate the burn relay,
+            -- stop recording, and disarm into RECOVERY.  cfg.dpt_gat_m is
+            -- the same depth gate used to declare "underwater" at mission
+            -- start, so we use it symmetrically here for "above water".
             local gps_stat = gps:status(0)
-            if gps_stat and gps_stat >= 3 then
+            if gps_stat and gps_stat >= 3 and depth < cfg.dpt_gat_m then
                 gcs:send_text(MAV_SEVERITY.INFO,
-                    string.format("DIVE: surface reached (GPS fix, depth=%.2fm)", depth))
+                    string.format("DIVE: surface reached (GPS fix, depth=%.2fm < gate=%.1fm)",
+                        depth, cfg.dpt_gat_m))
                 deactivate_relay()
                 ipcam_stop()
                 state = STATE_RECOVERY

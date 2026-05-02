@@ -277,8 +277,13 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
 
     async with _state_lock:
         if _session is not None and _session.is_alive():
+            # Idempotent: treat "start while already recording" as success so
+            # clients (the Lua dive script in particular) can freely call
+            # /rec/start on every phase transition without producing noisy
+            # HTTP 400s.  The active session is unchanged.
             return {
-                "success": False,
+                "success": True,
+                "already_recording": True,
                 "message": "Already recording",
                 "recording": True,
                 "base_stamp": _session.base_stamp,
