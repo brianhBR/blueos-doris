@@ -60,7 +60,10 @@ from . import usb_storage
 
 logger = logging.getLogger(__name__)
 
-IPCAM_RTSP_DIRECT = "rtsp://admin:blue@192.168.2.10:554/stream_0"
+_IPCAM_RTSP_DEFAULT = "rtsp://admin:blue@192.168.2.10:554/stream_0"
+IPCAM_RTSP_DIRECT = os.environ.get(
+    "DORIS_IPCAM_RTSP_URL", _IPCAM_RTSP_DEFAULT,
+)
 
 _RESTART_BACKOFF_S = 1.0
 _MIN_GOOD_RUNTIME_S = 3.0
