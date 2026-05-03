@@ -1,4 +1,24 @@
-"""HTTP endpoints for onboard IP camera recording (Lua-compatible /start /stop)."""
+"""HTTP endpoints for onboard IP camera recording.
+
+The same handlers are exposed under two URL prefixes:
+
+* ``/rec/*`` - used by the ``doris.lua`` dive script (fire-and-forget
+  POSTs from a raw socket).  Short paths keep the Lua HTTP emitter
+  compact.
+* ``/api/v1/ipcam/record/*`` - used by the web UI.
+
+Endpoints:
+
+* ``POST /rec/start?phase=<label>&split_duration=<seconds>`` - start
+  (or re-use) a recording session.  ``phase`` defaults to ``manual``
+  for UI-initiated recordings.  Idempotent when already recording.
+* ``POST /rec/stop`` - finalise the session cleanly.
+* ``POST /rec/rotate?phase=<label>`` - zero-gap phase rotation.
+  splitmuxsink fires ``split-now`` on the next keyframe; the next
+  ``.ts`` segment is tagged with ``phase`` in its filename.  The
+  RTSP/muxer pipeline stays alive across the split.
+* ``GET /rec/status`` - read-only inspection.
+"""
 
 import json
 import logging
@@ -10,8 +30,17 @@ from ..services import ip_camera_recorder as iprec
 logger = logging.getLogger(__name__)
 
 
+def _json_response(result: dict, status_code: int = 200) -> Response:
+    return Response(
+        status_code=status_code,
+        description=json.dumps(result),
+        headers={"Content-Type": "application/json"},
+    )
+
+
 async def _recorder_start_core(request):
-    logger.info("RECORD /start called")
+    phase_raw = request.query_params.get("phase", None)
+    phase = phase_raw if phase_raw not in (None, "") else None
     try:
         raw = request.query_params.get("split_duration", "")
         seg = None
@@ -19,21 +48,14 @@ async def _recorder_start_core(request):
             seg = int(raw)
     except (TypeError, ValueError):
         seg = None
+    logger.info("RECORD /start called (phase=%s, split_duration=%s)", phase, seg)
     try:
-        result = await iprec.start_recording(segment_seconds=seg)
+        result = await iprec.start_recording(segment_seconds=seg, phase=phase)
     except Exception as e:
         logger.exception("recorder /start failed")
-        return Response(
-            status_code=500,
-            description=json.dumps({"success": False, "message": str(e)}),
-            headers={"Content-Type": "application/json"},
-        )
+        return _json_response({"success": False, "message": str(e)}, 500)
     code = 200 if result.get("success") else 400
-    return Response(
-        status_code=code,
-        description=json.dumps(result),
-        headers={"Content-Type": "application/json"},
-    )
+    return _json_response(result, code)
 
 
 async def _recorder_stop_core(_request):
@@ -42,16 +64,29 @@ async def _recorder_stop_core(_request):
         result = await iprec.stop_recording()
     except Exception as e:
         logger.exception("recorder /stop failed")
-        return Response(
-            status_code=500,
-            description=json.dumps({"success": False, "message": str(e)}),
-            headers={"Content-Type": "application/json"},
+        return _json_response({"success": False, "message": str(e)}, 500)
+    return _json_response(result)
+
+
+async def _recorder_rotate_core(request):
+    phase_raw = request.query_params.get("phase", "")
+    if phase_raw in (None, ""):
+        logger.warning("RECORD /rotate missing required ?phase=...")
+        return _json_response(
+            {"success": False, "reason": "missing_phase",
+             "message": "phase query parameter is required"},
+            400,
         )
-    return Response(
-        status_code=200,
-        description=json.dumps(result),
-        headers={"Content-Type": "application/json"},
-    )
+    logger.info("RECORD /rotate called (phase=%s)", phase_raw)
+    try:
+        result = await iprec.rotate_to_phase(phase_raw)
+    except Exception as e:
+        logger.exception("recorder /rotate failed")
+        return _json_response({"success": False, "message": str(e)}, 500)
+    # Not-recording is reported as 200 with success=false rather than an
+    # HTTP error; this is a fire-and-forget endpoint for the Lua script
+    # and we don't want 4xx responses polluting doris.log.
+    return _json_response(result)
 
 
 async def _recorder_status_core(_request):
@@ -59,16 +94,8 @@ async def _recorder_status_core(_request):
         result = await iprec.recording_status()
     except Exception as e:
         logger.exception("recorder /status failed")
-        return Response(
-            status_code=500,
-            description=json.dumps({"success": False, "message": str(e)}),
-            headers={"Content-Type": "application/json"},
-        )
-    return Response(
-        status_code=200,
-        description=json.dumps({"success": True, **result}),
-        headers={"Content-Type": "application/json"},
-    )
+        return _json_response({"success": False, "message": str(e)}, 500)
+    return _json_response({"success": True, **result})
 
 
 def register_recorder_routes(app: Robyn) -> None:
@@ -93,6 +120,14 @@ def register_recorder_routes(app: Robyn) -> None:
     @app.post("/api/v1/ipcam/record/stop")
     async def recorder_stop_api(request):
         return await _recorder_stop_core(request)
+
+    @app.post("/rec/rotate")
+    async def recorder_rotate_lua(request):
+        return await _recorder_rotate_core(request)
+
+    @app.post("/api/v1/ipcam/record/rotate")
+    async def recorder_rotate_api(request):
+        return await _recorder_rotate_core(request)
 
     @app.get("/rec/status")
     async def recorder_status_lua(request):

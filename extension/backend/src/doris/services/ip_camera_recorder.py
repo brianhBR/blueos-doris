@@ -45,6 +45,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -65,6 +66,27 @@ _RESTART_BACKOFF_S = 1.0
 _MIN_GOOD_RUNTIME_S = 3.0
 _MAX_BACKOFF_S = 5.0
 _STOP_EOS_TIMEOUT_S = 5.0
+
+# Phase labels are embedded into filenames; keep them path-safe.
+# Accepted: lowercase alphanumerics + underscore, 1..32 chars.
+_PHASE_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+PHASE_DEFAULT = "manual"
+
+
+def sanitize_phase(raw: str | None) -> str:
+    """Return ``raw`` if it's a valid phase label, else ``PHASE_DEFAULT``.
+
+    The label is embedded verbatim into on-disk filenames so it must
+    be restricted to path-safe characters.  Anything the caller sends
+    that doesn't match the whitelist falls back to ``manual`` (the
+    same label used for non-dive UI-initiated recordings).
+    """
+    if raw is None:
+        return PHASE_DEFAULT
+    s = str(raw).strip().lower()
+    if not s or not _PHASE_RE.match(s):
+        return PHASE_DEFAULT
+    return s
 
 
 # ── GStreamer init (idempotent; safe across threads) ───────────────────────────
@@ -133,12 +155,18 @@ class RecordingSession:
     """
 
     def __init__(self, rtsp_url: str, segment_s: int, out_dir: Path,
-                 storage_label: str, base_stamp: str) -> None:
+                 storage_label: str, base_stamp: str,
+                 phase: str = PHASE_DEFAULT) -> None:
         self._rtsp_url = rtsp_url
         self._segment_s = segment_s
         self._out_dir = out_dir
         self.storage = storage_label
         self.base_stamp = base_stamp
+        # current_phase is read by the format-location callback on the
+        # GStreamer streaming thread.  Python attribute assignment is
+        # GIL-protected; no explicit lock needed.  Writes happen from
+        # the asyncio event loop (start_recording / rotate_to_phase).
+        self.current_phase: str = sanitize_phase(phase)
         self._user_stop = asyncio.Event()
         self._pipeline: "Gst.Pipeline | None" = None
         self._muxsink: "Gst.Element | None" = None
@@ -147,6 +175,8 @@ class RecordingSession:
         self.restart_count = 0
         self.last_pattern: str | None = None
         self.last_exit: dict | None = None
+        self.rotation_count = 0
+        self._last_phases: list[str] = [self.current_phase]
 
     def is_alive(self) -> bool:
         return self._task is not None and not self._task.done()
@@ -158,17 +188,64 @@ class RecordingSession:
 
     # Invoked by GStreamer on a streaming thread whenever splitmuxsink
     # opens a new fragment.  Must be fast and avoid blocking on anything
-    # that needs the asyncio loop.  Only reads session-immutable state
-    # (base_stamp, out_dir) plus the current part index (set before each
-    # pipeline instance is started).
+    # that needs the asyncio loop.  Reads ``current_phase`` at the
+    # moment the new file is opened -- so after rotate_to_phase updates
+    # current_phase and fires split-now, the next callback (triggered
+    # at the next keyframe) produces a file labelled with the new phase.
     def _on_format_location(self, _splitmux, fragment_id) -> str:
+        phase = self.current_phase
         path = str(
             self._out_dir
-            / f"radcam_{self.base_stamp}_part{self._current_part:02d}"
+            / f"radcam_{self.base_stamp}_{phase}_part{self._current_part:02d}"
             f"_{int(fragment_id):05d}.ts"
         )
         self.last_pattern = path
         return path
+
+    async def rotate_to_phase(self, new_phase: str) -> dict:
+        """Zero-gap rotate: next fragment will be tagged with ``new_phase``.
+
+        Sets ``current_phase`` and fires splitmuxsink's ``split-now``
+        action signal.  The rtspsrc and mux pipeline stay live; the
+        current .ts is closed on the next keyframe (<= one GOP), and
+        the next .ts opens with the new phase in its filename.
+
+        Returns ``{"success": True, "from_phase": ..., "to_phase": ...}``
+        on success, or ``{"success": False, "reason": ...}`` when the
+        pipeline isn't currently alive.
+        """
+        new_phase = sanitize_phase(new_phase)
+        if not self.is_alive():
+            return {"success": False, "reason": "not_recording"}
+        muxsink = self._muxsink
+        if muxsink is None:
+            return {"success": False, "reason": "pipeline_not_ready"}
+        old_phase = self.current_phase
+        if new_phase == old_phase:
+            return {
+                "success": True, "from_phase": old_phase,
+                "to_phase": new_phase, "rotated": False,
+                "note": "already in requested phase",
+            }
+        # Update the live variable BEFORE emitting split-now so the next
+        # format-location callback picks up the new label.  GIL-safe.
+        self.current_phase = new_phase
+        self.rotation_count += 1
+        self._last_phases.append(new_phase)
+        logger.info(
+            "RECORD rotate: %s -> %s (rotations=%d)",
+            old_phase, new_phase, self.rotation_count,
+        )
+        try:
+            muxsink.emit("split-now")
+        except Exception:
+            logger.exception("RECORD split-now emit failed")
+            return {"success": False, "reason": "split_now_failed"}
+        return {
+            "success": True, "from_phase": old_phase,
+            "to_phase": new_phase, "rotated": True,
+            "rotation_count": self.rotation_count,
+        }
 
     def _build_pipeline(self) -> "Gst.Pipeline":
         desc = _build_pipeline_description(self._rtsp_url, self._segment_s)
@@ -351,13 +428,24 @@ async def _select_rtsp_url() -> tuple[str, str]:
     return IPCAM_RTSP_DIRECT, "direct"
 
 
-async def start_recording(segment_seconds: int | None = None) -> dict:
+async def start_recording(
+    segment_seconds: int | None = None,
+    phase: str | None = None,
+) -> dict:
+    """Start (or re-use) a recording session.
+
+    ``phase`` tags every ``.ts`` segment produced by this session until
+    :func:`rotate_to_phase` is called; defaults to ``"manual"`` for UI-
+    initiated recordings outside of a dive.
+    """
     global _session, _last_base_stamp
 
     seg = segment_seconds
     if seg is None:
         seg = int(settings.ipcam_segment_seconds_default)
     seg = max(1, min(seg, 86_400))
+
+    phase_label = sanitize_phase(phase)
 
     rtsp_url, source_label = await _select_rtsp_url()
 
@@ -366,15 +454,23 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
             # Idempotent: treat "start while already recording" as success so
             # clients (the Lua dive script in particular) can freely call
             # /rec/start on every phase transition without producing noisy
-            # HTTP 400s.  The active session is unchanged.
-            return {
+            # HTTP 400s.  The active session is unchanged; if the caller
+            # passed a non-default phase different from the current one we
+            # transparently rotate so they get the expected labelling.
+            result = {
                 "success": True,
                 "already_recording": True,
                 "message": "Already recording",
                 "recording": True,
                 "base_stamp": _session.base_stamp,
                 "storage": _session.storage,
+                "phase": _session.current_phase,
             }
+            if phase is not None and phase_label != _session.current_phase:
+                rot = await _session.rotate_to_phase(phase_label)
+                result["rotate"] = rot
+                result["phase"] = _session.current_phase
+            return result
 
         out_dir, storage = _output_dir()
         stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
@@ -384,23 +480,42 @@ async def start_recording(segment_seconds: int | None = None) -> dict:
             out_dir=out_dir,
             storage_label=storage,
             base_stamp=stamp,
+            phase=phase_label,
         )
         sess.start()
         _session = sess
         _last_base_stamp = stamp
         logger.info(
-            "RECORD session started base=%s storage=%s rtsp=%s seg=%ds",
-            stamp, storage, source_label, seg,
+            "RECORD session started base=%s phase=%s storage=%s rtsp=%s seg=%ds",
+            stamp, phase_label, storage, source_label, seg,
         )
         return {
             "success": True,
             "recording": True,
             "base_stamp": stamp,
+            "phase": phase_label,
             "output_directory": str(out_dir),
             "storage": storage,
             "segment_seconds": seg,
             "rtsp_source": source_label,
         }
+
+
+async def rotate_to_phase(new_phase: str | None) -> dict:
+    """Module-level helper mirroring :meth:`RecordingSession.rotate_to_phase`.
+
+    Returns ``{"success": False, "reason": "not_recording"}`` if no
+    session is currently live.  This is the entry point wired to the
+    ``POST /rec/rotate`` HTTP route used by the Lua dive script.
+    """
+    new_phase_label = sanitize_phase(new_phase)
+    sess = _session
+    if sess is None or not sess.is_alive():
+        return {
+            "success": False, "reason": "not_recording",
+            "to_phase": new_phase_label,
+        }
+    return await sess.rotate_to_phase(new_phase_label)
 
 
 async def stop_recording() -> dict:
@@ -414,14 +529,16 @@ async def stop_recording() -> dict:
                     "message": "Was not recording"}
         await sess.stop()
         logger.info(
-            "RECORD stop completed; restarts=%d last_exit=%s",
-            sess.restart_count, sess.last_exit,
+            "RECORD stop completed; restarts=%d rotations=%d last_exit=%s",
+            sess.restart_count, sess.rotation_count, sess.last_exit,
         )
         return {
             "success": True,
             "recording": False,
             "base_stamp": sess.base_stamp,
             "restarts": sess.restart_count,
+            "rotations": sess.rotation_count,
+            "phases": list(sess._last_phases),
             "last_exit": sess.last_exit,
         }
 
@@ -452,10 +569,14 @@ async def recording_status() -> dict:
     pattern = sess.last_pattern if sess is not None else None
     restarts = sess.restart_count if sess is not None else 0
     last_exit = sess.last_exit if sess is not None else None
+    phase = sess.current_phase if sess is not None else None
+    rotations = sess.rotation_count if sess is not None else 0
     return {
         "recording": alive,
         "base_stamp": base_stamp,
         "output_pattern": pattern,
+        "phase": phase,
+        "rotations": rotations,
         "pid": None,  # in-process pipeline; field kept for API back-compat
         "restarts": restarts,
         "last_exit": last_exit,
