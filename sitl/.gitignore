@@ -2,3 +2,6 @@
 logs/
 *.tlog
 *.tlog.raw
+
+# local docker-compose volume mounts (recordings from rtsp-server validation runs)
+data/

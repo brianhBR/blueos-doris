@@ -21,8 +21,9 @@ dependencies = [
     # GStreamer Python bindings -- required for in-process control of the
     # IP camera RTSP pipeline (splitmuxsink format-location callback,
     # split-now for zero-gap phase rotation).  System libs are provided
-    # by gir1.2-gstreamer-1.0 / libgirepository-1.0-1 in the Dockerfile.
-    "PyGObject>=3.42",
+    # by the Dockerfile (libgirepository-2.0-dev at build time,
+    # libgirepository-2.0-0 + gir1.2-gstreamer-1.0 at runtime).
+    "PyGObject>=3.50",
 ]
 
 [project.optional-dependencies]

@@ -37,7 +37,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     build-essential \
     python3-dev \
     pkg-config \
-    libgirepository1.0-dev \
+    libgirepository-2.0-dev \
     libcairo2-dev \
     # kept at runtime
     ffmpeg \
@@ -45,7 +45,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     gstreamer1.0-plugins-base \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad \
-    libgirepository-1.0-1 \
+    libgirepository-2.0-0 \
     gir1.2-gstreamer-1.0 \
     gir1.2-gst-plugins-base-1.0 \
     && rm -rf /var/lib/apt/lists/*
@@ -58,7 +58,7 @@ RUN mkdir -p src/doris && echo '__version__ = "0.1.0"' > src/doris/__init__.py
 
 # Install Python dependencies (this layer is cached unless pyproject.toml changes)
 RUN python -m pip install --extra-index-url https://www.piwheels.org/simple -e . \
-    && apt-get purge -y build-essential python3-dev pkg-config libgirepository1.0-dev libcairo2-dev \
+    && apt-get purge -y build-essential python3-dev pkg-config libgirepository-2.0-dev libcairo2-dev \
     && apt-get autoremove -y \
     && rm -rf /root/.cache/pip
 
