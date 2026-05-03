@@ -20,6 +20,7 @@ from robyn import Response, Robyn
 
 from ..services.camera import CameraService
 from ..services.dive import DiveService
+from ..services.dive_finalize import finalize_dive
 from ..services import ip_camera_recorder as iprec
 from ..services.storage import DATA_ROOT, StorageService, media_download_id_from_abs_path
 
@@ -305,6 +306,37 @@ def register_dive_routes(app: Robyn) -> None:
             logger.warning(f"Failed to update mission state: {e}")
 
         return json.dumps({"success": ok, "message": "Dive cancelled" if ok else "Failed to set parameter"})
+
+    @app.post("/api/v1/dive/finalize")
+    async def dive_finalize(request):
+        """Concatenate per-phase .ts segments into per-phase MP4s.
+
+        Called by the Lua dive script on RECOVERY entry (fire-and-
+        forget).  Also callable manually from the UI or curl.  If no
+        ``?stamp=`` is given, the most recent recording session's
+        base_stamp is used.
+        """
+        try:
+            body = json.loads(request.body) if request.body else {}
+        except (json.JSONDecodeError, TypeError):
+            body = {}
+        stamp = request.query_params.get("stamp", "")
+        if stamp in (None, ""):
+            stamp = body.get("stamp") or None
+        try:
+            result = await finalize_dive(stamp)
+        except Exception as e:
+            logger.exception("dive finalize failed")
+            return Response(
+                status_code=500,
+                description=json.dumps({"success": False, "error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+        return Response(
+            status_code=200,
+            description=json.dumps(result, default=str),
+            headers={"Content-Type": "application/json"},
+        )
 
     @app.post("/api/v1/dive/sitl/simulate_drop")
     async def sitl_simulate_drop(request):
