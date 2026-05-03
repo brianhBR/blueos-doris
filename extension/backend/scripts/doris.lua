@@ -87,7 +87,7 @@ local STATE_ASCENT        = 3
 local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-assert(param:add_table(73, "DORIS_", 38),
+assert(param:add_table(73, "DORIS_", 36),
        "DIVE: could not add DORIS_ param table")
 
 -- mission control
@@ -136,10 +136,6 @@ assert(param:add_param(73, 34, "BTM_CMOD", 0),    "DORIS_BTM_CMOD")
 assert(param:add_param(73, 35, "BTM_RECS", 0),    "DORIS_BTM_RECS")
 -- BTM_PAUS: video_pause (BTM_CMOD=2) OR capture_frequency (BTM_CMOD=3) in seconds
 assert(param:add_param(73, 36, "BTM_PAUS", 0),    "DORIS_BTM_PAUS")
--- REC_ACT: 1 when the recorder is actively writing (pipeline PLAYING + not in
--- an interval-mode pause); written by this Lua on state transitions so the
--- BlueOS UI / .bin log / other consumers can observe it.
-assert(param:add_param(73, 37, "REC_ACT",  0),    "DORIS_REC_ACT")
 
 
 local DORIS_START    = Parameter("DORIS_START")
@@ -332,15 +328,18 @@ end
 -- IPCAM: HOST=127.0.0.1, BIND_PORT=9979 (inlined)
 local ipcam_recording        = false
 local ipcam_btm_started      = false
--- Interval-mode (VIDEO_INTERVAL) on-bottom duty-cycle state
-local ipcam_cycle_start_ms   = 0
-local ipcam_cycle_is_record  = false
-local ipcam_cycle_initialized = false
--- Timelapse-mode (TIMELAPSE) on-bottom state
-local ipcam_last_snap_ms     = 0
--- RECOVERY-entry one-shot: fired once per dive when Lua asks the
--- extension to concatenate the per-phase .ts segments into MP4s.
-local ipcam_finalize_sent    = false
+-- All remaining runtime state for the interval / timelapse / finalize
+-- orchestrators lives in a single table so we stay well under Lua's
+-- per-closure upvalue cap.  cycle_start_ms == 0 means "duty cycle not
+-- yet initialized for this bottom visit"; last_snap_ms == 0 means "no
+-- timelapse snapshot fired yet"; finalize_sent flips true exactly once
+-- per dive at RECOVERY entry.
+local ipcam_state = {
+    cycle_start_ms  = 0,
+    cycle_is_record = false,
+    last_snap_ms    = 0,
+    finalize_sent   = false,
+}
 
 -- ?????????? helpers ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
 local function get_depth_m()
@@ -734,20 +733,11 @@ local function ipcam_http_finalize(host, port)
     return ipcam_http_send("POST /api/v1/dive/finalize", host, port)
 end
 
-local function publish_rec_active(active)
-    -- Write DORIS_REC_ACT so external consumers (UI, MAVLink log) can see
-    -- the pipeline's active/idle state without polling /rec/status.  This
-    -- is a non-persistent set (param:set, not set_and_save) because we
-    -- toggle it frequently during interval-mode duty cycles.
-    param:set("DORIS_REC_ACT", active and 1 or 0)
-end
-
 local function ipcam_start(phase)
     if ipcam_recording then return end
     if not ipcam_cfg.rec_en then return end
     if ipcam_http_start("127.0.0.1", 8095, 1800, phase or "manual") then
         ipcam_recording = true
-        publish_rec_active(true)
         gcs:send_text(MAV_SEVERITY.INFO,
             string.format("DIVE: IPcam recording started (%s)", phase or "manual"))
     else
@@ -759,7 +749,6 @@ local function ipcam_stop()
     if not ipcam_recording then return end
     ipcam_http_stop("127.0.0.1", 8095)
     ipcam_recording = false
-    publish_rec_active(false)
     gcs:send_text(MAV_SEVERITY.INFO, "DIVE: IPcam recording stopped")
 end
 
@@ -775,7 +764,6 @@ local function ipcam_rotate(phase)
         return
     end
     if ipcam_http_rotate("127.0.0.1", 8095, phase or "manual") then
-        publish_rec_active(true)
         gcs:send_text(MAV_SEVERITY.INFO,
             string.format("DIVE: IPcam rotate -> %s", phase or "manual"))
     else
@@ -1081,10 +1069,9 @@ function update()
                 ipcam_btm_started = false
                 -- Reset interval/timelapse timers so the on_bottom
                 -- loop below can establish its own cadence.
-                ipcam_cycle_start_ms    = 0
-                ipcam_cycle_is_record   = false
-                ipcam_cycle_initialized = false
-                ipcam_last_snap_ms      = 0
+                ipcam_state.cycle_start_ms  = 0
+                ipcam_state.cycle_is_record = false
+                ipcam_state.last_snap_ms    = 0
                 -- For CONTINUOUS bottom mode with no camera delay we do
                 -- a zero-gap rotate-or-start right now so the moment
                 -- the vehicle settles, the first "on_bottom" .ts starts.
@@ -1158,29 +1145,28 @@ function update()
             -- VIDEO_INTERVAL: duty-cycle record for btm_rec_ms, pause btm_pau_ms.
             if cam_delay_done and ipcam_cfg.btm_rec_ms > 0
                and ipcam_cfg.btm_pau_ms > 0 then
-                if not ipcam_cycle_initialized then
-                    ipcam_cycle_start_ms    = now_ms
-                    ipcam_cycle_is_record   = true
-                    ipcam_cycle_initialized = true
+                if ipcam_state.cycle_start_ms == 0 then
+                    ipcam_state.cycle_start_ms  = now_ms
+                    ipcam_state.cycle_is_record = true
                     ipcam_begin_phase(true, "on_bottom")
                     ipcam_btm_started = ipcam_recording
                     gcs:send_text(MAV_SEVERITY.INFO,
                         string.format("DIVE: IPcam interval start (rec %ds)",
                             math.floor(ipcam_cfg.btm_rec_ms / 1000)))
                 else
-                    local cycle_elapsed = now_ms - ipcam_cycle_start_ms
-                    if ipcam_cycle_is_record
+                    local cycle_elapsed = now_ms - ipcam_state.cycle_start_ms
+                    if ipcam_state.cycle_is_record
                        and cycle_elapsed >= ipcam_cfg.btm_rec_ms then
-                        ipcam_cycle_is_record = false
-                        ipcam_cycle_start_ms  = now_ms
+                        ipcam_state.cycle_is_record = false
+                        ipcam_state.cycle_start_ms  = now_ms
                         if ipcam_recording then ipcam_stop() end
                         gcs:send_text(MAV_SEVERITY.INFO,
                             string.format("DIVE: IPcam interval pause (%ds)",
                                 math.floor(ipcam_cfg.btm_pau_ms / 1000)))
-                    elseif (not ipcam_cycle_is_record)
+                    elseif (not ipcam_state.cycle_is_record)
                        and cycle_elapsed >= ipcam_cfg.btm_pau_ms then
-                        ipcam_cycle_is_record = true
-                        ipcam_cycle_start_ms  = now_ms
+                        ipcam_state.cycle_is_record = true
+                        ipcam_state.cycle_start_ms  = now_ms
                         if not ipcam_recording then
                             ipcam_start("on_bottom")
                         end
@@ -1194,10 +1180,11 @@ function update()
             -- TIMELAPSE: snapshots are mutually exclusive with the pipeline.
             if ipcam_recording then ipcam_stop() end
             if cam_delay_done and ipcam_cfg.btm_pau_ms > 0 then
-                local since_last = now_ms - ipcam_last_snap_ms
-                if ipcam_last_snap_ms == 0 or since_last >= ipcam_cfg.btm_pau_ms then
+                local since_last = now_ms - ipcam_state.last_snap_ms
+                if ipcam_state.last_snap_ms == 0
+                   or since_last >= ipcam_cfg.btm_pau_ms then
                     ipcam_snapshot("on_bottom")
-                    ipcam_last_snap_ms = now_ms
+                    ipcam_state.last_snap_ms = now_ms
                 end
             end
         end
@@ -1290,9 +1277,9 @@ function update()
         -- extension rolls per-phase .ts segments into MP4s + manifest.
         -- Done before recovery_done so even if disarm is slow we still
         -- trigger the concat promptly.
-        if not ipcam_finalize_sent then
+        if not ipcam_state.finalize_sent then
             ipcam_finalize()
-            ipcam_finalize_sent = true
+            ipcam_state.finalize_sent = true
         end
         if not recovery_done and not arming:is_armed() then
             deactivate_relay()
