@@ -683,9 +683,11 @@ local function update_telemetry(now_ms)
 end
 
 local function ipcam_http_send(first_line, host, port)
-    if is_sitl then
-        return true
-    end
+    -- SITL short-circuit removed: the Lua now drives /rec/* and
+    -- /api/v1/dive/finalize directly in both SITL and production so
+    -- the same code path is exercised at every stage.  On BlueOS the
+    -- autopilot container and the extension container share the host
+    -- network namespace, so 127.0.0.1:8095 resolves to the extension.
     local sock = Socket(0)
     if not sock:bind("0.0.0.0", 0) then
         gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: IPcam bind failed")

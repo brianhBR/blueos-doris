@@ -18,22 +18,19 @@ What this monitor does:
       battery / GPS-loss simulation.
     * Waits for the operator to type ``deploy`` and then applies negative
       ``SIM_BUOYANCY`` to start the descent.
-    * The Lua script still emits ``"DIVE: IPcam recording started/stopped"``
-      STATUSTEXT at the correct trigger points, but in SITL mode it
-      short-circuits the onboard HTTP POST. This monitor bridges those
-      announcements to the vehicle's real ``POST /rec/start`` /
-      ``POST /rec/stop`` endpoints.
     * A background thread polls ``GET /rec/status`` at 2 Hz for ground-truth
-      recording state.
+      recording state (used by the coverage report below).
     * Per-phase dive windows (DESCENT / ON_BOTTOM / ASCENT) are measured
       against actual recording windows; a coverage report is printed when
       RECOVERY is reached (or when the monitor is stopped).
 
+The Lua dive script now drives the extension's HTTP API directly
+(POST /rec/start?phase=..., /rec/rotate, /rec/snapshot, /api/v1/dive/
+finalize).  This monitor no longer bridges STATUSTEXT to HTTP.
+
 Commands (type in this pane while the monitor is running):
     deploy      Sink the vehicle (sets SIM_BUOYANCY = -19.6 N)
     surface     Emergency surface (sets SIM_BUOYANCY = +19.6 N)
-    rec on      Force /rec/start on the vehicle (debug)
-    rec off     Force /rec/stop on the vehicle (debug)
     stop        Set DORIS_START=0 to cancel the mission
     q / quit    Exit the monitor (prints coverage report first)
 """
@@ -176,18 +173,6 @@ class ExtensionClient:
             return e.code, None, body or str(e)
         except (urllib.error.URLError, TimeoutError, ConnectionError, OSError) as e:
             return 0, None, str(e)
-
-    def rec_start(self, split_duration: int = 1800) -> tuple[bool, str]:
-        code, js, err = self._request("POST", f"/rec/start?split_duration={split_duration}")
-        if code == 200 and js and js.get("success"):
-            return True, ""
-        return False, err or (js.get("message") if js else f"HTTP {code}")
-
-    def rec_stop(self) -> tuple[bool, str]:
-        code, js, err = self._request("POST", "/rec/stop")
-        if code == 200 and js and js.get("success"):
-            return True, ""
-        return False, err or (js.get("message") if js else f"HTTP {code}")
 
     def rec_status(self) -> tuple[bool | None, dict | None, str]:
         code, js, err = self._request("GET", "/rec/status")
@@ -491,18 +476,10 @@ def main() -> None:
                 if mtype == "STATUSTEXT":
                     text = msg.text.rstrip("\x00")
                     lower = text.lower()
-                    if "ipcam recording started" in lower:
-                        print("%6.1f  *** Lua → START recording ***" % elapsed)
-                        ok, err = ext.rec_start(split_duration=1800)
-                        tag = "ok" if ok else ("FAIL: " + err)
-                        events.append((elapsed, "bridge", "POST /rec/start → %s" % tag))
-                    elif "ipcam recording stopped" in lower:
-                        print("%6.1f  *** Lua → STOP recording ***" % elapsed)
-                        ok, err = ext.rec_stop()
-                        tag = "ok" if ok else ("FAIL: " + err)
-                        events.append((elapsed, "bridge", "POST /rec/stop  → %s" % tag))
-                    elif "ipcam" in lower or "recording" in lower:
-                        print("%6.1f  REC-STATUS: %s" % (elapsed, text))
+                    # The Lua script now drives /rec/* directly; the
+                    # monitor just logs the STATUSTEXT for visibility.
+                    if "ipcam" in lower or "recording" in lower:
+                        print("%6.1f  REC: %s" % (elapsed, text))
                     else:
                         print("%6.1f  STATUS: %s" % (elapsed, text))
                 elif mtype == "SERVO_OUTPUT_RAW":
@@ -573,18 +550,12 @@ def main() -> None:
                 print("\n%6.1f  [surface] SIM_BUOYANCY = %.1f N\n"
                       % (elapsed, SURFACE_BUOYANCY))
                 set_param(mav, "SIM_BUOYANCY", SURFACE_BUOYANCY, timeout=2.0)
-            elif cmd == "rec on":
-                ok, err = ext.rec_start()
-                print("  [rec on]  %s" % ("ok" if ok else err))
-            elif cmd == "rec off":
-                ok, err = ext.rec_stop()
-                print("  [rec off] %s" % ("ok" if ok else err))
             elif cmd == "stop":
                 print("\n%6.1f  [stop] DORIS_START = 0\n" % elapsed)
                 set_param(mav, "DORIS_START", 0.0, timeout=2.0)
             elif cmd is not None and cmd not in ("q", "quit"):
                 print("  Unknown command '%s'. Available: deploy, surface, "
-                      "rec on, rec off, stop, q" % cmd)
+                      "stop, q" % cmd)
 
             # Periodic status row
             if elapsed - last_row >= 3.0:
