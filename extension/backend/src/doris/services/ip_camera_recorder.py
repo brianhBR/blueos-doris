@@ -112,7 +112,16 @@ _state_lock = asyncio.Lock()
 _session: "RecordingSession | None" = None
 # Retained across stop_recording() so callers (e.g. /api/v1/dive/finalize)
 # can resolve the most-recent dive's recordings without a second round-trip.
+# Also serves as the shared "dive base_stamp" for snapshots taken in
+# TIMELAPSE mode when no recording session exists.
 _last_base_stamp: str | None = None
+
+# Per-(stamp, phase) JPEG sequence counters for TIMELAPSE-mode snapshots.
+# Cleared on dive-finalize so each new dive starts fresh.
+_snapshot_seqs: dict[tuple[str, str], int] = {}
+
+# Lazily-initialised CameraService (httpx clients are cached inside).
+_camera_service = None
 
 
 def _data_root() -> Path:
@@ -560,6 +569,119 @@ def last_base_stamp() -> str | None:
     the caller doesn't pass an explicit ``stamp`` query parameter.
     """
     return _last_base_stamp
+
+
+def _ensure_dive_stamp() -> str:
+    """Return the current dive's base_stamp, allocating one if missing.
+
+    TIMELAPSE mode calls ``/rec/snapshot`` without ever starting a
+    recording session, so ``_last_base_stamp`` may be unset when the
+    first snapshot of a dive is taken.  Allocate one on demand and
+    reuse it for all snapshots in the same dive (until finalize clears
+    it).
+    """
+    global _last_base_stamp
+    if _last_base_stamp is None:
+        _last_base_stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return _last_base_stamp
+
+
+def _next_snapshot_seq(stamp: str, phase: str) -> int:
+    key = (stamp, phase)
+    seq = _snapshot_seqs.get(key, 0) + 1
+    _snapshot_seqs[key] = seq
+    return seq
+
+
+def clear_snapshot_state() -> None:
+    """Reset the snapshot sequence counters.
+
+    Called by ``/api/v1/dive/finalize`` so a subsequent dive starts
+    from snapshot seq=1 again.
+    """
+    _snapshot_seqs.clear()
+
+
+def _get_camera_service():
+    global _camera_service
+    if _camera_service is None:
+        # Local import to avoid a hard import-cycle at module load time.
+        from .camera import CameraService
+        _camera_service = CameraService()
+    return _camera_service
+
+
+async def take_phase_snapshot(phase: str | None) -> dict:
+    """Capture a single JPEG from the RTSP camera and save it under
+    ``<recordings>/radcam_<stamp>_<phase>_<seq>.jpg``.
+
+    This is the TIMELAPSE primitive driven by the Lua dive script.
+    Returns ``success=False, reason="recorder_active"`` (with an HTTP
+    status hint of 409) when the recorder pipeline is alive -- the
+    camera only supports one RTSP session at a time, so snapshot and
+    recording are mutually exclusive.
+
+    The Lua is expected to call :func:`stop_recording` first if it
+    wants to take snapshots during a previously-recording phase.
+    """
+    phase_label = sanitize_phase(phase)
+    if is_recording():
+        return {
+            "success": False,
+            "reason": "recorder_active",
+            "message": (
+                "Cannot take a snapshot while the IP camera recorder is "
+                "active (camera allows only one RTSP session)"
+            ),
+            "http_status": 409,
+        }
+
+    out_dir, storage = _output_dir()
+    stamp = _ensure_dive_stamp()
+    seq = _next_snapshot_seq(stamp, phase_label)
+    filename = f"radcam_{stamp}_{phase_label}_{seq:05d}.jpg"
+    path = out_dir / filename
+
+    camera = _get_camera_service()
+    try:
+        jpeg = await camera.get_snapshot()
+    except Exception as e:
+        logger.exception("SNAPSHOT get_snapshot raised")
+        return {
+            "success": False, "reason": "snapshot_exception",
+            "message": str(e), "http_status": 502,
+        }
+    if jpeg is None:
+        return {
+            "success": False, "reason": "snapshot_failed",
+            "message": "Camera returned no image",
+            "http_status": 502,
+        }
+
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(jpeg)
+    except Exception as e:
+        logger.exception("SNAPSHOT write failed: %s", path)
+        return {
+            "success": False, "reason": "write_failed",
+            "message": str(e), "http_status": 500,
+        }
+
+    logger.info(
+        "SNAPSHOT saved %s (%d bytes, phase=%s, seq=%d)",
+        path, len(jpeg), phase_label, seq,
+    )
+    return {
+        "success": True,
+        "path": str(path),
+        "filename": filename,
+        "base_stamp": stamp,
+        "phase": phase_label,
+        "seq": seq,
+        "size_bytes": len(jpeg),
+        "storage": storage,
+    }
 
 
 async def recording_status() -> dict:

@@ -68,6 +68,28 @@ async def _recorder_stop_core(_request):
     return _json_response(result)
 
 
+async def _recorder_snapshot_core(request):
+    phase_raw = request.query_params.get("phase", "")
+    if phase_raw in (None, ""):
+        logger.warning("RECORD /snapshot missing required ?phase=...")
+        return _json_response(
+            {"success": False, "reason": "missing_phase",
+             "message": "phase query parameter is required"},
+            400,
+        )
+    logger.info("RECORD /snapshot called (phase=%s)", phase_raw)
+    try:
+        result = await iprec.take_phase_snapshot(phase_raw)
+    except Exception as e:
+        logger.exception("recorder /snapshot failed")
+        return _json_response({"success": False, "message": str(e)}, 500)
+    code = 200
+    if not result.get("success"):
+        # Pop the hint so it doesn't leak into the body; fall back to 400.
+        code = result.pop("http_status", 400)
+    return _json_response(result, code)
+
+
 async def _recorder_rotate_core(request):
     phase_raw = request.query_params.get("phase", "")
     if phase_raw in (None, ""):
@@ -128,6 +150,14 @@ def register_recorder_routes(app: Robyn) -> None:
     @app.post("/api/v1/ipcam/record/rotate")
     async def recorder_rotate_api(request):
         return await _recorder_rotate_core(request)
+
+    @app.post("/rec/snapshot")
+    async def recorder_snapshot_lua(request):
+        return await _recorder_snapshot_core(request)
+
+    @app.post("/api/v1/ipcam/record/snapshot")
+    async def recorder_snapshot_api(request):
+        return await _recorder_snapshot_core(request)
 
     @app.get("/rec/status")
     async def recorder_status_lua(request):
