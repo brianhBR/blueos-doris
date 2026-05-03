@@ -18,6 +18,11 @@ dependencies = [
     "uvloop>=0.19.0",
     "websockets>=15.0",
     "pyserial>=3.5",
+    # GStreamer Python bindings -- required for in-process control of the
+    # IP camera RTSP pipeline (splitmuxsink format-location callback,
+    # split-now for zero-gap phase rotation).  System libs are provided
+    # by gir1.2-gstreamer-1.0 / libgirepository-1.0-1 in the Dockerfile.
+    "PyGObject>=3.42",
 ]
 
 [project.optional-dependencies]

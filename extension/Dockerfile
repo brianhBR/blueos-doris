@@ -20,19 +20,34 @@ FROM python:3.11-slim
 WORKDIR /app
 
 # Install build dependencies for uvloop (required by Robyn on Linux),
-# ffmpeg for RTSP snapshot capture, and GStreamer for IP camera
-# recording. ffmpeg's RTSP demuxer is incompatible with the RadCam
-# camera (camera tears down the session right after the first IDR
-# burst, leaving truncated stub files); GStreamer's rtspsrc keeps the
-# session running and is auto-restarted on disconnect by the recorder.
+# ffmpeg for RTSP snapshot capture, GStreamer for IP camera recording,
+# and the GObject Introspection toolchain + typelibs so the backend
+# can drive the GStreamer pipeline in-process via PyGObject (rather
+# than spawning gst-launch-1.0 as a subprocess).  This unlocks the
+# splitmuxsink format-location callback + split-now action signal
+# used for zero-gap phase rotation.
+#
+# ffmpeg's RTSP demuxer is incompatible with the RadCam camera
+# (camera tears down the session right after the first IDR burst,
+# leaving truncated stub files); GStreamer's rtspsrc keeps the
+# session running and is auto-restarted on disconnect by the
+# recorder watchdog.
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    # build-time only (purged after pip install below)
     build-essential \
     python3-dev \
+    pkg-config \
+    libgirepository1.0-dev \
+    libcairo2-dev \
+    # kept at runtime
     ffmpeg \
     gstreamer1.0-tools \
     gstreamer1.0-plugins-base \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad \
+    libgirepository-1.0-1 \
+    gir1.2-gstreamer-1.0 \
+    gir1.2-gst-plugins-base-1.0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy ONLY dependency files first (for better layer caching)
@@ -43,7 +58,7 @@ RUN mkdir -p src/doris && echo '__version__ = "0.1.0"' > src/doris/__init__.py
 
 # Install Python dependencies (this layer is cached unless pyproject.toml changes)
 RUN python -m pip install --extra-index-url https://www.piwheels.org/simple -e . \
-    && apt-get purge -y build-essential python3-dev \
+    && apt-get purge -y build-essential python3-dev pkg-config libgirepository1.0-dev libcairo2-dev \
     && apt-get autoremove -y \
     && rm -rf /root/.cache/pip
 
