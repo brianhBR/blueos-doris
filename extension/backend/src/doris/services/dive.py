@@ -58,10 +58,55 @@ def _time_value_to_seconds(tv: TimeValue) -> float:
 
 
 def _ipcam_phase_enabled(cam: CameraSettings) -> float:
-    """Return 1.0 if IP camera recording is wanted for this phase, else 0.0."""
+    """Return 1.0 if continuous IP camera recording is wanted for this phase.
+
+    Used for DESCENT and ASCENT, which only support "record the whole
+    phase continuously" or "don't record".  Advanced camera modes
+    (VIDEO_INTERVAL / TIMELAPSE) are bottom-only in v1 -- see
+    :func:`_bottom_camera_mode` for that dispatch.
+    """
     if cam.enabled and cam.camera_type == CameraType.CONTINUOUS_VIDEO:
         return 1.0
     return 0.0
+
+
+def _capture_frequency_to_seconds(cam: CameraSettings) -> float:
+    """Flatten TIMELAPSE ``capture_frequency`` + unit to seconds."""
+    try:
+        n = max(0, int(cam.capture_frequency))
+    except (TypeError, ValueError):
+        return 0.0
+    if cam.capture_frequency_unit == "minutes":
+        return n * 60.0
+    if cam.capture_frequency_unit == "hours":
+        return n * 3600.0
+    return float(n)
+
+
+def _bottom_camera_mode(cam: CameraSettings) -> tuple[int, float, float]:
+    """Translate a bottom-phase CameraSettings into ``(mode, rec_s, pau_s)``.
+
+    mode:
+        0  off (camera disabled, or unknown camera_type)
+        1  continuous video (entire bottom)
+        2  video-interval: record ``rec_s`` then pause ``pau_s``, repeat
+        3  timelapse: snapshot every ``pau_s`` seconds
+
+    For modes 0/1 both durations are 0.  For mode 3 ``rec_s`` is 0
+    (no video) and ``pau_s`` holds the snapshot interval.
+    """
+    if not cam.enabled:
+        return 0, 0.0, 0.0
+    if cam.camera_type == CameraType.CONTINUOUS_VIDEO:
+        return 1, 0.0, 0.0
+    if cam.camera_type == CameraType.VIDEO_INTERVAL:
+        rec = _time_value_to_seconds(cam.video_record)
+        pau = _time_value_to_seconds(cam.video_pause)
+        return 2, max(0.0, rec), max(0.0, pau)
+    if cam.camera_type == CameraType.TIMELAPSE:
+        freq = _capture_frequency_to_seconds(cam)
+        return 3, 0.0, max(0.0, freq)
+    return 0, 0.0, 0.0
 
 
 class DiveService:
@@ -102,8 +147,14 @@ class DiveService:
             config.descent.camera if config.ascent.same_as_descent else config.ascent.camera
         )
         d_rec = _ipcam_phase_enabled(config.descent.camera)
-        b_rec = _ipcam_phase_enabled(config.bottom.camera)
         a_rec = _ipcam_phase_enabled(ascent_cam)
+
+        btm_mode_int, btm_rec_s, btm_pau_s = _bottom_camera_mode(config.bottom.camera)
+        # Legacy DORIS_BTM_REC: 1 iff any bottom recording/snapshotting is
+        # wanted.  Kept in sync with BTM_CMOD so the Lua's back-compat
+        # fallback (CMOD=0 with BTM_REC=1 -> treat as continuous) only
+        # triggers on pre-CMOD profiles, never on a fresh push.
+        b_rec = 1.0 if btm_mode_int > 0 else 0.0
         rec_master = 1.0 if any(v >= 1.0 for v in (d_rec, b_rec, a_rec)) else 0.0
 
         params: list[tuple[str, float]] = [
@@ -122,6 +173,11 @@ class DiveService:
             ("DORIS_DSC_REC", d_rec),
             ("DORIS_BTM_REC", b_rec),
             ("DORIS_ASC_REC", a_rec),
+            # Bottom camera mode + interval/timelapse timings for the
+            # Lua's on-bottom dispatcher.
+            ("DORIS_BTM_CMOD", float(btm_mode_int)),
+            ("DORIS_BTM_RECS", round(btm_rec_s)),
+            ("DORIS_BTM_PAUS", round(btm_pau_s)),
         ]
 
         all_ok = True
