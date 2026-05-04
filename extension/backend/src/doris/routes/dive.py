@@ -225,6 +225,16 @@ def register_dive_routes(app: Robyn) -> None:
         if not ok:
             return json.dumps({"success": False, "message": "Failed to set parameter"})
 
+        # Clear any stale dive-scoped recorder state (base_stamp,
+        # snapshot sequence counters) left over from a prior UI session
+        # or an aborted dive.  Ensures this new dive's recordings get a
+        # fresh ``radcam_<stamp>_...`` prefix instead of sharing one with
+        # a previous session that never ran finalize.
+        try:
+            iprec.clear_snapshot_state()
+        except Exception as e:
+            logger.warning("clear_snapshot_state on dive start failed: %s", e)
+
         stale = _close_all_active_dive_records("completed")
         if stale:
             logger.info(f"Closed {stale} stale active dive record(s) before new dive")

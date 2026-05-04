@@ -113,10 +113,16 @@ def _ensure_gst_init() -> None:
 
 _state_lock = asyncio.Lock()
 _session: "RecordingSession | None" = None
-# Retained across stop_recording() so callers (e.g. /api/v1/dive/finalize)
-# can resolve the most-recent dive's recordings without a second round-trip.
-# Also serves as the shared "dive base_stamp" for snapshots taken in
-# TIMELAPSE mode when no recording session exists.
+# Dive-scoped base stamp.  All recording sessions (and TIMELAPSE-mode
+# snapshots) within a single dive reuse this stamp so every .ts / .jpg
+# carries the same ``radcam_<stamp>_...`` prefix.  That lets
+# ``finalize_dive`` group files across phase boundaries even when the
+# Lua script stops and restarts the recorder between phases (e.g.
+# descent -> on_bottom in VIDEO_INTERVAL mode, or the recorder's own
+# watchdog restarts after a camera-induced RTSP tear-down).
+#
+# Allocated lazily by the first start_recording / snapshot of a dive,
+# cleared by ``/api/v1/dive/finalize`` (via ``clear_snapshot_state``).
 _last_base_stamp: str | None = None
 
 # Per-(stamp, phase) JPEG sequence counters for TIMELAPSE-mode snapshots.
@@ -189,6 +195,12 @@ class RecordingSession:
         self.last_exit: dict | None = None
         self.rotation_count = 0
         self._last_phases: list[str] = [self.current_phase]
+        # Pending phase queued when a rotate lands while the underlying
+        # pipeline is not-yet-ready (between watchdog restarts, muxsink
+        # already torn down in _run_one's finally block).  Applied at
+        # the start of the next pipeline iteration so the first segment
+        # of that part carries the requested phase.
+        self._pending_phase: str | None = None
 
     def is_alive(self) -> bool:
         return self._task is not None and not self._task.done()
@@ -215,24 +227,43 @@ class RecordingSession:
         return path
 
     async def rotate_to_phase(self, new_phase: str) -> dict:
-        """Zero-gap rotate: next fragment will be tagged with ``new_phase``.
+        """Rotate to ``new_phase``.  Zero-gap when the pipeline is live,
+        queued otherwise so the next pipeline part picks it up.
 
-        Sets ``current_phase`` and fires splitmuxsink's ``split-now``
-        action signal.  The rtspsrc and mux pipeline stay live; the
-        current .ts is closed on the next keyframe (<= one GOP), and
-        the next .ts opens with the new phase in its filename.
+        Three code paths:
 
-        Returns ``{"success": True, "from_phase": ..., "to_phase": ...}``
-        on success, or ``{"success": False, "reason": ...}`` when the
-        pipeline isn't currently alive.
+        1. Pipeline live + muxsink ready  ->  update current_phase,
+           emit ``split-now``; the current .ts closes on the next
+           keyframe (<= one GOP) and the next .ts opens with the new
+           phase in its filename.  This is the intended zero-gap path.
+        2. Session alive but pipeline mid-restart (muxsink torn down in
+           _run_one's finally block, watchdog in backoff)  ->  queue
+           the phase in ``_pending_phase``.  The next ``_run_one``
+           iteration applies it before the first format-location
+           callback fires, so the first .ts of that part carries the
+           new phase.  Reports ``queued: True`` so the caller can tell.
+        3. Session not alive (watchdog exited, e.g. post-stop)  ->
+           return ``{"success": False, "reason": "not_recording"}``.
         """
         new_phase = sanitize_phase(new_phase)
         if not self.is_alive():
             return {"success": False, "reason": "not_recording"}
+
+        old_phase = self.current_phase
         muxsink = self._muxsink
         if muxsink is None:
-            return {"success": False, "reason": "pipeline_not_ready"}
-        old_phase = self.current_phase
+            # Pipeline mid-restart -- queue so the next iteration picks
+            # it up in _run_one before the first callback fires.
+            self._pending_phase = new_phase
+            logger.info(
+                "RECORD rotate queued: %s -> %s (pipeline mid-restart)",
+                old_phase, new_phase,
+            )
+            return {
+                "success": True, "from_phase": old_phase,
+                "to_phase": new_phase, "rotated": False,
+                "queued": True,
+            }
         if new_phase == old_phase:
             return {
                 "success": True, "from_phase": old_phase,
@@ -277,9 +308,22 @@ class RecordingSession:
         Returns ``(exit_reason, runtime_s)``.
         """
         t0 = asyncio.get_event_loop().time()
+        # If a rotate landed while the previous pipeline was tearing
+        # down, apply the queued phase now so the first fragment of
+        # this new part carries the requested label.
+        if self._pending_phase is not None and self._pending_phase != self.current_phase:
+            old_phase = self.current_phase
+            self.current_phase = self._pending_phase
+            self.rotation_count += 1
+            self._last_phases.append(self.current_phase)
+            logger.info(
+                "RECORD rotate applied on restart: %s -> %s (rotations=%d)",
+                old_phase, self.current_phase, self.rotation_count,
+            )
+        self._pending_phase = None
         logger.info(
-            "RECORD spawning Gst pipeline part=%d url=%s",
-            self._current_part, self._rtsp_url,
+            "RECORD spawning Gst pipeline part=%d url=%s phase=%s",
+            self._current_part, self._rtsp_url, self.current_phase,
         )
         try:
             pipeline = self._build_pipeline()
@@ -485,7 +529,13 @@ async def start_recording(
             return result
 
         out_dir, storage = _output_dir()
-        stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+        # Reuse the dive-scoped stamp if one already exists so a
+        # descent -> (stop) -> on_bottom transition (or a finalize-less
+        # restart) keeps writing under the same radcam_<stamp>_... prefix.
+        # Only finalize clears _last_base_stamp.
+        stamp = _last_base_stamp or datetime.now(tz=timezone.utc).strftime(
+            "%Y%m%d_%H%M%S",
+        )
         sess = RecordingSession(
             rtsp_url=rtsp_url,
             segment_s=seg,
@@ -597,12 +647,15 @@ def _next_snapshot_seq(stamp: str, phase: str) -> int:
 
 
 def clear_snapshot_state() -> None:
-    """Reset the snapshot sequence counters.
+    """Reset snapshot counters and the dive-scoped base stamp.
 
-    Called by ``/api/v1/dive/finalize`` so a subsequent dive starts
-    from snapshot seq=1 again.
+    Called by ``/api/v1/dive/finalize`` so the next dive allocates a
+    fresh ``_last_base_stamp`` on its first start_recording / snapshot
+    and snapshot seq counters start at 1 again.
     """
+    global _last_base_stamp
     _snapshot_seqs.clear()
+    _last_base_stamp = None
 
 
 def _get_camera_service():
