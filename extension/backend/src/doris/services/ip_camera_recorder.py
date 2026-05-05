@@ -92,6 +92,44 @@ from . import usb_storage
 
 logger = logging.getLogger(__name__)
 
+# ── DIAGNOSTIC: temporary GStreamer debug instrumentation ──────────────────────
+#
+# Investigating a reproducible freeze on the H.265 split-now path: every
+# dive on this branch records the descent fragment perfectly (122 s of
+# wallclock -> 122.6 s on disk) but the on_bottom fragment created by
+# splitmuxsink's first ``split-now`` only ever captures ~90-100 s of
+# video and then disk writes silently stop while the bus continues to
+# report the pipeline healthy.  The freeze isn't visible at the recorder
+# level (no errors, no EOS, no element warnings) so we crank up
+# splitmuxsink + mpegtsmux + filesink + multiqueue + h265parse logging
+# to a dedicated file (``$GST_DEBUG_FILE``) to capture exactly what each
+# element is doing across the rotate.
+#
+# We write to a file under ``/tmp/storage/userdata/`` (which is mapped
+# to the persistent BlueOS userdata volume so it survives container
+# restarts and is reachable via /api/v1/system/logs) instead of stderr,
+# because ``splitmuxsink:5`` alone produces hundreds of lines per
+# second at 50 Mbit/s and we don't want to flood the container's
+# rotated json log driver.  Remove this block once the split-now
+# freeze is understood and fixed.
+_GST_DEBUG_DIAG = (
+    "splitmuxsink:5,mpegtsmux:5,filesink:5,multiqueue:5,h265parse:4,"
+    "rtspsrc:4,rtph265depay:4,2"
+)
+_GST_DEBUG_FILE_DIAG = "/tmp/storage/userdata/gst-debug.log"
+if "GST_DEBUG" not in os.environ:
+    os.environ["GST_DEBUG"] = _GST_DEBUG_DIAG
+    os.environ["GST_DEBUG_FILE"] = _GST_DEBUG_FILE_DIAG
+    os.environ["GST_DEBUG_NO_COLOR"] = "1"
+    try:
+        Path(_GST_DEBUG_FILE_DIAG).parent.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        pass
+    logger.warning(
+        "GST_DEBUG forced to diagnostic level: %s -> %s",
+        _GST_DEBUG_DIAG, _GST_DEBUG_FILE_DIAG,
+    )
+
 _IPCAM_RTSP_DEFAULT = "rtsp://admin:blue@192.168.2.10:554/stream_0"
 IPCAM_RTSP_DIRECT = os.environ.get(
     "DORIS_IPCAM_RTSP_URL", _IPCAM_RTSP_DEFAULT,
