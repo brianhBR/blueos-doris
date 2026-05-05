@@ -28,12 +28,9 @@ Pipeline (per instance):
         ! rtph265depay wait-for-keyframe=true
         ! h265parse config-interval=-1
         ! video/x-h265,stream-format=byte-stream,alignment=au
-        ! queue max-size-time=30000000000
-                max-size-bytes=0 max-size-buffers=0
-                leaky=downstream silent=true
         ! splitmuxsink name=muxsink max-size-time=NS
                        muxer-factory=mpegtsmux send-keyframe-requests=true
-                       async-finalize=true
+                       async-finalize=false
 
 Key differences vs the H.264 pipeline:
 
@@ -48,10 +45,21 @@ Key differences vs the H.264 pipeline:
 * ``latency=5000`` (vs 2000) buffers more jitter at the cost of an
   extra 3 s of startup delay -- worthwhile at 50 Mbit/s HEVC where a
   single dropped packet is a much bigger deal than at 25 Mbit/s H.264.
-* A 30 s leaky downstream ``queue`` between parser and muxer absorbs
-  bursty input from the camera; if the muxer or disk falls behind for
-  any reason, ``leaky=downstream`` drops oldest buffers rather than
-  back-pressuring rtspsrc into a teardown.
+* ``async-finalize=false`` (vs the GStreamer default ``true``).  The
+  first version of this branch copied a 30 s ``leaky=downstream``
+  ``queue`` between the parser and ``splitmuxsink`` from the towfish
+  reference, paired with the default ``async-finalize=true``.  In live
+  testing that combination silently froze splitmuxsink's writer
+  ~6 minutes into a dive on the very first ``split-now`` rotation:
+  splitmuxsink kicked off background finalize of the descent segment,
+  the new on_bottom muxer instance got starved of buffers, the
+  upstream queue filled and started leaking at the output, and the
+  on_bottom .ts file simply stopped growing while the bus still
+  reported the pipeline healthy.  Synchronous finalize takes a tiny
+  fraction of a second for our short MPEG-TS fragments and avoids
+  that interaction entirely; rtspsrc's own 5 s jitterbuffer and the
+  splitmuxsink-internal muxer queue absorb whatever burstiness the
+  camera produces, so the dedicated upstream queue is unnecessary.
 
 The camera signals VPS/SPS/PPS only via the SDP, so without
 ``config-interval=-1`` only the first segment after each rtspsrc connect
@@ -185,25 +193,22 @@ def _build_pipeline_description(rtsp_url: str, segment_s: int) -> str:
 
     The muxer is named ``muxsink`` so we can fetch it after parsing and
     attach the ``format-location`` signal handler + emit ``split-now``
-    for zero-gap phase rotation.  Models on the towfish branch of
-    ``vshie/BlueOS_videorecorder`` (which records HEVC from the same
-    RadCam reliably for hours).
+    for zero-gap phase rotation.  Models loosely on the towfish branch
+    of ``vshie/BlueOS_videorecorder`` (which records HEVC from the same
+    RadCam reliably for hours), but uses ``splitmuxsink`` for our
+    per-phase rotation needs and ``async-finalize=false`` to avoid the
+    starvation deadlock documented in the module docstring.
     """
     seg_ns = max(1, segment_s) * 1_000_000_000
-    # Buffer 30 s of HEVC NAL units between parser and muxer so transient
-    # disk/muxer slowness doesn't back-pressure rtspsrc into a teardown.
-    queue_ns = 30 * 1_000_000_000
     return (
         f"rtspsrc location={rtsp_url} protocols=udp is-live=true latency=5000 "
         f"retry=5 timeout=5000000 do-retransmission=false "
         f"! rtph265depay wait-for-keyframe=true "
         f"! h265parse config-interval=-1 "
         f"! video/x-h265,stream-format=byte-stream,alignment=au "
-        f"! queue max-size-time={queue_ns} max-size-bytes=0 max-size-buffers=0 "
-        f"leaky=downstream silent=true "
         f"! splitmuxsink name=muxsink max-size-time={seg_ns} "
         f"muxer-factory=mpegtsmux send-keyframe-requests=true "
-        f"async-finalize=true"
+        f"async-finalize=false"
     )
 
 
@@ -421,32 +426,72 @@ class RecordingSession:
                 # last .ts file.  If the live rtspsrc pipeline can't
                 # flush cleanly in time, we fall back to an immediate
                 # NULL transition (same outcome as the old SIGKILL).
+                #
+                # ``pipeline.send_event`` is a synchronous PyGObject
+                # call into GStreamer's C event-dispatch path.  Empirically
+                # on a live H.265 ``rtspsrc protocols=udp`` pipeline this
+                # call can block forever -- a 15 min real-hardware test
+                # caught it sitting in ``send_event`` for 12+ minutes
+                # while the asyncio loop (and therefore the entire
+                # extension HTTP API) was completely starved.  Run it in
+                # a worker thread so the asyncio loop keeps spinning,
+                # and bound it with a wall-clock timeout so the watchdog
+                # can always fall through to the ``NULL`` state in the
+                # ``finally`` block.
                 logger.info(
                     "RECORD part=%d stopping (user); sending EOS",
                     self._current_part,
                 )
-                pipeline.send_event(Gst.Event.new_eos())
-                deadline = asyncio.get_event_loop().time() + _STOP_EOS_TIMEOUT_S
-                stopped = False
-                while asyncio.get_event_loop().time() < deadline:
-                    msg = bus.timed_pop_filtered(
-                        0, Gst.MessageType.ERROR | Gst.MessageType.EOS,
+                try:
+                    await asyncio.wait_for(
+                        asyncio.to_thread(
+                            pipeline.send_event, Gst.Event.new_eos(),
+                        ),
+                        timeout=_STOP_EOS_TIMEOUT_S,
                     )
-                    if msg is not None and msg.type in (
-                        Gst.MessageType.EOS, Gst.MessageType.ERROR,
-                    ):
-                        exit_reason = "stopped_clean"
-                        stopped = True
-                        break
-                    await asyncio.sleep(0.05)
-                if not stopped:
+                except asyncio.TimeoutError:
                     logger.warning(
-                        "RECORD part=%d EOS not observed within %.1fs",
+                        "RECORD part=%d send_event(EOS) blocked > %.1fs; "
+                        "forcing NULL transition",
                         self._current_part, _STOP_EOS_TIMEOUT_S,
                     )
-                    exit_reason = "stopped_forced"
+                    exit_reason = "stopped_forced_send"
+                else:
+                    deadline = asyncio.get_event_loop().time() + _STOP_EOS_TIMEOUT_S
+                    stopped = False
+                    while asyncio.get_event_loop().time() < deadline:
+                        msg = bus.timed_pop_filtered(
+                            0, Gst.MessageType.ERROR | Gst.MessageType.EOS,
+                        )
+                        if msg is not None and msg.type in (
+                            Gst.MessageType.EOS, Gst.MessageType.ERROR,
+                        ):
+                            exit_reason = "stopped_clean"
+                            stopped = True
+                            break
+                        await asyncio.sleep(0.05)
+                    if not stopped:
+                        logger.warning(
+                            "RECORD part=%d EOS not observed within %.1fs",
+                            self._current_part, _STOP_EOS_TIMEOUT_S,
+                        )
+                        exit_reason = "stopped_forced"
         finally:
-            pipeline.set_state(Gst.State.NULL)
+            # Force NULL in a thread too, so a misbehaving rtspsrc
+            # tear-down can't block the asyncio loop the way send_event
+            # did before.  Use a generous timeout but always return.
+            try:
+                await asyncio.wait_for(
+                    asyncio.to_thread(pipeline.set_state, Gst.State.NULL),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                logger.error(
+                    "RECORD part=%d set_state(NULL) blocked > 10s; "
+                    "abandoning pipeline reference (process restart "
+                    "will clean up GStreamer resources)",
+                    self._current_part,
+                )
             self._pipeline = None
             self._muxsink = None
 
