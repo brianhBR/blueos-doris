@@ -1,43 +1,67 @@
-"""Record IP camera RTSP streams to segmented MPEG-TS via GStreamer.
+"""Record IP camera RTSP streams to segmented MPEG-TS via GStreamer (H.265).
 
 The pipeline runs **in-process** via ``gi.repository.Gst`` (rather than
 spawning ``gst-launch-1.0``) so the backend can:
 
 * connect to ``splitmuxsink``'s ``format-location`` signal and compose
-  filenames dynamically (required for the per-phase tag added in the
-  next commit);
+  filenames dynamically (required for the per-phase tag);
 * fire ``split-now`` as an action signal for **zero-gap phase rotation**
   at dive-phase boundaries;
 * observe pipeline errors on the GStreamer bus and restart the pipeline
   via the same watchdog logic the legacy subprocess version used.
 
-ffmpeg's RTSP demuxer is incompatible with this camera: every session
-is torn down by the camera right after the first IDR/GOP, leaving
-~2.7 MB stub files.  GStreamer's ``rtspsrc`` keeps the same camera
-connected for ~4 to 30 s before the camera occasionally drops the
-session, so the watchdog restarts the pipeline on every unexpected
-exit until the caller explicitly stops recording.
+This is the H.265 variant of the recorder.  The H.264 variant lives on
+``tony-video``; this branch (``tony-video-h265``) targets the RadCam
+running in 50 Mbit/s HEVC mode.  Side-by-side comparison testing on
+``tony-video`` showed that the same camera is rock-solid at 25 Mbit/s
+H.264 (1 RTSP teardown per ~15 min) but tears the RTSP session down
+every ~25 s at 50 Mbit/s H.264 -- so we switched the camera to HEVC
+which delivers similar visual quality at roughly half the bitrate, and
+modeled the GStreamer pipeline on the towfish branch of
+``vshie/BlueOS_videorecorder`` (which records HEVC from the same
+camera reliably for hours).
 
 Pipeline (per instance):
 
-    rtspsrc location=URL protocols=tcp is-live=true latency=2000
+    rtspsrc location=URL protocols=udp is-live=true latency=5000
             retry=5 timeout=5000000 do-retransmission=false
-        ! rtph264depay
-        ! h264parse config-interval=-1
-        ! video/x-h264,stream-format=byte-stream,alignment=au
+        ! rtph265depay wait-for-keyframe=true
+        ! h265parse config-interval=-1
+        ! video/x-h265,stream-format=byte-stream,alignment=au
+        ! queue max-size-time=30000000000
+                max-size-bytes=0 max-size-buffers=0
+                leaky=downstream silent=true
         ! splitmuxsink name=muxsink max-size-time=NS
                        muxer-factory=mpegtsmux send-keyframe-requests=true
                        async-finalize=true
 
-The camera signals SPS/PPS only via the SDP and never re-emits them
-in-band, so without ``config-interval=-1`` only the first segment after
-each rtspsrc connect is decodable.  ``alignment=au`` then groups
-SPS+PPS+IDR into a single buffer so splitmuxsink can never split
-between the parameter sets and their keyframe.
+Key differences vs the H.264 pipeline:
 
-``splitmuxsink`` produces multiple ``radcam_<stamp>_part<NN>_%05d.ts``
-segments per restart; ``part<NN>`` increments each time the watchdog
-restarts the pipeline so files from different sessions do not collide.
+* ``rtph265depay`` + ``h265parse`` instead of the H.264 equivalents; the
+  pipeline caps reflect ``video/x-h265``.
+* ``wait-for-keyframe=true`` makes the depayloader hold buffers until
+  the first IDR arrives, so every recording starts at a decodable
+  keyframe instead of a partial GOP.
+* ``protocols=udp`` instead of ``tcp``: at 50 Mbit/s the camera
+  consistently tore down its TCP RTSP session every ~25 s.  UDP avoids
+  TCP's head-of-line blocking and matches the towfish reference.
+* ``latency=5000`` (vs 2000) buffers more jitter at the cost of an
+  extra 3 s of startup delay -- worthwhile at 50 Mbit/s HEVC where a
+  single dropped packet is a much bigger deal than at 25 Mbit/s H.264.
+* A 30 s leaky downstream ``queue`` between parser and muxer absorbs
+  bursty input from the camera; if the muxer or disk falls behind for
+  any reason, ``leaky=downstream`` drops oldest buffers rather than
+  back-pressuring rtspsrc into a teardown.
+
+The camera signals VPS/SPS/PPS only via the SDP, so without
+``config-interval=-1`` only the first segment after each rtspsrc connect
+is decodable.  ``alignment=au`` groups VPS+SPS+PPS+IDR into a single
+buffer so splitmuxsink can never split between the parameter sets and
+their keyframe.
+
+``splitmuxsink`` produces multiple ``radcam_<stamp>_<phase>_part<NN>_%05d.ts``
+segments per session; ``part<NN>`` increments each time the watchdog
+restarts the pipeline so files from different sessions never collide.
 """
 
 from __future__ import annotations
@@ -157,19 +181,26 @@ def _output_dir() -> tuple[Path, str]:
 
 
 def _build_pipeline_description(rtsp_url: str, segment_s: int) -> str:
-    """GStreamer pipeline description matching the legacy gst-launch args.
+    """H.265 GStreamer pipeline.  See module docstring for full rationale.
 
     The muxer is named ``muxsink`` so we can fetch it after parsing and
     attach the ``format-location`` signal handler + emit ``split-now``
-    for zero-gap phase rotation in the next commit.
+    for zero-gap phase rotation.  Models on the towfish branch of
+    ``vshie/BlueOS_videorecorder`` (which records HEVC from the same
+    RadCam reliably for hours).
     """
     seg_ns = max(1, segment_s) * 1_000_000_000
+    # Buffer 30 s of HEVC NAL units between parser and muxer so transient
+    # disk/muxer slowness doesn't back-pressure rtspsrc into a teardown.
+    queue_ns = 30 * 1_000_000_000
     return (
-        f"rtspsrc location={rtsp_url} protocols=tcp is-live=true latency=2000 "
+        f"rtspsrc location={rtsp_url} protocols=udp is-live=true latency=5000 "
         f"retry=5 timeout=5000000 do-retransmission=false "
-        f"! rtph264depay "
-        f"! h264parse config-interval=-1 "
-        f"! video/x-h264,stream-format=byte-stream,alignment=au "
+        f"! rtph265depay wait-for-keyframe=true "
+        f"! h265parse config-interval=-1 "
+        f"! video/x-h265,stream-format=byte-stream,alignment=au "
+        f"! queue max-size-time={queue_ns} max-size-bytes=0 max-size-buffers=0 "
+        f"leaky=downstream silent=true "
         f"! splitmuxsink name=muxsink max-size-time={seg_ns} "
         f"muxer-factory=mpegtsmux send-keyframe-requests=true "
         f"async-finalize=true"
