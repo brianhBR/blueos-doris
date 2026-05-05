@@ -129,6 +129,15 @@ _last_base_stamp: str | None = None
 # Cleared on dive-finalize so each new dive starts fresh.
 _snapshot_seqs: dict[tuple[str, str], int] = {}
 
+# Next part index any new RecordingSession should claim for the
+# current dive stamp.  VIDEO_INTERVAL mode stops the recorder during
+# pauses and starts a new session for each record cycle; without this
+# offset every session would start at part00 and clobber the previous
+# session's .ts files (splitmuxsink's fragment_id also restarts at 0
+# in each pipeline instance).  Bumped past the last-used part on
+# stop_recording, reset to 0 by clear_snapshot_state.
+_session_part_offset: int = 0
+
 # Lazily-initialised CameraService (httpx clients are cached inside).
 _camera_service = None
 
@@ -174,7 +183,8 @@ class RecordingSession:
 
     def __init__(self, rtsp_url: str, segment_s: int, out_dir: Path,
                  storage_label: str, base_stamp: str,
-                 phase: str = PHASE_DEFAULT) -> None:
+                 phase: str = PHASE_DEFAULT,
+                 initial_part: int = 0) -> None:
         self._rtsp_url = rtsp_url
         self._segment_s = segment_s
         self._out_dir = out_dir
@@ -189,7 +199,13 @@ class RecordingSession:
         self._pipeline: "Gst.Pipeline | None" = None
         self._muxsink: "Gst.Element | None" = None
         self._task: asyncio.Task | None = None
-        self._current_part = 0
+        # initial_part is the part index this session starts at; the
+        # caller (module-level start_recording) supplies a value past
+        # the last part used by the prior session for the same
+        # base_stamp so VIDEO_INTERVAL-mode start/stop cycles don't
+        # collide on _part00_00000.ts.
+        self._initial_part = max(0, int(initial_part))
+        self._current_part = self._initial_part
         self.restart_count = 0
         self.last_pattern: str | None = None
         self.last_exit: dict | None = None
@@ -536,6 +552,12 @@ async def start_recording(
         stamp = _last_base_stamp or datetime.now(tz=timezone.utc).strftime(
             "%Y%m%d_%H%M%S",
         )
+        # Claim a part-index range past anything the prior session for
+        # this stamp already wrote.  Without this, splitmuxsink's
+        # internal fragment_id (which also restarts at 0) plus our
+        # _current_part both reset, and a stop -> start cycle would
+        # overwrite the previous cycle's _part00_00000.ts.
+        initial_part = _session_part_offset
         sess = RecordingSession(
             rtsp_url=rtsp_url,
             segment_s=seg,
@@ -543,6 +565,7 @@ async def start_recording(
             storage_label=storage,
             base_stamp=stamp,
             phase=phase_label,
+            initial_part=initial_part,
         )
         sess.start()
         _session = sess
@@ -581,7 +604,7 @@ async def rotate_to_phase(new_phase: str | None) -> dict:
 
 
 async def stop_recording() -> dict:
-    global _session
+    global _session, _session_part_offset
     async with _state_lock:
         sess = _session
         _session = None
@@ -590,9 +613,17 @@ async def stop_recording() -> dict:
             return {"success": True, "recording": False,
                     "message": "Was not recording"}
         await sess.stop()
+        # Reserve every part index this session used (initial_part
+        # through _current_part) so the next session in the same dive
+        # stamp picks up where this one left off.  Without this bump,
+        # the next start_recording would re-use part00 and clobber the
+        # files this session just produced.
+        _session_part_offset = sess._current_part + 1
         logger.info(
-            "RECORD stop completed; restarts=%d rotations=%d last_exit=%s",
+            "RECORD stop completed; restarts=%d rotations=%d last_exit=%s "
+            "next_part_offset=%d",
             sess.restart_count, sess.rotation_count, sess.last_exit,
+            _session_part_offset,
         )
         return {
             "success": True,
@@ -647,15 +678,17 @@ def _next_snapshot_seq(stamp: str, phase: str) -> int:
 
 
 def clear_snapshot_state() -> None:
-    """Reset snapshot counters and the dive-scoped base stamp.
+    """Reset snapshot counters, the dive-scoped base stamp and part offset.
 
     Called by ``/api/v1/dive/finalize`` so the next dive allocates a
-    fresh ``_last_base_stamp`` on its first start_recording / snapshot
-    and snapshot seq counters start at 1 again.
+    fresh ``_last_base_stamp`` on its first start_recording / snapshot,
+    snapshot seq counters start at 1 again, and the next session
+    starts at part00 instead of inheriting the prior dive's offset.
     """
-    global _last_base_stamp
+    global _last_base_stamp, _session_part_offset
     _snapshot_seqs.clear()
     _last_base_stamp = None
+    _session_part_offset = 0
 
 
 def _get_camera_service():
