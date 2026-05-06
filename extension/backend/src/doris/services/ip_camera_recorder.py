@@ -138,8 +138,30 @@ _snapshot_seqs: dict[tuple[str, str], int] = {}
 # stop_recording, reset to 0 by clear_snapshot_state.
 _session_part_offset: int = 0
 
-# Lazily-initialised CameraService (httpx clients are cached inside).
-_camera_service = None
+# Direct camera snapshot endpoint.  This is a raw HTTP path on the
+# IP camera itself (NOT a MCM-mediated path) so that the timelapse
+# fast path is independent of mavlink-camera-manager state.  The
+# RadCam (firmware 18.010.U35.5) serves a fresh 4K JPEG at this URL
+# with no auth required, in ~200ms; resolution and quality are
+# whatever the operator set on the camera's "snap" page (see
+# http://<cam>:80/index.html#/cameraConf -> Video and Audio -> Snap).
+#
+# Override with the ``DORIS_IPCAM_SNAPSHOT_URL`` env var for testing
+# or other camera firmware.  Default is derived from the RTSP host
+# of ``IPCAM_RTSP_DIRECT`` so changing the camera IP in a single
+# place keeps both endpoints in sync.
+def _default_snapshot_url() -> str:
+    """Build ``http://<rtsp_host>/cgi-bin/onesnap.cgi`` from IPCAM_RTSP_DIRECT."""
+    from urllib.parse import urlsplit
+    parts = urlsplit(IPCAM_RTSP_DIRECT)
+    host = parts.hostname or "192.168.2.10"
+    return f"http://{host}/cgi-bin/onesnap.cgi"
+
+
+IPCAM_SNAPSHOT_URL = os.environ.get(
+    "DORIS_IPCAM_SNAPSHOT_URL", _default_snapshot_url(),
+)
+_SNAPSHOT_TIMEOUT_S = 5.0
 
 
 def _data_root() -> Path:
@@ -147,6 +169,13 @@ def _data_root() -> Path:
 
 
 def _output_dir() -> tuple[Path, str]:
+    """Return the recordings root + storage label (``"usb"`` or ``"internal"``).
+
+    Callers should NOT write files directly here: per-dive output now
+    lives inside ``<root>/dive_<stamp>/`` (see :func:`_dive_dir` below)
+    so a single dive's .ts segments, snapshots, finalised MP4s, and
+    manifest are colocated and easy to keep / move / delete as a unit.
+    """
     sub = settings.ipcam_recordings_subdir.strip("/").strip()
     usb_base = usb_storage.get_recording_dir_if_available(sub)
     if usb_base is not None:
@@ -154,6 +183,19 @@ def _output_dir() -> tuple[Path, str]:
     out = _data_root() / sub
     out.mkdir(parents=True, exist_ok=True)
     return out, "internal"
+
+
+def _dive_dir(root: Path, stamp: str) -> Path:
+    """``<root>/dive_<stamp>/``, created on demand.
+
+    All artifacts for a single dive (descent/on_bottom/ascent .ts
+    segments, TIMELAPSE .jpg snapshots, finalized .mp4 outputs, and
+    the manifest.json) live inside this folder so the data tab in
+    the UI doesn't accumulate one giant flat list across many dives.
+    """
+    d = root / f"dive_{stamp}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _build_pipeline_description(rtsp_url: str, segment_s: int) -> str:
@@ -544,7 +586,7 @@ async def start_recording(
                 result["phase"] = _session.current_phase
             return result
 
-        out_dir, storage = _output_dir()
+        out_root, storage = _output_dir()
         # Reuse the dive-scoped stamp if one already exists so a
         # descent -> (stop) -> on_bottom transition (or a finalize-less
         # restart) keeps writing under the same radcam_<stamp>_... prefix.
@@ -552,6 +594,10 @@ async def start_recording(
         stamp = _last_base_stamp or datetime.now(tz=timezone.utc).strftime(
             "%Y%m%d_%H%M%S",
         )
+        # All output for this dive (segments, snapshots, finalized MP4s,
+        # and the manifest) goes into <root>/dive_<stamp>/ so each dive
+        # is isolated in its own folder.  Created on demand.
+        out_dir = _dive_dir(out_root, stamp)
         # Claim a part-index range past anything the prior session for
         # this stamp already wrote.  Without this, splitmuxsink's
         # internal fragment_id (which also restarts at 0) plus our
@@ -691,13 +737,31 @@ def clear_snapshot_state() -> None:
     _session_part_offset = 0
 
 
-def _get_camera_service():
-    global _camera_service
-    if _camera_service is None:
-        # Local import to avoid a hard import-cycle at module load time.
-        from .camera import CameraService
-        _camera_service = CameraService()
-    return _camera_service
+async def _fetch_camera_jpeg() -> tuple[bytes | None, str]:
+    """GET a single JPEG straight from the IP camera at IPCAM_SNAPSHOT_URL.
+
+    No MCM, no auth, no ffmpeg.  Just a plain HTTP GET against the
+    camera's built-in snapshot CGI.  The RadCam returns a fresh 4K
+    JPEG (matching the operator-configured "snap" resolution and
+    quality) in roughly 200 ms with no authentication required.
+    Times out after :data:`_SNAPSHOT_TIMEOUT_S` seconds and tolerates
+    minor connection errors by returning ``(None, message)`` so the
+    caller can decide what to do.
+    """
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=_SNAPSHOT_TIMEOUT_S) as client:
+            resp = await client.get(IPCAM_SNAPSHOT_URL)
+    except Exception as e:
+        return None, f"http_error: {e}"
+    if resp.status_code != 200:
+        return None, f"http_status_{resp.status_code}"
+    ctype = resp.headers.get("content-type", "")
+    if not ctype.startswith("image"):
+        return None, f"unexpected_content_type: {ctype!r}"
+    if not resp.content or not resp.content.startswith(b"\xff\xd8"):
+        return None, "not_jpeg_magic"
+    return resp.content, "ok"
 
 
 async def take_phase_snapshot(phase: str | None) -> dict:
@@ -725,25 +789,21 @@ async def take_phase_snapshot(phase: str | None) -> dict:
             "http_status": 409,
         }
 
-    out_dir, storage = _output_dir()
+    out_root, storage = _output_dir()
     stamp = _ensure_dive_stamp()
+    out_dir = _dive_dir(out_root, stamp)
     seq = _next_snapshot_seq(stamp, phase_label)
     filename = f"radcam_{stamp}_{phase_label}_{seq:05d}.jpg"
     path = out_dir / filename
 
-    camera = _get_camera_service()
-    try:
-        jpeg = await camera.get_snapshot()
-    except Exception as e:
-        logger.exception("SNAPSHOT get_snapshot raised")
-        return {
-            "success": False, "reason": "snapshot_exception",
-            "message": str(e), "http_status": 502,
-        }
+    jpeg, reason = await _fetch_camera_jpeg()
     if jpeg is None:
+        logger.warning("SNAPSHOT fetch failed (%s) url=%s",
+                       reason, IPCAM_SNAPSHOT_URL)
         return {
             "success": False, "reason": "snapshot_failed",
-            "message": "Camera returned no image",
+            "message": f"Camera snapshot failed: {reason}",
+            "url": IPCAM_SNAPSHOT_URL,
             "http_status": 502,
         }
 

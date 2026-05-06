@@ -220,6 +220,11 @@ export interface CameraSettings {
   capture_frequency_unit: 'seconds' | 'minutes' | 'hours'
   video_record: TimeValue
   video_pause: TimeValue
+  // Optional on the wire: older deployment configurations on disk
+  // were saved before the timelapse light strobe params existed, so
+  // the load path falls back to (2 s pre, 1 s post) defaults.
+  timelapse_light_pre?: TimeValue
+  timelapse_light_post?: TimeValue
   resolution: string
   image_type: string
   file_format: string

@@ -87,7 +87,7 @@ local STATE_ASCENT        = 3
 local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-assert(param:add_table(73, "DORIS_", 36),
+assert(param:add_table(73, "DORIS_", 38),
        "DIVE: could not add DORIS_ param table")
 
 -- mission control
@@ -136,6 +136,14 @@ assert(param:add_param(73, 34, "BTM_CMOD", 0),    "DORIS_BTM_CMOD")
 assert(param:add_param(73, 35, "BTM_RECS", 0),    "DORIS_BTM_RECS")
 -- BTM_PAUS: video_pause (BTM_CMOD=2) OR capture_frequency (BTM_CMOD=3) in seconds
 assert(param:add_param(73, 36, "BTM_PAUS", 0),    "DORIS_BTM_PAUS")
+-- Timelapse light strobe (only used when BTM_CMOD=3): the Lua's bottom
+-- dispatcher turns RC9 ON for TL_PRE_S seconds before each snapshot
+-- fires (camera settle window), holds it ON for TL_PST_S seconds after
+-- the snapshot returns (so the marine biologist gets a couple of well-
+-- lit frames at full exposure), then drops it OFF for the rest of
+-- BTM_PAUS.  Effective minimum capture frequency = PRE + PST + 1 s.
+assert(param:add_param(73, 37, "TL_PRE_S", 2),    "DORIS_TL_PRE_S")
+assert(param:add_param(73, 38, "TL_PST_S", 1),    "DORIS_TL_PST_S")
 
 
 local DORIS_START    = Parameter("DORIS_START")
@@ -315,6 +323,9 @@ local ipcam_cfg = {
     btm_cmod = 0,
     btm_rec_ms = 0,
     btm_pau_ms = 0,
+    -- TIMELAPSE light strobe (DORIS_TL_PRE_S / DORIS_TL_PST_S in ms).
+    tl_pre_ms = 2000,
+    tl_post_ms = 1000,
 }
 
 local RC9 = rc:get_channel(9)
@@ -338,6 +349,13 @@ local ipcam_state = {
     cycle_start_ms  = 0,
     cycle_is_record = false,
     last_snap_ms    = 0,
+    -- Timelapse: ``next_snap_ms`` is the absolute millis when the
+    -- next snapshot should fire; the dispatcher sets it to ``now +
+    -- tl_pre_ms`` on first entry so the very first cycle gets a full
+    -- pre-roll instead of an instant snap.  ``last_snap_ms`` is
+    -- reused as ``tl_last_snap_ms`` (when the most recent snapshot
+    -- actually fired) to drive the post-roll light hold.
+    next_snap_ms    = 0,
     finalize_sent   = false,
 }
 
@@ -584,6 +602,10 @@ local function snapshot_config()
     end
     ipcam_cfg.btm_rec_ms = math.max(0, math.floor(_pgv("DORIS_BTM_RECS", 0) * 1000.0))
     ipcam_cfg.btm_pau_ms = math.max(0, math.floor(_pgv("DORIS_BTM_PAUS", 0) * 1000.0))
+    -- Timelapse strobe windows; default 2 s pre-roll / 1 s post-roll
+    -- if the operator's profile predates these params.
+    ipcam_cfg.tl_pre_ms  = math.max(0, math.floor(_pgv("DORIS_TL_PRE_S", 2) * 1000.0))
+    ipcam_cfg.tl_post_ms = math.max(0, math.floor(_pgv("DORIS_TL_PST_S", 1) * 1000.0))
 
     if ipcam_cfg.rec_en then
         local mode_name = "off"
@@ -1072,6 +1094,7 @@ function update()
                 ipcam_state.cycle_start_ms  = 0
                 ipcam_state.cycle_is_record = false
                 ipcam_state.last_snap_ms    = 0
+                ipcam_state.next_snap_ms    = 0
                 -- For CONTINUOUS bottom mode with no camera delay we do
                 -- a zero-gap rotate-or-start right now so the moment
                 -- the vehicle settles, the first "on_bottom" .ts starts.
@@ -1110,12 +1133,23 @@ function update()
         local cam_delay_done = ipcam_cfg.cam_btm_dly_ms <= 0
             or bottom_elapsed >= ipcam_cfg.cam_btm_dly_ms
 
-        -- Lights on bottom: in INTERVAL mode, gate by live recorder state
-        -- so the lights literally follow the duty cycle (off during the
-        -- pause window).  In all other modes, lights follow cfg.btm_lgt.
+        -- Lights on bottom:
+        --   CONTINUOUS  -> follow cfg.btm_lgt directly
+        --   INTERVAL    -> gate by live recorder state so the light
+        --                  literally follows the duty cycle (off
+        --                  during the pause window)
+        --   TIMELAPSE   -> strobe: light ON only inside the pre-roll
+        --                  + post-roll windows around each snapshot
+        --                  (driven by tl_strobe_active below)
         local bottom_lgt_eff = cfg.btm_lgt
         if ipcam_cfg.btm_cmod == 2 then
             bottom_lgt_eff = cfg.btm_lgt and ipcam_recording
+        elseif ipcam_cfg.btm_cmod == 3 then
+            local pre_active = ipcam_state.next_snap_ms > 0
+                and (ipcam_state.next_snap_ms - now_ms) <= ipcam_cfg.tl_pre_ms
+            local post_active = ipcam_state.last_snap_ms > 0
+                and (now_ms - ipcam_state.last_snap_ms) < ipcam_cfg.tl_post_ms
+            bottom_lgt_eff = cfg.btm_lgt and (pre_active or post_active)
         end
 
         if not bottom_delay_done then
@@ -1177,14 +1211,44 @@ function update()
                 end
             end
         elseif ipcam_cfg.btm_cmod == 3 then
-            -- TIMELAPSE: snapshots are mutually exclusive with the pipeline.
+            -- TIMELAPSE with light strobe.  Snapshots are mutually
+            -- exclusive with the recorder pipeline, so make sure it
+            -- isn't running, then drive a three-window state machine
+            -- around each capture-frequency tick:
+            --   1. light OFF for (PAUS - PRE - POST) seconds
+            --   2. light ON for PRE seconds before the snap fires
+            --   3. snapshot fires; light remains ON for POST seconds
+            -- The light is driven up above by ``bottom_lgt_eff``,
+            -- which inspects ``next_snap_ms`` and ``last_snap_ms``;
+            -- this branch is responsible only for scheduling.
             if ipcam_recording then ipcam_stop() end
             if cam_delay_done and ipcam_cfg.btm_pau_ms > 0 then
-                local since_last = now_ms - ipcam_state.last_snap_ms
-                if ipcam_state.last_snap_ms == 0
-                   or since_last >= ipcam_cfg.btm_pau_ms then
+                -- Effective period floor is pre+post so the pre and
+                -- post windows can run back-to-back without negative
+                -- idle time.  When the operator sets capture_frequency
+                -- below this floor the light just stays on continuously
+                -- across snaps; the floor only protects against
+                -- nonsensical schedules (e.g. pre=2 post=1 freq=1 s).
+                local min_period = ipcam_cfg.tl_pre_ms + ipcam_cfg.tl_post_ms
+                if min_period < 1 then min_period = 1 end
+                local period_ms = ipcam_cfg.btm_pau_ms
+                if period_ms < min_period then period_ms = min_period end
+
+                if ipcam_state.next_snap_ms == 0 then
+                    -- First entry: schedule the inaugural snap pre_ms
+                    -- in the future so the operator gets a full pre-
+                    -- roll window before the very first capture.
+                    ipcam_state.next_snap_ms = now_ms + ipcam_cfg.tl_pre_ms
+                    gcs:send_text(MAV_SEVERITY.INFO,
+                        string.format(
+                            "DIVE: IPcam timelapse strobe pre=%ds post=%ds period=%ds",
+                            math.floor(ipcam_cfg.tl_pre_ms / 1000),
+                            math.floor(ipcam_cfg.tl_post_ms / 1000),
+                            math.floor(period_ms / 1000)))
+                elseif now_ms >= ipcam_state.next_snap_ms then
                     ipcam_snapshot("on_bottom")
                     ipcam_state.last_snap_ms = now_ms
+                    ipcam_state.next_snap_ms = now_ms + period_ms
                 end
             end
         end

@@ -150,6 +150,12 @@ class DiveService:
         a_rec = _ipcam_phase_enabled(ascent_cam)
 
         btm_mode_int, btm_rec_s, btm_pau_s = _bottom_camera_mode(config.bottom.camera)
+        # TIMELAPSE strobe windows.  Only meaningful when btm_mode_int==3
+        # but always pushed so the Lua reads consistent values.  Default
+        # to (2 s pre, 1 s post) when the operator left the fields
+        # blank, matching the configuration model defaults.
+        btm_tl_pre_s = max(0.0, _time_value_to_seconds(config.bottom.camera.timelapse_light_pre))
+        btm_tl_pst_s = max(0.0, _time_value_to_seconds(config.bottom.camera.timelapse_light_post))
         # Legacy DORIS_BTM_REC: 1 iff any bottom recording/snapshotting is
         # wanted.  Kept in sync with BTM_CMOD so the Lua's back-compat
         # fallback (CMOD=0 with BTM_REC=1 -> treat as continuous) only
@@ -178,6 +184,9 @@ class DiveService:
             ("DORIS_BTM_CMOD", float(btm_mode_int)),
             ("DORIS_BTM_RECS", round(btm_rec_s)),
             ("DORIS_BTM_PAUS", round(btm_pau_s)),
+            # TIMELAPSE light strobe (whole seconds; Lua uses ms).
+            ("DORIS_TL_PRE_S", round(btm_tl_pre_s)),
+            ("DORIS_TL_PST_S", round(btm_tl_pst_s)),
         ]
 
         all_ok = True

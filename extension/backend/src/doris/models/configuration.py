@@ -45,6 +45,19 @@ class CameraSettings(BaseModel):
     video_record: TimeValue = Field(default_factory=lambda: TimeValue(number="10", unit="seconds"))
     video_pause: TimeValue = Field(default_factory=lambda: TimeValue(number="5", unit="seconds"))
 
+    # TIMELAPSE-only: light strobe windows around each snapshot fire.
+    # The Lua dive-script bottom dispatcher turns the light ON for
+    # ``timelapse_light_pre`` seconds before the snapshot, holds it ON
+    # while the camera commits the frame, then keeps it ON for
+    # ``timelapse_light_post`` seconds after, and OFF for the rest of
+    # the capture-frequency interval.  This saves power, reduces
+    # heat, and minimises marine-life disturbance during long
+    # timelapse sit-on-bottom dives.  Effective minimum capture
+    # frequency is ``pre + post + 1`` seconds (the +1 is reserved for
+    # the camera shutter latency itself).
+    timelapse_light_pre: TimeValue = Field(default_factory=lambda: TimeValue(number="2", unit="seconds"))
+    timelapse_light_post: TimeValue = Field(default_factory=lambda: TimeValue(number="1", unit="seconds"))
+
     resolution: str = "4K"
     image_type: str = "High-Rez JPG"
     file_format: str = "JPEG"

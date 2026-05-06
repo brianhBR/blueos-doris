@@ -163,29 +163,54 @@ async def finalize_dive(stamp: str | None = None) -> dict:
             "phases": [], "snapshots": [],
         }
 
-    rec_dir = _recordings_dir()
-    if not rec_dir.is_dir():
+    rec_root = _recordings_dir()
+    if not rec_root.is_dir():
         return {
             "success": True, "reason": "no_recordings_dir",
-            "message": f"{rec_dir} does not exist",
+            "message": f"{rec_root} does not exist",
             "dive_stamp": dive_stamp,
             "finalize_started_at": started_at,
             "phases": [], "snapshots": [],
         }
 
+    # Per-dive subfolder is where the recorder writes today.  The flat
+    # recordings root is also scanned so that any half-finished dive
+    # from a previous (pre-subfolder) build still finalises cleanly.
+    dive_dir = rec_root / f"dive_{dive_stamp}"
+    scan_dirs: list[Path] = []
+    if dive_dir.is_dir():
+        scan_dirs.append(dive_dir)
+    scan_dirs.append(rec_root)
+
     # Bucket files by phase.  Snapshots and segments both embed the
-    # dive stamp so we simply filter on it.
+    # dive stamp so we filter on it; we prefer the per-dive folder
+    # but fall back to the flat root for legacy artifacts.
     ts_by_phase: dict[str, list[Path]] = {}
     jpg_by_phase: dict[str, list[Path]] = {}
-    for p in sorted(rec_dir.iterdir()):
-        name = p.name
-        m = _TS_RE.match(name)
-        if m and m.group("stamp") == dive_stamp:
-            ts_by_phase.setdefault(m.group("phase"), []).append(p)
+    seen: set[Path] = set()
+    for d in scan_dirs:
+        try:
+            entries = sorted(d.iterdir())
+        except FileNotFoundError:
             continue
-        m = _JPG_RE.match(name)
-        if m and m.group("stamp") == dive_stamp:
-            jpg_by_phase.setdefault(m.group("phase"), []).append(p)
+        for p in entries:
+            if p in seen or not p.is_file():
+                continue
+            seen.add(p)
+            name = p.name
+            m = _TS_RE.match(name)
+            if m and m.group("stamp") == dive_stamp:
+                ts_by_phase.setdefault(m.group("phase"), []).append(p)
+                continue
+            m = _JPG_RE.match(name)
+            if m and m.group("stamp") == dive_stamp:
+                jpg_by_phase.setdefault(m.group("phase"), []).append(p)
+
+    # Write finalized MP4s + manifest into the per-dive folder.  Create
+    # it now (as a no-op if it already exists) so even a flat-only
+    # legacy dive ends up consolidated.
+    rec_dir = dive_dir
+    rec_dir.mkdir(parents=True, exist_ok=True)
 
     phase_results: list[dict] = []
     for phase, files in sorted(ts_by_phase.items()):
