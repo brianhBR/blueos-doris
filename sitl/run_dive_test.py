@@ -303,7 +303,13 @@ def main() -> int:
                     name = f.get("filename") or f.get("name") or ""
                     if (name.startswith(target_prefix)
                             and name.endswith(target_suffix)):
-                        sizes[name] = int(f.get("size", 0) or 0)
+                        # /api/v1/media/files returns size_bytes (the
+                        # MediaFile pydantic field).  Fall back to a
+                        # generic "size" for forward-compat.
+                        sz = f.get("size_bytes")
+                        if sz is None:
+                            sz = f.get("size", 0)
+                        sizes[name] = int(sz or 0)
             if sizes and sizes == last_sizes:
                 stable_ticks += 1
                 if stable_ticks >= STABLE_TICKS_REQUIRED:
