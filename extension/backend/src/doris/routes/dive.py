@@ -187,6 +187,25 @@ def register_dive_routes(app: Robyn) -> None:
                     "message": f"Configuration '{config_name}' not found",
                 })
             logger.info(f"Starting dive with configuration: {config_name}")
+        else:
+            # No configuration provided: the dive proceeds with whatever
+            # DORIS_* params are currently on the autopilot, which may be
+            # leftovers from a prior dive setup.  Most importantly,
+            # DORIS_BTM_TIM (the bottom-time release timer) keeps its
+            # previous value, which can produce surprisingly long dives
+            # when the operator expected the new profile's value to
+            # apply.  Real dive starts from the UI always send
+            # `configuration:`; this branch typically indicates a test
+            # script that misnamed the field (e.g. `name:`) -- be loud
+            # so the misuse is visible in logs.
+            other_keys = sorted(k for k in body.keys() if k != "configuration")
+            logger.warning(
+                "DIVE START with no configuration -- keeping current "
+                "DORIS_* params (incl. DORIS_BTM_TIM bottom timer); "
+                "body keys: %s.  Use 'configuration': '<name>' to push "
+                "fresh params.",
+                other_keys or "(empty body)",
+            )
 
         loaded_at = datetime.now(tz=timezone.utc)
         clock_sane = 2024 <= loaded_at.year <= 2030
