@@ -119,21 +119,68 @@ def test_select_skips_zero_byte(tmp_path: Path) -> None:
     assert [p.name for p in paths] == ["00000051.BIN"]
 
 
-def test_select_fallback_window(tmp_path: Path) -> None:
-    """No bin_log_start_num -> fall back to mtime overlap with dive window."""
+def test_select_fallback_window_active_interval(tmp_path: Path) -> None:
+    """Without bin_log_start_num, match by *active write interval* overlap.
+
+    A BIN's interval is (prev_mtime, mtime].  Here both 71 and 72 have an
+    active interval that overlaps the dive window:
+
+      71 active (now - 2h, now - 8m]   -- arms before dive, disarms in dive
+      72 active (now - 8m, now + 5m]   -- arms in dive, disarms after
+      73 active (now + 5m, now + 1h]   -- entirely after the dive
+      Dive window (with grace): [now - 10m30s, now + 60s]
+
+    71 and 72 should be selected; 70 (active far before) and 73 (active
+    after) should be skipped.
+    """
     now = datetime.now(tz=timezone.utc)
-    _make_bin(tmp_path, 70, mtime=now - timedelta(hours=3))  # before window
-    _make_bin(tmp_path, 71, mtime=now - timedelta(minutes=5))  # in window
-    _make_bin(tmp_path, 72, mtime=now - timedelta(minutes=1))  # in window
-    _make_bin(tmp_path, 73, mtime=now + timedelta(minutes=10))  # after window+grace
+    _make_bin(tmp_path, 70, mtime=now - timedelta(hours=2))
+    _make_bin(tmp_path, 71, mtime=now - timedelta(minutes=8))
+    _make_bin(tmp_path, 72, mtime=now + timedelta(minutes=5))
+    _make_bin(tmp_path, 73, mtime=now + timedelta(hours=1))
 
     record = {
         "started_at": (now - timedelta(minutes=10)).isoformat(),
         "ended_at": now.isoformat(),
-        # No bin_log_start_num, no LASTLOG -> fallback path
     }
     paths = binlog.select_bin_logs_for_dive(record, logs_dir=tmp_path)
     assert [p.name for p in paths] == ["00000071.BIN", "00000072.BIN"]
+
+
+def test_select_fallback_skips_pre_dive_finalized(tmp_path: Path) -> None:
+    """A BIN finalized comfortably before the dive should NOT be selected."""
+    now = datetime.now(tz=timezone.utc)
+    # 81 was finalized 1 minute before dive start -> well outside grace.
+    _make_bin(tmp_path, 80, mtime=now - timedelta(hours=1))
+    _make_bin(tmp_path, 81, mtime=now - timedelta(minutes=20))
+    _make_bin(tmp_path, 82, mtime=now + timedelta(minutes=2))
+
+    record = {
+        "started_at": (now - timedelta(minutes=10)).isoformat(),
+        "ended_at": now.isoformat(),
+    }
+    paths = binlog.select_bin_logs_for_dive(record, logs_dir=tmp_path)
+    assert [p.name for p in paths] == ["00000082.BIN"]
+
+
+def test_select_fallback_window_multi_overlap(tmp_path: Path) -> None:
+    """A long dive that spans multiple arm/disarm cycles selects all of them."""
+    now = datetime.now(tz=timezone.utc)
+    _make_bin(tmp_path, 80, mtime=now - timedelta(minutes=20))  # finalized before dive
+    _make_bin(tmp_path, 81, mtime=now - timedelta(minutes=10))  # finalized in dive
+    _make_bin(tmp_path, 82, mtime=now - timedelta(minutes=2))   # finalized in dive
+    _make_bin(tmp_path, 83, mtime=now + timedelta(minutes=3))   # spans dive end
+
+    record = {
+        "started_at": (now - timedelta(minutes=15)).isoformat(),
+        "ended_at": now.isoformat(),
+    }
+    paths = binlog.select_bin_logs_for_dive(record, logs_dir=tmp_path)
+    assert [p.name for p in paths] == [
+        "00000081.BIN",
+        "00000082.BIN",
+        "00000083.BIN",
+    ]
 
 
 def test_select_no_match(tmp_path: Path) -> None:

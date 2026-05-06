@@ -18,8 +18,12 @@ Selection rules (see :func:`select_bin_logs_for_dive`):
    start is the *previous* completed log; the dive's own arm cycle bumps
    the counter by at least one.
 2. Fallback (no ``bin_log_start_num`` recorded, e.g. a legacy dive or
-   the LASTLOG file was unreadable): every BIN whose mtime overlaps
-   ``started_at - 30s`` to ``ended_at + 60s``.
+   the LASTLOG file was unreadable): pick BIN files whose *active write
+   interval* overlaps the dive window.  A BIN file ``N`` has been
+   actively written from the previous BIN's mtime (``N-1``) up to its
+   own mtime (last write before disarm), so we treat it as active
+   during ``(prev_mtime, mtime]``.  A BIN matches when this interval
+   overlaps ``[started_at - 30s, ended_at + 60s]``.
 3. Skip empty / zero-byte files in either case.
 """
 
@@ -170,7 +174,11 @@ def select_bin_logs_for_dive(
         primary.sort(key=lambda x: x[0])
         return [p for _, p in primary]
 
-    # Fallback: time window
+    # Fallback: pick BINs whose *active write interval* overlaps the dive window.
+    # A BIN's interval is (prev_BIN.mtime, this.mtime].  We can't see when a
+    # BIN started being written, so we approximate it by the previous BIN's
+    # mtime (the moment the previous arm cycle ended).  Without this, fast
+    # dives whose BIN finalizes well after the dive ended would be skipped.
     started = _parse_iso_to_utc(dive_record.get("started_at"))
     ended = _parse_iso_to_utc(dive_record.get("ended_at"))
     if started is None:
@@ -181,17 +189,30 @@ def select_bin_logs_for_dive(
     lo = started - timedelta(seconds=_FALLBACK_PRE_S)
     hi = ended + timedelta(seconds=_FALLBACK_POST_S)
 
-    matches: list[tuple[int, Path]] = []
+    bins_with_mtime: list[tuple[int, Path, datetime]] = []
     for num, path in iter_bin_logs(logs_dir=base):
         if not _nonempty(path):
             continue
         try:
-            mtime = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
+            m = datetime.fromtimestamp(path.stat().st_mtime, tz=timezone.utc)
         except OSError:
             continue
-        if lo <= mtime <= hi:
+        bins_with_mtime.append((num, path, m))
+    bins_with_mtime.sort(key=lambda x: x[0])
+
+    # Build prev_mtime per BIN (by ascending num).  The "active" interval is
+    # (prev_mtime, mtime].  If there is no predecessor, treat prev_mtime as
+    # the epoch so the predicate becomes simply ``mtime > lo``.
+    epoch = datetime.fromtimestamp(0, tz=timezone.utc)
+    matches: list[tuple[int, Path]] = []
+    for idx, (num, path, mtime) in enumerate(bins_with_mtime):
+        prev_mtime = bins_with_mtime[idx - 1][2] if idx > 0 else epoch
+        # Active interval (prev_mtime, mtime] overlaps [lo, hi] iff
+        #   prev_mtime < hi  AND  mtime > lo  (using > to honour the open
+        #   lower bound -- a BIN whose mtime equals the dive start is the
+        #   PREVIOUS one).
+        if prev_mtime < hi and mtime > lo:
             matches.append((num, path))
-    matches.sort(key=lambda x: x[0])
     return [p for _, p in matches]
 
 
