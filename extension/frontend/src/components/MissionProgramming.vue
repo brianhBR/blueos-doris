@@ -821,12 +821,12 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                   <input type="radio" value="continuous-video" v-model="descentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                   <span style="color: #96EEF2">Continuous Video</span>
                 </label>
-                <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
-                  <input type="radio" value="video-interval" v-model="descentCameraType" disabled class="w-4 h-4" />
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" value="video-interval" v-model="descentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                   <span style="color: #96EEF2">Interval Video</span>
                 </label>
-                <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
-                  <input type="radio" value="timelapse" v-model="descentCameraType" disabled class="w-4 h-4" />
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" value="timelapse" v-model="descentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                   <span style="color: #96EEF2">Timelapse Images</span>
                 </label>
               </div>
@@ -1107,12 +1107,12 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                   <input type="radio" value="continuous-video" v-model="bottomCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                   <span style="color: #96EEF2">Continuous Video</span>
                 </label>
-                <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
-                  <input type="radio" value="video-interval" v-model="bottomCameraType" disabled class="w-4 h-4" />
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" value="video-interval" v-model="bottomCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                   <span style="color: #96EEF2">Interval Video</span>
                 </label>
-                <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
-                  <input type="radio" value="timelapse" v-model="bottomCameraType" disabled class="w-4 h-4" />
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" value="timelapse" v-model="bottomCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                   <span style="color: #96EEF2">Timelapse Images</span>
                 </label>
               </div>
@@ -1404,12 +1404,12 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                     <input type="radio" value="continuous-video" v-model="ascentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                     <span style="color: #96EEF2">Continuous Video</span>
                   </label>
-                  <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
-                    <input type="radio" value="video-interval" v-model="ascentCameraType" disabled class="w-4 h-4" />
+                  <label class="flex items-center gap-2 cursor-pointer">
+                    <input type="radio" value="video-interval" v-model="ascentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                     <span style="color: #96EEF2">Interval Video</span>
                   </label>
-                  <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
-                    <input type="radio" value="timelapse" v-model="ascentCameraType" disabled class="w-4 h-4" />
+                  <label class="flex items-center gap-2 cursor-pointer">
+                    <input type="radio" value="timelapse" v-model="ascentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                     <span style="color: #96EEF2">Timelapse Images</span>
                   </label>
                 </div>
