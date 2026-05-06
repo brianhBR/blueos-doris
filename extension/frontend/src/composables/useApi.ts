@@ -961,6 +961,21 @@ export interface DiveMissionState {
   cancelled_at?: string
 }
 
+/**
+ * Return shape of {@link useDiveControl().startDive}.
+ *
+ * Carries the optional receipt fields the backend attaches when it
+ * successfully writes a `DORIS_dive_load_<stamp>.txt` file to the USB
+ * recordings directory. The caller forwards them to `enqueueDownload`
+ * so the operator's browser saves the receipt automatically.
+ */
+export interface DiveStartResult {
+  success: boolean
+  receiptDownloadId?: string
+  receiptFilename?: string
+  receiptSizeBytes?: number
+}
+
 export function useDiveControl() {
   const status = ref<DiveStatus | null>(null)
   const mission = ref<DiveMissionState | null>(null)
@@ -968,22 +983,33 @@ export function useDiveControl() {
   const sitlDropLoading = ref(false)
   const error = ref<string | null>(null)
 
-  async function startDive(configurationName?: string, diveData?: Record<string, string>): Promise<boolean> {
+  async function startDive(configurationName?: string, diveData?: Record<string, string>): Promise<DiveStartResult> {
     loading.value = true
     error.value = null
     try {
       const body: Record<string, unknown> = {}
       if (configurationName) body.configuration = configurationName
       if (diveData) Object.assign(body, diveData)
-      const result = await postApi<{ success: boolean; message: string }>('/dive/start', Object.keys(body).length > 0 ? body : undefined)
+      const result = await postApi<{
+        success: boolean
+        message: string
+        receipt_download_id?: string
+        receipt_filename?: string
+        receipt_size_bytes?: number
+      }>('/dive/start', Object.keys(body).length > 0 ? body : undefined)
       if (result.success) {
         await fetchDiveStatus()
         await fetchDiveMission()
       }
-      return result.success
+      return {
+        success: result.success,
+        receiptDownloadId: result.receipt_download_id,
+        receiptFilename: result.receipt_filename,
+        receiptSizeBytes: result.receipt_size_bytes,
+      }
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Failed to start dive'
-      return false
+      return { success: false }
     } finally {
       loading.value = false
     }

@@ -15,6 +15,7 @@ import {
 } from 'lucide-vue-next'
 import { mdiCompassOutline } from '@mdi/js'
 import { useSystemStatus, useBattery, useStorage, useLocation, useSensors, useConfigurations, useDiveControl } from '../composables/useApi'
+import { enqueueDownload } from '../composables/useDownloads'
 import AttitudeVisualization from './AttitudeVisualization.vue'
 import type { SensorModule } from '../composables/useApi'
 import type { Screen } from '../types'
@@ -416,7 +417,17 @@ async function handleStartDive() {
     release_weight_date: releaseWeightDate.value,
     release_weight_time: releaseWeightTime.value,
   }
-  await startDive(selectedConfiguration.value, diveData)
+  const result = await startDive(selectedConfiguration.value, diveData)
+  // Auto-download the dive-load receipt the backend just wrote next
+  // to the videos on the USB drive.  Same streaming path the data tab
+  // uses for video downloads, so the save tray opens immediately.
+  if (result.success && result.receiptDownloadId && result.receiptFilename) {
+    void enqueueDownload(
+      result.receiptDownloadId,
+      result.receiptFilename,
+      result.receiptSizeBytes ?? 0,
+    )
+  }
 }
 
 const formatReleaseTime = (date: Date) => {

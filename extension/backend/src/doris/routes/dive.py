@@ -21,6 +21,7 @@ from robyn import Response, Robyn
 from ..services.camera import CameraService
 from ..services.dive import DiveService
 from ..services.dive_finalize import finalize_dive
+from ..services.dive_receipt import write_receipt as write_dive_receipt
 from ..services import ip_camera_recorder as iprec
 from ..services.storage import DATA_ROOT, StorageService, media_download_id_from_abs_path
 
@@ -299,13 +300,33 @@ def register_dive_routes(app: Robyn) -> None:
             "dive_file": dive_file.name,
         })
 
+        # Best-effort dive-load receipt.  Lands next to the videos on
+        # USB so the operator can grab it via the same /api/v1/media
+        # streaming pipeline as the recordings.  Failures are logged
+        # by ``write_dive_receipt`` and never block the dive start.
+        receipt_download_id: str | None = None
+        receipt_filename: str | None = None
+        receipt_size_bytes: int = 0
+        try:
+            result = write_dive_receipt(body, config, loaded_at, profile_id)
+            if result is not None:
+                receipt_path, receipt_download_id, receipt_size_bytes = result
+                receipt_filename = receipt_path.name
+        except Exception as e:
+            logger.warning("Dive-load receipt generation failed: %s", e)
+
         msg = f"DORIS_START set to 1 (dive: {dive_file.name})"
-        return json.dumps({
+        response_payload: dict = {
             "success": True,
             "message": msg,
             "dive_file": dive_file.name,
             "profile_id": profile_id,
-        })
+        }
+        if receipt_download_id and receipt_filename:
+            response_payload["receipt_download_id"] = receipt_download_id
+            response_payload["receipt_filename"] = receipt_filename
+            response_payload["receipt_size_bytes"] = receipt_size_bytes
+        return json.dumps(response_payload)
 
     @app.post("/api/v1/dive/stop")
     async def stop_dive():
