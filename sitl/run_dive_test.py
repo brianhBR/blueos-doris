@@ -24,9 +24,19 @@ What it does (in order):
    ``--max-bottom-min``, the runner manually rotates the recorder to
    ascent so the test can complete and any captured video is finalised
    into per-phase MP4s.
-5. After the dive ends (RECOVERY or hard cap), optionally calls
-   ``POST /api/v1/dive/finalize`` to produce
-   ``dive_<stamp>_<phase>.mp4`` files.
+5. After the dive ends (RECOVERY or hard cap), optionally polls
+   ``GET /api/v1/media/files`` until the per-phase MP4s for this
+   dive's ``base_stamp`` appear and stop growing.
+
+   .. note::
+      The Lua dive script already issues
+      ``POST /api/v1/dive/finalize`` exactly once on RECOVERY entry
+      (``ipcam_state.finalize_sent`` guard).  This runner used to
+      issue a second POST itself, which collided with the in-flight
+      Lua-triggered finalize: two ``ffmpeg -y`` processes wrote the
+      same output, the second HTTP handler blocked on the first
+      ffmpeg job, and ``[4] finalize`` would sit until the runner's
+      180s timeout.  We now never POST; we only observe.
 
 Usage examples:
 
@@ -123,8 +133,16 @@ def main() -> int:
                         "After this the runner stops the dive whatever "
                         "state it's in.")
     p.add_argument("--finalize", action="store_true",
-                   help="Call POST /api/v1/dive/finalize after the dive ends "
-                        "to concatenate per-phase MP4s.")
+                   help="After the dive ends, poll GET /api/v1/media/files "
+                        "until this dive's per-phase MP4s appear and stop "
+                        "growing.  Does NOT POST /api/v1/dive/finalize -- "
+                        "the Lua script already fires that exactly once on "
+                        "RECOVERY entry; a second POST collides with the "
+                        "in-flight ffmpeg jobs.")
+    p.add_argument("--finalize-wait-s", type=float, default=300.0,
+                   help="Hard cap on the post-RECOVERY observation window "
+                        "(default: 300s).  Lua's finalize finishes in well "
+                        "under this for normal dives.")
     args = p.parse_args()
 
     print(f"== DORIS SITL dive test ==")
@@ -166,6 +184,11 @@ def main() -> int:
     manual_ascent_fired = False
     manual_stop_fired = False
     log: list[dict] = []
+    # Latest non-null base_stamp seen on /ipcam/record/status; used as
+    # the dive identifier for the post-RECOVERY media-files poll. The
+    # recorder clears base_stamp after finalize completes, so we must
+    # capture it during the dive rather than reading it post-hoc.
+    dive_stamp: str | None = None
 
     print(f"\n  {'t':>6} {'state':<14} {'rec':<3} {'phase':<10} "
           f"{'rot':>3} {'restart':>7} {'free_mb':>9} note", flush=True)
@@ -196,6 +219,11 @@ def main() -> int:
         # Track when we entered ON_BOTTOM
         if state == "ON_BOTTOM" and bottom_started_at is None:
             bottom_started_at = elapsed
+
+        # Capture base_stamp while it is still set on the recorder.
+        bs = rs.get("base_stamp")
+        if bs and dive_stamp is None:
+            dive_stamp = str(bs)
 
         print(f"  {fmt_mmss(elapsed):>6} {state:<14} {'Y' if rec else 'N':<3} "
               f"{phase:<10} {rot:>3} {restarts:>7} "
@@ -247,21 +275,53 @@ def main() -> int:
     print(f"\n== dive finished t={fmt_mmss(elapsed)}, last state={last_state} ==")
 
     if args.finalize:
-        print("\n[4] finalize")
-        fr = post(args.vehicle, "/api/v1/dive/finalize", timeout=180)
-        if "_error" in fr:
-            print(f"    FAIL: {fr}")
+        print("\n[4] waiting for on-device finalize (passive observe)")
+        if dive_stamp is None:
+            print("    (no base_stamp captured during the dive; skipping wait)")
+            return 0
+
+        # Lua already POSTed /api/v1/dive/finalize on its first RECOVERY
+        # tick.  We just observe via /api/v1/media/files until this
+        # dive's three phase MP4s appear and stop growing.  No POST
+        # here -- a second finalize call collides with the in-flight
+        # ffmpeg jobs (two `ffmpeg -y` writers on the same output).
+        target_prefix = f"dive_{dive_stamp}_"
+        target_suffix = ".mp4"
+        deadline = time.time() + args.finalize_wait_s
+        last_sizes: dict[str, int] = {}
+        stable_ticks = 0
+        STABLE_TICKS_REQUIRED = 3
+        POLL_S = 5.0
+        print(f"    watching for files starting with '{target_prefix}*{target_suffix}' "
+              f"(cap={args.finalize_wait_s:.0f}s, poll={POLL_S:.0f}s)")
+        while time.time() < deadline:
+            files = get(args.vehicle, "/api/v1/media/files?type=video&limit=200",
+                        timeout=10)
+            sizes: dict[str, int] = {}
+            if isinstance(files, list):
+                for f in files:
+                    name = f.get("filename") or f.get("name") or ""
+                    if (name.startswith(target_prefix)
+                            and name.endswith(target_suffix)):
+                        sizes[name] = int(f.get("size", 0) or 0)
+            if sizes and sizes == last_sizes:
+                stable_ticks += 1
+                if stable_ticks >= STABLE_TICKS_REQUIRED:
+                    break
+            else:
+                last_sizes = sizes
+                stable_ticks = 0
+            time.sleep(POLL_S)
+
+        if not last_sizes:
+            print(f"    no '{target_prefix}*{target_suffix}' MP4s found "
+                  f"after {args.finalize_wait_s:.0f}s -- check Lua "
+                  f"finalize logs on the vehicle")
         else:
-            print(f"    success={fr.get('success')}")
-            for ph in fr.get("phases", []):
-                print(
-                    f"    {ph['phase']:<10} {ph.get('input_count', 0)} parts "
-                    f"-> {ph.get('output_duration_s', 0):.1f}s "
-                    f"({ph.get('output_bytes', 0) / 1_000_000:.1f} MB)"
-                )
-            mf = fr.get("manifest")
-            if mf:
-                print(f"    manifest: {mf}")
+            total_mb = sum(last_sizes.values()) / 1_000_000
+            print(f"    found {len(last_sizes)} MP4s, total {total_mb:.0f} MB:")
+            for fn in sorted(last_sizes):
+                print(f"      {fn:<60} {last_sizes[fn]/1_000_000:>8.1f} MB")
 
     return 0 if not log else 0
 
