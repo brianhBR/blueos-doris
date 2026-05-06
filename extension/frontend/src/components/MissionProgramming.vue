@@ -509,7 +509,14 @@ function applyConfig(cfg: DeploymentConfiguration) {
   estimatedDepth.value = cfg.estimated_depth
 
   descentCameraOn.value = cfg.descent.camera.enabled
-  descentCameraType.value = cfg.descent.camera.camera_type
+  // Lua only supports timelapse + video-interval on the bottom phase
+  // (services/dive._ipcam_phase_enabled returns 1.0 only for CONTINUOUS_VIDEO).
+  // Coerce legacy descent profiles with invalid modes back to continuous-video
+  // so the disabled UI radios don't render an unselected/invalid state.
+  descentCameraType.value =
+    cfg.descent.camera.camera_type === 'timelapse' || cfg.descent.camera.camera_type === 'video-interval'
+      ? 'continuous-video'
+      : cfg.descent.camera.camera_type
   descentCaptureFrequency.value = cfg.descent.camera.capture_frequency
   descentCaptureFrequencyUnit.value = cfg.descent.camera.capture_frequency_unit
   descentVideoRecordNumber.value = cfg.descent.camera.video_record.number
@@ -579,7 +586,11 @@ function applyConfig(cfg: DeploymentConfiguration) {
 
   ascentSameAsDescent.value = cfg.ascent.same_as_descent
   ascentCameraOn.value = cfg.ascent.camera.enabled
-  ascentCameraType.value = cfg.ascent.camera.camera_type
+  // See descentCameraType comment above: ascent has the same restriction.
+  ascentCameraType.value =
+    cfg.ascent.camera.camera_type === 'timelapse' || cfg.ascent.camera.camera_type === 'video-interval'
+      ? 'continuous-video'
+      : cfg.ascent.camera.camera_type
   ascentCaptureFrequency.value = cfg.ascent.camera.capture_frequency
   ascentCaptureFrequencyUnit.value = cfg.ascent.camera.capture_frequency_unit
   ascentVideoRecordNumber.value = cfg.ascent.camera.video_record.number
@@ -853,15 +864,18 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                   <input type="radio" value="continuous-video" v-model="descentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                   <span style="color: #96EEF2">Continuous Video</span>
                 </label>
-                <label class="flex items-center gap-2 cursor-pointer">
-                  <input type="radio" value="video-interval" v-model="descentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
+                <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
+                  <input type="radio" value="video-interval" v-model="descentCameraType" disabled class="w-4 h-4" />
                   <span style="color: #96EEF2">Interval Video</span>
                 </label>
-                <label class="flex items-center gap-2 cursor-pointer">
-                  <input type="radio" value="timelapse" v-model="descentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
+                <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
+                  <input type="radio" value="timelapse" v-model="descentCameraType" disabled class="w-4 h-4" />
                   <span style="color: #96EEF2">Timelapse Images</span>
                 </label>
               </div>
+              <p class="mt-2 text-xs italic" style="color: rgba(150, 238, 242, 0.5)">
+                Interval Video and Timelapse Images are only supported for the Bottom phase.
+              </p>
             </div>
 
             <!-- Timelapse: Capture Frequency -->
@@ -1460,15 +1474,18 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                     <input type="radio" value="continuous-video" v-model="ascentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                     <span style="color: #96EEF2">Continuous Video</span>
                   </label>
-                  <label class="flex items-center gap-2 cursor-pointer">
-                    <input type="radio" value="video-interval" v-model="ascentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
+                  <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
+                    <input type="radio" value="video-interval" v-model="ascentCameraType" disabled class="w-4 h-4" />
                     <span style="color: #96EEF2">Interval Video</span>
                   </label>
-                  <label class="flex items-center gap-2 cursor-pointer">
-                    <input type="radio" value="timelapse" v-model="ascentCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
+                  <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
+                    <input type="radio" value="timelapse" v-model="ascentCameraType" disabled class="w-4 h-4" />
                     <span style="color: #96EEF2">Timelapse Images</span>
                   </label>
                 </div>
+                <p class="mt-2 text-xs italic" style="color: rgba(150, 238, 242, 0.5)">
+                  Interval Video and Timelapse Images are only supported for the Bottom phase.
+                </p>
               </div>
 
               <div v-if="ascentCameraType === 'timelapse'">
