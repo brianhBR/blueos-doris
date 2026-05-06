@@ -402,6 +402,19 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
         if mcap_path is not None:
             rel_mcap = media_download_id_from_abs_path(mcap_path, root)
 
+        bin_log_status: str | None = data.get("bin_log_status") or None
+        raw_bin_files = data.get("bin_log_files") or []
+        bin_log_rel: list[str] = []
+        if isinstance(raw_bin_files, list):
+            for raw in raw_bin_files:
+                try:
+                    p = Path(str(raw))
+                except (TypeError, ValueError):
+                    continue
+                rel_id = media_download_id_from_abs_path(p, root)
+                if rel_id:
+                    bin_log_rel.append(rel_id)
+
         entries.append(
             DiveHistoryEntry(
                 id=stem,
@@ -417,6 +430,8 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
                 image_count=img,
                 video_count=vid,
                 configuration=str(data.get("configuration") or ""),
+                bin_log_files=bin_log_rel,
+                bin_log_status=bin_log_status,
             )
         )
     return entries
