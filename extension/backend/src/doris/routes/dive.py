@@ -338,12 +338,20 @@ def register_dive_routes(app: Robyn) -> None:
 
     @app.post("/api/v1/dive/finalize")
     async def dive_finalize(request):
-        """Concatenate per-phase .ts segments into per-phase MP4s.
+        """Produce per-phase MP4s from this dive's .ts segments.
 
         Called by the Lua dive script on RECOVERY entry (fire-and-
-        forget).  Also callable manually from the UI or curl.  If no
-        ``?stamp=`` is given, the most recent recording session's
-        base_stamp is used.
+        forget).  Also callable manually from the UI or curl.
+
+        Optional inputs (query string OR JSON body):
+
+        * ``stamp``: dive stamp; defaults to the most recent recording
+          session's ``base_stamp``.
+        * ``bottom_mode``: ``DORIS_BTM_CMOD`` value (1=continuous,
+          2=interval, 3=timelapse).  Selects the bottom-phase output
+          strategy: continuous yields one MP4 per 5-min chunk,
+          interval yields one MP4 per ipcam start/stop cycle, anything
+          else falls back to the legacy concat-into-one behavior.
         """
         try:
             body = json.loads(request.body) if request.body else {}
@@ -352,8 +360,20 @@ def register_dive_routes(app: Robyn) -> None:
         stamp = request.query_params.get("stamp", "")
         if stamp in (None, ""):
             stamp = body.get("stamp") or None
+        # Accept ``bottom_mode`` from the query string OR the JSON body
+        # so the Lua HTTP emitter (which doesn't construct a body) can
+        # pass it as a query param without a Content-Length header.
+        bm_raw = request.query_params.get("bottom_mode", "")
+        if bm_raw in (None, ""):
+            bm_raw = body.get("bottom_mode")
+        bottom_mode: int | None = None
+        if bm_raw not in (None, ""):
+            try:
+                bottom_mode = int(bm_raw)
+            except (TypeError, ValueError):
+                bottom_mode = None
         try:
-            result = await finalize_dive(stamp)
+            result = await finalize_dive(stamp, bottom_mode=bottom_mode)
         except Exception as e:
             logger.exception("dive finalize failed")
             return Response(

@@ -41,13 +41,20 @@ def _json_response(result: dict, status_code: int = 200) -> Response:
 async def _recorder_start_core(request):
     phase_raw = request.query_params.get("phase", None)
     phase = phase_raw if phase_raw not in (None, "") else None
-    try:
-        raw = request.query_params.get("split_duration", "")
-        seg = None
-        if raw not in (None, ""):
+    # ``split_duration`` is the historical name used by /rec/start;
+    # ``segment_seconds`` is accepted as a synonym so callers wired to
+    # /rec/rotate (which advertises both) can use the same key on both
+    # endpoints.
+    raw = (
+        request.query_params.get("split_duration", "")
+        or request.query_params.get("segment_seconds", "")
+    )
+    seg: int | None = None
+    if raw not in (None, ""):
+        try:
             seg = int(raw)
-    except (TypeError, ValueError):
-        seg = None
+        except (TypeError, ValueError):
+            seg = None
     logger.info("RECORD /start called (phase=%s, split_duration=%s)", phase, seg)
     try:
         result = await iprec.start_recording(segment_seconds=seg, phase=phase)
@@ -99,9 +106,27 @@ async def _recorder_rotate_core(request):
              "message": "phase query parameter is required"},
             400,
         )
-    logger.info("RECORD /rotate called (phase=%s)", phase_raw)
+    # Optional segment override (seconds).  Used by the Lua dive script
+    # to switch the live splitmuxsink to 5-min chunks on the
+    # descent->bottom rotation in CONTINUOUS mode and back to the
+    # default on the bottom->ascent rotation.  Accepted under either
+    # name to mirror /rec/start (which uses ``split_duration``).
+    seg: int | None = None
+    raw_seg = (
+        request.query_params.get("split_duration", "")
+        or request.query_params.get("segment_seconds", "")
+    )
+    if raw_seg not in (None, ""):
+        try:
+            seg = int(raw_seg)
+        except (TypeError, ValueError):
+            seg = None
+    logger.info(
+        "RECORD /rotate called (phase=%s, split_duration=%s)",
+        phase_raw, seg,
+    )
     try:
-        result = await iprec.rotate_to_phase(phase_raw)
+        result = await iprec.rotate_to_phase(phase_raw, segment_seconds=seg)
     except Exception as e:
         logger.exception("recorder /rotate failed")
         return _json_response({"success": False, "message": str(e)}, 500)

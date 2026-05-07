@@ -739,10 +739,17 @@ local function ipcam_http_stop(host, port)
     return ipcam_http_send("POST /rec/stop", host, port)
 end
 
-local function ipcam_http_rotate(host, port, phase)
-    return ipcam_http_send(
-        string.format("POST /rec/rotate?phase=%s", phase or "manual"),
-        host, port)
+local function ipcam_http_rotate(host, port, phase, seg_s)
+    -- Optional seg_s retunes the live splitmuxsink so the
+    -- descent->bottom rotation can clamp continuous-mode bottom to
+    -- 5 min chunks and the bottom->ascent rotation can restore the
+    -- larger default.  Omitted (== nil/<=0) -> recorder keeps its
+    -- prior segment policy.
+    local q = string.format("?phase=%s", phase or "manual")
+    if seg_s and seg_s > 0 then
+        q = q .. string.format("&split_duration=%d", math.floor(seg_s))
+    end
+    return ipcam_http_send("POST /rec/rotate" .. q, host, port)
 end
 
 local function ipcam_http_snapshot(host, port, phase)
@@ -751,17 +758,27 @@ local function ipcam_http_snapshot(host, port, phase)
         host, port)
 end
 
-local function ipcam_http_finalize(host, port)
-    return ipcam_http_send("POST /api/v1/dive/finalize", host, port)
+local function ipcam_http_finalize(host, port, btm_cmod)
+    -- bottom_mode tells the extension how to slice the on_bottom
+    -- phase: 1=continuous (one MP4 per 5-min chunk), 2=interval (one
+    -- MP4 per ipcam start/stop cycle), other=legacy concat-into-one.
+    local q = ""
+    if btm_cmod and btm_cmod > 0 then
+        q = string.format("?bottom_mode=%d", math.floor(btm_cmod))
+    end
+    return ipcam_http_send("POST /api/v1/dive/finalize" .. q, host, port)
 end
 
-local function ipcam_start(phase)
+local function ipcam_start(phase, seg_s)
     if ipcam_recording then return end
     if not ipcam_cfg.rec_en then return end
-    if ipcam_http_start("127.0.0.1", 8095, 1800, phase or "manual") then
+    local s = seg_s
+    if not s or s <= 0 then s = 1800 end
+    if ipcam_http_start("127.0.0.1", 8095, s, phase or "manual") then
         ipcam_recording = true
         gcs:send_text(MAV_SEVERITY.INFO,
-            string.format("DIVE: IPcam recording started (%s)", phase or "manual"))
+            string.format("DIVE: IPcam recording started (%s, seg=%ds)",
+                phase or "manual", math.floor(s)))
     else
         gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: IPcam recording start FAILED")
     end
@@ -776,18 +793,22 @@ end
 
 -- Zero-gap phase rotation: next .ts file will be tagged <phase>.  The
 -- rtspsrc+muxer pipeline stays live; splitmuxsink fires split-now and
--- closes the current fragment at the next keyframe.
-local function ipcam_rotate(phase)
+-- closes the current fragment at the next keyframe.  ``seg_s`` (if
+-- given) also retunes max-size-time on the live splitmuxsink so the
+-- caller can switch chunk granularity at the rotate point.
+local function ipcam_rotate(phase, seg_s)
     if not ipcam_cfg.rec_en then return end
     if not ipcam_recording then
         -- No active pipeline; fall back to a fresh start so the caller's
-        -- phase request is still honored.
-        ipcam_start(phase)
+        -- phase + segment request is still honored.
+        ipcam_start(phase, seg_s)
         return
     end
-    if ipcam_http_rotate("127.0.0.1", 8095, phase or "manual") then
+    if ipcam_http_rotate("127.0.0.1", 8095, phase or "manual", seg_s) then
         gcs:send_text(MAV_SEVERITY.INFO,
-            string.format("DIVE: IPcam rotate -> %s", phase or "manual"))
+            string.format("DIVE: IPcam rotate -> %s (seg=%ds)",
+                phase or "manual",
+                math.floor((seg_s and seg_s > 0) and seg_s or 0)))
     else
         gcs:send_text(MAV_SEVERITY.WARNING,
             string.format("DIVE: IPcam rotate -> %s FAILED", phase or "manual"))
@@ -810,12 +831,17 @@ local function ipcam_snapshot(phase)
 end
 
 -- Fire a single POST /api/v1/dive/finalize at RECOVERY entry so the
--- extension concatenates the dive's .ts segments into per-phase MP4s
--- (+ manifest JSON) on the device.  Fire-and-forget; the dive script
--- is done by this point and the HTTP response isn't needed.
+-- extension turns the dive's .ts segments into per-phase MP4s (+
+-- manifest JSON) on the device.  Fire-and-forget; the dive script is
+-- done by this point and the HTTP response isn't needed.  We pass
+-- ipcam_cfg.btm_cmod so the extension knows how to slice the
+-- on_bottom phase (1=continuous chunk-per-5min, 2=interval session-
+-- per-cycle, other=legacy concat-into-one).
 local function ipcam_finalize()
-    if ipcam_http_finalize("127.0.0.1", 8095) then
-        gcs:send_text(MAV_SEVERITY.INFO, "DIVE: IPcam finalize requested")
+    if ipcam_http_finalize("127.0.0.1", 8095, ipcam_cfg.btm_cmod) then
+        gcs:send_text(MAV_SEVERITY.INFO,
+            string.format("DIVE: IPcam finalize requested (btm_cmod=%d)",
+                math.floor(ipcam_cfg.btm_cmod or 0)))
     else
         gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: IPcam finalize POST FAILED")
     end
@@ -825,13 +851,17 @@ end
 -- DESCENT, ASCENT, and on_bottom when BTM_CMOD=1 (continuous).  Does the
 -- right thing whether we're not-yet-recording (start), already recording
 -- in a different phase (rotate), or the phase is disabled (stop).
-local function ipcam_begin_phase(phase_enabled, phase_name)
+-- ``seg_s`` (optional) clamps splitmuxsink's max-size-time at this
+-- transition: pass 300 to switch on_bottom continuous to 5-min chunks,
+-- pass 1800 to restore the default for descent/ascent so those phases
+-- finalize as a single MP4.  Omit / pass nil to keep the prior policy.
+local function ipcam_begin_phase(phase_enabled, phase_name, seg_s)
     if not ipcam_cfg.rec_en then return end
     if phase_enabled then
         if ipcam_recording then
-            ipcam_rotate(phase_name)
+            ipcam_rotate(phase_name, seg_s)
         else
-            ipcam_start(phase_name)
+            ipcam_start(phase_name, seg_s)
         end
     elseif ipcam_recording then
         ipcam_stop()
@@ -998,7 +1028,9 @@ function update()
             ascent_start_ms = now_ms
             init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
-            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent")
+            -- Restore default segment so ascent finalizes as one MP4
+            -- (no chunking) regardless of bottom mode.
+            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent", 1800)
             state = STATE_ASCENT
             return update, UPDATE_INTERVAL_MS
         end
@@ -1041,7 +1073,10 @@ function update()
                     dive_start_ms = now_ms
                     init_ring(dr, DORIS_BTM_AVG:get())
                     reset_light_cycle(now_ms)
-                    ipcam_begin_phase(ipcam_cfg.dsc_rec, "descent")
+                    -- Descent uses the default 1800s segment so the
+                    -- whole descent is one .ts -> one MP4 after
+                    -- finalize, regardless of bottom mode.
+                    ipcam_begin_phase(ipcam_cfg.dsc_rec, "descent", 1800)
                     state = STATE_DESCENT
                 end
             end
@@ -1053,7 +1088,7 @@ function update()
             ascent_start_ms = now_ms
             init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
-            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent")
+            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent", 1800)
             state = STATE_ASCENT
             return update, UPDATE_INTERVAL_MS
         end
@@ -1098,13 +1133,16 @@ function update()
                 -- For CONTINUOUS bottom mode with no camera delay we do
                 -- a zero-gap rotate-or-start right now so the moment
                 -- the vehicle settles, the first "on_bottom" .ts starts.
+                -- Pass seg=300 so splitmuxsink rotates at 5-min
+                -- boundaries (lossless) for the rest of the bottom
+                -- phase, producing on_bottom_chunkNN.mp4 outputs.
                 -- For INTERVAL / TIMELAPSE / OFF (or any mode w/ a
                 -- camera delay) we stop any descent recording and let
                 -- the on_bottom loop own the cadence.
                 local want_now = (ipcam_cfg.btm_cmod == 1)
                     and (ipcam_cfg.cam_btm_dly_ms <= 0)
                 if want_now then
-                    ipcam_begin_phase(true, "on_bottom")
+                    ipcam_begin_phase(true, "on_bottom", 300)
                     ipcam_btm_started = ipcam_recording
                 elseif ipcam_recording then
                     ipcam_stop()
@@ -1119,7 +1157,9 @@ function update()
             ascent_start_ms = now_ms
             init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
-            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent")
+            -- Restore default segment so ascent is one MP4 even after
+            -- continuous bottom (which set splitmuxsink to 300s).
+            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent", 1800)
             state = STATE_ASCENT
             return update, UPDATE_INTERVAL_MS
         end
@@ -1171,8 +1211,10 @@ function update()
             if ipcam_recording then ipcam_stop() end
         elseif ipcam_cfg.btm_cmod == 1 then
             -- CONTINUOUS: start once after camera delay, keep running.
+            -- seg=300 -> splitmuxsink rotates every 5 minutes so the
+            -- finalize step can produce on_bottom_chunkNN.mp4 files.
             if cam_delay_done and not ipcam_recording then
-                ipcam_begin_phase(true, "on_bottom")
+                ipcam_begin_phase(true, "on_bottom", 300)
                 ipcam_btm_started = ipcam_recording
             end
         elseif ipcam_cfg.btm_cmod == 2 then
@@ -1267,7 +1309,9 @@ function update()
             ascent_start_ms = now_ms
             init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
-            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent")
+            -- Restore default segment so ascent is one MP4 even after
+            -- continuous bottom (which set splitmuxsink to 300s).
+            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent", 1800)
             state = STATE_ASCENT
         end
 

@@ -284,9 +284,19 @@ class RecordingSession:
         self.last_pattern = path
         return path
 
-    async def rotate_to_phase(self, new_phase: str) -> dict:
+    async def rotate_to_phase(
+        self, new_phase: str, segment_seconds: int | None = None,
+    ) -> dict:
         """Rotate to ``new_phase``.  Zero-gap when the pipeline is live,
         queued otherwise so the next pipeline part picks it up.
+
+        ``segment_seconds`` (if given) updates the live splitmuxsink's
+        ``max-size-time`` so subsequent fragments rotate at the new
+        boundary.  Used by the Lua dive script to clamp the bottom
+        phase to 5-minute chunks in CONTINUOUS mode (DORIS_BTM_CMOD=1)
+        and to restore the larger default for ascent.  The new value
+        is also stored on the session so a watchdog-driven pipeline
+        rebuild keeps the same segment policy.
 
         Three code paths:
 
@@ -307,6 +317,18 @@ class RecordingSession:
         if not self.is_alive():
             return {"success": False, "reason": "not_recording"}
 
+        # Clamp + persist the new segment policy so a watchdog rebuild
+        # picks it up too.  Applied to the live muxsink below; the
+        # mid-restart branch just persists.
+        new_segment_s: int | None = None
+        if segment_seconds is not None:
+            try:
+                new_segment_s = max(1, min(int(segment_seconds), 86_400))
+            except (TypeError, ValueError):
+                new_segment_s = None
+        if new_segment_s is not None:
+            self._segment_s = new_segment_s
+
         old_phase = self.current_phase
         muxsink = self._muxsink
         if muxsink is None:
@@ -314,28 +336,45 @@ class RecordingSession:
             # it up in _run_one before the first callback fires.
             self._pending_phase = new_phase
             logger.info(
-                "RECORD rotate queued: %s -> %s (pipeline mid-restart)",
-                old_phase, new_phase,
+                "RECORD rotate queued: %s -> %s segment_s=%s "
+                "(pipeline mid-restart)",
+                old_phase, new_phase, new_segment_s,
             )
             return {
                 "success": True, "from_phase": old_phase,
                 "to_phase": new_phase, "rotated": False,
                 "queued": True,
+                "segment_seconds": self._segment_s,
             }
-        if new_phase == old_phase:
+        if new_phase == old_phase and new_segment_s is None:
             return {
                 "success": True, "from_phase": old_phase,
                 "to_phase": new_phase, "rotated": False,
                 "note": "already in requested phase",
+                "segment_seconds": self._segment_s,
             }
         # Update the live variable BEFORE emitting split-now so the next
         # format-location callback picks up the new label.  GIL-safe.
         self.current_phase = new_phase
-        self.rotation_count += 1
-        self._last_phases.append(new_phase)
+        if new_segment_s is not None:
+            # splitmuxsink.max-size-time is a runtime-writable GObject
+            # property; setting it before split-now means the new value
+            # governs every fragment after this rotation.
+            try:
+                muxsink.set_property(
+                    "max-size-time", int(new_segment_s) * 1_000_000_000,
+                )
+            except Exception:
+                logger.exception(
+                    "RECORD failed to update splitmuxsink max-size-time "
+                    "(continuing with prior value)"
+                )
+        if new_phase != old_phase:
+            self.rotation_count += 1
+            self._last_phases.append(new_phase)
         logger.info(
-            "RECORD rotate: %s -> %s (rotations=%d)",
-            old_phase, new_phase, self.rotation_count,
+            "RECORD rotate: %s -> %s segment_s=%d (rotations=%d)",
+            old_phase, new_phase, self._segment_s, self.rotation_count,
         )
         try:
             muxsink.emit("split-now")
@@ -346,6 +385,7 @@ class RecordingSession:
             "success": True, "from_phase": old_phase,
             "to_phase": new_phase, "rotated": True,
             "rotation_count": self.rotation_count,
+            "segment_seconds": self._segment_s,
         }
 
     def _build_pipeline(self) -> "Gst.Pipeline":
@@ -580,10 +620,24 @@ async def start_recording(
                 "storage": _session.storage,
                 "phase": _session.current_phase,
             }
+            # If the caller passed a segment override, fold it through
+            # the rotate path so a /rec/start while-already-recording
+            # can also retune splitmuxsink.  Passing None preserves the
+            # current segment policy.
             if phase is not None and phase_label != _session.current_phase:
-                rot = await _session.rotate_to_phase(phase_label)
+                rot = await _session.rotate_to_phase(
+                    phase_label, segment_seconds=segment_seconds,
+                )
                 result["rotate"] = rot
                 result["phase"] = _session.current_phase
+            elif segment_seconds is not None:
+                # Same phase but a segment retune was requested.  Apply
+                # via rotate_to_phase (idempotent on the phase label,
+                # writes the live splitmuxsink property).
+                rot = await _session.rotate_to_phase(
+                    _session.current_phase, segment_seconds=segment_seconds,
+                )
+                result["rotate"] = rot
             return result
 
         out_root, storage = _output_dir()
@@ -632,8 +686,15 @@ async def start_recording(
         }
 
 
-async def rotate_to_phase(new_phase: str | None) -> dict:
+async def rotate_to_phase(
+    new_phase: str | None, segment_seconds: int | None = None,
+) -> dict:
     """Module-level helper mirroring :meth:`RecordingSession.rotate_to_phase`.
+
+    ``segment_seconds`` (when supplied) updates the live splitmuxsink's
+    max segment time so the Lua can switch to 5-minute chunking on the
+    descent->bottom rotation in CONTINUOUS mode and restore the larger
+    default on the bottom->ascent rotation.
 
     Returns ``{"success": False, "reason": "not_recording"}`` if no
     session is currently live.  This is the entry point wired to the
@@ -646,7 +707,9 @@ async def rotate_to_phase(new_phase: str | None) -> dict:
             "success": False, "reason": "not_recording",
             "to_phase": new_phase_label,
         }
-    return await sess.rotate_to_phase(new_phase_label)
+    return await sess.rotate_to_phase(
+        new_phase_label, segment_seconds=segment_seconds,
+    )
 
 
 async def stop_recording() -> dict:

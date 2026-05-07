@@ -26,7 +26,15 @@ What it does (in order):
    into per-phase MP4s.
 5. After the dive ends (RECOVERY or hard cap), optionally polls
    ``GET /api/v1/media/files`` until the per-phase MP4s for this
-   dive's ``base_stamp`` appear and stop growing.
+   dive's ``base_stamp`` appear and stop growing.  Discovery is by
+   filename prefix so it catches every per-phase output the
+   extension may produce, including the multi-file bottom shapes:
+
+       dive_<stamp>_descent.mp4         (always one per dive)
+       dive_<stamp>_on_bottom.mp4       (legacy single-file fallback)
+       dive_<stamp>_on_bottom_chunkNN.mp4  (continuous, 5-min chunks)
+       dive_<stamp>_on_bottom_videoNN.mp4  (interval, per-cycle)
+       dive_<stamp>_ascent.mp4          (always one per dive)
 
    .. note::
       The Lua dive script already issues
@@ -135,10 +143,16 @@ def main() -> int:
     p.add_argument("--finalize", action="store_true",
                    help="After the dive ends, poll GET /api/v1/media/files "
                         "until this dive's per-phase MP4s appear and stop "
-                        "growing.  Does NOT POST /api/v1/dive/finalize -- "
-                        "the Lua script already fires that exactly once on "
-                        "RECOVERY entry; a second POST collides with the "
-                        "in-flight ffmpeg jobs.")
+                        "growing.  Discovery is by filename prefix "
+                        "(dive_<stamp>_*.mp4) so multi-chunk bottom outputs "
+                        "(_on_bottom_chunkNN.mp4 in continuous mode, "
+                        "_on_bottom_videoNN.mp4 in interval mode) are "
+                        "picked up alongside the single-file _descent.mp4 "
+                        "and _ascent.mp4.  Does NOT POST "
+                        "/api/v1/dive/finalize -- the Lua script already "
+                        "fires that exactly once on RECOVERY entry; a "
+                        "second POST collides with the in-flight ffmpeg "
+                        "jobs.")
     p.add_argument("--finalize-wait-s", type=float, default=300.0,
                    help="Hard cap on the post-RECOVERY observation window "
                         "(default: 300s).  Lua's finalize finishes in well "
@@ -282,9 +296,15 @@ def main() -> int:
 
         # Lua already POSTed /api/v1/dive/finalize on its first RECOVERY
         # tick.  We just observe via /api/v1/media/files until this
-        # dive's three phase MP4s appear and stop growing.  No POST
-        # here -- a second finalize call collides with the in-flight
-        # ffmpeg jobs (two `ffmpeg -y` writers on the same output).
+        # dive's per-phase MP4s appear and stop growing.  No POST here
+        # -- a second finalize call collides with the in-flight ffmpeg
+        # jobs (two `ffmpeg -y` writers on the same output).
+        #
+        # The prefix glob ``dive_<stamp>_*.mp4`` deliberately catches
+        # every per-phase output the extension may produce, so a
+        # continuous-mode dive (multiple _on_bottom_chunkNN.mp4) or an
+        # interval-mode dive (multiple _on_bottom_videoNN.mp4) both
+        # converge here without runner-side mode awareness.
         target_prefix = f"dive_{dive_stamp}_"
         target_suffix = ".mp4"
         deadline = time.time() + args.finalize_wait_s
