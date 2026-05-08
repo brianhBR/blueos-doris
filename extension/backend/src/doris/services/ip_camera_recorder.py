@@ -35,9 +35,20 @@ each rtspsrc connect is decodable.  ``alignment=au`` then groups
 SPS+PPS+IDR into a single buffer so splitmuxsink can never split
 between the parameter sets and their keyframe.
 
-``splitmuxsink`` produces multiple ``radcam_<stamp>_part<NN>_%05d.ts``
-segments per restart; ``part<NN>`` increments each time the watchdog
-restarts the pipeline so files from different sessions do not collide.
+``splitmuxsink`` produces multiple
+``radcam_<stamp>_<phase>_cyc<CC>_part<NN>_%05d.ts`` segments per
+session.  Two distinct counters are embedded in the filename:
+
+* ``cyc<CC>`` increments **once per ``start_recording`` call** within
+  one dive.  Every ``.ts`` file written by a single ipcam_start /
+  ipcam_stop cycle therefore carries the same ``<CC>``, regardless of
+  how many times the watchdog rebuilt the pipeline mid-cycle (camera
+  RTSP teardowns, transient errors, anything).  Finalize uses
+  ``<CC>`` alone to identify a logical interval cycle -- no
+  timing/mtime heuristics.
+* ``part<NN>`` increments on every pipeline rebuild (initial start +
+  each watchdog restart) so file paths are unique even when ``<CC>``
+  is repeated across rebuilds.
 """
 
 from __future__ import annotations
@@ -138,6 +149,18 @@ _snapshot_seqs: dict[tuple[str, str], int] = {}
 # stop_recording, reset to 0 by clear_snapshot_state.
 _session_part_offset: int = 0
 
+# Sequence counter for ``ipcam_start / ipcam_stop`` cycles within a
+# dive.  Incremented once per ``start_recording`` call (the
+# non-idempotent path that actually constructs a new
+# RecordingSession); idempotent re-uses do NOT bump it.  The current
+# value is stamped into every ``.ts`` filename as ``cyc<CC>``, so
+# every fragment written by a single ipcam_start / ipcam_stop cycle
+# (including all fragments produced by mid-cycle watchdog rebuilds)
+# shares the same ``<CC>`` and finalize can group them into one MP4
+# without any timing heuristic.  Reset to 0 by clear_snapshot_state
+# so each fresh dive starts at cyc01.
+_dive_cycle_seq: int = 0
+
 # Direct camera snapshot endpoint.  This is a raw HTTP path on the
 # IP camera itself (NOT a MCM-mediated path) so that the timelapse
 # fast path is independent of mavlink-camera-manager state.  The
@@ -226,7 +249,8 @@ class RecordingSession:
     def __init__(self, rtsp_url: str, segment_s: int, out_dir: Path,
                  storage_label: str, base_stamp: str,
                  phase: str = PHASE_DEFAULT,
-                 initial_part: int = 0) -> None:
+                 initial_part: int = 0,
+                 cycle_seq: int = 0) -> None:
         self._rtsp_url = rtsp_url
         self._segment_s = segment_s
         self._out_dir = out_dir
@@ -248,6 +272,12 @@ class RecordingSession:
         # collide on _part00_00000.ts.
         self._initial_part = max(0, int(initial_part))
         self._current_part = self._initial_part
+        # cycle_seq stays constant for the whole life of this session
+        # (start -> watchdog rebuilds -> stop) and is stamped into
+        # every .ts filename as cyc<CC>.  Finalize groups bottom .ts
+        # by cyc<CC> to stitch each ipcam_start / ipcam_stop cycle
+        # into a single MP4.
+        self.cycle_seq = max(0, int(cycle_seq))
         self.restart_count = 0
         self.last_pattern: str | None = None
         self.last_exit: dict | None = None
@@ -278,8 +308,8 @@ class RecordingSession:
         phase = self.current_phase
         path = str(
             self._out_dir
-            / f"radcam_{self.base_stamp}_{phase}_part{self._current_part:02d}"
-            f"_{int(fragment_id):05d}.ts"
+            / f"radcam_{self.base_stamp}_{phase}_cyc{self.cycle_seq:02d}"
+            f"_part{self._current_part:02d}_{int(fragment_id):05d}.ts"
         )
         self.last_pattern = path
         return path
@@ -592,7 +622,7 @@ async def start_recording(
     :func:`rotate_to_phase` is called; defaults to ``"manual"`` for UI-
     initiated recordings outside of a dive.
     """
-    global _session, _last_base_stamp
+    global _session, _last_base_stamp, _dive_cycle_seq
 
     seg = segment_seconds
     if seg is None:
@@ -658,6 +688,14 @@ async def start_recording(
         # _current_part both reset, and a stop -> start cycle would
         # overwrite the previous cycle's _part00_00000.ts.
         initial_part = _session_part_offset
+        # Bump the dive-scoped cycle counter so this ipcam_start/stop
+        # cycle gets its own ``cyc<CC>`` tag, distinct from any prior
+        # cycle in the same dive.  All .ts files this session writes
+        # (including those produced by mid-cycle watchdog rebuilds)
+        # share this number, so finalize can stitch them losslessly
+        # into one MP4 per cycle without any timing heuristic.
+        _dive_cycle_seq += 1
+        cycle_seq = _dive_cycle_seq
         sess = RecordingSession(
             rtsp_url=rtsp_url,
             segment_s=seg,
@@ -666,19 +704,22 @@ async def start_recording(
             base_stamp=stamp,
             phase=phase_label,
             initial_part=initial_part,
+            cycle_seq=cycle_seq,
         )
         sess.start()
         _session = sess
         _last_base_stamp = stamp
         logger.info(
-            "RECORD session started base=%s phase=%s storage=%s rtsp=%s seg=%ds",
-            stamp, phase_label, storage, source_label, seg,
+            "RECORD session started base=%s phase=%s cyc=%02d storage=%s "
+            "rtsp=%s seg=%ds",
+            stamp, phase_label, cycle_seq, storage, source_label, seg,
         )
         return {
             "success": True,
             "recording": True,
             "base_stamp": stamp,
             "phase": phase_label,
+            "cycle_seq": cycle_seq,
             "output_directory": str(out_dir),
             "storage": storage,
             "segment_seconds": seg,
@@ -787,17 +828,20 @@ def _next_snapshot_seq(stamp: str, phase: str) -> int:
 
 
 def clear_snapshot_state() -> None:
-    """Reset snapshot counters, the dive-scoped base stamp and part offset.
+    """Reset snapshot counters, dive-scoped stamp, part offset, and cycle seq.
 
     Called by ``/api/v1/dive/finalize`` so the next dive allocates a
     fresh ``_last_base_stamp`` on its first start_recording / snapshot,
-    snapshot seq counters start at 1 again, and the next session
-    starts at part00 instead of inheriting the prior dive's offset.
+    snapshot seq counters start at 1 again, the next session starts
+    at part00 instead of inheriting the prior dive's offset, and the
+    next session's first ``ipcam_start`` produces ``cyc01`` rather
+    than continuing the prior dive's cycle counter.
     """
-    global _last_base_stamp, _session_part_offset
+    global _last_base_stamp, _session_part_offset, _dive_cycle_seq
     _snapshot_seqs.clear()
     _last_base_stamp = None
     _session_part_offset = 0
+    _dive_cycle_seq = 0
 
 
 async def _fetch_camera_jpeg() -> tuple[bytes | None, str]:
