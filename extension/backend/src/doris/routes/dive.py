@@ -10,6 +10,7 @@ triggering. A dive record (dive_NNNN.json) is persisted under
 DATA_ROOT/dives/.
 """
 
+import asyncio
 import json
 import logging
 import re
@@ -18,9 +19,10 @@ from pathlib import Path
 
 from robyn import Response, Robyn
 
+from ..services import binlog
+from ..services import ip_camera_recorder as iprec
 from ..services.camera import CameraService
 from ..services.dive import DiveService
-from ..services import ip_camera_recorder as iprec
 from ..services.storage import DATA_ROOT, StorageService, media_download_id_from_abs_path
 
 logger = logging.getLogger(__name__)
@@ -72,9 +74,12 @@ def _sync_mission_state_from_vehicle(status_dict: dict) -> None:
         ms[f"{new_status}_at"] = datetime.now(tz=timezone.utc).isoformat()
         changed = True
         try:
-            _update_active_dive_record(new_status)
+            updated = _update_active_dive_record(new_status)
         except Exception as e:
             logger.warning("Failed to mark dive record %s: %s", new_status, e)
+            updated = None
+        if updated is not None:
+            _schedule_binlog_archive(updated)
     if changed:
         try:
             MISSION_STATE_PATH.write_text(json.dumps(ms, indent=2, default=str))
@@ -117,8 +122,13 @@ def _next_dive_filename() -> Path:
     return DIVES_DIR / f"dive_{highest + 1:04d}.json"
 
 
-def _update_active_dive_record(new_status: str) -> None:
-    """Find the most recent active dive record and update its status."""
+def _update_active_dive_record(new_status: str) -> Path | None:
+    """Find the most recent active dive record and update its status.
+
+    Returns the path of the dive record that was updated, or ``None`` if
+    no active dive was found.  The caller uses the returned path to
+    schedule downstream finalize work (e.g. BIN log archive).
+    """
     DIVES_DIR.mkdir(parents=True, exist_ok=True)
     pattern = re.compile(r"^dive_(\d{4})\.json$")
     dive_files = []
@@ -136,9 +146,34 @@ def _update_active_dive_record(new_status: str) -> None:
                 record["ended_at"] = datetime.now(tz=timezone.utc).isoformat()
                 dive_file.write_text(json.dumps(record, indent=2, default=str))
                 logger.info(f"Dive record updated: {dive_file.name} -> {new_status}")
-                return
+                return dive_file
         except Exception as e:
             logger.warning(f"Error reading {dive_file.name}: {e}")
+    return None
+
+
+def _schedule_binlog_archive(dive_file: Path) -> None:
+    """Fire-and-forget background BIN log archive for a finalized dive.
+
+    Picks up the dive's BIN log(s) from the firmware logs dir and copies
+    them to USB (where they'll surface in the Data tab).  Failures are
+    logged but never bubble up to the caller — finalization happens on
+    the request path and must not block on a slow USB write.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.debug("No running loop; skipping BIN archive for %s", dive_file)
+        return
+
+    async def _runner() -> None:
+        try:
+            result = await binlog.archive_dive_bin_logs(dive_file)
+            logger.info("BIN archive (%s): %s", dive_file.name, result)
+        except Exception:
+            logger.exception("BIN archive failed for %s", dive_file)
+
+    loop.create_task(_runner())
 
 
 def _close_all_active_dive_records(new_status: str = "completed") -> int:
@@ -229,6 +264,14 @@ def register_dive_routes(app: Robyn) -> None:
             logger.info(f"Closed {stale} stale active dive record(s) before new dive")
 
         dive_file = _next_dive_filename()
+        # Snapshot the most recent ArduPilot BIN log number so that on
+        # dive end we can copy *only* the BINs created during this dive.
+        try:
+            bin_log_start_num = binlog.read_lastlog_num()
+        except Exception as e:
+            logger.warning("Failed to read ArduPilot LASTLOG.TXT at dive start: %s", e)
+            bin_log_start_num = None
+
         dive_record = {
             "dive_name": body.get("dive_name", ""),
             "username": body.get("username", ""),
@@ -239,6 +282,7 @@ def register_dive_routes(app: Robyn) -> None:
             "started_at": loaded_at.isoformat(),
             "status": "active",
             "profile_id": profile_id,
+            "bin_log_start_num": bin_log_start_num,
         }
         lat, lon = body.get("latitude"), body.get("longitude")
         if lat is not None and lon is not None:
@@ -294,10 +338,14 @@ def register_dive_routes(app: Robyn) -> None:
             logger.warning(f"Failed to stop IP camera recorder: {e}")
 
         # Update the most recent active dive record
+        updated_dive_file: Path | None = None
         try:
-            _update_active_dive_record("cancelled")
+            updated_dive_file = _update_active_dive_record("cancelled")
         except Exception as e:
             logger.warning(f"Failed to update dive record: {e}")
+
+        if updated_dive_file is not None:
+            _schedule_binlog_archive(updated_dive_file)
 
         try:
             _set_mission_terminal_status("cancelled")
@@ -435,3 +483,40 @@ def register_dive_routes(app: Robyn) -> None:
                 headers={"Content-Type": "application/json"},
             )
         return json.dumps({"success": True})
+
+    @app.post("/api/v1/dive/history/:dive_id/archive_binlogs")
+    async def dive_history_archive_binlogs(request):
+        """Re-run the BIN log archive for a past dive.
+
+        Useful when the USB drive was missing at dive end, or when the
+        operator wants a fresh copy.  Returns the same status dict the
+        background archiver writes into the dive record.
+        """
+        dive_id = request.path_params.get("dive_id", "").strip()
+        if not re.fullmatch(r"dive_\d{4}", dive_id):
+            return Response(
+                status_code=400,
+                description=json.dumps({"error": "Invalid dive id"}),
+                headers={"Content-Type": "application/json"},
+            )
+        path = DIVES_DIR / f"{dive_id}.json"
+        if not path.is_file():
+            return Response(
+                status_code=404,
+                description=json.dumps({"error": "Dive record not found"}),
+                headers={"Content-Type": "application/json"},
+            )
+        try:
+            result = await binlog.archive_dive_bin_logs(path)
+        except Exception as e:
+            logger.exception("Manual BIN archive failed for %s", dive_id)
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+        return Response(
+            status_code=200,
+            description=json.dumps(result, default=str),
+            headers={"Content-Type": "application/json"},
+        )

@@ -22,3 +22,8 @@ class DiveHistoryEntry(BaseModel):
     image_count: int = 0
     video_count: int = 0
     configuration: str = ""
+    # ArduPilot BIN log archive results (populated by services.binlog).
+    # ``bin_log_files`` is a list of media-download ids (relative to USB or
+    # DATA_ROOT) that the frontend can pass to ``/api/v1/media/download``.
+    bin_log_files: list[str] = []
+    bin_log_status: str | None = None

@@ -48,11 +48,13 @@ function formatFileSize(bytes: number): string {
   return `${bytes} B`
 }
 
-function mapMediaType(mediaType: string): DisplayFile['type'] {
+function mapMediaType(mediaType: string, filename: string = ''): DisplayFile['type'] {
   if (mediaType === 'video') return 'video'
   if (mediaType === 'image') return 'image'
-  if (mediaType === 'data') return 'sensor'
   if (mediaType === 'system') return 'system'
+  // ArduPilot BIN logs land in the data bucket but render better as "log".
+  if (filename.toLowerCase().endsWith('.bin')) return 'log'
+  if (mediaType === 'data') return 'sensor'
   return 'log'
 }
 
@@ -88,7 +90,7 @@ const mediaFiles = computed<DisplayFile[]>(() => {
     return {
       id: f.id,
       fileName: f.filename,
-      type: mapMediaType(f.media_type),
+      type: mapMediaType(f.media_type, f.filename),
       diveName: (f.dive_name && f.dive_name.trim()) ? f.dive_name.trim() : '—',
       datePart,
       timePart,
@@ -327,6 +329,7 @@ const handlePageChange = (page: number) => {
               {{ mediaFiles.filter((f: DisplayFile) => f.type === 'video').length }} videos,
               {{ mediaFiles.filter((f: DisplayFile) => f.type === 'image').length }} images,
               {{ mediaFiles.filter((f: DisplayFile) => f.type === 'sensor').length }} sensor,
+              {{ mediaFiles.filter((f: DisplayFile) => f.type === 'log').length }} logs,
               {{ mediaFiles.filter((f: DisplayFile) => f.type === 'system').length }} system
             </p>
           </div>
