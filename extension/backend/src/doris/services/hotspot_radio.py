@@ -82,6 +82,7 @@ Note on ``sudo``: the BlueOS Commander API's shell PATH does not include
 through ``sudo`` (which resets the PATH).
 """
 
+import base64
 import json
 import logging
 
@@ -170,32 +171,86 @@ async def _run_host_command(command: str, timeout: float = 30.0) -> tuple[bool, 
 
 
 async def _read_host_file(path: str) -> str | None:
-    """Return the contents of a host file, or None if it doesn't exist."""
-    ok, out = await _run_host_command(f"cat {path} 2>/dev/null")
+    """Return the contents of a host file, or None if it doesn't exist.
+
+    Uses ``sudo cat`` so we can read root-owned config like
+    ``/root/.config/blueos/bootstrap/startup.json`` - Commander runs as
+    ``pi``, so a bare ``cat`` returns empty/EACCES on such files and we'd
+    incorrectly conclude the file doesn't exist.
+    """
+    ok, out = await _run_host_command(f"sudo cat {path} 2>/dev/null")
     return out if ok else None
+
+
+# Max number of base64 chars per chunk-append command. nginx in front of
+# Commander caps the request URI around 8 KB; the chunk lives inside a
+# ``printf %s '...' >> /tmp/...`` shell command plus the
+# ``i_know_what_i_am_doing`` flag, both of which inflate further under
+# URL-encoding. 2000 keeps comfortable headroom.
+_HOSTFILE_CHUNK_SIZE = 2000
+_HOSTFILE_STAGING = "/tmp/.doris_hostfile_stage"
 
 
 async def _write_host_file(path: str, content: str) -> bool:
     """Write *content* to *path* on the host atomically.
 
-    Skips the write if the existing file already has the same content,
-    avoiding unnecessary inotify churn.
+    Streams the payload as base64 in small chunks appended to a staging
+    file, then atomically renames into place under ``sudo``. The previous
+    implementation used a single ``sudo tee <<HEREDOC`` shell command sent
+    through the Commander API's query string, which hit nginx's request
+    URI length limit (around 8 KB) for anything bigger than a few KB and
+    silently failed with HTTP 400 - notably the ~25 KB patched
+    ``networkmanager.py``. Chunked base64 keeps each request well under
+    the limit and works for any file size.
+
+    Skips the write entirely if the destination already has the same
+    content, avoiding unnecessary inotify churn.
     """
     existing = await _read_host_file(path)
     if existing is not None and existing.strip() == content.strip():
         logger.info("Host file %s already up to date, skipping", path)
         return True
 
-    # Use a heredoc with a unique sentinel to avoid quote-escaping headaches.
-    sentinel = "DORIS_HOSTFILE_EOF"
-    cmd = (
-        f"sudo tee {path} > /dev/null <<'{sentinel}'\n"
-        f"{content}"
-        f"{sentinel}\n"
+    encoded = base64.b64encode(content.encode("utf-8")).decode("ascii")
+    total_chunks = (len(encoded) + _HOSTFILE_CHUNK_SIZE - 1) // _HOSTFILE_CHUNK_SIZE
+
+    ok, _ = await _run_host_command(f"true > {_HOSTFILE_STAGING}")
+    if not ok:
+        logger.warning("Could not truncate staging file %s", _HOSTFILE_STAGING)
+        return False
+
+    for idx in range(total_chunks):
+        chunk = encoded[idx * _HOSTFILE_CHUNK_SIZE : (idx + 1) * _HOSTFILE_CHUNK_SIZE]
+        # Base64 alphabet is shell-safe, so single-quoting the chunk is
+        # sufficient escaping; no embedded quotes possible.
+        ok, _ = await _run_host_command(
+            f"printf %s '{chunk}' >> {_HOSTFILE_STAGING}"
+        )
+        if not ok:
+            logger.warning(
+                "Chunk %d/%d failed while writing %s; aborting",
+                idx + 1, total_chunks, path,
+            )
+            await _run_host_command(f"rm -f {_HOSTFILE_STAGING}")
+            return False
+
+    # Atomic install: decode-to-temp, rename, clean up staging. The
+    # redirect must live inside the sudo'd shell so root owns the target.
+    final_cmd = (
+        f"sudo bash -c 'base64 -d {_HOSTFILE_STAGING} > {path}.doris.tmp"
+        f" && mv {path}.doris.tmp {path}"
+        f" && rm -f {_HOSTFILE_STAGING}'"
     )
-    ok, _ = await _run_host_command(cmd)
+    ok, _ = await _run_host_command(final_cmd)
     if ok:
-        logger.info("Wrote %s on host (%d bytes)", path, len(content))
+        logger.info(
+            "Wrote %s on host (%d bytes via %d base64 chunks)",
+            path, len(content), total_chunks,
+        )
+    else:
+        await _run_host_command(
+            f"sudo rm -f {_HOSTFILE_STAGING} {path}.doris.tmp"
+        )
     return ok
 
 
