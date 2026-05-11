@@ -61,6 +61,59 @@ VHT80 (80 MHz width) is *not* enabled - it is unstable in AP mode on
 ``rtl88x2bu`` (hostapd brings up and immediately disables the AP). HT40
 on a non-DFS channel is the sweet spot.
 
+5 GHz investigation notes (May 2026, deferred)
+----------------------------------------------
+The 5 GHz patch encoded above (``-c 36``) does *not* work on the
+``88x2bu`` driver we ship (``morrownr/88x2bu-20210702`` @
+``bd7c7eb9d``). Findings, in case we pick this back up:
+
+* **Channel 36 / UNII-1** (this patch): hostapd never reaches
+  ``AP-ENABLED``. The driver hard-rejects beacon programming with::
+
+      uap0: INTERFACE-DISABLED
+      Failed to set beacon parameters
+      uap0: Could not connect to kernel driver
+      Interface initialization failed
+
+  This is a software-side ``nl80211`` rejection (no RF energy has been
+  transmitted yet), consistent with the well-known FCC indoor-only /
+  UNII-1 restriction baked into older Realtek out-of-tree drivers.
+  ``--ht_capab`` / ``--vht_capab`` / 20 MHz fallback do *not* change the
+  outcome on channel 36.
+
+* **Channels 40, 44, 48 (UNII-1)**: not exhaustively tested but expected
+  to share channel 36's fate (same regulatory regime).
+
+* **Channel 149 / UNII-3** with the same HT40+VHT flags: hostapd reaches
+  ``AP-ENABLED`` cleanly, the radio broadcasts at channel 149 / 40 MHz /
+  13 dBm. Stability across longer runs is *not yet confirmed* - one
+  90 s run dropped the AP around the 45 s mark, but a separate leftover
+  test stayed up for several minutes. Needs a clean, longer repro before
+  shipping. Channels 153, 157, 161, 165 untested.
+
+* The radio itself (``iw phy phy1 info``) advertises 5 GHz AP capability,
+  HT40, VHT80, RX LDPC, short-GI on all relevant 5 GHz frequencies, so
+  this isn't a hardware limit - it's the driver's AP-mode firmware path.
+
+Paths forward when we resume:
+
+  1. Switch ``-c 36`` to ``-c 149`` and re-validate stability for >5 min.
+  2. Or update the bundled ``88x2bu.ko`` to a newer ``morrownr`` commit
+     (current build is 2021-07-02) and re-test channel 36.
+  3. RF / antenna sanity check: even if the failure mode above is
+     software, the AC1200 Techkey antenna may not be well tuned across
+     the full 5 GHz range, so picking a channel that *also* matches the
+     antenna's actual SWR sweet spot is worth doing.
+
+Until then, ``_install_create_ap_5ghz_patch()`` is left in place because
+the host I/O plumbing it exercises (chunked-base64 write, ``sudo cat``,
+the ``_decode_commander_field`` decoder) is reused by other DORIS code.
+The patch itself is a no-op on the live device: the resulting create_ap
+argv simply fails to bring up the AP and wifi-manager falls back to its
+default 2.4 GHz / channel 1 / HT20 configuration. Disable the call to
+``_install_create_ap_5ghz_patch()`` from ``setup_hotspot_radio()`` if
+the failure noise in ``wifi-manager`` logs becomes a problem.
+
 Boot order
 ----------
   1. Kernel + USB enumeration -> ``rtl88x2bu`` loads -> udev rule renames
@@ -82,6 +135,7 @@ Note on ``sudo``: the BlueOS Commander API's shell PATH does not include
 through ``sudo`` (which resets the PATH).
 """
 
+import ast
 import base64
 import json
 import logging
@@ -146,6 +200,53 @@ NM_CONF_CONTENT = (
 )
 
 
+def _decode_commander_field(value: str) -> str:
+    """Decode a stdout/stderr field returned by BlueOS Commander.
+
+    Commander captures the child's output via Python's ``subprocess`` and
+    serialises it back as the ``repr()`` of the string, so the JSON value
+    we receive looks like ``"'line1\\nline2\\n'"`` for a normal file and
+    ``"'a\\'b'"`` for content containing a single quote. The previous
+    decoder did ``out.strip("'\\"").replace("\\\\n", "\\n").strip()`` which
+    only handled ``\\n`` - it left every embedded ``\\'`` and ``\\\\`` literal
+    in the result, silently corrupting any file we read through
+    ``docker exec cat`` or ``cat``. That bit us when the patched
+    ``networkmanager.py`` we wrote to the host contained
+    ``f"[{\\'-\\'.join(...)}]"`` and crashed wifi-manager with a
+    ``SyntaxError: f-string expression part cannot include a backslash``
+    on every boot.
+
+    ``ast.literal_eval`` understands the full Python string-escape set in
+    one shot, so we use it as the primary decoder and only fall back to
+    the old strip/replace heuristic when the value isn't a quoted Python
+    literal (e.g. some commander builds return raw text for empty
+    output).
+    """
+    if not value:
+        return ""
+    text = value.strip()
+    if not text:
+        return ""
+    if text[0] in ("'", '"') and text[-1] == text[0]:
+        try:
+            decoded = ast.literal_eval(text)
+            if isinstance(decoded, str):
+                return decoded.strip()
+        except (ValueError, SyntaxError):
+            pass
+    return (
+        text.strip("'\"")
+        .replace("\\\\", "\x00")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\r", "\r")
+        .replace("\\'", "'")
+        .replace('\\"', '"')
+        .replace("\x00", "\\")
+        .strip()
+    )
+
+
 async def _run_host_command(command: str, timeout: float = 30.0) -> tuple[bool, str]:
     """Execute a command on the host via the BlueOS Commander API.
 
@@ -159,8 +260,8 @@ async def _run_host_command(command: str, timeout: float = 30.0) -> tuple[bool, 
             resp.raise_for_status()
             data = resp.json()
             rc = data.get("return_code", -1)
-            out = data.get("stdout", "").strip("'\"").replace("\\n", "\n").strip()
-            err = data.get("stderr", "").strip("'\"").replace("\\n", "\n").strip()
+            out = _decode_commander_field(data.get("stdout", ""))
+            err = _decode_commander_field(data.get("stderr", ""))
             if rc != 0:
                 logger.warning("Command returned %d: %s %s", rc, out, err)
                 return False, err or out
