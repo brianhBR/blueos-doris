@@ -205,16 +205,25 @@ _CREATE_AP_ANCHOR = (
 # filled at install time by :func:`_pick_24ghz_channel` so the AP lands
 # on whichever of channels 1/6/11 is least crowded.
 #
-# Why HT20 and not HT40? The ``morrownr/88x2bu-20210702`` driver
+# Why HT20 and not HT40?  The ``morrownr/88x2bu-20210702`` driver
 # advertises HT40 in ``iw phy phy1 info`` but its AP-mode firmware path
-# silently downgrades any HT40 BSS to HT20 (verified on channels 1, 6
-# and 11; ``hostapd_cli status`` reports ``secondary_channel=0`` every
-# time). We still ask for ``[HT40+]`` so hostapd uses its standard
-# "try HT40, fall back to HT20 if OBSS coexistence scan finds neighbours"
-# logic - free 5 Mbps if we ever land on a clean enough RF environment.
-# The other capabilities (LDPC, both SGI rates, RX-STBC1, MAX-AMSDU-7935,
-# DSSS/CCK in HT40) all stick at HT20 and lift real TCP throughput from
-# ~25 Mbps (stock) to ~80 Mbps.
+# silently downgrades any HT40 BSS to HT20.  Confirmed on May 2026 with
+# a deliberately-cleaned RF environment (test owner moved all 2.4 GHz
+# neighbours out of ch 11 HT40-'s affected band of 2442-2482 MHz, then
+# hot-deployed ``-c 11 --ht_capab [HT40-]`` straight into the live
+# wifi-manager).  hostapd reached ``state=ENABLED`` cleanly but reported
+# ``secondary_channel=0`` and ``iw dev uap0 info`` showed
+# ``width: 20 MHz`` - i.e. the downgrade is happening below hostapd's
+# OBSS coexistence check, in the driver itself.  Same class of issue as
+# the 5 GHz failure documented below.
+#
+# We still ask for ``[HT40+]`` in the ht_capab line because (a) it
+# advertises the wider capability to clients that might benefit if a
+# future driver fixes this, and (b) hostapd's standard "try HT40, fall
+# back to HT20 if OBSS coexistence scan finds neighbours" logic remains
+# in effect for free.  The other capabilities (LDPC, both SGI rates,
+# RX-STBC1, MAX-AMSDU-7935, DSSS/CCK in HT40) all stick at HT20 and
+# lift real TCP throughput from ~25 Mbps (stock) to ~80 Mbps.
 _CREATE_AP_24GHZ_FLAGS_TEMPLATE = (
     '            "-c", "{channel}",\n'
     '            "--ieee80211n",\n'
