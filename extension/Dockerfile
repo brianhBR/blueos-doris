@@ -15,17 +15,27 @@ COPY frontend/ ./
 RUN yarn build
 
 # Stage 2: Python backend with frontend
-FROM python:3.11-slim
+#
+# Pin to Debian bookworm (system python = 3.11) so the apt-installed
+# python3-gi (built for 3.11) is ABI-compatible with the docker-library
+# /usr/local/bin/python that this image ships.  python:3.11-slim
+# without a suite suffix now resolves to trixie (system python = 3.13),
+# which would mismatch the app's interpreter and force a from-source
+# pygobject build under emulation -- the latter deterministically
+# segfaults gcc-14 in QEMU on linux/arm64 and linux/arm/v7.
+FROM python:3.11-slim-bookworm
 
 WORKDIR /app
 
-# Install build dependencies for uvloop (required by Robyn on Linux),
-# ffmpeg for RTSP snapshot capture, GStreamer for IP camera recording,
-# and the GObject Introspection toolchain + typelibs so the backend
-# can drive the GStreamer pipeline in-process via PyGObject (rather
-# than spawning gst-launch-1.0 as a subprocess).  This unlocks the
-# splitmuxsink format-location callback + split-now action signal
-# used for zero-gap phase rotation.
+# Runtime deps only:
+#   * ffmpeg          -- snapshot capture + post-dive concat/segment
+#   * gstreamer1.0-*  -- IP camera RTSP recording pipeline
+#   * python3-gi      -- PyGObject for in-process Gst control
+#                        (apt-shipped binary; avoids a from-source
+#                         build that segfaults gcc-14 in QEMU on
+#                         the emulated arm legs of buildx).
+#   * gir1.2-*        -- GObject Introspection typelibs the recorder
+#                        loads via gi.require_version("Gst", "1.0").
 #
 # ffmpeg's RTSP demuxer is incompatible with the RadCam camera
 # (camera tears down the session right after the first IDR burst,
@@ -33,22 +43,22 @@ WORKDIR /app
 # session running and is auto-restarted on disconnect by the
 # recorder watchdog.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    # build-time only (purged after pip install below)
-    build-essential \
-    python3-dev \
-    pkg-config \
-    libgirepository-2.0-dev \
-    libcairo2-dev \
-    # kept at runtime
     ffmpeg \
     gstreamer1.0-tools \
     gstreamer1.0-plugins-base \
     gstreamer1.0-plugins-good \
     gstreamer1.0-plugins-bad \
-    libgirepository-2.0-0 \
+    python3-gi \
+    gir1.2-glib-2.0 \
     gir1.2-gstreamer-1.0 \
     gir1.2-gst-plugins-base-1.0 \
     && rm -rf /var/lib/apt/lists/*
+
+# Make the apt-installed python3-gi (under /usr/lib/python3/dist-packages,
+# built against Debian's python3.11) importable from /usr/local/bin/python
+# (the docker-library python3.11.x).  Both interpreters are CPython 3.11,
+# so the cpython-311 ABI tag matches and the .so loads cleanly.
+ENV PYTHONPATH=/usr/lib/python3/dist-packages
 
 # Copy ONLY dependency files first (for better layer caching)
 COPY backend/pyproject.toml backend/README.md ./
@@ -57,33 +67,9 @@ COPY backend/pyproject.toml backend/README.md ./
 RUN mkdir -p src/doris && echo '__version__ = "0.1.0"' > src/doris/__init__.py
 
 # Install Python dependencies (this layer is cached unless pyproject.toml changes).
-#
-# When buildx emulates a non-native arch via QEMU (linux/arm64 and
-# linux/arm/v7 on a Hub/CI x86_64 host), gcc-14's -O3 -Wstrict-
-# aliasing optimizer hits a known cc1 segfault while compiling
-# pygobject 3.56's pygi-cache-closure.c.  Forcing -O1 on the
-# emulated builds dodges the segfault without measurably hurting
-# pygobject's runtime cost (the hot path is libgstreamer-* which is
-# precompiled by apt above and isn't recompiled here).  amd64 builds
-# natively so we leave the default -O3 in place there.
-#
-# We also retry the install up to 3 times because the same emulator
-# occasionally segfaults inside apt's dpkg postinst scripts (seen
-# already on this branch); the layer is otherwise deterministic.
-ARG TARGETARCH
-RUN set -e; \
-    if [ "$TARGETARCH" = "arm64" ] || [ "$TARGETARCH" = "arm" ]; then \
-        export CFLAGS="-O1" CXXFLAGS="-O1"; \
-        echo "Building under emulation ($TARGETARCH); CFLAGS=$CFLAGS"; \
-    fi; \
-    n=0; until [ $n -ge 3 ]; do \
-        python -m pip install --extra-index-url https://www.piwheels.org/simple -e . \
-            && break; \
-        n=$((n+1)); echo "pip install failed (attempt $n/3); retrying in 10s"; \
-        sleep 10; \
-    done; [ $n -lt 3 ] || (echo "pip install failed after 3 attempts" && exit 1); \
-    apt-get purge -y build-essential python3-dev pkg-config libgirepository-2.0-dev libcairo2-dev \
-    && apt-get autoremove -y \
+# All wheels here have prebuilt manylinux2014 / piwheels artifacts for
+# arm64 + armv7, so no compiler is needed at install time.
+RUN python -m pip install --extra-index-url https://www.piwheels.org/simple -e . \
     && rm -rf /root/.cache/pip
 
 # NOW copy the actual source code (changes here don't invalidate dependency cache)
