@@ -26,6 +26,13 @@ jobs:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           image-name: ${{ env.IMAGE_NAME }}
           context: ./extension
+          # arm64 + amd64 only.  linux/arm/v7 (Pi 3) is dropped because
+          # uvloop and lz4 don't ship manylinux2014_armv7l wheels and
+          # building them from sdist under QEMU requires the C toolchain
+          # (build-essential, python3-dev), which we removed to avoid
+          # the gcc-14 cc1 segfault that broke the pygobject from-source
+          # build on emulated arm legs.  DORIS targets Pi 4/5 (arm64).
+          build-platforms: linux/arm64/v8,linux/amd64
 
   deploy-ghcr:
     runs-on: ubuntu-latest
@@ -64,7 +71,8 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: ./extension
-          platforms: linux/arm/v7,linux/arm64/v8,linux/amd64
+          # See deploy-docker above: arm/v7 is intentionally omitted.
+          platforms: linux/arm64/v8,linux/amd64
           push: ${{ github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
