@@ -283,7 +283,12 @@ class NetworkService:
 
         interfaces_data = await self._client.list_interfaces()
         if not interfaces_data:
-            logger.warning("No WiFi interfaces found (v2 API unavailable)")
+            # BlueOS WiFi Manager v2 is not available on this build
+            # (e.g. blueos-core 1.5.0-beta.36 ships v1 only). The v2 path
+            # below uses per-interface mode/hotspot APIs that don't exist
+            # in v1, so all we can do is rename the global hotspot SSID
+            # and restart the AP via v1.
+            await self._configure_hotspot_v1(ssid, password)
             return
 
         interfaces = interfaces_data.get("interfaces", [])
@@ -340,6 +345,51 @@ class NetworkService:
 
         # -- ensure the secondary is in hotspot (or dual) mode --
         await self._ensure_secondary_hotspot(iface_name)
+
+    async def _configure_hotspot_v1(self, ssid: str, password: str) -> None:
+        """Rename the global BlueOS hotspot via the v1 WiFi Manager API.
+
+        Used when v2 is unavailable. v1 has no concept of per-interface
+        hotspots, so we just retarget the single global hotspot. If the
+        SSID already matches, we skip the toggle so we don't interrupt
+        connected clients on every backend restart.
+        """
+        try:
+            current = await self._client.get_hotspot_credentials()
+            current_ssid = current.get("ssid") if isinstance(current, dict) else None
+        except Exception as e:
+            logger.warning("v1 hotspot: failed to read current credentials: %s", e)
+            current_ssid = None
+
+        if current_ssid == ssid:
+            logger.info("Hotspot SSID already %r (v1 path), nothing to do", ssid)
+            return
+
+        logger.info(
+            "Renaming hotspot via v1 API: %r -> %r (BlueOS v2 unavailable)",
+            current_ssid, ssid,
+        )
+
+        try:
+            await self._client.set_hotspot_credentials(ssid, password)
+        except Exception as e:
+            logger.warning("v1 hotspot: set_hotspot_credentials failed: %s", e)
+            return
+
+        try:
+            if await self._client.get_smart_hotspot():
+                await self._client.set_smart_hotspot(False)
+                logger.info("Smart hotspot disabled (v1 path)")
+        except Exception as e:
+            logger.debug("v1 hotspot: smart_hotspot check failed: %s", e)
+
+        try:
+            await self._client.set_hotspot(False)
+            await asyncio.sleep(3)
+            await self._client.set_hotspot(True)
+            logger.info("Hotspot restarted via v1; broadcasting %r", ssid)
+        except Exception as e:
+            logger.warning("v1 hotspot: toggle failed (creds set but not applied): %s", e)
 
     async def _is_hotspot_actually_running(self, iface_name: str) -> bool:
         """Check if the AP is genuinely serving, not just labelled 'hotspot'."""
