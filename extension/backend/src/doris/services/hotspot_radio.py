@@ -35,18 +35,18 @@ We also tell NetworkManager to leave ``uap0`` alone so hostapd /
     [keyfile]
     unmanaged-devices=interface-name:uap0
 
-Part 2: tell ``create_ap`` to use 5 GHz / 802.11ac
+Part 2: tell ``create_ap`` to max out 2.4 GHz HT20
 --------------------------------------------------
 ``wifi-manager`` invokes ``create_ap`` with no band/channel/HT/VHT flags,
-so hostapd defaults to ``hw_mode=g, channel=1`` with no HT and no VHT.
-We patch the wifi-handler module inside ``blueos-core`` to add::
+so hostapd defaults to ``hw_mode=g, channel=1`` with no HT capabilities
+advertised - real-world TCP throughput tops out around 25 Mbps in that
+mode even on hardware capable of much more. We patch the wifi-handler
+module inside ``blueos-core`` to add::
 
-    "--freq-band", "5",
-    "-c", "36",
+    "-c", "<auto-picked: 1, 6 or 11>",
     "--ieee80211n",
-    "--ieee80211ac",
-    "--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40]",
-    "--vht_capab", "[SHORT-GI-80][RXLDPC]",
+    "--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40][LDPC][RX-STBC1]"
+                  "[MAX-AMSDU-7935][DSSS_CCK-40]",
     "--country", "US",
 
 right before the SSID/password arguments. The patched module is written
@@ -57,9 +57,38 @@ re-reads ``startup.json`` on every boot, so the override survives
 ``blueos-core`` recreations and BlueOS upgrades that don't touch the
 target file.
 
-VHT80 (80 MHz width) is *not* enabled - it is unstable in AP mode on
-``rtl88x2bu`` (hostapd brings up and immediately disables the AP). HT40
-on a non-DFS channel is the sweet spot.
+Even though the ht_capab line asks for ``[HT40+]``, hostapd is allowed
+(and required by 802.11n on 2.4 GHz) to fall back to HT20 if its OBSS
+coexistence scan finds neighbouring BSSes overlapping the would-be 40
+MHz band - this gives us "try HT40, fall back to HT20" for free. In
+practice on the bundled ``88x2bu`` driver HT40 never actually sticks on
+2.4 GHz (see deferred-work note below), so the asked-for HT40 always
+downgrades and we run HT20-with-full-caps - still about 3x stock
+throughput because the rich ``ht_capab`` flags add SHORT-GI, LDPC,
+RX-STBC, MAX-AMSDU and DSSS/CCK aggregation on top of the bare HT20
+``wifi-manager`` ships.
+
+Channel auto-selection
+~~~~~~~~~~~~~~~~~~~~~~
+At patch-install time :func:`_pick_24ghz_channel` reads the kernel's
+cached ``iw dev wlan0 scan dump`` (refreshed every few seconds by
+``wifi-manager``'s ``_autoscan``), scores each of the three non-
+overlapping 2.4 GHz primaries (1, 6, 11) by the total linear-power
+signal of neighbour BSSes inside its HT20 footprint, and picks the
+quietest. Ties (or an empty scan) default to channel 6. The picker
+runs each time :func:`setup_hotspot_radio` runs, so a vehicle that
+boots in a new RF environment ends up on a sensible channel without
+manual intervention.
+
+Measurements (channel 6, this radio + AC1200 Techkey antenna)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Stock ``wifi-manager`` (no ``ht_capab``):     ~25-30 Mbps real TCP.
+This patch (HT20 + full caps, channel 6):     ~82 Mbps down / 77 Mbps up
+(``iperf3 -c 192.168.42.1 -p 5201 -t 20 -P 4``, May 2026, indoor
+2-3 m, 1 AP neighbour on ch 5). PHY ceiling for 2-stream HT20 + SGI
+is 144 Mbps and real-world TCP typically caps at 55-65% of PHY, so
+~80 Mbps is at the achievable ceiling - the link is clean, the
+remaining headroom would require a driver that can keep HT40 alive.
 
 5 GHz investigation notes (May 2026, deferred)
 ----------------------------------------------
@@ -105,14 +134,11 @@ Paths forward when we resume:
      the full 5 GHz range, so picking a channel that *also* matches the
      antenna's actual SWR sweet spot is worth doing.
 
-Until then, ``_install_create_ap_5ghz_patch()`` is left in place because
-the host I/O plumbing it exercises (chunked-base64 write, ``sudo cat``,
-the ``_decode_commander_field`` decoder) is reused by other DORIS code.
-The patch itself is a no-op on the live device: the resulting create_ap
-argv simply fails to bring up the AP and wifi-manager falls back to its
-default 2.4 GHz / channel 1 / HT20 configuration. Disable the call to
-``_install_create_ap_5ghz_patch()`` from ``setup_hotspot_radio()`` if
-the failure noise in ``wifi-manager`` logs becomes a problem.
+The 5 GHz attempt has since been replaced by the 2.4 GHz HT20-with-
+full-caps patch described above (:func:`_install_create_ap_speed_patch`)
+which delivers ~3x stock throughput on the same driver and *does* keep
+the AP stable. The findings here are preserved for whenever the driver
+is updated or a different 5 GHz-capable radio is dropped in.
 
 Boot order
 ----------
@@ -125,10 +151,11 @@ Boot order
      on it with the 5 GHz / 802.11ac flags -> hostapd brings the AP up on
      channel 36, HT40, with VHT MCS rates available.
 
-Result: hotspot broadcast from the Realtek's external antenna at 5 GHz
-802.11ac; ~200-400 Mbps real-world throughput to 2x2 MIMO clients.
-Onboard Broadcom is STA-only on ``wlan0``; in our testing its retransmit
-count dropped from ~14,900/min to ~30/min.
+Result: hotspot broadcast from the Realtek's external antenna at 2.4
+GHz HT20 with the full set of HT capabilities the radio supports;
+~80 Mbps real-world TCP throughput, ~3x what stock ``wifi-manager``
+delivers. Onboard Broadcom is STA-only on ``wlan0``; in our testing
+its retransmit count dropped from ~14,900/min to ~30/min.
 
 Note on ``sudo``: the BlueOS Commander API's shell PATH does not include
 ``/sbin`` or ``/usr/sbin``, so ``udevadm`` and friends are only reachable
@@ -139,6 +166,7 @@ import ast
 import base64
 import json
 import logging
+import re
 
 import httpx
 
@@ -166,22 +194,52 @@ BOOTSTRAP_STARTUP_JSON = "/root/.config/blueos/bootstrap/startup.json"
 
 # Anchor in the upstream wifi-manager source where the create_ap argv list
 # ends ``--redirect-to-localhost`` and continues with the SSID/password.
-# We insert the 5 GHz / 802.11ac flags between the anchor and the SSID line.
+# We insert our HT20-with-full-caps flags between the anchor and the SSID
+# line.
 _CREATE_AP_ANCHOR = (
     '            "--redirect-to-localhost",'
     "  # Redirect all traffic to localhost, captive-portal style\n"
 )
-_CREATE_AP_5GHZ_FLAGS = (
-    '            "--freq-band", "5",\n'
-    '            "-c", "36",\n'
+
+# Maxed-out 2.4 GHz HT20 configuration. The ``{channel}`` placeholder is
+# filled at install time by :func:`_pick_24ghz_channel` so the AP lands
+# on whichever of channels 1/6/11 is least crowded.
+#
+# Why HT20 and not HT40? The ``morrownr/88x2bu-20210702`` driver
+# advertises HT40 in ``iw phy phy1 info`` but its AP-mode firmware path
+# silently downgrades any HT40 BSS to HT20 (verified on channels 1, 6
+# and 11; ``hostapd_cli status`` reports ``secondary_channel=0`` every
+# time). We still ask for ``[HT40+]`` so hostapd uses its standard
+# "try HT40, fall back to HT20 if OBSS coexistence scan finds neighbours"
+# logic - free 5 Mbps if we ever land on a clean enough RF environment.
+# The other capabilities (LDPC, both SGI rates, RX-STBC1, MAX-AMSDU-7935,
+# DSSS/CCK in HT40) all stick at HT20 and lift real TCP throughput from
+# ~25 Mbps (stock) to ~80 Mbps.
+_CREATE_AP_24GHZ_FLAGS_TEMPLATE = (
+    '            "-c", "{channel}",\n'
     '            "--ieee80211n",\n'
-    '            "--ieee80211ac",\n'
-    '            "--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40]",\n'
-    '            "--vht_capab", "[SHORT-GI-80][RXLDPC]",\n'
+    '            "--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40]'
+    '[LDPC][RX-STBC1][MAX-AMSDU-7935][DSSS_CCK-40]",\n'
     '            "--country", "US",\n'
 )
-# Substring used to detect that the patch is already applied (idempotency).
-_PATCH_MARKER = '"--freq-band", "5"'
+
+# Matches *any* DORIS create_ap insertion that may already follow
+# ``_CREATE_AP_ANCHOR`` - either the legacy 5 GHz attempt (with
+# ``--freq-band 5`` and ``--vht_capab``) or the current 2.4 GHz patch
+# with any auto-picked channel. Used at install time so re-running the
+# patch on an upgraded install converges to the current canonical block
+# instead of stacking flags. Anchored via ``re.match`` from the position
+# right after ``_CREATE_AP_ANCHOR``, never used as a free search, so
+# false positives outside our managed region are impossible.
+_DORIS_PATCH_BLOCK_RE = re.compile(
+    r'(?:[ \t]*"--freq-band", "[0-9]+",\n)?'        # legacy 5 GHz only
+    r'[ \t]*"-c", "[0-9]+",\n'                      # always present
+    r'[ \t]*"--ieee80211n",\n'                      # always present
+    r'(?:[ \t]*"--ieee80211ac",\n)?'                # legacy only
+    r'[ \t]*"--ht_capab", "[^"]+",\n'               # always present
+    r'(?:[ \t]*"--vht_capab", "[^"]+",\n)?'         # legacy only
+    r'[ \t]*"--country", "[A-Z]+",\n'               # always present
+)
 
 UDEV_RULE_CONTENT = (
     "# Managed by DORIS extension (services/hotspot_radio.py).\n"
@@ -377,45 +435,172 @@ async def _read_container_file(container: str, path: str) -> str | None:
     return out if ok else None
 
 
-async def _install_create_ap_5ghz_patch() -> None:
-    """Patch wifi-manager's ``create_ap`` invocation for 5 GHz / 802.11ac.
+async def _pick_24ghz_channel() -> int:
+    """Pick the cleanest 2.4 GHz primary channel from {1, 6, 11}.
 
-    Reads the in-container ``networkmanager.py``, inserts the 5 GHz flags
-    after the ``--redirect-to-localhost`` anchor, and writes the result to
+    Uses the kernel's cached scan results on ``wlan0`` (``wifi-manager``
+    refreshes them every ~10 s via ``_autoscan``) to score each
+    candidate channel by total neighbour-BSS signal power inside its
+    HT20 footprint (primary ± 2 channels). Returns the candidate with
+    the lowest score; ties and an empty scan default to channel 6
+    (centre of band, conventionally cleanest).
+
+    This is intentionally read-only: it consumes whatever the kernel
+    happens to have cached and does *not* trigger a fresh scan, because
+    a live ``scan trigger`` on a connected ``wlan0`` can briefly stall
+    the STA link.
+    """
+    ok, dump = await _run_host_command(
+        "sudo iw dev wlan0 scan dump 2>/dev/null"
+    )
+    if not ok or not dump.strip():
+        logger.info(
+            "2.4 GHz channel scan unavailable; defaulting to channel 6"
+        )
+        return 6
+
+    # ``iw scan dump`` groups fields per-BSS with a ``BSS <bssid>`` header
+    # then a block of ``\tkey: value`` lines.  Field order within a block
+    # is driver-dependent (typically ``freq:`` comes before ``signal:``,
+    # but we don't rely on that), so we accumulate per-BSS state and
+    # emit one entry into ``neighbours_by_channel`` at each new BSS header
+    # / end of file.  We skip our own AP (SSID prefix ``DORIS``) so a
+    # vehicle that booted on channel X last time doesn't get pushed off
+    # X this time just because its own beacon is in the scan cache.
+    neighbours_by_channel: dict[int, list[float]] = {}
+    current: dict[str, object] = {}
+
+    def _flush() -> None:
+        ssid = current.get("ssid")
+        if isinstance(ssid, str) and ssid.startswith("DORIS"):
+            return
+        ch = current.get("channel")
+        sig = current.get("signal")
+        if isinstance(ch, int) and isinstance(sig, float):
+            neighbours_by_channel.setdefault(ch, []).append(sig)
+
+    for raw in dump.splitlines():
+        line = raw.strip()
+        if line.startswith("BSS "):
+            _flush()
+            current = {}
+            continue
+        if line.startswith("signal:"):
+            try:
+                current["signal"] = float(line.split()[1])
+            except (IndexError, ValueError):
+                pass
+            continue
+        if line.startswith("freq:"):
+            try:
+                freq = int(line.split()[1])
+            except (IndexError, ValueError):
+                continue
+            # 2.4 GHz channels 1-13 sit at 2412 + 5*(ch-1) MHz.
+            if 2412 <= freq <= 2472:
+                current["channel"] = (freq - 2407) // 5
+            continue
+        if line.startswith("SSID:"):
+            # ``iw`` prints ``SSID: <name>`` (no quotes); empty SSID is a
+            # hidden AP, which we still want to count as a neighbour.
+            current["ssid"] = line[len("SSID:"):].strip()
+    _flush()
+
+    if not neighbours_by_channel:
+        logger.info(
+            "No 2.4 GHz neighbours visible; defaulting to channel 6"
+        )
+        return 6
+
+    def linear_power(dbm: float) -> float:
+        # dBm -> linear mW. Summing in linear space gives a correct
+        # "total interfering energy" score; summing in dB would be wrong.
+        return 10.0 ** (dbm / 10.0)
+
+    def score(primary: int) -> float:
+        total = 0.0
+        for ch, signals in neighbours_by_channel.items():
+            if abs(ch - primary) <= 2:  # HT20 footprint ~ primary +/- 2
+                total += sum(linear_power(s) for s in signals)
+        return total
+
+    # Candidate order also breaks ties: prefer 6 (middle of band) first,
+    # then 1, then 11.  We include the candidate's list index in the sort
+    # tuple so that equal scores pick the earlier-listed channel.
+    candidates = [6, 1, 11]
+    scored = sorted(
+        (score(c), idx, c) for idx, c in enumerate(candidates)
+    )
+    chosen = scored[0][2]
+    logger.info(
+        "2.4 GHz channel scores (lower = cleaner): %s -> chose ch %d",
+        ", ".join(f"ch{c}={s:.2e}" for s, _, c in scored),
+        chosen,
+    )
+    return chosen
+
+
+def _strip_doris_patch(source: str) -> str:
+    """Remove any prior DORIS ``create_ap`` insertion that immediately
+    follows :data:`_CREATE_AP_ANCHOR`. No-op if no such block is present.
+
+    Anchored to the position right after the anchor line so we can never
+    accidentally strip something else that happens to look like our
+    flags elsewhere in the file.
+    """
+    anchor_idx = source.find(_CREATE_AP_ANCHOR)
+    if anchor_idx < 0:
+        return source
+    end_of_anchor = anchor_idx + len(_CREATE_AP_ANCHOR)
+    m = _DORIS_PATCH_BLOCK_RE.match(source, end_of_anchor)
+    if not m:
+        return source
+    return source[:end_of_anchor] + source[m.end():]
+
+
+async def _install_create_ap_speed_patch() -> None:
+    """Patch wifi-manager's ``create_ap`` invocation for max 2.4 GHz HT20.
+
+    Reads the in-container ``networkmanager.py``, picks the cleanest
+    2.4 GHz primary via :func:`_pick_24ghz_channel`, inserts the
+    HT20-with-full-caps flags after the ``--redirect-to-localhost``
+    anchor, and writes the result to
     ``/usr/blueos/userdata/wifi-overrides/networkmanager.py`` so the
-    bind mount in ``startup.json`` picks it up at next ``blueos-core``
-    start. Idempotent: if the file already contains our marker, skip.
+    bind mount in ``startup.json`` picks it up on the next
+    ``blueos-core`` start.
+
+    Upgrade-safe and re-run-safe: any prior DORIS patch (legacy 5 GHz
+    attempt, or current 2.4 GHz patch with a different auto-picked
+    channel) is stripped first via :func:`_strip_doris_patch`, then
+    the current canonical block is applied. :func:`_write_host_file`
+    short-circuits when the host file already matches.
     """
     source = await _read_container_file(
         BLUEOS_CORE_CONTAINER, WIFI_OVERRIDE_CONTAINER_PATH
     )
     if source is None:
         logger.warning(
-            "Could not read %s from %s; skipping 5 GHz patch",
+            "Could not read %s from %s; skipping create_ap speed patch",
             WIFI_OVERRIDE_CONTAINER_PATH,
             BLUEOS_CORE_CONTAINER,
         )
         return
 
-    if _PATCH_MARKER in source:
-        # Either the bind mount is already active and serving the patched
-        # file, or the patch was applied previously. Either way we just
-        # make sure the host file matches our current expected content.
-        patched = source
-    elif _CREATE_AP_ANCHOR in source:
-        patched = source.replace(
-            _CREATE_AP_ANCHOR,
-            _CREATE_AP_ANCHOR + _CREATE_AP_5GHZ_FLAGS,
-            1,
-        )
-    else:
+    if _CREATE_AP_ANCHOR not in source:
         logger.warning(
             "create_ap anchor not found in %s; BlueOS upstream may have "
-            "changed - skipping 5 GHz patch (hotspot will still work, just "
-            "at default 2.4 GHz / 802.11g speeds)",
+            "changed - skipping create_ap speed patch (hotspot will still "
+            "work, at default 2.4 GHz / 802.11g speeds)",
             WIFI_OVERRIDE_CONTAINER_PATH,
         )
         return
+
+    stripped = _strip_doris_patch(source)
+    channel = await _pick_24ghz_channel()
+    flags = _CREATE_AP_24GHZ_FLAGS_TEMPLATE.format(channel=channel)
+    patched = stripped.replace(
+        _CREATE_AP_ANCHOR, _CREATE_AP_ANCHOR + flags, 1
+    )
 
     await _run_host_command(f"sudo mkdir -p {WIFI_OVERRIDE_DIR}")
     await _write_host_file(WIFI_OVERRIDE_HOST_PATH, patched)
@@ -468,7 +653,8 @@ async def _ensure_startup_bind() -> None:
 
 async def setup_hotspot_radio() -> None:
     """Install the host-side config that pins ``uap0`` to the USB Realtek
-    *and* makes the AP come up on 5 GHz / 802.11ac.
+    *and* makes the AP come up on 2.4 GHz HT20 with the full set of HT
+    capabilities the radio supports.
 
     Idempotent: writes are skipped where existing host content already
     matches. Both the udev rename and the bind-mounted wifi override only
@@ -492,7 +678,7 @@ async def setup_hotspot_radio() -> None:
     await _reload_udev()
     await _reload_network_manager()
 
-    await _install_create_ap_5ghz_patch()
+    await _install_create_ap_speed_patch()
     await _ensure_startup_bind()
 
     # Heads-up if the rename hasn't taken effect on this boot.
