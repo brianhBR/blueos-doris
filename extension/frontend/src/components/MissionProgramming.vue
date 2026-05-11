@@ -165,7 +165,9 @@ const batteryData = computed(() => {
   const lumenCount = 2                  // number of lumen lights installed
 
   // -- Battery --
-  const batteryCapacity_Wh = 266        // onboard battery capacity in watt-hours
+  // 2× Blue Robotics 10 Ah 4S Li-ion packs in parallel @ 14.8 V nominal.
+  // Keep in sync with HomeScreen.vue and backend system.py.
+  const batteryCapacity_Wh = 2 * 10 * 14.8   // 296 Wh total
 
   // -- Dive duration from depth + release weight settings --
   const depth = parseFloat(estimatedDepth.value) || 0

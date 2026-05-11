@@ -1,7 +1,6 @@
 """System information service."""
 
 import logging
-import math
 import os
 from pathlib import Path
 
@@ -14,6 +13,64 @@ from .external_storage import get_migration_status
 from .storage import DATA_ROOT
 
 logger = logging.getLogger(__name__)
+
+# 4S LiPo pack voltage → State-of-Charge (%), piecewise-linear.
+# Derived from a typical resting-cell discharge curve (×4 cells in series).
+# Used because ArduPilot's BATTERY_STATUS.battery_remaining (coulomb-counted
+# against BATT_CAPACITY) defaults near 100% and is unreliable on this rig.
+_SOC_CURVE_4S: list[tuple[float, float]] = [
+    (16.80, 100.0),
+    (16.45, 90.0),
+    (16.08, 80.0),
+    (15.80, 70.0),
+    (15.48, 60.0),
+    (15.36, 50.0),
+    (15.20, 40.0),
+    (15.08, 30.0),
+    (14.92, 20.0),
+    (14.76, 10.0),
+    (14.44, 5.0),
+    (13.20, 0.0),
+]
+
+# Battery pack: 2× Blue Robotics 10 Ah 4S Li-ion packs wired in parallel.
+# Update these together with the matching constants in the frontend
+# (HomeScreen.vue / MissionProgramming.vue) if the hardware ever changes.
+_BATTERY_PACK_COUNT = 2
+_BATTERY_PACK_AH = 10.0
+_BATTERY_NOMINAL_V = 14.8  # 4S Li-ion nominal
+_BATTERY_TOTAL_AH = _BATTERY_PACK_COUNT * _BATTERY_PACK_AH      # 20 Ah
+_BATTERY_CAPACITY_WH = _BATTERY_TOTAL_AH * _BATTERY_NOMINAL_V   # 296 Wh
+
+# Reserve held back from the time-remaining estimate so the vehicle has
+# margin for surfacing, recovery, and unexpected loads. SOC% below this
+# value is reported as zero hours remaining.
+_BATTERY_RESERVE_PCT = 15.0
+
+# Standard platform load (W) used when no live current measurement is
+# available. Pi5 (15) + RadCAM (5) + 2× lumen lights (15 each) = 50 W.
+_STANDARD_LOAD_W = 50.0
+
+
+def _voltage_to_soc_4s(voltage: float) -> float:
+    """Map a measured 4S pack voltage to State-of-Charge (0–100 %).
+
+    Linearly interpolates between points on `_SOC_CURVE_4S`. Voltages above
+    or below the curve are clamped to 100 % / 0 %.
+    """
+    curve = _SOC_CURVE_4S
+    if voltage >= curve[0][0]:
+        return curve[0][1]
+    if voltage <= curve[-1][0]:
+        return curve[-1][1]
+    for (v_hi, soc_hi), (v_lo, soc_lo) in zip(curve, curve[1:]):
+        if v_lo <= voltage <= v_hi:
+            span = v_hi - v_lo
+            if span <= 0:
+                return soc_lo
+            frac = (voltage - v_lo) / span
+            return soc_lo + frac * (soc_hi - soc_lo)
+    return 0.0
 
 
 class SystemService:
@@ -100,14 +157,14 @@ class SystemService:
             voltages = message.get("voltages", [0])
             voltage = voltages[0] / 1000.0 if voltages and voltages[0] > 0 else None
             current = message.get("current_battery", 0) / 100.0
-            remaining = message.get("battery_remaining", -1)
 
-            if remaining < 0 and voltage is not None:
-                k = 3.0
-                v_mid = 14.52
-                soc = 100.0 / (1.0 + math.exp(-k * (voltage - v_mid)))
-                remaining = max(0.0, min(100.0, soc))
-            elif remaining < 0:
+            # Always derive SOC from the measured pack voltage. ArduPilot's
+            # battery_remaining field is a coulomb-counted estimate that
+            # defaults to ~99 % until BATT_CAPACITY worth of mAh have been
+            # consumed, so it misreports SOC on a partially-charged pack.
+            if voltage is not None:
+                remaining = _voltage_to_soc_4s(voltage)
+            else:
                 remaining = 0.0
 
             remaining_hours = self._estimate_remaining_hours(remaining, current)
@@ -264,13 +321,20 @@ class SystemService:
     def _estimate_remaining_hours(
         self, percent: float, current: float | None
     ) -> float | None:
-        """Estimate remaining battery hours."""
+        """Estimate remaining battery hours before hitting the safety reserve.
+
+        Assumes 2× Blue Robotics 10 Ah 4S Li-ion packs in parallel (20 Ah
+        total) with `_BATTERY_RESERVE_PCT` of capacity held back as
+        margin. With a measured current draw the remaining usable
+        ampere-hours are divided by the instantaneous current; otherwise
+        we fall back to the standard DORIS platform load (~50 W).
+        """
+        usable_pct = max(0.0, percent - _BATTERY_RESERVE_PCT)
+        usable_ah = (usable_pct / 100.0) * _BATTERY_TOTAL_AH
         if current is None or current <= 0:
-            capacity_ah = 100
-            return (percent / 100) * (capacity_ah / 10)
-        capacity_ah = 100
-        remaining_ah = (percent / 100) * capacity_ah
-        return remaining_ah / current if current > 0 else None
+            standard_current_a = _STANDARD_LOAD_W / _BATTERY_NOMINAL_V
+            return usable_ah / standard_current_a
+        return usable_ah / current
 
     def _format_time_remaining(self, hours: float | None) -> str:
         """Format remaining hours as a human-readable string."""
