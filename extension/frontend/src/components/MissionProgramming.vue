@@ -90,6 +90,8 @@ const bottomVideoFileFormat = ref('.MP4')
 const bottomFrameRate = ref(30)
 const bottomCaptureFrequency = ref(10)
 const bottomCaptureFrequencyUnit = ref('seconds')
+const bottomTimelapseLightPreNumber = ref('2')
+const bottomTimelapseLightPostNumber = ref('1')
 const bottomFocus = ref('auto')
 const bottomSleepTimerNumber = ref('')
 const bottomSleepTimerUnit = ref('hours')
@@ -190,6 +192,27 @@ const batteryData = computed(() => {
   return { totalPower, batteryLife, batteryUsagePercent, diveDuration }
 })
 
+// Bottom timelapse strobe helpers.  Both pre/post are stored in
+// seconds (matching DORIS_TL_PRE_S / DORIS_TL_PST_S on the
+// autopilot); ``minSeconds`` reflects the Lua's ``pre + post + 1``
+// cycle floor so the UI can warn the operator when they pick a
+// capture frequency tighter than the strobe schedule needs.
+const bottomCaptureFrequencySeconds = computed(() => {
+  const n = Number(bottomCaptureFrequency.value) || 0
+  if (bottomCaptureFrequencyUnit.value === 'hours') return n * 3600
+  if (bottomCaptureFrequencyUnit.value === 'minutes') return n * 60
+  return n
+})
+const bottomTimelapseMinSeconds = computed(() => {
+  const pre = Math.max(0, Number(bottomTimelapseLightPreNumber.value) || 0)
+  const post = Math.max(0, Number(bottomTimelapseLightPostNumber.value) || 0)
+  return Math.max(1, pre + post)
+})
+const bottomTimelapseTooFast = computed(() =>
+  bottomCameraType.value === 'timelapse'
+  && bottomCaptureFrequencySeconds.value < bottomTimelapseMinSeconds.value,
+)
+
 const descentCaptureFrequencyTooLow = computed(() => {
   const totalHours = descentCaptureFrequencyUnit.value === 'hours'
     ? descentCaptureFrequency.value
@@ -288,6 +311,8 @@ function resetToDefaults() {
   bottomFrameRate.value = 30
   bottomCaptureFrequency.value = 10
   bottomCaptureFrequencyUnit.value = 'seconds'
+  bottomTimelapseLightPreNumber.value = '2'
+  bottomTimelapseLightPostNumber.value = '1'
   bottomFocus.value = 'auto'
   bottomSleepTimerEnabled.value = false
   bottomSleepTimerNumber.value = ''
@@ -404,6 +429,8 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         capture_frequency_unit: bottomCaptureFrequencyUnit.value as 'seconds' | 'minutes' | 'hours',
         video_record: tv(bottomVideoRecordNumber.value, bottomVideoRecordUnit.value),
         video_pause: tv(bottomVideoPauseNumber.value, bottomVideoPauseUnit.value),
+        timelapse_light_pre: tv(bottomTimelapseLightPreNumber.value, 'seconds'),
+        timelapse_light_post: tv(bottomTimelapseLightPostNumber.value, 'seconds'),
         resolution: bottomResolution.value,
         image_type: bottomImageType.value,
         file_format: bottomFileFormat.value,
@@ -482,7 +509,14 @@ function applyConfig(cfg: DeploymentConfiguration) {
   estimatedDepth.value = cfg.estimated_depth
 
   descentCameraOn.value = cfg.descent.camera.enabled
-  descentCameraType.value = cfg.descent.camera.camera_type
+  // Lua only supports timelapse + video-interval on the bottom phase
+  // (services/dive._ipcam_phase_enabled returns 1.0 only for CONTINUOUS_VIDEO).
+  // Coerce legacy descent profiles with invalid modes back to continuous-video
+  // so the disabled UI radios don't render an unselected/invalid state.
+  descentCameraType.value =
+    cfg.descent.camera.camera_type === 'timelapse' || cfg.descent.camera.camera_type === 'video-interval'
+      ? 'continuous-video'
+      : cfg.descent.camera.camera_type
   descentCaptureFrequency.value = cfg.descent.camera.capture_frequency
   descentCaptureFrequencyUnit.value = cfg.descent.camera.capture_frequency_unit
   descentVideoRecordNumber.value = cfg.descent.camera.video_record.number
@@ -521,6 +555,11 @@ function applyConfig(cfg: DeploymentConfiguration) {
   bottomVideoRecordUnit.value = cfg.bottom.camera.video_record.unit
   bottomVideoPauseNumber.value = cfg.bottom.camera.video_pause.number
   bottomVideoPauseUnit.value = cfg.bottom.camera.video_pause.unit
+  // Older configurations predate the timelapse light strobe windows;
+  // fall back to the (2 s pre, 1 s post) defaults so the form still
+  // populates cleanly and the user can immediately tune them.
+  bottomTimelapseLightPreNumber.value = cfg.bottom.camera.timelapse_light_pre?.number ?? '2'
+  bottomTimelapseLightPostNumber.value = cfg.bottom.camera.timelapse_light_post?.number ?? '1'
   bottomResolution.value = cfg.bottom.camera.resolution
   bottomImageType.value = cfg.bottom.camera.image_type
   bottomFileFormat.value = cfg.bottom.camera.file_format
@@ -547,7 +586,11 @@ function applyConfig(cfg: DeploymentConfiguration) {
 
   ascentSameAsDescent.value = cfg.ascent.same_as_descent
   ascentCameraOn.value = cfg.ascent.camera.enabled
-  ascentCameraType.value = cfg.ascent.camera.camera_type
+  // See descentCameraType comment above: ascent has the same restriction.
+  ascentCameraType.value =
+    cfg.ascent.camera.camera_type === 'timelapse' || cfg.ascent.camera.camera_type === 'video-interval'
+      ? 'continuous-video'
+      : cfg.ascent.camera.camera_type
   ascentCaptureFrequency.value = cfg.ascent.camera.capture_frequency
   ascentCaptureFrequencyUnit.value = cfg.ascent.camera.capture_frequency_unit
   ascentVideoRecordNumber.value = cfg.ascent.camera.video_record.number
@@ -830,6 +873,9 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                   <span style="color: #96EEF2">Timelapse Images</span>
                 </label>
               </div>
+              <p class="mt-2 text-xs italic" style="color: rgba(150, 238, 242, 0.5)">
+                Interval Video and Timelapse Images are only supported for the Bottom phase.
+              </p>
             </div>
 
             <!-- Timelapse: Capture Frequency -->
@@ -1107,24 +1153,48 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                   <input type="radio" value="continuous-video" v-model="bottomCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                   <span style="color: #96EEF2">Continuous Video</span>
                 </label>
-                <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
-                  <input type="radio" value="video-interval" v-model="bottomCameraType" disabled class="w-4 h-4" />
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" value="video-interval" v-model="bottomCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                   <span style="color: #96EEF2">Interval Video</span>
                 </label>
-                <label class="flex items-center gap-2 cursor-not-allowed opacity-40">
-                  <input type="radio" value="timelapse" v-model="bottomCameraType" disabled class="w-4 h-4" />
+                <label class="flex items-center gap-2 cursor-pointer">
+                  <input type="radio" value="timelapse" v-model="bottomCameraType" @change="hasUnsavedChanges = true" class="w-4 h-4" />
                   <span style="color: #96EEF2">Timelapse Images</span>
                 </label>
               </div>
             </div>
 
-            <div v-if="bottomCameraType === 'timelapse'">
-              <label class="block mb-2 text-sm" style="color: #96EEF2">Capture Frequency</label>
-              <div class="flex gap-2">
-                <input type="number" min="1" v-model.number="bottomCaptureFrequency" @input="hasUnsavedChanges = true" class="w-1/2 px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" />
-                <select v-model="bottomCaptureFrequencyUnit" @change="hasUnsavedChanges = true" class="w-1/2 px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle">
-                  <option value="seconds">Seconds</option><option value="minutes">Minutes</option><option value="hours">Hours</option>
-                </select>
+            <div v-if="bottomCameraType === 'timelapse'" class="space-y-4">
+              <div>
+                <label class="block mb-2 text-sm" style="color: #96EEF2">Capture Frequency</label>
+                <div class="flex gap-2">
+                  <input type="number" min="1" v-model.number="bottomCaptureFrequency" @input="hasUnsavedChanges = true" class="w-1/2 px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" />
+                  <select v-model="bottomCaptureFrequencyUnit" @change="hasUnsavedChanges = true" class="w-1/2 px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle">
+                    <option value="seconds">Seconds</option><option value="minutes">Minutes</option><option value="hours">Hours</option>
+                  </select>
+                </div>
+              </div>
+              <div class="p-4 rounded-lg space-y-3" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
+                <h4 class="text-sm" style="color: #96EEF2">Light Strobe Around Each Snap</h4>
+                <p class="text-xs" style="color: rgba(150, 238, 242, 0.7)">
+                  Light turns on this many seconds before each snapshot, holds while the picture is taken,
+                  then stays on for this many seconds after, before going dark again until the next snap.
+                  Effective minimum capture frequency is {{ bottomTimelapseMinSeconds }} s.
+                </p>
+                <div class="flex gap-2 items-end">
+                  <div class="flex-1">
+                    <label class="block mb-1 text-xs" style="color: #96EEF2">Light on before snap (s)</label>
+                    <input type="number" min="0" step="1" v-model="bottomTimelapseLightPreNumber" @input="hasUnsavedChanges = true" class="w-full px-3 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" />
+                  </div>
+                  <div class="flex-1">
+                    <label class="block mb-1 text-xs" style="color: #96EEF2">Light on after snap (s)</label>
+                    <input type="number" min="0" step="1" v-model="bottomTimelapseLightPostNumber" @input="hasUnsavedChanges = true" class="w-full px-3 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" />
+                  </div>
+                </div>
+                <p v-if="bottomTimelapseTooFast" class="text-xs" style="color: #FF8888">
+                  Capture Frequency ({{ bottomCaptureFrequencySeconds }} s) is shorter than the strobe window
+                  ({{ bottomTimelapseMinSeconds }} s); the light will stay on continuously between snaps.
+                </p>
               </div>
             </div>
 
@@ -1413,6 +1483,9 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                     <span style="color: #96EEF2">Timelapse Images</span>
                   </label>
                 </div>
+                <p class="mt-2 text-xs italic" style="color: rgba(150, 238, 242, 0.5)">
+                  Interval Video and Timelapse Images are only supported for the Bottom phase.
+                </p>
               </div>
 
               <div v-if="ascentCameraType === 'timelapse'">

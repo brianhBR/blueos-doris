@@ -5,6 +5,7 @@
  * See backend OpenAPI spec at /openapi.json for full endpoint docs.
  */
 import { ref, readonly, computed } from 'vue'
+import { enqueueDownload, enqueueBulkDownload } from './useDownloads'
 
 const API_BASE = '/api/v1'
 
@@ -219,6 +220,11 @@ export interface CameraSettings {
   capture_frequency_unit: 'seconds' | 'minutes' | 'hours'
   video_record: TimeValue
   video_pause: TimeValue
+  // Optional on the wire: older deployment configurations on disk
+  // were saved before the timelapse light strobe params existed, so
+  // the load path falls back to (2 s pre, 1 s post) defaults.
+  timelapse_light_pre?: TimeValue
+  timelapse_light_post?: TimeValue
   resolution: string
   image_type: string
   file_format: string
@@ -760,15 +766,44 @@ export function useMedia() {
     }
   }
 
+  /**
+   * Single-file download — delegates to the shared download queue so the
+   * `<DownloadToast />` overlay shows progress feedback (preparing / starting
+   * / streaming) instead of leaving the user staring at a frozen UI while
+   * the backend opens the file. The file size is looked up from the
+   * already-fetched `MediaFile` list so the toast can show "X.Y GB" right
+   * away without an extra round-trip.
+   */
   function downloadFile(filePath: string, fileName?: string) {
-    const params = new URLSearchParams({ path: filePath }).toString()
-    const url = `${API_BASE}/media/download?${params}`
-    const a = document.createElement('a')
-    a.href = url
-    a.download = fileName || filePath.split('/').pop() || 'download'
-    document.body.appendChild(a)
-    a.click()
-    document.body.removeChild(a)
+    const match = files.value.find(f => f.id === filePath)
+    const resolvedName = fileName
+      || match?.filename
+      || filePath.split('/').pop()
+      || 'download'
+    const sizeBytes = match?.size_bytes ?? 0
+    void enqueueDownload(filePath, resolvedName, sizeBytes)
+  }
+
+  /**
+   * Bulk download — same surface as `downloadFile` but for an array of
+   * file ids. Files are downloaded one-at-a-time with a short gap between
+   * navigations; concurrent same-origin downloads can otherwise be
+   * silently cancelled by the browser.
+   */
+  function downloadFiles(fileIds: string[]) {
+    const items = fileIds
+      .map(id => {
+        const m = files.value.find(f => f.id === id)
+        if (!m) return null
+        return {
+          filePath: m.id,
+          fileName: m.filename,
+          sizeBytes: m.size_bytes,
+        }
+      })
+      .filter((x): x is { filePath: string; fileName: string; sizeBytes: number } => x !== null)
+    if (items.length === 0) return
+    void enqueueBulkDownload(items)
   }
 
   async function fetchSyncStatus() {
@@ -800,6 +835,7 @@ export function useMedia() {
     fetchMediaMissions,
     deleteFile,
     downloadFile,
+    downloadFiles,
     fetchSyncStatus,
     startSync,
   }

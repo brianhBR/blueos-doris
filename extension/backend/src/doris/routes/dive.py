@@ -23,6 +23,7 @@ from ..services import binlog
 from ..services import ip_camera_recorder as iprec
 from ..services.camera import CameraService
 from ..services.dive import DiveService
+from ..services.dive_finalize import finalize_dive
 from ..services.storage import DATA_ROOT, StorageService, media_download_id_from_abs_path
 
 logger = logging.getLogger(__name__)
@@ -221,6 +222,25 @@ def register_dive_routes(app: Robyn) -> None:
                     "message": f"Configuration '{config_name}' not found",
                 })
             logger.info(f"Starting dive with configuration: {config_name}")
+        else:
+            # No configuration provided: the dive proceeds with whatever
+            # DORIS_* params are currently on the autopilot, which may be
+            # leftovers from a prior dive setup.  Most importantly,
+            # DORIS_BTM_TIM (the bottom-time release timer) keeps its
+            # previous value, which can produce surprisingly long dives
+            # when the operator expected the new profile's value to
+            # apply.  Real dive starts from the UI always send
+            # `configuration:`; this branch typically indicates a test
+            # script that misnamed the field (e.g. `name:`) -- be loud
+            # so the misuse is visible in logs.
+            other_keys = sorted(k for k in body.keys() if k != "configuration")
+            logger.warning(
+                "DIVE START with no configuration -- keeping current "
+                "DORIS_* params (incl. DORIS_BTM_TIM bottom timer); "
+                "body keys: %s.  Use 'configuration': '<name>' to push "
+                "fresh params.",
+                other_keys or "(empty body)",
+            )
 
         loaded_at = datetime.now(tz=timezone.utc)
         clock_sane = 2024 <= loaded_at.year <= 2030
@@ -258,6 +278,16 @@ def register_dive_routes(app: Robyn) -> None:
         )
         if not ok:
             return json.dumps({"success": False, "message": "Failed to set parameter"})
+
+        # Clear any stale dive-scoped recorder state (base_stamp,
+        # snapshot sequence counters) left over from a prior UI session
+        # or an aborted dive.  Ensures this new dive's recordings get a
+        # fresh ``radcam_<stamp>_...`` prefix instead of sharing one with
+        # a previous session that never ran finalize.
+        try:
+            iprec.clear_snapshot_state()
+        except Exception as e:
+            logger.warning("clear_snapshot_state on dive start failed: %s", e)
 
         stale = _close_all_active_dive_records("completed")
         if stale:
@@ -353,6 +383,57 @@ def register_dive_routes(app: Robyn) -> None:
             logger.warning(f"Failed to update mission state: {e}")
 
         return json.dumps({"success": ok, "message": "Dive cancelled" if ok else "Failed to set parameter"})
+
+    @app.post("/api/v1/dive/finalize")
+    async def dive_finalize(request):
+        """Produce per-phase MP4s from this dive's .ts segments.
+
+        Called by the Lua dive script on RECOVERY entry (fire-and-
+        forget).  Also callable manually from the UI or curl.
+
+        Optional inputs (query string OR JSON body):
+
+        * ``stamp``: dive stamp; defaults to the most recent recording
+          session's ``base_stamp``.
+        * ``bottom_mode``: ``DORIS_BTM_CMOD`` value (1=continuous,
+          2=interval, 3=timelapse).  Selects the bottom-phase output
+          strategy: continuous yields one MP4 per 5-min chunk,
+          interval yields one MP4 per ipcam start/stop cycle, anything
+          else falls back to the legacy concat-into-one behavior.
+        """
+        try:
+            body = json.loads(request.body) if request.body else {}
+        except (json.JSONDecodeError, TypeError):
+            body = {}
+        stamp = request.query_params.get("stamp", "")
+        if stamp in (None, ""):
+            stamp = body.get("stamp") or None
+        # Accept ``bottom_mode`` from the query string OR the JSON body
+        # so the Lua HTTP emitter (which doesn't construct a body) can
+        # pass it as a query param without a Content-Length header.
+        bm_raw = request.query_params.get("bottom_mode", "")
+        if bm_raw in (None, ""):
+            bm_raw = body.get("bottom_mode")
+        bottom_mode: int | None = None
+        if bm_raw not in (None, ""):
+            try:
+                bottom_mode = int(bm_raw)
+            except (TypeError, ValueError):
+                bottom_mode = None
+        try:
+            result = await finalize_dive(stamp, bottom_mode=bottom_mode)
+        except Exception as e:
+            logger.exception("dive finalize failed")
+            return Response(
+                status_code=500,
+                description=json.dumps({"success": False, "error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+        return Response(
+            status_code=200,
+            description=json.dumps(result, default=str),
+            headers={"Content-Type": "application/json"},
+        )
 
     @app.post("/api/v1/dive/sitl/simulate_drop")
     async def sitl_simulate_drop(request):

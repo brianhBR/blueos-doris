@@ -1,0 +1,7 @@
+# runtime artifacts from sitl_monitor.py / stitch_dive_phases.py
+logs/
+*.tlog
+*.tlog.raw
+
+# local docker-compose volume mounts (recordings from rtsp-server validation runs)
+data/

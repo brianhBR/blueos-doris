@@ -18,6 +18,13 @@ dependencies = [
     "uvloop>=0.19.0",
     "websockets>=15.0",
     "pyserial>=3.5",
+    # NOTE: PyGObject is intentionally NOT a pip dependency.  It's
+    # provided by Debian's apt python3-gi in the Dockerfile (and made
+    # importable via PYTHONPATH=/usr/lib/python3/dist-packages).  We
+    # used to pip-install it from sdist, but pygobject 3.50+ requires
+    # libgirepository-2.0-dev (trixie-only) and the from-source build
+    # deterministically segfaults gcc-14 inside QEMU on linux/arm64
+    # and linux/arm/v7, breaking multi-arch CI.
 ]
 
 [project.optional-dependencies]

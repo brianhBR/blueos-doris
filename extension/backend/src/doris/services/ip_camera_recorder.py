@@ -1,75 +1,190 @@
-"""Record IP camera RTSP streams to segmented MPEG-TS via ffmpeg.
+"""Record IP camera RTSP streams to segmented MPEG-TS via GStreamer.
 
-Default pipeline matches the BlueOS_videorecorder hauv-v2 idea: **remux** the incoming
-compressed video (e.g. H.265 from RadCam) with ``-c:v copy`` — no decode/re-encode,
-low CPU — analogous to GStreamer ``rtspsrc`` → depay/parse → mux. Optional
-``DORIS_IPCAM_VIDEO_CODEC=libx264`` if you explicitly need transcoding.
+The pipeline runs **in-process** via ``gi.repository.Gst`` (rather than
+spawning ``gst-launch-1.0``) so the backend can:
+
+* connect to ``splitmuxsink``'s ``format-location`` signal and compose
+  filenames dynamically (required for the per-phase tag added in the
+  next commit);
+* fire ``split-now`` as an action signal for **zero-gap phase rotation**
+  at dive-phase boundaries;
+* observe pipeline errors on the GStreamer bus and restart the pipeline
+  via the same watchdog logic the legacy subprocess version used.
+
+ffmpeg's RTSP demuxer is incompatible with this camera: every session
+is torn down by the camera right after the first IDR/GOP, leaving
+~2.7 MB stub files.  GStreamer's ``rtspsrc`` keeps the same camera
+connected for ~4 to 30 s before the camera occasionally drops the
+session, so the watchdog restarts the pipeline on every unexpected
+exit until the caller explicitly stops recording.
+
+Pipeline (per instance):
+
+    rtspsrc location=URL protocols=tcp is-live=true latency=2000
+            retry=5 timeout=5000000 do-retransmission=false
+        ! rtph264depay
+        ! h264parse config-interval=-1
+        ! video/x-h264,stream-format=byte-stream,alignment=au
+        ! splitmuxsink name=muxsink max-size-time=NS
+                       muxer-factory=mpegtsmux send-keyframe-requests=true
+                       async-finalize=true
+
+The camera signals SPS/PPS only via the SDP and never re-emits them
+in-band, so without ``config-interval=-1`` only the first segment after
+each rtspsrc connect is decodable.  ``alignment=au`` then groups
+SPS+PPS+IDR into a single buffer so splitmuxsink can never split
+between the parameter sets and their keyframe.
+
+``splitmuxsink`` produces multiple
+``radcam_<stamp>_<phase>_cyc<CC>_part<NN>_%05d.ts`` segments per
+session.  Two distinct counters are embedded in the filename:
+
+* ``cyc<CC>`` increments **once per ``start_recording`` call** within
+  one dive.  Every ``.ts`` file written by a single ipcam_start /
+  ipcam_stop cycle therefore carries the same ``<CC>``, regardless of
+  how many times the watchdog rebuilt the pipeline mid-cycle (camera
+  RTSP teardowns, transient errors, anything).  Finalize uses
+  ``<CC>`` alone to identify a logical interval cycle -- no
+  timing/mtime heuristics.
+* ``part<NN>`` increments on every pipeline rebuild (initial start +
+  each watchdog restart) so file paths are unique even when ``<CC>``
+  is repeated across rebuilds.
 """
 
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
 import os
-import signal
+import re
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
+
+import gi
+
+gi.require_version("Gst", "1.0")
+from gi.repository import Gst  # noqa: E402  (module-level import after require_version)
 
 from ..config import settings
 from . import usb_storage
 
-import httpx
-
 logger = logging.getLogger(__name__)
 
-# Direct camera URL (fallback only).
-IPCAM_RTSP_DIRECT = "rtsp://admin:blue@192.168.2.10:554/stream_0"
+_IPCAM_RTSP_DEFAULT = "rtsp://admin:blue@192.168.2.10:554/stream_0"
+IPCAM_RTSP_DIRECT = os.environ.get(
+    "DORIS_IPCAM_RTSP_URL", _IPCAM_RTSP_DEFAULT,
+)
 
-# MCM re-serves the camera stream via its built-in RTSP server on port 8554.
-# Connecting here avoids stealing the camera's single RTSP session from MCM.
-_DOCKER_HOST = os.environ.get("DORIS_BLUEOS_ADDRESS", "http://host.docker.internal")
-_HOST_IP = _DOCKER_HOST.replace("http://", "").replace("https://", "").split(":")[0]
-MCM_STREAMS_URL = f"{_DOCKER_HOST.rstrip('/')}:6020/streams"
-MCM_RTSP_HOST = f"{_HOST_IP}:8554"
+_RESTART_BACKOFF_S = 1.0
+_MIN_GOOD_RUNTIME_S = 3.0
+_MAX_BACKOFF_S = 5.0
+_STOP_EOS_TIMEOUT_S = 5.0
 
-
-async def _discover_mcm_rtsp() -> str | None:
-    """Query Mavlink Camera Manager for its local RTSP relay endpoint."""
-    try:
-        async with httpx.AsyncClient(timeout=5.0) as client:
-            resp = await client.get(MCM_STREAMS_URL)
-            resp.raise_for_status()
-            items = resp.json()
-    except Exception:
-        return None
-    for item in items:
-        endpoints = (
-            item.get("video_and_stream", {})
-            .get("stream_information", {})
-            .get("endpoints", [])
-        )
-        for ep in endpoints:
-            if "8554" in ep:
-                import re as _re
-                return _re.sub(r"rtsp://[^:/]+:8554", f"rtsp://{MCM_RTSP_HOST}", ep)
-    return None
+# Phase labels are embedded into filenames; keep them path-safe.
+# Accepted: lowercase alphanumerics + underscore, 1..32 chars.
+_PHASE_RE = re.compile(r"^[a-z0-9_]{1,32}$")
+PHASE_DEFAULT = "manual"
 
 
-_process: asyncio.subprocess.Process | None = None
-_stderr_task: asyncio.Task | None = None
-_liveness_task: asyncio.Task | None = None
-_lock = asyncio.Lock()
-_last_pattern: str | None = None
-_recording_active: bool = False
+def sanitize_phase(raw: str | None) -> str:
+    """Return ``raw`` if it's a valid phase label, else ``PHASE_DEFAULT``.
 
-LIVENESS_TIMEOUT_S = 10
-LIVENESS_MAX_RETRIES = 3
+    The label is embedded verbatim into on-disk filenames so it must
+    be restricted to path-safe characters.  Anything the caller sends
+    that doesn't match the whitelist falls back to ``manual`` (the
+    same label used for non-dive UI-initiated recordings).
+    """
+    if raw is None:
+        return PHASE_DEFAULT
+    s = str(raw).strip().lower()
+    if not s or not _PHASE_RE.match(s):
+        return PHASE_DEFAULT
+    return s
 
 
-def is_recording() -> bool:
-    """Thread/task-safe flag — no lock needed. Use this instead of poking _process."""
-    return _recording_active
+# ── GStreamer init (idempotent; safe across threads) ───────────────────────────
+
+_gst_init_lock = threading.Lock()
+_gst_initialized = False
+
+
+def _ensure_gst_init() -> None:
+    global _gst_initialized
+    with _gst_init_lock:
+        if not _gst_initialized:
+            Gst.init(None)
+            _gst_initialized = True
+            logger.info(
+                "GStreamer initialized (version %s)", Gst.version_string(),
+            )
+
+
+# ── module state ───────────────────────────────────────────────────────────────
+
+_state_lock = asyncio.Lock()
+_session: "RecordingSession | None" = None
+# Dive-scoped base stamp.  All recording sessions (and TIMELAPSE-mode
+# snapshots) within a single dive reuse this stamp so every .ts / .jpg
+# carries the same ``radcam_<stamp>_...`` prefix.  That lets
+# ``finalize_dive`` group files across phase boundaries even when the
+# Lua script stops and restarts the recorder between phases (e.g.
+# descent -> on_bottom in VIDEO_INTERVAL mode, or the recorder's own
+# watchdog restarts after a camera-induced RTSP tear-down).
+#
+# Allocated lazily by the first start_recording / snapshot of a dive,
+# cleared by ``/api/v1/dive/finalize`` (via ``clear_snapshot_state``).
+_last_base_stamp: str | None = None
+
+# Per-(stamp, phase) JPEG sequence counters for TIMELAPSE-mode snapshots.
+# Cleared on dive-finalize so each new dive starts fresh.
+_snapshot_seqs: dict[tuple[str, str], int] = {}
+
+# Next part index any new RecordingSession should claim for the
+# current dive stamp.  VIDEO_INTERVAL mode stops the recorder during
+# pauses and starts a new session for each record cycle; without this
+# offset every session would start at part00 and clobber the previous
+# session's .ts files (splitmuxsink's fragment_id also restarts at 0
+# in each pipeline instance).  Bumped past the last-used part on
+# stop_recording, reset to 0 by clear_snapshot_state.
+_session_part_offset: int = 0
+
+# Sequence counter for ``ipcam_start / ipcam_stop`` cycles within a
+# dive.  Incremented once per ``start_recording`` call (the
+# non-idempotent path that actually constructs a new
+# RecordingSession); idempotent re-uses do NOT bump it.  The current
+# value is stamped into every ``.ts`` filename as ``cyc<CC>``, so
+# every fragment written by a single ipcam_start / ipcam_stop cycle
+# (including all fragments produced by mid-cycle watchdog rebuilds)
+# shares the same ``<CC>`` and finalize can group them into one MP4
+# without any timing heuristic.  Reset to 0 by clear_snapshot_state
+# so each fresh dive starts at cyc01.
+_dive_cycle_seq: int = 0
+
+# Direct camera snapshot endpoint.  This is a raw HTTP path on the
+# IP camera itself (NOT a MCM-mediated path) so that the timelapse
+# fast path is independent of mavlink-camera-manager state.  The
+# RadCam (firmware 18.010.U35.5) serves a fresh 4K JPEG at this URL
+# with no auth required, in ~200ms; resolution and quality are
+# whatever the operator set on the camera's "snap" page (see
+# http://<cam>:80/index.html#/cameraConf -> Video and Audio -> Snap).
+#
+# Override with the ``DORIS_IPCAM_SNAPSHOT_URL`` env var for testing
+# or other camera firmware.  Default is derived from the RTSP host
+# of ``IPCAM_RTSP_DIRECT`` so changing the camera IP in a single
+# place keeps both endpoints in sync.
+def _default_snapshot_url() -> str:
+    """Build ``http://<rtsp_host>/cgi-bin/onesnap.cgi`` from IPCAM_RTSP_DIRECT."""
+    from urllib.parse import urlsplit
+    parts = urlsplit(IPCAM_RTSP_DIRECT)
+    host = parts.hostname or "192.168.2.10"
+    return f"http://{host}/cgi-bin/onesnap.cgi"
+
+
+IPCAM_SNAPSHOT_URL = os.environ.get(
+    "DORIS_IPCAM_SNAPSHOT_URL", _default_snapshot_url(),
+)
+_SNAPSHOT_TIMEOUT_S = 5.0
 
 
 def _data_root() -> Path:
@@ -77,7 +192,13 @@ def _data_root() -> Path:
 
 
 def _output_dir() -> tuple[Path, str]:
-    """Return (directory, label) with ``label`` ``usb`` or ``internal``."""
+    """Return the recordings root + storage label (``"usb"`` or ``"internal"``).
+
+    Callers should NOT write files directly here: per-dive output now
+    lives inside ``<root>/dive_<stamp>/`` (see :func:`_dive_dir` below)
+    so a single dive's .ts segments, snapshots, finalised MP4s, and
+    manifest are colocated and easy to keep / move / delete as a unit.
+    """
     sub = settings.ipcam_recordings_subdir.strip("/").strip()
     usb_base = usb_storage.get_recording_dir_if_available(sub)
     if usb_base is not None:
@@ -87,351 +208,755 @@ def _output_dir() -> tuple[Path, str]:
     return out, "internal"
 
 
-def _build_ffmpeg_args(rtsp_url: str, segment_s: int, pattern: str,
-                       creation_time: str | None = None) -> list[str]:
-    """RTSP in -> segmented MPEG-TS. ``copy`` = bitstream remux only (gst-style pass-through)."""
-    vcodec = settings.ipcam_video_codec
-    if vcodec not in ("copy", "libx264"):
-        vcodec = "copy"
+def _dive_dir(root: Path, stamp: str) -> Path:
+    """``<root>/dive_<stamp>/``, created on demand.
 
-    args: list[str] = [
-        "ffmpeg",
-        "-hide_banner",
-        "-loglevel",
-        "info",
-        "-rtsp_transport",
-        "tcp",
-        "-i",
-        rtsp_url,
-        "-map",
-        "0:v:0",
-        "-an",
-    ]
-
-    if vcodec == "libx264":
-        args += [
-            "-c:v",
-            "libx264",
-            "-preset",
-            settings.ipcam_x264_preset,
-            "-tune",
-            "zerolatency",
-            "-pix_fmt",
-            "yuv420p",
-        ]
-    else:
-        args += ["-c:v", "copy"]
-
-    if creation_time:
-        args += ["-metadata", f"creation_time={creation_time}"]
-
-    args += [
-        "-f",
-        "segment",
-        "-segment_time",
-        str(max(segment_s, 1)),
-        "-segment_format",
-        "mpegts",
-        "-reset_timestamps",
-        "1",
-        pattern,
-    ]
-    return args
-
-
-async def _try_launch_ffmpeg(
-    rtsp_url: str, seg: int, pattern: str, label: str,
-    creation_time: str | None = None,
-) -> tuple[asyncio.subprocess.Process | None, str]:
-    """Spawn ffmpeg and wait briefly to confirm it stays alive.
-
-    Returns ``(process, "")`` on success, or ``(None, error_text)`` on failure.
+    All artifacts for a single dive (descent/on_bottom/ascent .ts
+    segments, TIMELAPSE .jpg snapshots, finalized .mp4 outputs, and
+    the manifest.json) live inside this folder so the data tab in
+    the UI doesn't accumulate one giant flat list across many dives.
     """
-    cmd = _build_ffmpeg_args(rtsp_url, seg, pattern, creation_time)
-    logger.info("Starting IP camera recorder (%s): %s", label, " ".join(cmd[:12]) + " ... " + pattern)
-
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            *cmd,
-            stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.DEVNULL,
-            stderr=asyncio.subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        return None, "ffmpeg not found"
-    except Exception as e:
-        logger.exception("ffmpeg start failed")
-        return None, str(e)
-
-    await asyncio.sleep(0.35)
-    if proc.returncode is not None:
-        err_bytes = await proc.stderr.read() if proc.stderr else b""
-        err_text = err_bytes.decode(errors="replace").strip()
-        logger.error("ffmpeg exited immediately rc=%s url=%s stderr=%s", proc.returncode, rtsp_url, err_text[:500])
-        return None, f"ffmpeg exited with {proc.returncode}: {err_text[:300]}"
-
-    return proc, ""
+    d = root / f"dive_{stamp}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
-async def _drain_stderr(p: asyncio.subprocess.Process) -> None:
-    """Log ffmpeg stderr lines in background; log exit when it dies."""
-    assert p.stderr is not None
-    while True:
-        line = await p.stderr.readline()
-        if not line:
-            break
-        logger.warning("ffmpeg: %s", line.decode(errors="replace").rstrip())
-    rc = await p.wait()
-    if rc != 0 and rc != -2:
-        logger.error("ffmpeg exited unexpectedly rc=%s", rc)
+def _build_pipeline_description(rtsp_url: str, segment_s: int) -> str:
+    """GStreamer pipeline description matching the legacy gst-launch args.
 
-
-async def _kill_process(proc: asyncio.subprocess.Process) -> None:
-    """Send SIGINT then escalate to SIGKILL if needed."""
-    try:
-        proc.send_signal(signal.SIGINT)
-    except ProcessLookupError:
-        return
-    try:
-        await asyncio.wait_for(proc.wait(), timeout=5.0)
-    except asyncio.TimeoutError:
-        logger.warning("ffmpeg did not exit after SIGINT, killing")
-        try:
-            proc.kill()
-            await proc.wait()
-        except ProcessLookupError:
-            pass
-
-
-def _cleanup_empty_segment(pattern: str) -> None:
-    """Remove the first segment file if it's 0 bytes (stalled recording artifact)."""
-    first = Path(pattern.replace("%03d", "000"))
-    try:
-        if first.exists() and first.stat().st_size == 0:
-            first.unlink()
-            logger.info("Cleaned up 0-byte stalled file: %s", first.name)
-    except OSError:
-        pass
-
-
-MANIFEST_FILENAME = "recording_manifest.jsonl"
-
-
-def _append_manifest(out_dir: Path, entry: dict) -> None:
-    """Best-effort append a JSON line to the recording manifest."""
-    try:
-        with open(out_dir / MANIFEST_FILENAME, "a") as f:
-            f.write(json.dumps(entry, separators=(",", ":")) + "\n")
-    except OSError:
-        pass
-
-
-async def _liveness_monitor(pattern: str, seg: int, retries_left: int = LIVENESS_MAX_RETRIES) -> None:
-    """Verify ffmpeg is actually writing video data; restart if stalled.
-
-    MCM's RTSP relay can accept a connection (passing the 0.35s alive check)
-    but stall without forwarding frames, producing a 0-byte segment file.
-    This monitor detects that and restarts with a fresh RTSP discovery.
+    The muxer is named ``muxsink`` so we can fetch it after parsing and
+    attach the ``format-location`` signal handler + emit ``split-now``
+    for zero-gap phase rotation in the next commit.
     """
-    global _process, _recording_active, _stderr_task, _liveness_task, _last_pattern
-
-    await asyncio.sleep(LIVENESS_TIMEOUT_S)
-
-    if not _recording_active:
-        return
-
-    first_segment = Path(pattern.replace("%03d", "000"))
-    try:
-        size = first_segment.stat().st_size
-    except FileNotFoundError:
-        size = 0
-
-    if size > 0:
-        logger.info("Recording liveness OK: %s is %d bytes", first_segment.name, size)
-        return
-
-    logger.warning(
-        "Recording STALLED: %s is 0 bytes after %ds — restarting (retries_left=%d)",
-        first_segment.name, LIVENESS_TIMEOUT_S, retries_left,
+    seg_ns = max(1, segment_s) * 1_000_000_000
+    return (
+        f"rtspsrc location={rtsp_url} protocols=tcp is-live=true latency=2000 "
+        f"retry=5 timeout=5000000 do-retransmission=false "
+        f"! rtph264depay "
+        f"! h264parse config-interval=-1 "
+        f"! video/x-h264,stream-format=byte-stream,alignment=au "
+        f"! splitmuxsink name=muxsink max-size-time={seg_ns} "
+        f"muxer-factory=mpegtsmux send-keyframe-requests=true "
+        f"async-finalize=true"
     )
 
-    if retries_left <= 0:
-        logger.error("Recording liveness: max retries exhausted, giving up")
-        async with _lock:
-            if _process is not None and _process.returncode is None:
-                await _kill_process(_process)
-                _process = None
-            _recording_active = False
-        _cleanup_empty_segment(pattern)
-        return
 
-    mcm_url = await _discover_mcm_rtsp()
-    rtsp_candidates: list[tuple[str, str]] = [(IPCAM_RTSP_DIRECT, "direct")]
-    if mcm_url:
-        rtsp_candidates.append((mcm_url, "mcm-relay"))
+class RecordingSession:
+    """One logical recording.  Owns a GStreamer pipeline in-process and
+    restarts it across camera-induced disconnects until ``stop()``.
+    """
 
-    async with _lock:
-        if not _recording_active:
-            return
+    def __init__(self, rtsp_url: str, segment_s: int, out_dir: Path,
+                 storage_label: str, base_stamp: str,
+                 phase: str = PHASE_DEFAULT,
+                 initial_part: int = 0,
+                 cycle_seq: int = 0) -> None:
+        self._rtsp_url = rtsp_url
+        self._segment_s = segment_s
+        self._out_dir = out_dir
+        self.storage = storage_label
+        self.base_stamp = base_stamp
+        # current_phase is read by the format-location callback on the
+        # GStreamer streaming thread.  Python attribute assignment is
+        # GIL-protected; no explicit lock needed.  Writes happen from
+        # the asyncio event loop (start_recording / rotate_to_phase).
+        self.current_phase: str = sanitize_phase(phase)
+        self._user_stop = asyncio.Event()
+        self._pipeline: "Gst.Pipeline | None" = None
+        self._muxsink: "Gst.Element | None" = None
+        self._task: asyncio.Task | None = None
+        # initial_part is the part index this session starts at; the
+        # caller (module-level start_recording) supplies a value past
+        # the last part used by the prior session for the same
+        # base_stamp so VIDEO_INTERVAL-mode start/stop cycles don't
+        # collide on _part00_00000.ts.
+        self._initial_part = max(0, int(initial_part))
+        self._current_part = self._initial_part
+        # cycle_seq stays constant for the whole life of this session
+        # (start -> watchdog rebuilds -> stop) and is stamped into
+        # every .ts filename as cyc<CC>.  Finalize groups bottom .ts
+        # by cyc<CC> to stitch each ipcam_start / ipcam_stop cycle
+        # into a single MP4.
+        self.cycle_seq = max(0, int(cycle_seq))
+        self.restart_count = 0
+        self.last_pattern: str | None = None
+        self.last_exit: dict | None = None
+        self.rotation_count = 0
+        self._last_phases: list[str] = [self.current_phase]
+        # Pending phase queued when a rotate lands while the underlying
+        # pipeline is not-yet-ready (between watchdog restarts, muxsink
+        # already torn down in _run_one's finally block).  Applied at
+        # the start of the next pipeline iteration so the first segment
+        # of that part carries the requested phase.
+        self._pending_phase: str | None = None
 
-        if _process is not None and _process.returncode is None:
-            await _kill_process(_process)
-            _process = None
+    def is_alive(self) -> bool:
+        return self._task is not None and not self._task.done()
 
-        _cleanup_empty_segment(pattern)
+    def current_pid(self) -> int | None:
+        # No subprocess any more; pipeline runs in the extension process.
+        # Kept in the API shape for back-compat with /rec/status consumers.
+        return None
 
-        out_dir, storage = _output_dir()
-        now = datetime.now(tz=timezone.utc)
-        stamp = now.strftime("%Y%m%d_%H%M%S")
-        iso_stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        new_pattern = str(out_dir / f"radcam_{stamp}_%03d.ts")
+    # Invoked by GStreamer on a streaming thread whenever splitmuxsink
+    # opens a new fragment.  Must be fast and avoid blocking on anything
+    # that needs the asyncio loop.  Reads ``current_phase`` at the
+    # moment the new file is opened -- so after rotate_to_phase updates
+    # current_phase and fires split-now, the next callback (triggered
+    # at the next keyframe) produces a file labelled with the new phase.
+    def _on_format_location(self, _splitmux, fragment_id) -> str:
+        phase = self.current_phase
+        path = str(
+            self._out_dir
+            / f"radcam_{self.base_stamp}_{phase}_cyc{self.cycle_seq:02d}"
+            f"_part{self._current_part:02d}_{int(fragment_id):05d}.ts"
+        )
+        self.last_pattern = path
+        return path
 
-        last_err = ""
-        for rtsp_url, source in rtsp_candidates:
-            logger.info("Liveness restart: trying %s (%s)", source, rtsp_url)
-            proc, err = await _try_launch_ffmpeg(rtsp_url, seg, new_pattern, f"{storage}/{source}", iso_stamp)
-            if proc is not None:
-                _stderr_task = asyncio.create_task(_drain_stderr(proc))
-                _process = proc
-                _last_pattern = new_pattern
-                logger.info("Liveness restart succeeded via %s", source)
-                _liveness_task = asyncio.create_task(
-                    _liveness_monitor(new_pattern, seg, retries_left - 1)
+    async def rotate_to_phase(
+        self, new_phase: str, segment_seconds: int | None = None,
+    ) -> dict:
+        """Rotate to ``new_phase``.  Zero-gap when the pipeline is live,
+        queued otherwise so the next pipeline part picks it up.
+
+        ``segment_seconds`` (if given) updates the live splitmuxsink's
+        ``max-size-time`` so subsequent fragments rotate at the new
+        boundary.  Used by the Lua dive script to clamp the bottom
+        phase to 5-minute chunks in CONTINUOUS mode (DORIS_BTM_CMOD=1)
+        and to restore the larger default for ascent.  The new value
+        is also stored on the session so a watchdog-driven pipeline
+        rebuild keeps the same segment policy.
+
+        Three code paths:
+
+        1. Pipeline live + muxsink ready  ->  update current_phase,
+           emit ``split-now``; the current .ts closes on the next
+           keyframe (<= one GOP) and the next .ts opens with the new
+           phase in its filename.  This is the intended zero-gap path.
+        2. Session alive but pipeline mid-restart (muxsink torn down in
+           _run_one's finally block, watchdog in backoff)  ->  queue
+           the phase in ``_pending_phase``.  The next ``_run_one``
+           iteration applies it before the first format-location
+           callback fires, so the first .ts of that part carries the
+           new phase.  Reports ``queued: True`` so the caller can tell.
+        3. Session not alive (watchdog exited, e.g. post-stop)  ->
+           return ``{"success": False, "reason": "not_recording"}``.
+        """
+        new_phase = sanitize_phase(new_phase)
+        if not self.is_alive():
+            return {"success": False, "reason": "not_recording"}
+
+        # Clamp + persist the new segment policy so a watchdog rebuild
+        # picks it up too.  Applied to the live muxsink below; the
+        # mid-restart branch just persists.
+        new_segment_s: int | None = None
+        if segment_seconds is not None:
+            try:
+                new_segment_s = max(1, min(int(segment_seconds), 86_400))
+            except (TypeError, ValueError):
+                new_segment_s = None
+        if new_segment_s is not None:
+            self._segment_s = new_segment_s
+
+        old_phase = self.current_phase
+        muxsink = self._muxsink
+        if muxsink is None:
+            # Pipeline mid-restart -- queue so the next iteration picks
+            # it up in _run_one before the first callback fires.
+            self._pending_phase = new_phase
+            logger.info(
+                "RECORD rotate queued: %s -> %s segment_s=%s "
+                "(pipeline mid-restart)",
+                old_phase, new_phase, new_segment_s,
+            )
+            return {
+                "success": True, "from_phase": old_phase,
+                "to_phase": new_phase, "rotated": False,
+                "queued": True,
+                "segment_seconds": self._segment_s,
+            }
+        if new_phase == old_phase and new_segment_s is None:
+            return {
+                "success": True, "from_phase": old_phase,
+                "to_phase": new_phase, "rotated": False,
+                "note": "already in requested phase",
+                "segment_seconds": self._segment_s,
+            }
+        # Update the live variable BEFORE emitting split-now so the next
+        # format-location callback picks up the new label.  GIL-safe.
+        self.current_phase = new_phase
+        if new_segment_s is not None:
+            # splitmuxsink.max-size-time is a runtime-writable GObject
+            # property; setting it before split-now means the new value
+            # governs every fragment after this rotation.
+            try:
+                muxsink.set_property(
+                    "max-size-time", int(new_segment_s) * 1_000_000_000,
                 )
-                return
-            last_err = err
-            logger.warning("Liveness restart: %s failed (%s)", source, err[:200])
+            except Exception:
+                logger.exception(
+                    "RECORD failed to update splitmuxsink max-size-time "
+                    "(continuing with prior value)"
+                )
+        if new_phase != old_phase:
+            self.rotation_count += 1
+            self._last_phases.append(new_phase)
+        logger.info(
+            "RECORD rotate: %s -> %s segment_s=%d (rotations=%d)",
+            old_phase, new_phase, self._segment_s, self.rotation_count,
+        )
+        try:
+            muxsink.emit("split-now")
+        except Exception:
+            logger.exception("RECORD split-now emit failed")
+            return {"success": False, "reason": "split_now_failed"}
+        return {
+            "success": True, "from_phase": old_phase,
+            "to_phase": new_phase, "rotated": True,
+            "rotation_count": self.rotation_count,
+            "segment_seconds": self._segment_s,
+        }
 
-        logger.error("Liveness restart: all RTSP sources failed, marking inactive")
-        _recording_active = False
+    def _build_pipeline(self) -> "Gst.Pipeline":
+        desc = _build_pipeline_description(self._rtsp_url, self._segment_s)
+        pipeline = Gst.parse_launch(desc)
+        if not isinstance(pipeline, Gst.Pipeline):
+            raise RuntimeError("Gst.parse_launch returned non-pipeline object")
+        muxsink = pipeline.get_by_name("muxsink")
+        if muxsink is None:
+            raise RuntimeError("splitmuxsink 'muxsink' not found in pipeline")
+        muxsink.connect("format-location", self._on_format_location)
+        self._muxsink = muxsink
+        return pipeline
+
+    async def _run_one(self) -> tuple[str, float]:
+        """Start the pipeline, poll its bus until ERROR/EOS or user stop.
+
+        Returns ``(exit_reason, runtime_s)``.
+        """
+        t0 = asyncio.get_event_loop().time()
+        # If a rotate landed while the previous pipeline was tearing
+        # down, apply the queued phase now so the first fragment of
+        # this new part carries the requested label.
+        if self._pending_phase is not None and self._pending_phase != self.current_phase:
+            old_phase = self.current_phase
+            self.current_phase = self._pending_phase
+            self.rotation_count += 1
+            self._last_phases.append(self.current_phase)
+            logger.info(
+                "RECORD rotate applied on restart: %s -> %s (rotations=%d)",
+                old_phase, self.current_phase, self.rotation_count,
+            )
+        self._pending_phase = None
+        logger.info(
+            "RECORD spawning Gst pipeline part=%d url=%s phase=%s",
+            self._current_part, self._rtsp_url, self.current_phase,
+        )
+        try:
+            pipeline = self._build_pipeline()
+        except Exception:
+            logger.exception("RECORD pipeline build failed")
+            return "build_failed", asyncio.get_event_loop().time() - t0
+
+        self._pipeline = pipeline
+        bus = pipeline.get_bus()
+
+        ret = pipeline.set_state(Gst.State.PLAYING)
+        if ret == Gst.StateChangeReturn.FAILURE:
+            logger.warning("RECORD set_state(PLAYING) returned FAILURE")
+            pipeline.set_state(Gst.State.NULL)
+            self._pipeline = None
+            self._muxsink = None
+            return "set_state_failure", asyncio.get_event_loop().time() - t0
+
+        exit_reason = "unknown"
+        try:
+            # Main loop: poll the bus for ERROR / EOS while waiting for
+            # the caller to request a stop.  100ms granularity is fine
+            # for our needs (phase rotation uses the split-now action
+            # signal directly, not the bus).
+            while not self._user_stop.is_set():
+                msg = bus.timed_pop_filtered(
+                    0, Gst.MessageType.ERROR | Gst.MessageType.EOS,
+                )
+                if msg is not None:
+                    if msg.type == Gst.MessageType.ERROR:
+                        err, dbg = msg.parse_error()
+                        logger.warning(
+                            "gst[part=%d] error: %s (%s)",
+                            self._current_part, err.message, dbg,
+                        )
+                        exit_reason = f"error:{err.message}"
+                    else:
+                        logger.info(
+                            "gst[part=%d] unexpected EOS",
+                            self._current_part,
+                        )
+                        exit_reason = "unexpected_eos"
+                    break
+                await asyncio.sleep(0.1)
+
+            if self._user_stop.is_set() and exit_reason == "unknown":
+                # Request a clean EOS so splitmuxsink finalises the
+                # last .ts file.  If the live rtspsrc pipeline can't
+                # flush cleanly in time, we fall back to an immediate
+                # NULL transition (same outcome as the old SIGKILL).
+                logger.info(
+                    "RECORD part=%d stopping (user); sending EOS",
+                    self._current_part,
+                )
+                pipeline.send_event(Gst.Event.new_eos())
+                deadline = asyncio.get_event_loop().time() + _STOP_EOS_TIMEOUT_S
+                stopped = False
+                while asyncio.get_event_loop().time() < deadline:
+                    msg = bus.timed_pop_filtered(
+                        0, Gst.MessageType.ERROR | Gst.MessageType.EOS,
+                    )
+                    if msg is not None and msg.type in (
+                        Gst.MessageType.EOS, Gst.MessageType.ERROR,
+                    ):
+                        exit_reason = "stopped_clean"
+                        stopped = True
+                        break
+                    await asyncio.sleep(0.05)
+                if not stopped:
+                    logger.warning(
+                        "RECORD part=%d EOS not observed within %.1fs",
+                        self._current_part, _STOP_EOS_TIMEOUT_S,
+                    )
+                    exit_reason = "stopped_forced"
+        finally:
+            pipeline.set_state(Gst.State.NULL)
+            self._pipeline = None
+            self._muxsink = None
+
+        return exit_reason, asyncio.get_event_loop().time() - t0
+
+    async def _watchdog(self) -> None:
+        """Run the pipeline; restart on unexpected exit until stop()."""
+        backoff = _RESTART_BACKOFF_S
+        while not self._user_stop.is_set():
+            self.restart_count = self._current_part
+            try:
+                exit_reason, runtime_s = await self._run_one()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "RECORD pipeline run failed (part=%d)", self._current_part,
+                )
+                exit_reason, runtime_s = "exception", 0.0
+            self.last_exit = {
+                "part": self._current_part,
+                "reason": exit_reason,
+                "runtime_s": round(runtime_s, 2),
+                "pattern": self.last_pattern,
+            }
+            if self._user_stop.is_set():
+                logger.info(
+                    "RECORD pipeline part=%d exited reason=%s runtime=%.1fs (user stop)",
+                    self._current_part, exit_reason, runtime_s,
+                )
+                break
+            logger.warning(
+                "RECORD pipeline part=%d exited reason=%s runtime=%.1fs - restarting",
+                self._current_part, exit_reason, runtime_s,
+            )
+            if runtime_s >= _MIN_GOOD_RUNTIME_S:
+                backoff = _RESTART_BACKOFF_S
+            else:
+                backoff = min(_MAX_BACKOFF_S, backoff * 1.5)
+            try:
+                await asyncio.wait_for(self._user_stop.wait(), timeout=backoff)
+                break
+            except asyncio.TimeoutError:
+                pass
+            self._current_part += 1
+        logger.info(
+            "RECORD watchdog exiting; total parts=%d", self._current_part + 1,
+        )
+
+    def start(self) -> None:
+        if self._task is not None:
+            raise RuntimeError("session already started")
+        _ensure_gst_init()
+        self._task = asyncio.create_task(self._watchdog())
+
+    async def stop(self, timeout_s: float = 12.0) -> None:
+        """Request stop; wait for the current pipeline instance to finalise."""
+        self._user_stop.set()
+        if self._task is not None:
+            try:
+                await asyncio.wait_for(self._task, timeout=timeout_s)
+            except asyncio.TimeoutError:
+                logger.warning(
+                    "RECORD watchdog did not exit in %.1fs, cancelling",
+                    timeout_s,
+                )
+                self._task.cancel()
+                try:
+                    await self._task
+                except Exception:
+                    pass
 
 
-async def start_recording(segment_seconds: int | None = None) -> dict:
-    """Start ffmpeg segment recording. Each /start after /stop uses a new basename."""
-    global _process, _last_pattern, _liveness_task
+async def _select_rtsp_url() -> tuple[str, str]:
+    """Always use the direct camera URL; MCM is intentionally not used.
+
+    Returned tuple is ``(url, label)``; the label is logged so an
+    operator can quickly see which RTSP endpoint a recording started
+    against.  Kept as a function (rather than a constant) to leave
+    room for future fallback logic without changing call sites.
+    """
+    return IPCAM_RTSP_DIRECT, "direct"
+
+
+async def start_recording(
+    segment_seconds: int | None = None,
+    phase: str | None = None,
+) -> dict:
+    """Start (or re-use) a recording session.
+
+    ``phase`` tags every ``.ts`` segment produced by this session until
+    :func:`rotate_to_phase` is called; defaults to ``"manual"`` for UI-
+    initiated recordings outside of a dive.
+    """
+    global _session, _last_base_stamp, _dive_cycle_seq
 
     seg = segment_seconds
     if seg is None:
         seg = int(settings.ipcam_segment_seconds_default)
     seg = max(1, min(seg, 86_400))
 
-    if _liveness_task is not None:
-        _liveness_task.cancel()
-        _liveness_task = None
+    phase_label = sanitize_phase(phase)
 
-    mcm_url = await _discover_mcm_rtsp()
-    rtsp_candidates: list[tuple[str, str]] = [(IPCAM_RTSP_DIRECT, "direct")]
-    if mcm_url:
-        rtsp_candidates.append((mcm_url, "mcm-relay"))
+    rtsp_url, source_label = await _select_rtsp_url()
 
-    async with _lock:
-        if _process is not None and _process.returncode is None:
-            logger.info("Auto-stopping previous recording before starting new segment")
-            await _kill_process(_process)
-            _process = None
+    async with _state_lock:
+        if _session is not None and _session.is_alive():
+            # Idempotent: treat "start while already recording" as success so
+            # clients (the Lua dive script in particular) can freely call
+            # /rec/start on every phase transition without producing noisy
+            # HTTP 400s.  The active session is unchanged; if the caller
+            # passed a non-default phase different from the current one we
+            # transparently rotate so they get the expected labelling.
+            result = {
+                "success": True,
+                "already_recording": True,
+                "message": "Already recording",
+                "recording": True,
+                "base_stamp": _session.base_stamp,
+                "storage": _session.storage,
+                "phase": _session.current_phase,
+            }
+            # If the caller passed a segment override, fold it through
+            # the rotate path so a /rec/start while-already-recording
+            # can also retune splitmuxsink.  Passing None preserves the
+            # current segment policy.
+            if phase is not None and phase_label != _session.current_phase:
+                rot = await _session.rotate_to_phase(
+                    phase_label, segment_seconds=segment_seconds,
+                )
+                result["rotate"] = rot
+                result["phase"] = _session.current_phase
+            elif segment_seconds is not None:
+                # Same phase but a segment retune was requested.  Apply
+                # via rotate_to_phase (idempotent on the phase label,
+                # writes the live splitmuxsink property).
+                rot = await _session.rotate_to_phase(
+                    _session.current_phase, segment_seconds=segment_seconds,
+                )
+                result["rotate"] = rot
+            return result
 
-        out_dir, storage = _output_dir()
-        now = datetime.now(tz=timezone.utc)
-        stamp = now.strftime("%Y%m%d_%H%M%S")
-        iso_stamp = now.strftime("%Y-%m-%dT%H:%M:%SZ")
-        pattern = str(out_dir / f"radcam_{stamp}_%03d.ts")
-        _last_pattern = pattern
-
-        last_err = ""
-        for rtsp_url, source in rtsp_candidates:
-            logger.info("Trying RTSP source: %s (%s)", source, rtsp_url)
-            proc, err = await _try_launch_ffmpeg(rtsp_url, seg, pattern, f"{storage}/{source}", iso_stamp)
-            if proc is not None:
-                break
-            last_err = err
-            if len(rtsp_candidates) > 1:
-                logger.warning("RTSP source %s failed (%s), trying next", source, err[:200])
-        else:
-            return {"success": False, "message": last_err, "recording": False}
-
-        global _stderr_task, _recording_active
-        _stderr_task = asyncio.create_task(_drain_stderr(proc))
-        _process = proc
-        _recording_active = True
-        _liveness_task = asyncio.create_task(_liveness_monitor(pattern, seg))
-        _append_manifest(out_dir, {
-            "event": "start",
-            "time_utc": iso_stamp,
-            "file": Path(pattern).name,
-            "source": source,
-            "codec": settings.ipcam_video_codec or "copy",
-            "segment_s": seg,
-            "storage": storage,
-        })
+        out_root, storage = _output_dir()
+        # Reuse the dive-scoped stamp if one already exists so a
+        # descent -> (stop) -> on_bottom transition (or a finalize-less
+        # restart) keeps writing under the same radcam_<stamp>_... prefix.
+        # Only finalize clears _last_base_stamp.
+        stamp = _last_base_stamp or datetime.now(tz=timezone.utc).strftime(
+            "%Y%m%d_%H%M%S",
+        )
+        # All output for this dive (segments, snapshots, finalized MP4s,
+        # and the manifest) goes into <root>/dive_<stamp>/ so each dive
+        # is isolated in its own folder.  Created on demand.
+        out_dir = _dive_dir(out_root, stamp)
+        # Claim a part-index range past anything the prior session for
+        # this stamp already wrote.  Without this, splitmuxsink's
+        # internal fragment_id (which also restarts at 0) plus our
+        # _current_part both reset, and a stop -> start cycle would
+        # overwrite the previous cycle's _part00_00000.ts.
+        initial_part = _session_part_offset
+        # Bump the dive-scoped cycle counter so this ipcam_start/stop
+        # cycle gets its own ``cyc<CC>`` tag, distinct from any prior
+        # cycle in the same dive.  All .ts files this session writes
+        # (including those produced by mid-cycle watchdog rebuilds)
+        # share this number, so finalize can stitch them losslessly
+        # into one MP4 per cycle without any timing heuristic.
+        _dive_cycle_seq += 1
+        cycle_seq = _dive_cycle_seq
+        sess = RecordingSession(
+            rtsp_url=rtsp_url,
+            segment_s=seg,
+            out_dir=out_dir,
+            storage_label=storage,
+            base_stamp=stamp,
+            phase=phase_label,
+            initial_part=initial_part,
+            cycle_seq=cycle_seq,
+        )
+        sess.start()
+        _session = sess
+        _last_base_stamp = stamp
+        logger.info(
+            "RECORD session started base=%s phase=%s cyc=%02d storage=%s "
+            "rtsp=%s seg=%ds",
+            stamp, phase_label, cycle_seq, storage, source_label, seg,
+        )
         return {
             "success": True,
             "recording": True,
-            "output_pattern": pattern,
+            "base_stamp": stamp,
+            "phase": phase_label,
+            "cycle_seq": cycle_seq,
             "output_directory": str(out_dir),
             "storage": storage,
             "segment_seconds": seg,
-            "rtsp_source": source,
+            "rtsp_source": source_label,
         }
+
+
+async def rotate_to_phase(
+    new_phase: str | None, segment_seconds: int | None = None,
+) -> dict:
+    """Module-level helper mirroring :meth:`RecordingSession.rotate_to_phase`.
+
+    ``segment_seconds`` (when supplied) updates the live splitmuxsink's
+    max segment time so the Lua can switch to 5-minute chunking on the
+    descent->bottom rotation in CONTINUOUS mode and restore the larger
+    default on the bottom->ascent rotation.
+
+    Returns ``{"success": False, "reason": "not_recording"}`` if no
+    session is currently live.  This is the entry point wired to the
+    ``POST /rec/rotate`` HTTP route used by the Lua dive script.
+    """
+    new_phase_label = sanitize_phase(new_phase)
+    sess = _session
+    if sess is None or not sess.is_alive():
+        return {
+            "success": False, "reason": "not_recording",
+            "to_phase": new_phase_label,
+        }
+    return await sess.rotate_to_phase(
+        new_phase_label, segment_seconds=segment_seconds,
+    )
 
 
 async def stop_recording() -> dict:
-    """Signal ffmpeg to finalize segments (SIGINT), then kill if needed."""
-    global _process, _recording_active, _liveness_task
+    global _session, _session_part_offset
+    async with _state_lock:
+        sess = _session
+        _session = None
+        if sess is None or not sess.is_alive():
+            logger.info("RECORD stop called with no active session")
+            return {"success": True, "recording": False,
+                    "message": "Was not recording"}
+        await sess.stop()
+        # Reserve every part index this session used (initial_part
+        # through _current_part) so the next session in the same dive
+        # stamp picks up where this one left off.  Without this bump,
+        # the next start_recording would re-use part00 and clobber the
+        # files this session just produced.
+        _session_part_offset = sess._current_part + 1
+        logger.info(
+            "RECORD stop completed; restarts=%d rotations=%d last_exit=%s "
+            "next_part_offset=%d",
+            sess.restart_count, sess.rotation_count, sess.last_exit,
+            _session_part_offset,
+        )
+        return {
+            "success": True,
+            "recording": False,
+            "base_stamp": sess.base_stamp,
+            "restarts": sess.restart_count,
+            "rotations": sess.rotation_count,
+            "phases": list(sess._last_phases),
+            "last_exit": sess.last_exit,
+        }
 
-    if _liveness_task is not None:
-        _liveness_task.cancel()
-        _liveness_task = None
 
-    async with _lock:
-        _recording_active = False
-        pattern = _last_pattern
-        proc = _process
-        _process = None
-        if proc is None or proc.returncode is not None:
-            return {"success": True, "recording": False, "message": "Was not recording"}
+def is_recording() -> bool:
+    """Synchronous helper: True iff a recording session is currently live.
 
-        try:
-            proc.send_signal(signal.SIGINT)
-        except ProcessLookupError:
-            return {"success": True, "recording": False}
+    Used by ``camera`` and ``routes/sensors`` to skip snapshot capture
+    while the recorder owns the camera's RTSP session.
+    """
+    sess = _session
+    return sess is not None and sess.is_alive()
 
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=12.0)
-        except asyncio.TimeoutError:
-            logger.warning("ffmpeg did not exit after SIGINT, killing")
-            try:
-                proc.kill()
-                await proc.wait()
-            except ProcessLookupError:
-                pass
 
-        if pattern:
-            first = Path(pattern.replace("%03d", "000"))
-            size = 0
-            try:
-                if first.exists():
-                    size = first.stat().st_size
-            except OSError:
-                pass
-            _append_manifest(first.parent, {
-                "event": "stop",
-                "time_utc": datetime.now(tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
-                "file": Path(pattern).name,
-                "size_bytes": size,
-            })
+def last_base_stamp() -> str | None:
+    """Most recent session's base_stamp, preserved across stop_recording().
 
-        return {"success": True, "recording": False}
+    Used by ``/api/v1/dive/finalize`` to resolve the dive's files when
+    the caller doesn't pass an explicit ``stamp`` query parameter.
+    """
+    return _last_base_stamp
+
+
+def _ensure_dive_stamp() -> str:
+    """Return the current dive's base_stamp, allocating one if missing.
+
+    TIMELAPSE mode calls ``/rec/snapshot`` without ever starting a
+    recording session, so ``_last_base_stamp`` may be unset when the
+    first snapshot of a dive is taken.  Allocate one on demand and
+    reuse it for all snapshots in the same dive (until finalize clears
+    it).
+    """
+    global _last_base_stamp
+    if _last_base_stamp is None:
+        _last_base_stamp = datetime.now(tz=timezone.utc).strftime("%Y%m%d_%H%M%S")
+    return _last_base_stamp
+
+
+def _next_snapshot_seq(stamp: str, phase: str) -> int:
+    key = (stamp, phase)
+    seq = _snapshot_seqs.get(key, 0) + 1
+    _snapshot_seqs[key] = seq
+    return seq
+
+
+def clear_snapshot_state() -> None:
+    """Reset snapshot counters, dive-scoped stamp, part offset, and cycle seq.
+
+    Called by ``/api/v1/dive/finalize`` so the next dive allocates a
+    fresh ``_last_base_stamp`` on its first start_recording / snapshot,
+    snapshot seq counters start at 1 again, the next session starts
+    at part00 instead of inheriting the prior dive's offset, and the
+    next session's first ``ipcam_start`` produces ``cyc01`` rather
+    than continuing the prior dive's cycle counter.
+    """
+    global _last_base_stamp, _session_part_offset, _dive_cycle_seq
+    _snapshot_seqs.clear()
+    _last_base_stamp = None
+    _session_part_offset = 0
+    _dive_cycle_seq = 0
+
+
+async def _fetch_camera_jpeg() -> tuple[bytes | None, str]:
+    """GET a single JPEG straight from the IP camera at IPCAM_SNAPSHOT_URL.
+
+    No MCM, no auth, no ffmpeg.  Just a plain HTTP GET against the
+    camera's built-in snapshot CGI.  The RadCam returns a fresh 4K
+    JPEG (matching the operator-configured "snap" resolution and
+    quality) in roughly 200 ms with no authentication required.
+    Times out after :data:`_SNAPSHOT_TIMEOUT_S` seconds and tolerates
+    minor connection errors by returning ``(None, message)`` so the
+    caller can decide what to do.
+    """
+    import httpx
+    try:
+        async with httpx.AsyncClient(timeout=_SNAPSHOT_TIMEOUT_S) as client:
+            resp = await client.get(IPCAM_SNAPSHOT_URL)
+    except Exception as e:
+        return None, f"http_error: {e}"
+    if resp.status_code != 200:
+        return None, f"http_status_{resp.status_code}"
+    ctype = resp.headers.get("content-type", "")
+    if not ctype.startswith("image"):
+        return None, f"unexpected_content_type: {ctype!r}"
+    if not resp.content or not resp.content.startswith(b"\xff\xd8"):
+        return None, "not_jpeg_magic"
+    return resp.content, "ok"
+
+
+async def take_phase_snapshot(phase: str | None) -> dict:
+    """Capture a single JPEG from the RTSP camera and save it under
+    ``<recordings>/radcam_<stamp>_<phase>_<seq>.jpg``.
+
+    This is the TIMELAPSE primitive driven by the Lua dive script.
+    Returns ``success=False, reason="recorder_active"`` (with an HTTP
+    status hint of 409) when the recorder pipeline is alive -- the
+    camera only supports one RTSP session at a time, so snapshot and
+    recording are mutually exclusive.
+
+    The Lua is expected to call :func:`stop_recording` first if it
+    wants to take snapshots during a previously-recording phase.
+    """
+    phase_label = sanitize_phase(phase)
+    if is_recording():
+        return {
+            "success": False,
+            "reason": "recorder_active",
+            "message": (
+                "Cannot take a snapshot while the IP camera recorder is "
+                "active (camera allows only one RTSP session)"
+            ),
+            "http_status": 409,
+        }
+
+    out_root, storage = _output_dir()
+    stamp = _ensure_dive_stamp()
+    out_dir = _dive_dir(out_root, stamp)
+    seq = _next_snapshot_seq(stamp, phase_label)
+    filename = f"radcam_{stamp}_{phase_label}_{seq:05d}.jpg"
+    path = out_dir / filename
+
+    jpeg, reason = await _fetch_camera_jpeg()
+    if jpeg is None:
+        logger.warning("SNAPSHOT fetch failed (%s) url=%s",
+                       reason, IPCAM_SNAPSHOT_URL)
+        return {
+            "success": False, "reason": "snapshot_failed",
+            "message": f"Camera snapshot failed: {reason}",
+            "url": IPCAM_SNAPSHOT_URL,
+            "http_status": 502,
+        }
+
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+        path.write_bytes(jpeg)
+    except Exception as e:
+        logger.exception("SNAPSHOT write failed: %s", path)
+        return {
+            "success": False, "reason": "write_failed",
+            "message": str(e), "http_status": 500,
+        }
+
+    logger.info(
+        "SNAPSHOT saved %s (%d bytes, phase=%s, seq=%d)",
+        path, len(jpeg), phase_label, seq,
+    )
+    return {
+        "success": True,
+        "path": str(path),
+        "filename": filename,
+        "base_stamp": stamp,
+        "phase": phase_label,
+        "seq": seq,
+        "size_bytes": len(jpeg),
+        "storage": storage,
+    }
 
 
 async def recording_status() -> dict:
-    """Return whether the recorder subprocess is alive."""
-    global _process
-    async with _lock:
-        alive = _process is not None and _process.returncode is None
-        rc = _process.returncode if _process is not None else None
-        return {
-            "recording": alive,
-            "returncode": rc,
-            "output_pattern": _last_pattern,
-            "usb": usb_storage.get_status(),
-        }
+    sess = _session
+    alive = sess is not None and sess.is_alive()
+    base_stamp = sess.base_stamp if sess is not None else None
+    pattern = sess.last_pattern if sess is not None else None
+    restarts = sess.restart_count if sess is not None else 0
+    last_exit = sess.last_exit if sess is not None else None
+    phase = sess.current_phase if sess is not None else None
+    rotations = sess.rotation_count if sess is not None else 0
+    return {
+        "recording": alive,
+        "base_stamp": base_stamp,
+        "output_pattern": pattern,
+        "phase": phase,
+        "rotations": rotations,
+        "pid": None,  # in-process pipeline; field kept for API back-compat
+        "restarts": restarts,
+        "last_exit": last_exit,
+        "usb": usb_storage.get_status(),
+    }

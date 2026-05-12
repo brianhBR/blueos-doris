@@ -27,6 +27,7 @@ from .routes import (
     register_system_routes,
 )
 from .services.external_storage import start_external_storage_setup
+from .services.storage import DATA_ROOT
 from .services.usb_storage import start_usb_storage_probe
 from .services.frame import FrameService
 from .services.mdns import restart_avahi, setup_doris_local, start_hotspot_dns
@@ -202,6 +203,37 @@ def create_app() -> Robyn:
 
         logger.info("DORIS backend startup complete")
         asyncio.get_event_loop().create_task(_restart_autopilot(logger))
+
+    # ── Streaming roots for media downloads ─────────────────────────
+    #
+    # ``/api/v1/media/download?path=…`` issues a 302 to one of these
+    # mounts, which are served by Robyn via ``actix_files::Files`` —
+    # true async streaming with HTTP Range support and zero buffering on
+    # the Pi. This is the only file path in Robyn 0.76 that doesn't
+    # ``read_to_end`` the entire file before responding (FileResponse
+    # does, which OOMs on multi-GB recordings).
+    #
+    # Each call to ``serve_directory`` is registered at startup; actix
+    # resolves the on-disk path at request time, so files appearing on
+    # the USB stick after boot are served correctly. Roots are created
+    # if they don't exist so the registration never fails.
+    for streaming_route, streaming_dir in (
+        ("/api/v1/media/raw/internal", str(DATA_ROOT)),
+        ("/api/v1/media/raw/usb", str(settings.usb_mount_point.rstrip("/") or "/mnt/usb")),
+        ("/api/v1/media/raw/host_mnt", "/mnt"),
+    ):
+        try:
+            os.makedirs(streaming_dir, exist_ok=True)
+        except OSError:
+            # /mnt may be a read-only mountpoint when no USB is plugged in;
+            # actix-files will just 404 for files that aren't there yet, so
+            # the missing mkdir is harmless.
+            pass
+        app.serve_directory(
+            route=streaming_route,
+            directory_path=streaming_dir,
+            show_files_listing=False,
+        )
 
     # Serve frontend static files if they exist
     # Check multiple possible locations for frontend dist

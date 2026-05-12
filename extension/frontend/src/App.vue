@@ -16,6 +16,7 @@ import Location from './components/Location.vue'
 import AllMissions from './components/AllMissions.vue'
 import ViewMediaScreen from './components/ViewMediaScreen.vue'
 import ArtemisFlash from './components/ArtemisFlash.vue'
+import DownloadToast from './components/DownloadToast.vue'
 
 const currentScreen = ref<Screen>('home')
 const previousScreen = ref<Screen>('media')
@@ -237,5 +238,7 @@ const setConnected = (connected: boolean) => {
     </main>
 
     <Footer />
+
+    <DownloadToast />
   </div>
 </template>

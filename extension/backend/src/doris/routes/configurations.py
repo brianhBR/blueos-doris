@@ -1,12 +1,40 @@
 """Configuration API routes."""
 
 import json
+import logging
 from urllib.parse import unquote
 
 from robyn import Response, Robyn
 
-from ..models.configuration import DeploymentConfiguration
+from ..models.configuration import CameraType, DeploymentConfiguration
 from ..services.storage import StorageService
+
+logger = logging.getLogger(__name__)
+
+
+def _coerce_non_bottom_camera_modes(config: DeploymentConfiguration) -> None:
+    """Coerce descent/ascent camera modes to CONTINUOUS_VIDEO if they are set
+    to TIMELAPSE or VIDEO_INTERVAL.
+
+    The Lua dispatcher only implements timelapse + video-interval for the
+    bottom phase (see scripts/doris.lua and services/dive._ipcam_phase_enabled,
+    which only returns 1.0 when camera_type == CONTINUOUS_VIDEO). For descent
+    and ascent it only honours a single record-the-whole-phase boolean. The UI
+    now hides those modes for non-bottom phases, but coerce here as a
+    belt-and-braces guard against direct API submissions of legacy or
+    hand-crafted payloads.
+    """
+    invalid_modes = (CameraType.TIMELAPSE, CameraType.VIDEO_INTERVAL)
+    for phase_name in ("descent", "ascent"):
+        phase = getattr(config, phase_name)
+        if phase.camera.camera_type in invalid_modes:
+            logger.warning(
+                "Coercing %s camera_type %s -> continuous-video "
+                "(only supported for bottom phase)",
+                phase_name,
+                phase.camera.camera_type,
+            )
+            phase.camera.camera_type = CameraType.CONTINUOUS_VIDEO
 
 
 def register_configuration_routes(app: Robyn) -> None:
@@ -61,6 +89,7 @@ def register_configuration_routes(app: Robyn) -> None:
         try:
             data = json.loads(request.body)
             config = DeploymentConfiguration.model_validate(data)
+            _coerce_non_bottom_camera_modes(config)
             saved = await storage_service.save_configuration(config)
             return saved.model_dump_json()
         except json.JSONDecodeError:

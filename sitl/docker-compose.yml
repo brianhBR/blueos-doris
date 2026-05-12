@@ -16,6 +16,19 @@ services:
       - "host.docker.internal:host-gateway"
     restart: unless-stopped
 
+  # ── RTSP test server ──────────────────────────────────────────────────────
+  # Serves a videotestsrc-backed H.264 stream so the extension's
+  # in-process ip_camera_recorder pipeline (splitmuxsink, split-now
+  # rotation) can be validated end-to-end without a real RadCam.
+  # Point the extension at it via DORIS_IPCAM_RTSP_URL below.
+  rtsp-server:
+    build:
+      context: ./rtsp-server
+      dockerfile: Dockerfile
+    ports:
+      - "8554:8554"
+    restart: unless-stopped
+
   # ── DORIS extension ───────────────────────────────────────────────────────
   # Full BlueOS extension backend + Vue frontend.
   doris:
@@ -26,12 +39,21 @@ services:
       - "8095:8095"
     environment:
       - DORIS_BLUEOS_ADDRESS=http://mavlink2rest
+      # Override the hardcoded RadCam URL so the in-process Gst
+      # recorder talks to the sidecar test server instead.  The Lua
+      # dive script's POST /rec/start still works unchanged.
+      - DORIS_IPCAM_RTSP_URL=rtsp://rtsp-server:8554/test
     extra_hosts:
       - "host.docker.internal:host-gateway"
     volumes:
       - ./data/configurations:/tmp/storage/configurations
       - ./data/dives:/tmp/storage/dives
       - ./data/userdata:/tmp/storage/userdata
+      # Surface the recordings dir on the host so the operator /
+      # test harness can inspect the per-phase .mp4 output of
+      # /api/v1/dive/finalize without exec'ing into the container.
+      - ./data/recordings:/tmp/storage/recordings
     depends_on:
       - mavlink2rest
+      - rtsp-server
     restart: unless-stopped
