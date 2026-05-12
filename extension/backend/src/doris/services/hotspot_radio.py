@@ -61,12 +61,13 @@ Even though the ht_capab line asks for ``[HT40+]``, hostapd is allowed
 (and required by 802.11n on 2.4 GHz) to fall back to HT20 if its OBSS
 coexistence scan finds neighbouring BSSes overlapping the would-be 40
 MHz band - this gives us "try HT40, fall back to HT20" for free. In
-practice on the bundled ``88x2bu`` driver HT40 never actually sticks on
-2.4 GHz (see deferred-work note below), so the asked-for HT40 always
-downgrades and we run HT20-with-full-caps - still about 3x stock
-throughput because the rich ``ht_capab`` flags add SHORT-GI, LDPC,
-RX-STBC, MAX-AMSDU and DSSS/CCK aggregation on top of the bare HT20
-``wifi-manager`` ships.
+practice the bundled ``88x2bu`` driver also silently downgrades HT40
+to HT20 in AP mode even in a clean OBSS environment (see the inline
+comment on :data:`_CREATE_AP_24GHZ_FLAGS_TEMPLATE` below for the
+empirical proof), so we always end up running HT20-with-full-caps -
+still about 3x stock throughput because the rich ``ht_capab`` flags
+add SHORT-GI, LDPC, RX-STBC, MAX-AMSDU and DSSS/CCK aggregation on
+top of the bare HT20 ``wifi-manager`` ships.
 
 Channel auto-selection
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -80,8 +81,8 @@ runs each time :func:`setup_hotspot_radio` runs, so a vehicle that
 boots in a new RF environment ends up on a sensible channel without
 manual intervention.
 
-Measurements (channel 6, this radio + AC1200 Techkey antenna)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+Measurements (channel 6, this radio + DORIS potted external antenna)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Stock ``wifi-manager`` (no ``ht_capab``):     ~25-30 Mbps real TCP.
 This patch (HT20 + full caps, channel 6):     ~82 Mbps down / 77 Mbps up
 (``iperf3 -c 192.168.42.1 -p 5201 -t 20 -P 4``, May 2026, indoor
@@ -90,55 +91,32 @@ is 144 Mbps and real-world TCP typically caps at 55-65% of PHY, so
 ~80 Mbps is at the achievable ceiling - the link is clean, the
 remaining headroom would require a driver that can keep HT40 alive.
 
-5 GHz investigation notes (May 2026, deferred)
-----------------------------------------------
-The 5 GHz patch encoded above (``-c 36``) does *not* work on the
-``88x2bu`` driver we ship (``morrownr/88x2bu-20210702`` @
-``bd7c7eb9d``). Findings, in case we pick this back up:
+Why no 5 GHz mode
+~~~~~~~~~~~~~~~~~
+5 GHz is intentionally not attempted. Two independent blockers:
 
-* **Channel 36 / UNII-1** (this patch): hostapd never reaches
-  ``AP-ENABLED``. The driver hard-rejects beacon programming with::
+  1. **The DORIS potted external antenna is single-band 2.4 GHz.** Even
+     if the software produced a valid 5 GHz beacon the RF would not
+     radiate efficiently, so usable 5 GHz coverage is impossible
+     without an antenna swap.
+  2. **The bundled ``88x2bu`` driver doesn't reliably do 5 GHz AP
+     anyway.** May 2026 testing on ``morrownr/88x2bu-20210702`` showed
+     UNII-1 (ch 36-48) hard-rejected by the driver before any RF
+     transmit (``Failed to set beacon parameters`` / ``INTERFACE-
+     DISABLED``), and UNII-3 (ch 149) brought hostapd up but the AP
+     dropped within ~45 s in repeat runs. Same class of AP-mode
+     firmware-path issue as the 2.4 GHz HT40 downgrade documented at
+     :data:`_CREATE_AP_24GHZ_FLAGS_TEMPLATE` below.
 
-      uap0: INTERFACE-DISABLED
-      Failed to set beacon parameters
-      uap0: Could not connect to kernel driver
-      Interface initialization failed
-
-  This is a software-side ``nl80211`` rejection (no RF energy has been
-  transmitted yet), consistent with the well-known FCC indoor-only /
-  UNII-1 restriction baked into older Realtek out-of-tree drivers.
-  ``--ht_capab`` / ``--vht_capab`` / 20 MHz fallback do *not* change the
-  outcome on channel 36.
-
-* **Channels 40, 44, 48 (UNII-1)**: not exhaustively tested but expected
-  to share channel 36's fate (same regulatory regime).
-
-* **Channel 149 / UNII-3** with the same HT40+VHT flags: hostapd reaches
-  ``AP-ENABLED`` cleanly, the radio broadcasts at channel 149 / 40 MHz /
-  13 dBm. Stability across longer runs is *not yet confirmed* - one
-  90 s run dropped the AP around the 45 s mark, but a separate leftover
-  test stayed up for several minutes. Needs a clean, longer repro before
-  shipping. Channels 153, 157, 161, 165 untested.
-
-* The radio itself (``iw phy phy1 info``) advertises 5 GHz AP capability,
-  HT40, VHT80, RX LDPC, short-GI on all relevant 5 GHz frequencies, so
-  this isn't a hardware limit - it's the driver's AP-mode firmware path.
-
-Paths forward when we resume:
-
-  1. Switch ``-c 36`` to ``-c 149`` and re-validate stability for >5 min.
-  2. Or update the bundled ``88x2bu.ko`` to a newer ``morrownr`` commit
-     (current build is 2021-07-02) and re-test channel 36.
-  3. RF / antenna sanity check: even if the failure mode above is
-     software, the AC1200 Techkey antenna may not be well tuned across
-     the full 5 GHz range, so picking a channel that *also* matches the
-     antenna's actual SWR sweet spot is worth doing.
-
-The 5 GHz attempt has since been replaced by the 2.4 GHz HT20-with-
-full-caps patch described above (:func:`_install_create_ap_speed_patch`)
-which delivers ~3x stock throughput on the same driver and *does* keep
-the AP stable. The findings here are preserved for whenever the driver
-is updated or a different 5 GHz-capable radio is dropped in.
+Anyone resuming 5 GHz work needs both (a) a dual-band antenna with
+characterised 5 GHz SWR and (b) a different driver or radio that
+keeps an AP-mode 5 GHz BSS up under sustained load. Until then,
+2.4 GHz HT20 with the full ``ht_capab`` set above is the achievable
+ceiling on this hardware. The legacy-patch regex
+:data:`_DORIS_PATCH_BLOCK_RE` still recognises and strips the old
+``--freq-band 5`` / ``--ieee80211ac`` / ``--vht_capab`` flags so users
+upgrading from a previous extension that wrote a 5 GHz patch are
+cleanly migrated to the 2.4 GHz config.
 
 Boot order
 ----------
@@ -148,8 +126,9 @@ Boot order
   3. ``blueos-bootstrap`` reads ``startup.json``, mounts the patched
      ``networkmanager.py`` over the stock one, then starts ``blueos-core``.
   4. ``wifi-manager`` sees ``uap0`` already exists -> runs ``create_ap``
-     on it with the 5 GHz / 802.11ac flags -> hostapd brings the AP up on
-     channel 36, HT40, with VHT MCS rates available.
+     on it with the 2.4 GHz HT20-with-full-caps flags installed at the
+     previous DORIS extension start -> hostapd brings the AP up on the
+     auto-picked channel (1, 6 or 11) with the rich ``ht_capab`` set.
 
 Result: hotspot broadcast from the Realtek's external antenna at 2.4
 GHz HT20 with the full set of HT capabilities the radio supports;
@@ -214,8 +193,9 @@ _CREATE_AP_ANCHOR = (
 # wifi-manager).  hostapd reached ``state=ENABLED`` cleanly but reported
 # ``secondary_channel=0`` and ``iw dev uap0 info`` showed
 # ``width: 20 MHz`` - i.e. the downgrade is happening below hostapd's
-# OBSS coexistence check, in the driver itself.  Same class of issue as
-# the 5 GHz failure documented below.
+# OBSS coexistence check, in the driver itself.  Same class of
+# AP-mode firmware-path issue as the 5 GHz failure noted in the module
+# docstring ("Why no 5 GHz mode" section).
 #
 # We still ask for ``[HT40+]`` in the ht_capab line because (a) it
 # advertises the wider capability to clients that might benefit if a
