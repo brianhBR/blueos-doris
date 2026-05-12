@@ -64,20 +64,31 @@ const storageUsed = computed(() => storage.value?.used_percent ?? systemStatus.v
 const storageTotal = computed(() => storage.value?.total_gb ?? systemStatus.value?.storage_total_gb ?? 100)
 const storageAvailableGb = computed(() => storage.value?.available_gb ?? (storageTotal.value - (storage.value?.used_gb ?? systemStatus.value?.storage_used_gb ?? 0)))
 const storageType = computed(() => storage.value?.storage_type ?? 'SD Card')
+// Pack: 2× Blue Robotics 10 Ah 4S Li-ion packs in parallel (20 Ah / 296 Wh).
+// Keep these in sync with the backend (system.py) and the dive planner
+// (MissionProgramming.vue).
+const BATTERY_PACK_COUNT = 2
+const BATTERY_PACK_AH = 10
+const BATTERY_NOMINAL_V = 14.8
+const BATTERY_TOTAL_WH = BATTERY_PACK_COUNT * BATTERY_PACK_AH * BATTERY_NOMINAL_V
+const BATTERY_RESERVE_PCT = 15
+
 const batteryTimeRemaining = computed(() => {
   const powerRPi5_W = 15
   const powerRadCAM_W = 5
   const powerPerLumen_W = 15
   const lumenCount = 2
-  const batteryCapacity_Wh = 266
 
   const totalPower_W = powerRPi5_W + powerRadCAM_W + (powerPerLumen_W * lumenCount)
-  const remainingCapacity_Wh = batteryCapacity_Wh * (batteryLevel.value / 100)
-  const hoursRemaining = totalPower_W > 0 ? remainingCapacity_Wh / totalPower_W : 0
+  const usablePct = Math.max(0, batteryLevel.value - BATTERY_RESERVE_PCT)
+  const usableCapacity_Wh = BATTERY_TOTAL_WH * (usablePct / 100)
+  const hoursRemaining = totalPower_W > 0 ? usableCapacity_Wh / totalPower_W : 0
   const h = Math.floor(hoursRemaining)
   const m = Math.round((hoursRemaining - h) * 60)
   return `${h}h ${m}m`
 })
+
+const batteryEstimateAssumption = `Assumes ${BATTERY_PACK_COUNT}× ${BATTERY_PACK_AH} Ah Blue Robotics 4S packs (${BATTERY_TOTAL_WH.toFixed(0)} Wh) at ~50 W draw, ${BATTERY_RESERVE_PCT}% reserve held back`
 
 const gpsStatus = computed<'active' | 'searching' | 'inactive'>(() => {
   if (!location.value) return 'inactive'
@@ -834,7 +845,12 @@ const formatReleaseTime = (date: Date) => {
             }"
           />
         </div>
-        <p class="text-sm mt-2" style="color: #96EEF2">Estimated: {{ batteryTimeRemaining }} remaining</p>
+        <p class="text-sm mt-2" style="color: #96EEF2" :title="batteryEstimateAssumption">
+          Estimated: {{ batteryTimeRemaining }} remaining
+        </p>
+        <p class="text-xs mt-1 opacity-75" style="color: #96EEF2">
+          2× 10 Ah 4S packs · 50 W draw · 15% reserve
+        </p>
       </div>
 
       <!-- Storage Available -->

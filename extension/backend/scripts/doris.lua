@@ -901,6 +901,13 @@ function update()
             return update, UPDATE_INTERVAL_MS
         end
     else
+        -- Test just ended (DORIS_LGT_TST went back to 0). In CONFIG state no
+        -- dive branch calls update_lights(), so the last RC9 override stays
+        -- latched and the light stays on. Drive RC9 down once on the
+        -- transition so the light actually turns off.
+        if lgt_tst_start_ms ~= 0 and RC9 then
+            RC9:set_override(LIGHT_PWM_MIN)
+        end
         lgt_tst_start_ms = 0
     end
 
