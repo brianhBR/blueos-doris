@@ -346,19 +346,46 @@ _HOSTFILE_STAGING = "/tmp/.doris_hostfile_stage"
 
 
 async def _write_host_file(path: str, content: str) -> bool:
-    """Write *content* to *path* on the host atomically.
+    """Write *content* to *path* on the host, preserving the inode in place.
 
     Streams the payload as base64 in small chunks appended to a staging
-    file, then atomically renames into place under ``sudo``. The previous
-    implementation used a single ``sudo tee <<HEREDOC`` shell command sent
-    through the Commander API's query string, which hit nginx's request
-    URI length limit (around 8 KB) for anything bigger than a few KB and
-    silently failed with HTTP 400 - notably the ~25 KB patched
-    ``networkmanager.py``. Chunked base64 keeps each request well under
-    the limit and works for any file size.
+    file, decodes the staging into a verified ``.doris.tmp`` binary,
+    then writes the verified bytes *through* the destination path with
+    a final ``cat tmp > path`` redirect. The redirect opens ``path``
+    with ``O_WRONLY|O_CREAT|O_TRUNC``, which truncates and rewrites the
+    existing inode in place when the file already exists - bind mounts
+    that target this inode (notably the wifi override mount in
+    ``blueos-core``) keep seeing the new content with no remount.
+
+    Why not the obvious ``mv tmp path``?  ``mv`` always allocates a
+    new inode; the old inode lingers as long as something else holds
+    it open. ``blueos-core``'s bind mount is established at container
+    start against the host file's inode at that moment, so after a
+    ``mv`` the in-container view still points at the previous
+    (now-orphaned) inode while the host filesystem path resolves to
+    the fresh one. We hit this in May 2026 when ``setup_hotspot_radio``
+    rewrote a corrupt override on the host but ``wifi-manager`` kept
+    crash-looping for hours because its bind-mounted view was still
+    the corrupt orphan inode. Symptom on the host:
+    ``stat -c %i host_path != stat -c %i container_path`` even though
+    the bind-mount config in ``startup.json`` is correct.
+
+    The previous implementation used a single ``sudo tee <<HEREDOC``
+    shell command sent through the Commander API's query string, which
+    hit nginx's request URI length limit (around 8 KB) for anything
+    bigger than a few KB and silently failed with HTTP 400 - notably
+    the ~25 KB patched ``networkmanager.py``. Chunked base64 keeps each
+    request well under the limit and works for any file size.
 
     Skips the write entirely if the destination already has the same
     content, avoiding unnecessary inotify churn.
+
+    Atomicity caveat: trading ``mv`` for an in-place truncate+rewrite
+    means a reader hitting *path* during the (sub-ms) ``cat`` window
+    could observe a partially-written file. Acceptable for our
+    consumers - ``wifi-manager`` reads its bind-mounted file once at
+    process start; udev and NetworkManager configs are reloaded by
+    explicit signals after this function returns.
     """
     existing = await _read_host_file(path)
     if existing is not None and existing.strip() == content.strip():
@@ -388,17 +415,21 @@ async def _write_host_file(path: str, content: str) -> bool:
             await _run_host_command(f"rm -f {_HOSTFILE_STAGING}")
             return False
 
-    # Atomic install: decode-to-temp, rename, clean up staging. The
-    # redirect must live inside the sudo'd shell so root owns the target.
+    # Install in two steps under one sudo'd shell:
+    #   1. base64 -d into a verified ``.doris.tmp`` (any decode error
+    #      stops here, leaving ``path`` untouched).
+    #   2. cat ``.doris.tmp > path``: ``>`` opens ``path`` with
+    #      O_TRUNC, preserving the inode if the file exists - which
+    #      is what keeps active bind mounts seeing the new content.
     final_cmd = (
         f"sudo bash -c 'base64 -d {_HOSTFILE_STAGING} > {path}.doris.tmp"
-        f" && mv {path}.doris.tmp {path}"
-        f" && rm -f {_HOSTFILE_STAGING}'"
+        f" && cat {path}.doris.tmp > {path}"
+        f" && rm -f {path}.doris.tmp {_HOSTFILE_STAGING}'"
     )
     ok, _ = await _run_host_command(final_cmd)
     if ok:
         logger.info(
-            "Wrote %s on host (%d bytes via %d base64 chunks)",
+            "Wrote %s on host (%d bytes via %d base64 chunks, inode-preserving)",
             path, len(content), total_chunks,
         )
     else:
@@ -578,6 +609,18 @@ async def _install_create_ap_speed_patch() -> None:
     channel) is stripped first via :func:`_strip_doris_patch`, then
     the current canonical block is applied. :func:`_write_host_file`
     short-circuits when the host file already matches.
+
+    Self-healing on existing corruption: if the bind-mounted source we
+    read here is not valid Python, an earlier DORIS extension version
+    (or an interrupted write) must have left a corrupt file on the host.
+    Patching a corrupt source and writing it back would just re-stamp
+    the corruption on every boot - which is exactly how we ended up in
+    a ``SyntaxError`` crash loop for ``wifi-manager`` in May 2026. So
+    we detect that case with :func:`ast.parse`, delete the host
+    override outright, and bail without writing. The next
+    ``blueos-core`` restart re-binds to the stock file from the image,
+    and the *next* :func:`setup_hotspot_radio` reads a clean baseline
+    and re-installs the patch correctly.
     """
     source = await _read_container_file(
         BLUEOS_CORE_CONTAINER, WIFI_OVERRIDE_CONTAINER_PATH
@@ -588,6 +631,23 @@ async def _install_create_ap_speed_patch() -> None:
             WIFI_OVERRIDE_CONTAINER_PATH,
             BLUEOS_CORE_CONTAINER,
         )
+        return
+
+    try:
+        ast.parse(source)
+    except SyntaxError as exc:
+        logger.warning(
+            "Bind-mounted %s is not valid Python (line %s: %s); a prior "
+            "DORIS write was corrupted. Removing host override %s so "
+            "blueos-core falls back to stock wifi-manager networkmanager.py "
+            "on next restart - the next DORIS run will re-patch from the "
+            "clean baseline.",
+            WIFI_OVERRIDE_CONTAINER_PATH,
+            exc.lineno,
+            exc.msg,
+            WIFI_OVERRIDE_HOST_PATH,
+        )
+        await _run_host_command(f"sudo rm -f {WIFI_OVERRIDE_HOST_PATH}")
         return
 
     if _CREATE_AP_ANCHOR not in source:
