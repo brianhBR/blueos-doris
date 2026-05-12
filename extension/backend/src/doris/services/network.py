@@ -1,18 +1,42 @@
 """Network/WiFi service."""
 
 import asyncio
+import json
 import logging
+from datetime import datetime, timezone
 from typing import Any
 
 from ..config import blueos_services
-from ..models.network import ConnectionStatus, NetworkCredentials, NetworkInfo, WifiNetwork
+from ..models.network import (
+    ConnectionStatus,
+    NetworkCredentials,
+    NetworkInfo,
+    WifiNetwork,
+    WlanLastAttempt,
+    WlanState,
+)
 from .base import BlueOSClient
 from .blueos.network import NetworkClient
+from .storage import DATA_ROOT
 
 logger = logging.getLogger(__name__)
 
 AP_WATCHDOG_INTERVAL_S = 60
 AP_WATCHDOG_SETTLE_S = 15
+
+# Intent file lives under DATA_ROOT (bind-mounted /tmp/storage/userdata
+# in production) so the last-attempt record survives container restarts
+# and can be shown to the user when they reconnect to the hotspot after
+# a failed switch attempt. The ``mode`` field is always reset to ``ap``
+# on backend startup regardless of what was previously persisted.
+WLAN_INTENT_FILE = DATA_ROOT / "network_intent.json"
+
+# Total wall time we'll wait for a STA association after flipping the
+# external radio out of hotspot mode. The mode change itself eats ~5-15s
+# (driver re-init), then the supplicant + DHCP add another ~5-20s on a
+# typical home router. 60s is a comfortable upper bound.
+STA_CONNECT_TIMEOUT_S = 60.0
+STA_POLL_INTERVAL_S = 2.0
 
 
 class NetworkService:
@@ -27,6 +51,15 @@ class NetworkService:
         self._linux2rest = BlueOSClient(blueos_services.linux2rest)
         self._cached_mac: str | None = None
         self._cached_serial: str | None = None
+
+        # WLAN AP<->STA switching state. Loaded lazily on first read so
+        # tests don't touch the filesystem just by instantiating the
+        # service. The lock guards against concurrent switch attempts —
+        # the user could spam the Connect button or two clients could
+        # race when both have the page open.
+        self._wlan_state: WlanState | None = None
+        self._wlan_switch_lock = asyncio.Lock()
+        self._wlan_switch_task: asyncio.Task[None] | None = None
 
     async def get_network_info(self) -> NetworkInfo:
         """Get current network information including device identity."""
@@ -473,11 +506,20 @@ class NetworkService:
         After a dive the vehicle loses all WiFi connections.  BlueOS /
         NetworkManager may not automatically restart the AP on wlan1.
         This watchdog detects that and brings it back.
+
+        Suppressed while WLAN intent is ``sta_pending`` or
+        ``sta_connected``: in those states the external radio is
+        intentionally *not* hosting an AP (it's associated to a client
+        WLAN), so re-asserting hotspot mode would tear down the user's
+        chosen connection.
         """
         await asyncio.sleep(AP_WATCHDOG_SETTLE_S)
         while True:
             await asyncio.sleep(AP_WATCHDOG_INTERVAL_S)
             try:
+                state = await self.get_wlan_state()
+                if state.mode != "ap":
+                    continue
                 iface = await self._get_secondary_interface_name()
                 if not iface:
                     continue
@@ -494,7 +536,293 @@ class NetworkService:
             except Exception as e:
                 logger.debug("AP watchdog check error: %s", e)
 
+    # ── WLAN AP <-> STA mode switching ───────────────────────────────
+    #
+    # On this hardware the *only* reliable radio when the vehicle is
+    # fully assembled is the external USB Realtek (renamed to ``uap0``
+    # by udev). It can be either an AP (hotspot mode) or a client (STA
+    # / "normal" mode) but not both at once. The user switches between
+    # them from the Network Setup tab; the AP is the safe default and
+    # is restored on every backend startup.
+
+    def _load_wlan_state(self) -> WlanState:
+        """Read the persisted intent file. ``mode`` is always force-reset
+        to ``ap`` on load — only ``last_attempt`` is kept across boots
+        for UX feedback."""
+        try:
+            raw = WLAN_INTENT_FILE.read_text()
+            data = json.loads(raw)
+            persisted = WlanState.model_validate(data)
+            return WlanState(mode="ap", last_attempt=persisted.last_attempt)
+        except FileNotFoundError:
+            return WlanState(mode="ap")
+        except Exception as e:
+            logger.warning("Could not load WLAN intent (%s); defaulting to ap", e)
+            return WlanState(mode="ap")
+
+    def _save_wlan_state(self, state: WlanState) -> None:
+        try:
+            WLAN_INTENT_FILE.parent.mkdir(parents=True, exist_ok=True)
+            WLAN_INTENT_FILE.write_text(state.model_dump_json(indent=2))
+        except OSError as e:
+            logger.warning("Could not persist WLAN intent: %s", e)
+
+    async def get_wlan_state(self) -> WlanState:
+        """Return the current AP/STA state, refreshing IP from the
+        WiFi Manager if we're in an STA mode."""
+        if self._wlan_state is None:
+            self._wlan_state = self._load_wlan_state()
+
+        state = self._wlan_state
+        if state.mode == "sta_connected":
+            try:
+                status = await self._client.get_status()
+                if status.get("state") == "connected":
+                    ip = status.get("ip_address")
+                    ssid = status.get("ssid") or state.target_ssid
+                    if ip != state.ip_address or ssid != state.target_ssid:
+                        state = state.model_copy(
+                            update={"ip_address": ip, "target_ssid": ssid}
+                        )
+                        self._wlan_state = state
+                else:
+                    # Connection dropped out from under us. The user
+                    # would otherwise see "connected" in the UI forever
+                    # while actually being unreachable.
+                    logger.warning(
+                        "STA connection lost (status=%s), treating as ap",
+                        status.get("state"),
+                    )
+                    state = WlanState(mode="ap", last_attempt=state.last_attempt)
+                    self._wlan_state = state
+                    self._save_wlan_state(state)
+            except Exception as e:
+                logger.debug("get_wlan_state status refresh failed: %s", e)
+
+        return state
+
+    async def reset_wlan_to_ap_on_boot(self) -> None:
+        """Force WLAN intent back to ``ap`` and proactively disconnect
+        any client association so NetworkManager can't quietly auto-join
+        a saved network behind our back. Called once at startup *after*
+        ``configure_hotspot()``.
+
+        Saved networks are *kept* (option (b)) so the user can pick a
+        previously-used SSID from the scan list and reconnect with one
+        click during the same session.
+        """
+        last_attempt: WlanLastAttempt | None = None
+        try:
+            persisted = self._load_wlan_state()
+            last_attempt = persisted.last_attempt
+        except Exception:
+            pass
+
+        try:
+            await self._client.disconnect()
+        except Exception as e:
+            logger.debug("Boot-time WLAN disconnect failed (likely no STA): %s", e)
+
+        self._wlan_state = WlanState(mode="ap", last_attempt=last_attempt)
+        self._save_wlan_state(self._wlan_state)
+        logger.info("WLAN intent reset to AP on startup")
+
+    async def begin_switch_to_sta(
+        self, ssid: str, password: str
+    ) -> WlanState:
+        """Initiate an asynchronous switch from AP mode to STA mode.
+
+        Returns immediately with ``mode=sta_pending``. The user's browser
+        will lose its AP connection within a few seconds of this call —
+        the actual outcome (success / failure) is recorded in the
+        persisted state file and surfaced via :meth:`get_wlan_state`.
+
+        Concurrent switch requests are rejected (returns the existing
+        in-flight state). To re-attempt after a failure, the previous
+        task must have completed.
+        """
+        if not ssid:
+            raise ValueError("ssid is required")
+
+        async with self._wlan_switch_lock:
+            current = await self.get_wlan_state()
+            if current.mode == "sta_pending":
+                return current
+            if (
+                self._wlan_switch_task is not None
+                and not self._wlan_switch_task.done()
+            ):
+                return current
+
+            new_state = WlanState(
+                mode="sta_pending",
+                target_ssid=ssid,
+                last_attempt=current.last_attempt,
+            )
+            self._wlan_state = new_state
+            self._save_wlan_state(new_state)
+            self._wlan_switch_task = asyncio.create_task(
+                self._run_switch_to_sta(ssid, password)
+            )
+            return new_state
+
+    async def begin_switch_to_ap(self) -> WlanState:
+        """Tear down any STA connection and put the external radio back
+        into hotspot mode. Same async pattern as :meth:`begin_switch_to_sta`
+        — the call returns immediately while the work runs in the
+        background.
+
+        Saved networks are kept (option (b)).
+        """
+        async with self._wlan_switch_lock:
+            current = await self.get_wlan_state()
+            if (
+                self._wlan_switch_task is not None
+                and not self._wlan_switch_task.done()
+            ):
+                return current
+            self._wlan_switch_task = asyncio.create_task(
+                self._run_switch_to_ap()
+            )
+            return current
+
+    async def _run_switch_to_sta(self, ssid: str, password: str) -> None:
+        """Background task that performs the AP -> STA flip."""
+        iface = await self._resolve_hotspot_interface_name()
+        if not iface:
+            logger.warning("No external WiFi interface; aborting STA switch")
+            self._record_failure(ssid, "External WiFi interface not found")
+            return
+
+        logger.info("Switching %s from AP to STA, target SSID=%r", iface, ssid)
+
+        try:
+            await self._client.set_interface_mode(iface, "normal", timeout=30.0)
+        except Exception as e:
+            logger.warning("Failed to switch %s to normal mode: %s", iface, e)
+            await self._restore_ap_after_failure(iface)
+            self._record_failure(ssid, f"Could not disable hotspot: {e}")
+            return
+
+        await asyncio.sleep(2)
+
+        try:
+            await self._client.connect(ssid, password, interface=iface)
+        except Exception as e:
+            logger.warning("Connect call to %r failed: %s", ssid, e)
+            await self._client.forget_network(ssid)
+            await self._restore_ap_after_failure(iface)
+            self._record_failure(ssid, f"Connect rejected: {e}")
+            return
+
+        deadline = asyncio.get_event_loop().time() + STA_CONNECT_TIMEOUT_S
+        last_status: dict[str, Any] = {}
+        while asyncio.get_event_loop().time() < deadline:
+            try:
+                last_status = await self._client.get_status()
+                if (
+                    last_status.get("state") == "connected"
+                    and last_status.get("ssid") == ssid
+                ):
+                    break
+            except Exception as e:
+                logger.debug("STA poll error: %s", e)
+            await asyncio.sleep(STA_POLL_INTERVAL_S)
+        else:
+            logger.warning(
+                "STA association to %r timed out after %.0fs (last status=%s)",
+                ssid, STA_CONNECT_TIMEOUT_S, last_status,
+            )
+            await self._client.forget_network(ssid)
+            await self._restore_ap_after_failure(iface)
+            self._record_failure(
+                ssid,
+                "Timed out waiting for association — check password / signal.",
+            )
+            return
+
+        ip = last_status.get("ip_address")
+        logger.info("STA connected to %r (ip=%s)", ssid, ip)
+        success = WlanLastAttempt(
+            ssid=ssid,
+            status="success",
+            timestamp=datetime.now(timezone.utc),
+        )
+        self._wlan_state = WlanState(
+            mode="sta_connected",
+            target_ssid=ssid,
+            ip_address=ip,
+            last_attempt=success,
+        )
+        self._save_wlan_state(self._wlan_state)
+
+    async def _run_switch_to_ap(self) -> None:
+        """Background task that performs the STA -> AP flip."""
+        iface = await self._resolve_hotspot_interface_name()
+        if not iface:
+            logger.warning("No external WiFi interface; cannot restore AP")
+            return
+
+        logger.info("Restoring %s to hotspot mode", iface)
+        try:
+            await self._client.disconnect(interface=iface)
+        except Exception as e:
+            logger.debug("Disconnect call failed (may already be disconnected): %s", e)
+
+        await self._restore_ap_after_failure(iface)
+
+        self._wlan_state = WlanState(
+            mode="ap",
+            last_attempt=self._wlan_state.last_attempt if self._wlan_state else None,
+        )
+        self._save_wlan_state(self._wlan_state)
+
+    async def _restore_ap_after_failure(self, iface: str) -> None:
+        """Best-effort: put ``iface`` back into hotspot mode. Used both
+        on the failure path of a STA switch and on user-initiated
+        switch-back."""
+        try:
+            ok = await self._ensure_secondary_hotspot(iface)
+            if not ok:
+                logger.warning(
+                    "Could not restore hotspot on %s after failed switch", iface,
+                )
+        except Exception as e:
+            logger.warning("Hotspot restore failed: %s", e)
+
+    def _record_failure(self, ssid: str, error: str) -> None:
+        """Persist a failure outcome so the UI can surface it once the
+        user reconnects to the AP."""
+        failure = WlanLastAttempt(
+            ssid=ssid,
+            status="failed",
+            error=error,
+            timestamp=datetime.now(timezone.utc),
+        )
+        self._wlan_state = WlanState(mode="ap", last_attempt=failure)
+        self._save_wlan_state(self._wlan_state)
+
     async def close(self) -> None:
         """Close HTTP clients."""
         await self._client.close()
         await self._linux2rest.close()
+
+
+# ── Module-level singleton ──────────────────────────────────────────
+#
+# WLAN switch state (the in-memory lock, the task handle, the cached
+# WlanState) lives on the ``NetworkService`` instance. Routes and the
+# startup handler must therefore share the *same* instance, otherwise
+# the watchdog thread and the HTTP handler disagree on whether a switch
+# is in flight and could race into a double-switch. The persisted intent
+# file mitigates the worst of it but the in-flight lock is needed too.
+
+_NETWORK_SERVICE_SINGLETON: NetworkService | None = None
+
+
+def get_network_service() -> NetworkService:
+    """Return the process-wide :class:`NetworkService` instance."""
+    global _NETWORK_SERVICE_SINGLETON
+    if _NETWORK_SERVICE_SINGLETON is None:
+        _NETWORK_SERVICE_SINGLETON = NetworkService()
+    return _NETWORK_SERVICE_SINGLETON

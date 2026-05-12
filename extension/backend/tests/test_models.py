@@ -1,10 +1,15 @@
 """Tests for Pydantic models."""
 
-from datetime import datetime
+from datetime import datetime, timezone
 import pytest
 
 from doris.models.system import SystemStatus, BatteryInfo, StorageInfo, LocationInfo
-from doris.models.network import WifiNetwork, ConnectionStatus
+from doris.models.network import (
+    ConnectionStatus,
+    WifiNetwork,
+    WlanLastAttempt,
+    WlanState,
+)
 from doris.models.sensors import ModuleInfo
 from doris.models.missions import Mission, MissionConfig, MissionStatus, TriggerConfig, TriggerType
 
@@ -76,6 +81,42 @@ def test_connection_status():
     )
     assert status.is_connected is True
     assert status.ssid == "TestNetwork"
+
+
+def test_wlan_state_default_is_ap():
+    """Default WlanState is the safe ``ap`` mode with no last attempt."""
+    state = WlanState(mode="ap")
+    assert state.mode == "ap"
+    assert state.target_ssid is None
+    assert state.ip_address is None
+    assert state.last_attempt is None
+
+
+def test_wlan_state_round_trips_through_json():
+    """The persisted intent file is JSON; verify it survives a round-trip."""
+    attempt = WlanLastAttempt(
+        ssid="HomeWiFi",
+        status="failed",
+        error="Timed out waiting for association",
+        timestamp=datetime(2026, 5, 11, 22, 30, tzinfo=timezone.utc),
+    )
+    state = WlanState(
+        mode="sta_connected",
+        target_ssid="HomeWiFi",
+        ip_address="192.168.1.42",
+        last_attempt=attempt,
+    )
+    blob = state.model_dump_json()
+    restored = WlanState.model_validate_json(blob)
+    assert restored == state
+    assert restored.last_attempt is not None
+    assert restored.last_attempt.status == "failed"
+
+
+def test_wlan_state_rejects_unknown_mode():
+    """Mode is a Literal; bad values must fail validation."""
+    with pytest.raises(Exception):
+        WlanState(mode="sideways")  # type: ignore[arg-type]
 
 
 def test_module_info():
