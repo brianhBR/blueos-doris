@@ -43,7 +43,7 @@ advertised - real-world TCP throughput tops out around 25 Mbps in that
 mode even on hardware capable of much more. We patch the wifi-handler
 module inside ``blueos-core`` to add::
 
-    "-c", "<auto-picked: 1, 6 or 11>",
+    "-c", "<auto-picked: 1 or 6>",
     "--ieee80211n",
     "--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40][LDPC][RX-STBC1]"
                   "[MAX-AMSDU-7935][DSSS_CCK-40]",
@@ -73,13 +73,17 @@ Channel auto-selection
 ~~~~~~~~~~~~~~~~~~~~~~
 At patch-install time :func:`_pick_24ghz_channel` reads the kernel's
 cached ``iw dev wlan0 scan dump`` (refreshed every few seconds by
-``wifi-manager``'s ``_autoscan``), scores each of the three non-
-overlapping 2.4 GHz primaries (1, 6, 11) by the total linear-power
-signal of neighbour BSSes inside its HT20 footprint, and picks the
-quietest. Ties (or an empty scan) default to channel 6. The picker
-runs each time :func:`setup_hotspot_radio` runs, so a vehicle that
-boots in a new RF environment ends up on a sensible channel without
-manual intervention.
+``wifi-manager``'s ``_autoscan``), scores the two non-overlapping
+2.4 GHz primaries (1, 6) by the total linear-power signal of neighbour
+BSSes inside each one's HT20 footprint, and picks the quietest. Ties
+(or an empty scan) default to channel 6. Channel 11 is intentionally
+*not* a candidate: the DORIS potted external antenna is tuned for the
+lower half of the 2.4 GHz band (roughly 2412-2437 MHz), so ch 11 at
+2462 MHz sits noticeably outside its SWR sweet spot - the resulting
+mismatch loss is likely to exceed any interference benefit from being
+on a quieter primary. The picker runs each time :func:`setup_hotspot_
+radio` runs, so a vehicle that boots in a new RF environment still
+gets the cleaner of the two antenna-compatible primaries.
 
 Measurements (channel 6, this radio + DORIS potted external antenna)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -128,7 +132,7 @@ Boot order
   4. ``wifi-manager`` sees ``uap0`` already exists -> runs ``create_ap``
      on it with the 2.4 GHz HT20-with-full-caps flags installed at the
      previous DORIS extension start -> hostapd brings the AP up on the
-     auto-picked channel (1, 6 or 11) with the rich ``ht_capab`` set.
+     auto-picked channel (1 or 6) with the rich ``ht_capab`` set.
 
 Result: hotspot broadcast from the Realtek's external antenna at 2.4
 GHz HT20 with the full set of HT capabilities the radio supports;
@@ -182,7 +186,9 @@ _CREATE_AP_ANCHOR = (
 
 # Maxed-out 2.4 GHz HT20 configuration. The ``{channel}`` placeholder is
 # filled at install time by :func:`_pick_24ghz_channel` so the AP lands
-# on whichever of channels 1/6/11 is least crowded.
+# on whichever of channels 1/6 is least crowded.  Channel 11 is left
+# out because the DORIS potted external antenna's SWR sweet spot is
+# the lower half of the 2.4 GHz band; see :func:`_pick_24ghz_channel`.
 #
 # Why HT20 and not HT40?  The ``morrownr/88x2bu-20210702`` driver
 # advertises HT40 in ``iw phy phy1 info`` but its AP-mode firmware path
@@ -425,7 +431,7 @@ async def _read_container_file(container: str, path: str) -> str | None:
 
 
 async def _pick_24ghz_channel() -> int:
-    """Pick the cleanest 2.4 GHz primary channel from {1, 6, 11}.
+    """Pick the cleanest 2.4 GHz primary channel from {1, 6}.
 
     Uses the kernel's cached scan results on ``wlan0`` (``wifi-manager``
     refreshes them every ~10 s via ``_autoscan``) to score each
@@ -433,6 +439,13 @@ async def _pick_24ghz_channel() -> int:
     HT20 footprint (primary ± 2 channels). Returns the candidate with
     the lowest score; ties and an empty scan default to channel 6
     (centre of band, conventionally cleanest).
+
+    Channel 11 is deliberately excluded from the candidate set: the
+    DORIS potted external antenna is tuned for the lower half of the
+    2.4 GHz band (roughly 2412-2437 MHz), so channel 11 at 2462 MHz
+    sits outside its SWR sweet spot. Adding it back would gain nothing
+    on average - the antenna mismatch loss at 2462 MHz is likely to
+    exceed any interference advantage from being on a quieter primary.
 
     This is intentionally read-only: it consumes whatever the kernel
     happens to have cached and does *not* trigger a fresh scan, because
@@ -514,9 +527,11 @@ async def _pick_24ghz_channel() -> int:
         return total
 
     # Candidate order also breaks ties: prefer 6 (middle of band) first,
-    # then 1, then 11.  We include the candidate's list index in the sort
-    # tuple so that equal scores pick the earlier-listed channel.
-    candidates = [6, 1, 11]
+    # then 1.  We include the candidate's list index in the sort tuple
+    # so that equal scores pick the earlier-listed channel.  Channel 11
+    # is excluded - see function docstring for the antenna-tuning
+    # rationale.
+    candidates = [6, 1]
     scored = sorted(
         (score(c), idx, c) for idx, c in enumerate(candidates)
     )
