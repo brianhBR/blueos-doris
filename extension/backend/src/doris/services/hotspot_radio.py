@@ -143,6 +143,22 @@ its retransmit count dropped from ~14,900/min to ~30/min.
 Note on ``sudo``: the BlueOS Commander API's shell PATH does not include
 ``/sbin`` or ``/usr/sbin``, so ``udevadm`` and friends are only reachable
 through ``sudo`` (which resets the PATH).
+
+Note on the bind-mount + missing-source booby trap: Docker silently
+creates an empty *directory* at any bind-mount source path that doesn't
+exist on the host. So a transient state where ``startup.json`` lists
+``/usr/blueos/userdata/wifi-overrides/networkmanager.py`` as a bind
+source while the host file is missing is fatal - the next
+``blueos-core`` restart turns the missing source into a directory, then
+container init fails with "not a directory" because the target is a
+file, and ``blueos-bootstrap`` falls back to the factory image. We hit
+this on the vehicle in May 2026 after :func:`_install_create_ap_speed
+_patch`'s self-heal ``rm``'d a corrupt override without also removing
+the bind entry. The fix - and the contract every caller in this module
+must honour - is: **never delete the override file while its bind entry
+is still in startup.json**. The self-heal path now removes the bind
+*first*, then the file; :func:`_remove_startup_bind` is the safe
+counterpart to :func:`_ensure_startup_bind` for that purpose.
 """
 
 import ast
@@ -638,15 +654,27 @@ async def _install_create_ap_speed_patch() -> None:
     except SyntaxError as exc:
         logger.warning(
             "Bind-mounted %s is not valid Python (line %s: %s); a prior "
-            "DORIS write was corrupted. Removing host override %s so "
-            "blueos-core falls back to stock wifi-manager networkmanager.py "
-            "on next restart - the next DORIS run will re-patch from the "
-            "clean baseline.",
+            "DORIS write was corrupted. Removing host override %s AND its "
+            "bind-mount entry from %s so blueos-core falls back to stock "
+            "wifi-manager networkmanager.py on next restart - the next "
+            "DORIS run will re-patch from the clean baseline and "
+            "re-install the bind.",
             WIFI_OVERRIDE_CONTAINER_PATH,
             exc.lineno,
             exc.msg,
             WIFI_OVERRIDE_HOST_PATH,
+            BOOTSTRAP_STARTUP_JSON,
         )
+        # Order matters: REMOVE THE BIND ENTRY FIRST, then delete the
+        # file. If we did it the other way and a blueos-core restart
+        # happened in between, Docker would silently create the missing
+        # source as a directory (default behavior for absent bind
+        # sources), then fail the next container start with
+        # "Are you trying to mount a directory onto a file" and
+        # blueos-bootstrap would fall back to the factory image. We hit
+        # exactly this on the vehicle in May 2026, which is why both
+        # steps are non-negotiable here.
+        await _remove_startup_bind()
         await _run_host_command(f"sudo rm -f {WIFI_OVERRIDE_HOST_PATH}")
         return
 
@@ -668,6 +696,63 @@ async def _install_create_ap_speed_patch() -> None:
 
     await _run_host_command(f"sudo mkdir -p {WIFI_OVERRIDE_DIR}")
     await _write_host_file(WIFI_OVERRIDE_HOST_PATH, patched)
+
+
+async def _remove_startup_bind() -> None:
+    """Remove the wifi-override bind from ``startup.json`` if present.
+
+    Counterpart to :func:`_ensure_startup_bind`, used by the self-heal
+    path in :func:`_install_create_ap_speed_patch` when we have to
+    delete the host override.
+
+    Why this exists: Docker silently creates an empty *directory* at
+    any bind-mount source that doesn't exist on the host. So if we
+    delete the host override while ``startup.json`` still lists it as a
+    bind source, the next ``blueos-core`` restart triggers Docker to
+    create a directory at that path, then container init fails with
+    ``not a directory: Are you trying to mount a directory onto a
+    file (or vice-versa)?`` and ``blueos-bootstrap`` falls back to the
+    factory image (silently re-pinning the user away from their
+    chosen blueos-core tag). Removing the bind entry first means the
+    next ``blueos-core`` restart simply doesn't try to mount anything
+    at that path; on a subsequent DORIS run we add the bind back and
+    install a fresh override.
+
+    No-op if the entry isn't present or the JSON can't be parsed -
+    matches the conservative shape of :func:`_ensure_startup_bind`.
+    """
+    raw = await _read_host_file(BOOTSTRAP_STARTUP_JSON)
+    if raw is None:
+        logger.warning(
+            "Could not read %s; skipping bind-mount removal",
+            BOOTSTRAP_STARTUP_JSON,
+        )
+        return
+
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError as e:
+        logger.warning(
+            "Bootstrap %s is not valid JSON: %s", BOOTSTRAP_STARTUP_JSON, e
+        )
+        return
+
+    binds = data.get("core", {}).get("binds", {})
+    if WIFI_OVERRIDE_HOST_PATH not in binds:
+        logger.info(
+            "No wifi-override bind in %s; nothing to remove",
+            BOOTSTRAP_STARTUP_JSON,
+        )
+        return
+
+    del binds[WIFI_OVERRIDE_HOST_PATH]
+    new_content = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    if await _write_host_file(BOOTSTRAP_STARTUP_JSON, new_content):
+        logger.info(
+            "Removed wifi-override bind from %s; restart blueos-core to "
+            "drop the stale mount",
+            BOOTSTRAP_STARTUP_JSON,
+        )
 
 
 async def _ensure_startup_bind() -> None:

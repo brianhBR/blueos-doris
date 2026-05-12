@@ -157,6 +157,13 @@ async def test_install_patch_removes_override_when_source_is_corrupt(
 
     monkeypatch.setattr(hotspot_radio, "_pick_24ghz_channel", must_not_run)
 
+    remove_bind_called = []
+
+    async def fake_remove_bind() -> None:
+        remove_bind_called.append(True)
+
+    monkeypatch.setattr(hotspot_radio, "_remove_startup_bind", fake_remove_bind)
+
     await hotspot_radio._install_create_ap_speed_patch()
 
     rm_cmds = [c for c in patched_command.calls if "rm -f" in c]
@@ -166,10 +173,55 @@ async def test_install_patch_removes_override_when_source_is_corrupt(
         f"expected `rm -f {hotspot_radio.WIFI_OVERRIDE_HOST_PATH}` to be "
         f"issued; got commands: {patched_command.calls}"
     )
+    # The bind entry MUST be removed too - otherwise Docker creates
+    # a directory at the missing source on next blueos-core restart
+    # and bootstrap falls back to factory (the May 2026 incident).
+    assert remove_bind_called, (
+        "self-heal must also remove the bind from startup.json; "
+        "deleting only the file leaves a booby trap for next "
+        "blueos-core restart"
+    )
     # And we must not have tried to install anything.
     assert not any(
         ".doris.tmp" in c for c in patched_command.calls
     ), "must not write to host while source is corrupt"
+
+
+async def test_install_patch_removes_bind_BEFORE_file_on_corrupt_source(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Ordering matters: removing the bind first prevents Docker from
+    seeing a startup.json entry pointing at a missing source.  If the
+    rm happens first and a blueos-core restart sneaks in before the
+    bind removal lands, Docker auto-creates a directory at the missing
+    source and the next start fails."""
+
+    async def fake_read(container: str, path: str) -> str:
+        return CORRUPT_SOURCE
+
+    monkeypatch.setattr(hotspot_radio, "_read_container_file", fake_read)
+
+    order: list[str] = []
+
+    async def fake_remove_bind() -> None:
+        order.append("remove_bind")
+
+    rec = _RunHostCommandRecorder()
+    original_call = rec.__call__
+
+    async def recording_run_host_command(command: str, timeout: float = 30.0):
+        if "rm -f" in command and hotspot_radio.WIFI_OVERRIDE_HOST_PATH in command:
+            order.append("rm_file")
+        return await original_call(command, timeout)
+
+    monkeypatch.setattr(hotspot_radio, "_remove_startup_bind", fake_remove_bind)
+    monkeypatch.setattr(hotspot_radio, "_run_host_command", recording_run_host_command)
+
+    await hotspot_radio._install_create_ap_speed_patch()
+
+    assert order == ["remove_bind", "rm_file"], (
+        f"expected bind-removal BEFORE file-removal; got: {order}"
+    )
 
 
 async def test_install_patch_skips_when_anchor_missing(
@@ -258,6 +310,119 @@ async def test_write_host_file_uses_inode_preserving_redirect(
     assert "mv " not in final_cmd or "/tmp/some-dest" not in final_cmd.split("mv ", 1)[1].split()[:2], (
         f"_write_host_file must not install via `mv`; got: {final_cmd}"
     )
+
+
+# ---------------------------------------------------------------------
+# _remove_startup_bind: counterpart of _ensure_startup_bind, used by
+# the self-heal path.  Must rewrite startup.json with our bind entry
+# stripped while leaving every other bind untouched.
+# ---------------------------------------------------------------------
+
+
+def _startup_json_with_our_bind() -> str:
+    """A miniature startup.json that contains our wifi-override bind
+    plus an unrelated bind we must not touch."""
+    import json as _json
+
+    return _json.dumps({
+        "core": {
+            "tag": "1.5.0",
+            "binds": {
+                "/dev/": {"bind": "/dev/", "mode": "rw"},
+                hotspot_radio.WIFI_OVERRIDE_HOST_PATH: {
+                    "bind": hotspot_radio.WIFI_OVERRIDE_CONTAINER_PATH,
+                    "mode": "ro",
+                },
+            },
+        }
+    }, indent=2) + "\n"
+
+
+def _startup_json_without_our_bind() -> str:
+    import json as _json
+
+    return _json.dumps({
+        "core": {
+            "tag": "1.5.0",
+            "binds": {
+                "/dev/": {"bind": "/dev/", "mode": "rw"},
+            },
+        }
+    }, indent=2) + "\n"
+
+
+async def test_remove_startup_bind_removes_our_entry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_read(path: str) -> str:
+        assert path == hotspot_radio.BOOTSTRAP_STARTUP_JSON
+        return _startup_json_with_our_bind()
+
+    written: list[tuple[str, str]] = []
+
+    async def fake_write(path: str, content: str) -> bool:
+        written.append((path, content))
+        return True
+
+    monkeypatch.setattr(hotspot_radio, "_read_host_file", fake_read)
+    monkeypatch.setattr(hotspot_radio, "_write_host_file", fake_write)
+
+    await hotspot_radio._remove_startup_bind()
+
+    assert len(written) == 1
+    path, content = written[0]
+    assert path == hotspot_radio.BOOTSTRAP_STARTUP_JSON
+    import json as _json
+
+    parsed = _json.loads(content)
+    binds = parsed["core"]["binds"]
+    assert hotspot_radio.WIFI_OVERRIDE_HOST_PATH not in binds, (
+        "our bind entry must be gone after _remove_startup_bind"
+    )
+    # And unrelated binds must remain untouched.
+    assert "/dev/" in binds
+
+
+async def test_remove_startup_bind_noop_when_entry_absent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_read(path: str) -> str:
+        return _startup_json_without_our_bind()
+
+    written: list[tuple[str, str]] = []
+
+    async def fake_write(path: str, content: str) -> bool:
+        written.append((path, content))
+        return True
+
+    monkeypatch.setattr(hotspot_radio, "_read_host_file", fake_read)
+    monkeypatch.setattr(hotspot_radio, "_write_host_file", fake_write)
+
+    await hotspot_radio._remove_startup_bind()
+    assert written == [], (
+        f"must not rewrite startup.json when our bind isn't there; "
+        f"got writes: {written}"
+    )
+
+
+async def test_remove_startup_bind_handles_unreadable_file(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_read(path: str) -> None:
+        return None  # simulate Commander not returning content
+
+    written: list[tuple[str, str]] = []
+
+    async def fake_write(path: str, content: str) -> bool:
+        written.append((path, content))
+        return True
+
+    monkeypatch.setattr(hotspot_radio, "_read_host_file", fake_read)
+    monkeypatch.setattr(hotspot_radio, "_write_host_file", fake_write)
+
+    # Must not raise even if startup.json can't be read.
+    await hotspot_radio._remove_startup_bind()
+    assert written == []
 
 
 async def test_write_host_file_skips_when_existing_matches(
