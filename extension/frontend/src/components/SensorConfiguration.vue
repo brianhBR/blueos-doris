@@ -223,22 +223,32 @@ function startTrackerPolling() {
 watch(hasTracker, startTrackerPolling)
 
 // ── Iridium test ─────────────────────────────────────────────────────
+//
+// The AGT runs the SBD test for 2-10 minutes and emits a handful of
+// `IRIDIUM: …` STATUSTEXT messages along the way (`Test starting`,
+// `Test PASSED`, `Test FAILED`, occasional progress).  In between it
+// keeps spamming `GPS: …` warnings, and mavlink2rest only caches the
+// latest STATUSTEXT.  We therefore poll the backend with `since_id`
+// and walk every new buffered AGT message — that way the PASSED/FAILED
+// can never be overwritten before we see it.
 type IridiumState = 'idle' | 'sending' | 'running' | 'passed' | 'failed'
+interface IridiumMessage {
+  id: number
+  text: string
+  severity: number
+  timestamp: string
+}
 const iridiumState = ref<IridiumState>('idle')
 const iridiumMessage = ref('')
 let iridiumPollInterval: number | undefined
-let iridiumBaselineCounter = -1
+let iridiumLastSeenId = 0
+let iridiumDeadline = 0
+const IRIDIUM_TEST_MAX_MS = 12 * 60 * 1000  // hard cap; AGT should resolve in <10 min
 
 async function triggerIridiumTest() {
   if (iridiumState.value === 'sending' || iridiumState.value === 'running') return
   iridiumState.value = 'sending'
   iridiumMessage.value = ''
-
-  const baseline = await fetch('/api/v1/tracker/iridium-status')
-  if (baseline.ok) {
-    const data = await baseline.json()
-    iridiumBaselineCounter = data.counter ?? 0
-  }
 
   try {
     const resp = await fetch('/api/v1/tracker/iridium-test', { method: 'POST' })
@@ -249,6 +259,8 @@ async function triggerIridiumTest() {
       iridiumMessage.value = result.error || 'Command rejected'
       return
     }
+    iridiumLastSeenId = typeof result.latest_id === 'number' ? result.latest_id : 0
+    iridiumDeadline = Date.now() + IRIDIUM_TEST_MAX_MS
     iridiumState.value = 'running'
     iridiumMessage.value = 'Test starting — this may take 2–10 minutes…'
     startIridiumPolling()
@@ -268,23 +280,37 @@ function stopIridiumPolling() {
 }
 
 async function pollIridiumStatus() {
+  if (iridiumDeadline && Date.now() > iridiumDeadline) {
+    iridiumState.value = 'failed'
+    iridiumMessage.value = 'Test timed out (no result after 12 min)'
+    stopIridiumPolling()
+    return
+  }
   try {
-    const resp = await fetch('/api/v1/tracker/iridium-status')
+    const resp = await fetch(`/api/v1/tracker/iridium-status?since_id=${iridiumLastSeenId}`)
     if (!resp.ok) return
     const data = await resp.json()
-    if (!data.text || data.counter <= iridiumBaselineCounter) return
-
-    const text: string = data.text
-    if (text.includes('PASSED')) {
-      iridiumState.value = 'passed'
-      iridiumMessage.value = text
-      stopIridiumPolling()
-    } else if (text.includes('FAILED')) {
-      iridiumState.value = 'failed'
-      iridiumMessage.value = text
-      stopIridiumPolling()
-    } else if (text.includes('IRIDIUM')) {
-      iridiumMessage.value = text
+    const messages: IridiumMessage[] = Array.isArray(data.messages) ? data.messages : []
+    if (typeof data.latest_id === 'number' && data.latest_id > iridiumLastSeenId) {
+      iridiumLastSeenId = data.latest_id
+    }
+    for (const m of messages) {
+      const text = m.text || ''
+      if (text.includes('IRIDIUM')) {
+        if (text.includes('PASSED')) {
+          iridiumState.value = 'passed'
+          iridiumMessage.value = text
+          stopIridiumPolling()
+          return
+        }
+        if (text.includes('FAILED')) {
+          iridiumState.value = 'failed'
+          iridiumMessage.value = text
+          stopIridiumPolling()
+          return
+        }
+        iridiumMessage.value = text
+      }
     }
   } catch { /* best effort */ }
 }
@@ -293,6 +319,7 @@ function resetIridiumTest() {
   stopIridiumPolling()
   iridiumState.value = 'idle'
   iridiumMessage.value = ''
+  iridiumDeadline = 0
 }
 
 // ── Light test button ───────────────────────────────────────────────
