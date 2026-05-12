@@ -8,7 +8,7 @@ from robyn import ALLOW_CORS, Robyn
 from robyn.openapi import Contact, OpenAPI, OpenAPIInfo
 
 from .config import settings
-from .services.network import NetworkService
+from .services.network import get_network_service
 from .services.persistent_log import setup_persistent_logging, start_dmesg_capture
 from .routes import (
     register_artemis_routes,
@@ -168,13 +168,21 @@ def create_app() -> Robyn:
         except Exception as e:
             logger.warning("doris.local setup skipped: %s", e)
 
-        network_service = NetworkService()
+        network_service = get_network_service()
         hotspot_changed = False
         try:
             await network_service.configure_hotspot()
             hotspot_changed = True
         except Exception as e:
             logger.warning("Hotspot configuration skipped: %s", e)
+
+        # Force the AP/STA intent back to AP and pre-emptively disconnect
+        # any client association so a saved client WLAN can't quietly
+        # auto-join behind our back. Power cycle == AP, always.
+        try:
+            await network_service.reset_wlan_to_ap_on_boot()
+        except Exception as e:
+            logger.warning("WLAN intent reset skipped: %s", e)
 
         try:
             await start_hotspot_dns()
