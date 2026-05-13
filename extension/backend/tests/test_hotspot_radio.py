@@ -335,17 +335,33 @@ async def test_install_patch_writes_when_source_is_clean(
     assert "--ht_capab" in content
 
 
-async def test_install_patch_emits_ht20_only_caps(
+async def test_install_patch_emits_mt7921u_ht40_he_caps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Regression for the May 2026 field report: an earlier revision
-    of this patch asked for ``[HT40+]`` and a field unit with a clean
-    RF environment hit a morrownr 88x2bu AP-mode firmware bug, cycling
-    the BSS INTERFACE-ENABLED/DISABLED on every client association.
-    The fix is to advertise HT20 only so hostapd has no path to ever
-    request an HT40 BSS. Asserts both the positive (HT20 caps present,
-    correct order) and the negative (none of the HT40-specific caps
-    are emitted, regardless of channel)."""
+    """The MT7921U-tuned patch must emit:
+
+      * ``--no-virt`` (REQUIRED for MT7921U - the chip's interface
+        combo allows only one AP per phy, so create_ap can't add a
+        virtual __ap on top of the existing managed uap0).
+      * ``--ieee80211n`` AND ``--ieee80211ax`` together (HT for
+        HT40 channel width, HE for 802.11ax). ``--ieee80211ax``
+        alone wouldn't make create_ap emit the
+        ``ieee80211n=1``/``ht_capab=`` lines.
+      * ``[HT40+]`` plus the HT40-only caps the chip supports
+        (SHORT-GI-40, TX-STBC) AND the HT20-valid base caps
+        (SHORT-GI-20, LDPC, RX-STBC1, MAX-AMSDU-7935). HT20 fall-
+        back is left to hostapd's OBSS-coexistence logic.
+      * No ``[DSSS_CCK-40]`` - MT7921U's ``iw phy`` info reads
+        ``No DSSS/CCK HT40`` and hostapd will refuse to start with
+        ``Driver does not support configured HT capability
+        [DSSS_CCK-40]``. This is the single most likely
+        copy-paste regression to land in this template.
+      * Channel + country flags wired through from the picker /
+        regdomain helpers (we mock both here).
+      * No legacy 5 GHz flags (--freq-band / --ieee80211ac /
+        --vht_capab) - that path was abandoned and the strip regex
+        relies on them being absent in fresh writes.
+    """
     captured: dict[str, str] = {}
 
     async def fake_read(_c: str, _p: str) -> str | None:
@@ -356,51 +372,170 @@ async def test_install_patch_emits_ht20_only_caps(
         return True
 
     async def fake_pick() -> int:
-        # Channel 1 is the case that broke in the field - HT40+ on
-        # ch 1 was the specific failure trigger - so we exercise it
-        # here to make sure HT20-only is emitted for that channel
-        # too, not just the docstring's example channel 6.
+        # Channel 1 has been the production default; pick it
+        # explicitly so the assertions below don't have to care
+        # which of {1, 6} the picker happened to choose.
         return 1
+
+    async def fake_country() -> str:
+        # Mock the regdomain probe so this test stays hermetic
+        # (no Commander HTTP call attempted from CI).
+        return "US"
 
     monkeypatch.setattr(hotspot_radio, "_read_container_file", fake_read)
     monkeypatch.setattr(hotspot_radio, "_write_host_file", fake_write)
     monkeypatch.setattr(hotspot_radio, "_pick_24ghz_channel", fake_pick)
+    monkeypatch.setattr(hotspot_radio, "_get_country_code", fake_country)
 
     result = await hotspot_radio._install_create_ap_speed_patch()
     assert result is True
 
     content = captured["content"]
-    # HT20-valid caps we keep
+
+    # Required MT7921U-only flags
+    assert '"--no-virt"' in content, (
+        "--no-virt is mandatory for MT7921U; without it create_ap "
+        "tries to add a virtual __ap iface on top of uap0 and the "
+        "firmware refuses ('Maybe your WiFi adapter does not fully "
+        "support virtual interfaces') - AP never starts."
+    )
+    assert '"--ieee80211ax"' in content, "802.11ax must be enabled on 2.4 GHz HE-capable hardware"
+    # Both HT and HE switches together: --ieee80211ax alone is not
+    # enough because create_ap only emits ieee80211n=1 + ht_capab=
+    # when --ieee80211n is also set.
+    assert '"--ieee80211n"' in content
+
+    # ht_capab content
+    assert "[HT40+]" in content, (
+        "MT7921U supports HT40 in AP mode (unlike the previous "
+        "Realtek). Without [HT40+] hostapd defaults to 20 MHz, "
+        "halving the achievable PHY rate."
+    )
     assert "[SHORT-GI-20]" in content
+    assert "[SHORT-GI-40]" in content, "MT7921U supports short GI on HT40"
     assert "[LDPC]" in content
+    assert "[TX-STBC]" in content
     assert "[RX-STBC1]" in content
     assert "[MAX-AMSDU-7935]" in content
-    # HT40-specific caps that broke Tony's unit. Each one is checked
-    # individually so a regression that brings back just one of them
-    # fails with a specific message.
-    assert "[HT40+]" not in content, (
-        "HT40+ must not be re-introduced - it caused INTERFACE-DISABLED "
-        "cycling on the morrownr 88x2bu AP-mode firmware path on units "
-        "with clean RF environments. See May 2026 field report."
+
+    # Specifically forbidden: causes hostapd to refuse to start
+    assert "[DSSS_CCK-40]" not in content, (
+        "MT7921U's ``iw phy`` info reads 'No DSSS/CCK HT40' and "
+        "hostapd will refuse to start with 'Driver does not support "
+        "configured HT capability [DSSS_CCK-40]'. Do not re-add."
     )
-    assert "[HT40-]" not in content, "HT40- has the same driver issue as HT40+"
-    assert "SHORT-GI-40" not in content, (
-        "SHORT-GI-40 only applies inside an HT40 BSS; emitting it "
-        "implies an HT40 path we explicitly removed."
-    )
-    assert "DSSS_CCK-40" not in content, (
-        "DSSS_CCK-40 only applies inside an HT40 BSS; same reason."
-    )
-    # Channel and country must also be present and correct for the
-    # picked channel.
+
+    # Channel + country wired through from the helpers we mocked
     assert '"-c", "1"' in content
     assert '"--country", "US"' in content
-    assert '"--ieee80211n"' in content
-    # And nothing about ac/VHT should sneak in - that's the 5 GHz
-    # path we deliberately abandoned.
+
+    # Legacy 5 GHz flags must never appear in fresh writes
     assert "--ieee80211ac" not in content
     assert "--vht_capab" not in content
     assert "--freq-band" not in content
+
+
+async def test_get_country_code_uses_system_regdomain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """When the kernel's regdomain is set, ``_get_country_code`` returns
+    its 2-letter code, not the fallback."""
+    iw_output = (
+        "global\n"
+        "country GB: DFS-ETSI\n"
+        "\t(2400 - 2483 @ 40), (N/A, 20), (N/A)\n"
+        "phy#0\n"
+        "country 99: DFS-UNSET\n"
+    )
+
+    async def fake_run(_cmd: str, timeout: float = 30.0) -> tuple[bool, str]:
+        return True, iw_output
+
+    monkeypatch.setattr(hotspot_radio, "_run_host_command", fake_run)
+    assert await hotspot_radio._get_country_code() == "GB"
+
+
+async def test_get_country_code_falls_back_when_world_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``country 00`` is the world regulatory default; treat it as unset
+    and fall back so hostapd doesn't get a TX-power-clamping country code."""
+    iw_output = "global\ncountry 00: DFS-UNSET\n"
+
+    async def fake_run(_cmd: str, timeout: float = 30.0) -> tuple[bool, str]:
+        return True, iw_output
+
+    monkeypatch.setattr(hotspot_radio, "_run_host_command", fake_run)
+    assert (
+        await hotspot_radio._get_country_code()
+        == hotspot_radio._COUNTRY_CODE_FALLBACK
+    )
+
+
+async def test_get_country_code_falls_back_when_command_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """If ``iw reg get`` errors (no iw binary, no permission, etc.),
+    the fallback keeps create_ap getting *some* country code so it
+    doesn't drop to world regulatory."""
+
+    async def fake_run(_cmd: str, timeout: float = 30.0) -> tuple[bool, str]:
+        return False, ""
+
+    monkeypatch.setattr(hotspot_radio, "_run_host_command", fake_run)
+    assert (
+        await hotspot_radio._get_country_code()
+        == hotspot_radio._COUNTRY_CODE_FALLBACK
+    )
+
+
+def test_doris_patch_block_re_strips_legacy_realtek_ht20_block() -> None:
+    """An upgrade from the Realtek-era HT20-only patch (master @
+    85de5dc) must be cleanly stripped by the new strip regex so that
+    re-running ``_install_create_ap_speed_patch`` converges to the
+    MT7921U canonical block instead of stacking flags."""
+    legacy = (
+        '            "--redirect-to-localhost",\n'
+        '            "-c", "6",\n'
+        '            "--ieee80211n",\n'
+        '            "--ht_capab", "[SHORT-GI-20][LDPC][RX-STBC1]'
+        '[MAX-AMSDU-7935]",\n'
+        '            "--country", "US",\n'
+        '            ssid,\n'
+    )
+    stripped = hotspot_radio._strip_doris_patch(legacy)
+    assert "-c" not in stripped
+    assert "--ieee80211n" not in stripped
+    assert "--ht_capab" not in stripped
+    assert "--country" not in stripped
+    # Anchor and SSID line must survive untouched
+    assert '"--redirect-to-localhost"' in stripped
+    assert "ssid," in stripped
+
+
+def test_doris_patch_block_re_strips_current_mt7921u_block() -> None:
+    """And of course the MT7921U block written by THIS revision must
+    also be strippable on re-run (idempotency / channel re-pick)."""
+    current = (
+        '            "--redirect-to-localhost",\n'
+        '            "-c", "1",\n'
+        '            "--no-virt",\n'
+        '            "--ieee80211n",\n'
+        '            "--ieee80211ax",\n'
+        '            "--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40]'
+        '[LDPC][TX-STBC][RX-STBC1][MAX-AMSDU-7935]",\n'
+        '            "--country", "US",\n'
+        '            ssid,\n'
+    )
+    stripped = hotspot_radio._strip_doris_patch(current)
+    assert "-c" not in stripped
+    assert "--no-virt" not in stripped
+    assert "--ieee80211n" not in stripped
+    assert "--ieee80211ax" not in stripped
+    assert "--ht_capab" not in stripped
+    assert "--country" not in stripped
+    assert '"--redirect-to-localhost"' in stripped
+    assert "ssid," in stripped
 
 
 # ---------------------------------------------------------------------

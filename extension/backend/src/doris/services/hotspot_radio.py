@@ -61,47 +61,81 @@ We also tell NetworkManager to leave ``uap0`` alone so hostapd /
     [keyfile]
     unmanaged-devices=interface-name:uap0
 
-Part 2: tell ``create_ap`` to max out 2.4 GHz HT20
---------------------------------------------------
-``wifi-manager`` invokes ``create_ap`` with no band/channel/HT/VHT flags,
-so hostapd defaults to ``hw_mode=g, channel=1`` with no HT capabilities
-advertised - real-world TCP throughput tops out around 25 Mbps in that
-mode even on hardware capable of much more. We patch the wifi-handler
-module inside ``blueos-core`` to add::
+Part 2: tell ``create_ap`` to max out 2.4 GHz with HT40+ + 802.11ax
+------------------------------------------------------------------
+``wifi-manager`` invokes ``create_ap`` with no band/channel/HT/VHT
+flags, so hostapd defaults to ``hw_mode=g, channel=1`` with no HT
+capabilities advertised - real-world TCP throughput tops out around
+25 Mbps in that mode even on hardware capable of much more. We patch
+the wifi-handler module inside ``blueos-core`` to add the following
+flags right before the SSID/password arguments::
 
     "-c", "<auto-picked: 1 or 6>",
+    "--no-virt",
     "--ieee80211n",
-    "--ht_capab", "[SHORT-GI-20][LDPC][RX-STBC1][MAX-AMSDU-7935]",
-    "--country", "US",
+    "--ieee80211ax",
+    "--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40][LDPC]"
+                  "[TX-STBC][RX-STBC1][MAX-AMSDU-7935]",
+    "--country", "<from system regdomain>",
 
-right before the SSID/password arguments. The patched module is written
-to ``/usr/blueos/userdata/wifi-overrides/networkmanager.py`` on the host
+The patched module is written to
+``/usr/blueos/userdata/wifi-overrides/networkmanager.py`` on the host
 and bind-mounted into the container by adding an entry to
 ``/root/.config/blueos/bootstrap/startup.json``. ``blueos-bootstrap``
 re-reads ``startup.json`` on every boot, so the override survives
 ``blueos-core`` recreations and BlueOS upgrades that don't touch the
 target file.
 
-The ht_capab line explicitly declares HT20-only capabilities. An
-earlier revision of this patch asked for ``[HT40+]`` on the theory
-that hostapd's "try HT40, OBSS-coex fall back to HT20" logic would
-get us the wider channel for free in clean RF environments and a
-graceful downgrade otherwise. In practice the bundled
-``morrownr/88x2bu-20210702`` driver's AP-mode firmware path cannot
-keep an HT40 BSS up: in a busy 2.4 GHz environment hostapd's OBSS
-scan downgrades to HT20 before the driver ever sees the request and
-things look fine, but in a clean RF environment hostapd actually
-issues the HT40 BSS request, the driver rejects it, and the BSS
-cycles ``INTERFACE-ENABLED`` → ``INTERFACE-DISABLED`` (end-user
-symptom: "AP shows up, you connect, it disappears, you lose
-connection"; ``iw dev uap0 info`` shows ``txpower -100.00 dBm`` and
-no ``channel/width/center`` line). Confirmed in field reports May
-2026 on a unit with no 2.4 GHz neighbours on the picker-chosen
-channel. Asking for HT20 directly removes the failure mode at the
-cost of nothing - the driver was downgrading to HT20 every time it
-actually completed a BSS bring-up anyway. The other capabilities
-(LDPC, SHORT-GI-20, RX-STBC1, MAX-AMSDU-7935) still lift real TCP
-throughput from ~25 Mbps (stock) to ~80 Mbps on this radio.
+Why every flag
+~~~~~~~~~~~~~~
+
+* ``--no-virt`` is **non-negotiable** for the MT7921U. The chip's
+  interface combination matrix only allows ``#{ AP, P2P-GO } <= 1``
+  per phy. ``create_ap``'s default behaviour is to add a virtual
+  ``__ap`` iface on top of the existing managed ``uap0``, which
+  asks for one managed + one AP iface on the same phy; the
+  firmware refuses with ``ERROR: Maybe your WiFi adapter does not
+  fully support virtual interfaces`` and the AP never starts.
+  ``--no-virt`` converts the existing ``uap0`` from managed to AP
+  in place, landing cleanly inside the combo limit.
+
+* ``--ieee80211n`` + ``--ieee80211ax`` together enable HT (802.11n,
+  needed for HT40 channel width) **and** HE (802.11ax, ``ieee80211ax=1``
+  in the generated hostapd.conf). MT7921U advertises ``HE Iftypes:
+  AP`` with ``HE40/2.4GHz`` support, so 2.4 GHz HE40 is in scope.
+  ``--ieee80211ax`` alone wouldn't be enough - upstream ``create_ap``
+  only emits ``ieee80211n=1`` + ``ht_capab=...`` when ``IEEE80211N=1``,
+  so without ``--ieee80211n`` hostapd silently falls back to
+  ``hw_mode=g`` no-HT and ignores our ``--ht_capab`` line.
+
+* ``--ht_capab`` includes ``[HT40+]`` (40 MHz channel width with
+  primary at the low end), the short-guard-interval and STBC bits
+  the chip advertises in ``iw phy phy<N> info``, and
+  ``[MAX-AMSDU-7935]``. We deliberately **omit** ``[DSSS_CCK-40]``:
+  MT7921U's ``iw phy`` info reads ``No DSSS/CCK HT40`` and hostapd
+  refuses to start with ``Driver does not support configured HT
+  capability [DSSS_CCK-40]``.
+
+  Note: with ``[HT40+]`` advertised but **without** ``noscan=1``,
+  hostapd will run an OBSS coexistence scan at AP startup; if it
+  detects any overlapping 2.4 GHz BSS in the secondary-channel
+  footprint it downgrades to HT20 per 802.11n spec. This is the
+  *most-reliable* behaviour for "fastest for a few clients in
+  whatever environment we're in" - HT40 (~290 Mbps PHY) when the
+  channel is clean, HT20 (~144 Mbps PHY) when crowded - so we
+  intentionally do not inject ``noscan=1`` into the generated
+  hostapd.conf. If a future deployment finds itself wanting to
+  force HT40 unconditionally (clean marine RF, willing to be
+  uncooperative with neighbours), the cleanest knob to add is a
+  one-line ``noscan=1`` injection into ``/usr/bin/create_ap`` via
+  ``docker exec ... sed -i`` at extension start.
+
+* ``--country`` is read live from the system regdomain by
+  :func:`_get_country_code`, falling back to ``US`` if the kernel
+  reports the world default ``00``. Without a country code the
+  regulatory domain is "world" and hostapd clamps TX power to
+  20 dBm and refuses 40 MHz channel widths on 2.4 GHz altogether,
+  which silently undoes the ``[HT40+]`` capability above.
 
 Channel auto-selection
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -119,42 +153,23 @@ on a quieter primary. The picker runs each time :func:`setup_hotspot_
 radio` runs, so a vehicle that boots in a new RF environment still
 gets the cleaner of the two antenna-compatible primaries.
 
-Measurements (channel 6, this radio + DORIS potted external antenna)
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-Stock ``wifi-manager`` (no ``ht_capab``):     ~25-30 Mbps real TCP.
-This patch (HT20 + full caps, channel 6):     ~82 Mbps down / 77 Mbps up
-(``iperf3 -c 192.168.42.1 -p 5201 -t 20 -P 4``, May 2026, indoor
-2-3 m, 1 AP neighbour on ch 5). PHY ceiling for 2-stream HT20 + SGI
-is 144 Mbps and real-world TCP typically caps at 55-65% of PHY, so
-~80 Mbps is at the achievable ceiling - the link is clean, the
-remaining headroom would require a driver that can keep HT40 alive.
-
 Why no 5 GHz mode
 ~~~~~~~~~~~~~~~~~
-5 GHz is intentionally not attempted. Two independent blockers:
+5 GHz is intentionally not attempted, but the reason now is purely
+the antenna - the MT7921U itself supports 2.4/5/6 GHz AP mode in
+mainline ``mt7921u``. **The DORIS potted external antenna is
+single-band 2.4 GHz.** A 5 GHz beacon out of a 2.4 GHz antenna
+radiates so inefficiently that usable coverage is impossible
+without an antenna swap, so the software stays on 2.4 GHz to put
+the radio energy where the antenna can actually launch it. Anyone
+resuming 5 GHz work needs a dual-band antenna with characterised
+5 GHz SWR; the chip + driver side is ready.
 
-  1. **The DORIS potted external antenna is single-band 2.4 GHz.** Even
-     if the software produced a valid 5 GHz beacon the RF would not
-     radiate efficiently, so usable 5 GHz coverage is impossible
-     without an antenna swap.
-  2. **The bundled ``88x2bu`` driver doesn't reliably do 5 GHz AP
-     anyway.** May 2026 testing on ``morrownr/88x2bu-20210702`` showed
-     UNII-1 (ch 36-48) hard-rejected by the driver before any RF
-     transmit (``Failed to set beacon parameters`` / ``INTERFACE-
-     DISABLED``), and UNII-3 (ch 149) brought hostapd up but the AP
-     dropped within ~45 s in repeat runs. Same class of AP-mode
-     firmware-path issue as the 2.4 GHz HT40 downgrade documented at
-     :data:`_CREATE_AP_24GHZ_FLAGS_TEMPLATE` below.
-
-Anyone resuming 5 GHz work needs both (a) a dual-band antenna with
-characterised 5 GHz SWR and (b) a different driver or radio that
-keeps an AP-mode 5 GHz BSS up under sustained load. Until then,
-2.4 GHz HT20 with the full ``ht_capab`` set above is the achievable
-ceiling on this hardware. The legacy-patch regex
-:data:`_DORIS_PATCH_BLOCK_RE` still recognises and strips the old
-``--freq-band 5`` / ``--ieee80211ac`` / ``--vht_capab`` flags so users
-upgrading from a previous extension that wrote a 5 GHz patch are
-cleanly migrated to the 2.4 GHz config.
+The legacy-patch regex :data:`_DORIS_PATCH_BLOCK_RE` still
+recognises and strips the old ``--freq-band 5`` / ``--ieee80211ac``
+/ ``--vht_capab`` flags AND the previous Realtek-era HT20-only
+flag set, so units upgrading from any prior DORIS extension are
+cleanly migrated to the current MT7921U config.
 
 Boot order
 ----------
@@ -254,60 +269,50 @@ _CREATE_AP_ANCHOR_RE = re.compile(
     re.MULTILINE,
 )
 
-# Maxed-out 2.4 GHz HT20 configuration. ``{channel}`` is filled at
-# install time by :func:`_pick_24ghz_channel` so the AP lands on
-# whichever of channels 1/6 is least crowded.  Channel 11 is left
-# out because the DORIS potted external antenna's SWR sweet spot is
-# the lower half of the 2.4 GHz band; see :func:`_pick_24ghz_channel`.
+# Maxed-out 2.4 GHz HT40 + 802.11ax configuration for the MT7921U.
+# ``{channel}`` is filled at install time by :func:`_pick_24ghz_channel`
+# so the AP lands on whichever of channels 1/6 is least crowded - see
+# that function for why channel 11 is excluded (antenna SWR sweet spot).
+# ``{country}`` is filled by :func:`_get_country_code` from the live
+# system regdomain (fallback ``US``); without a country code hostapd
+# clamps TX power to 20 dBm and refuses 40 MHz on 2.4 GHz, silently
+# undoing the ``[HT40+]`` capability below.
 # ``{indent}`` is filled with the whitespace captured by
 # :data:`_CREATE_AP_ANCHOR_RE` so the inserted lines line up with the
 # surrounding argv entries regardless of upstream indentation choice.
 #
-# Why HT20 explicitly and not HT40?  The ``morrownr/88x2bu-20210702``
-# driver advertises HT40 capability but its AP-mode firmware path
-# cannot keep an HT40 BSS up.  May 2026 lab testing on a deliberately
-# cleaned RF environment (test owner moved all 2.4 GHz neighbours out
-# of ch 11 HT40-'s affected 2442-2482 MHz band, then hot-deployed
-# ``-c 11 --ht_capab [HT40-]`` into the live wifi-manager) showed
-# hostapd reach ``state=ENABLED`` but report ``secondary_channel=0``
-# and ``iw dev uap0 info`` come back with ``width: 20 MHz`` - i.e.
-# when things "worked" the driver was silently dropping us to HT20
-# below hostapd's state machine, inside the driver/firmware seam.
+# Why each flag (longer rationale in the module docstring):
 #
-# An earlier revision of this patch asked for ``[HT40+]`` anyway,
-# betting on (a) "the driver downgrades for us" and (b) "hostapd's
-# OBSS coex scan downgrades to HT20 if any 2.4 GHz neighbour overlaps
-# the secondary 40 MHz band, so HT40+ falls back gracefully for free."
-# A field report in May 2026 broke that bet: a unit with no 2.4 GHz
-# neighbours on the auto-picked channel saw hostapd actually issue
-# the HT40 BSS request (no OBSS neighbours to coex-downgrade off of),
-# the driver rejected it inside the firmware path, and the BSS
-# entered an ``INTERFACE-ENABLED`` -> ``INTERFACE-DISABLED`` cycle
-# on every client association attempt.  The user-visible signature
-# is "AP appears, you connect, it disappears, you lose connection"
-# and ``iw dev uap0 info`` shows ``txpower -100.00 dBm`` (the
-# firmware-unset sentinel) with no ``channel/width/center`` line -
-# distinct from the "stable HT20" signature where the same command
-# reports ``channel <N>, width: 20 MHz, txpower 20.00 dBm`` cleanly.
-#
-# Same class of AP-mode firmware-path issue as the 5 GHz failure
-# noted in the module docstring ("Why no 5 GHz mode" section): the
-# driver advertises a capability it cannot actually sustain.
-#
-# We therefore advertise HT20 only.  This costs nothing: every unit
-# that "worked" with the previous patch was running HT20 internally
-# already (per the lab measurement above).  The ht_capab caps we
-# keep - SHORT-GI-20, LDPC, RX-STBC1, MAX-AMSDU-7935 - are all
-# HT20-valid and lift real TCP throughput from ~25 Mbps stock to
-# ~80 Mbps.  The HT40-specific caps ([HT40+], SHORT-GI-40,
-# DSSS_CCK-40) are removed both because they would be ignored at
-# HT20 and to make sure hostapd has no path back to attempting an
-# HT40 BSS.
+#   --no-virt    : MT7921U interface combo allows only one AP per
+#                  phy. create_ap's default would add a virtual __ap
+#                  iface on top of the existing managed uap0 and the
+#                  firmware refuses with "Maybe your WiFi adapter
+#                  does not fully support virtual interfaces".
+#   --ieee80211n : enables HT (without it create_ap doesn't emit
+#                  ieee80211n=1 / ht_capab= into hostapd.conf, so
+#                  --ht_capab below is silently ignored).
+#   --ieee80211ax: enables 802.11ax (HE). MT7921U advertises
+#                  ``HE Iftypes: AP`` with ``HE40/2.4GHz``.
+#   --ht_capab   : HT40+ (40 MHz primary at low end), SHORT-GI on
+#                  both widths, LDPC, TX/RX STBC, MAX-AMSDU-7935.
+#                  Intentionally omits [DSSS_CCK-40] - MT7921U's
+#                  ``iw phy`` info reads ``No DSSS/CCK HT40`` and
+#                  hostapd refuses to start with ``Driver does not
+#                  support configured HT capability [DSSS_CCK-40]``.
+#                  No noscan=1 - we let hostapd's OBSS coexistence
+#                  scan downgrade us to HT20 when neighbours are
+#                  present, which is the most-reliable behaviour
+#                  for "fastest in whatever environment we're in".
+#   --country    : sourced live from the kernel's regdomain so the
+#                  AP behaves correctly wherever the vehicle is.
 _CREATE_AP_24GHZ_FLAGS_TEMPLATE = (
     '{indent}"-c", "{channel}",\n'
+    '{indent}"--no-virt",\n'
     '{indent}"--ieee80211n",\n'
-    '{indent}"--ht_capab", "[SHORT-GI-20][LDPC][RX-STBC1][MAX-AMSDU-7935]",\n'
-    '{indent}"--country", "US",\n'
+    '{indent}"--ieee80211ax",\n'
+    '{indent}"--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40][LDPC]'
+    '[TX-STBC][RX-STBC1][MAX-AMSDU-7935]",\n'
+    '{indent}"--country", "{country}",\n'
 )
 
 # Matches *any* DORIS create_ap insertion that may already follow
@@ -319,13 +324,31 @@ _CREATE_AP_24GHZ_FLAGS_TEMPLATE = (
 # Anchored via ``re.match`` from the position right after the
 # anchor match, never used as a free search, so false positives
 # outside our managed region are impossible.
+# Three lineages exist in the wild:
+#
+#   1. Legacy 5 GHz attempt (very old DORIS, never shipped widely):
+#      --freq-band 5 / -c <ch> / --ieee80211n / --ieee80211ac /
+#      --ht_capab "..." / --vht_capab "..." / --country "..."
+#   2. Realtek-era HT20-only (master @ 85de5dc):
+#      -c <ch> / --ieee80211n / --ht_capab "..." / --country "..."
+#   3. MT7921U HT40+HE (this branch):
+#      -c <ch> / --no-virt / --ieee80211n / --ieee80211ax /
+#      --ht_capab "..." / --country "..."
+#
+# Each line that's only in some lineages is wrapped in (?:...)?
+# Lines that appear in *all* lineages stay required. The regex is
+# anchored to the position right after :data:`_CREATE_AP_ANCHOR_RE`'s
+# match, so it can never match unmanaged content elsewhere in the
+# file.
 _DORIS_PATCH_BLOCK_RE = re.compile(
     r'(?:[ \t]*"--freq-band", "[0-9]+",\n)?'        # legacy 5 GHz only
     r'[ \t]*"-c", "[0-9]+",\n'                      # always present
+    r'(?:[ \t]*"--no-virt",\n)?'                    # MT7921U only
     r'[ \t]*"--ieee80211n",\n'                      # always present
-    r'(?:[ \t]*"--ieee80211ac",\n)?'                # legacy only
+    r'(?:[ \t]*"--ieee80211ac",\n)?'                # legacy 5 GHz only
+    r'(?:[ \t]*"--ieee80211ax",\n)?'                # MT7921U only
     r'[ \t]*"--ht_capab", "[^"]+",\n'               # always present
-    r'(?:[ \t]*"--vht_capab", "[^"]+",\n)?'         # legacy only
+    r'(?:[ \t]*"--vht_capab", "[^"]+",\n)?'         # legacy 5 GHz only
     r'[ \t]*"--country", "[A-Z]+",\n'               # always present
 )
 
@@ -688,13 +711,60 @@ def _strip_doris_patch(source: str) -> str:
     return source[:end_of_anchor] + source[block_match.end():]
 
 
+# Default country code when the kernel reports the world default ``00``
+# (or when the regdomain read fails). ``US`` is a safe choice for the
+# DORIS operator footprint (FCC permits 30 dBm and 40 MHz on 2.4 GHz);
+# it can be overridden post-hoc on a vehicle by setting the system
+# regdomain (``iw reg set <CC>`` or NetworkManager / kernel cmdline).
+_COUNTRY_CODE_FALLBACK = "US"
+
+
+async def _get_country_code() -> str:
+    """Return the active 2-letter country code, or ``US`` if unset.
+
+    Reads ``iw reg get`` on the host and parses the global block for
+    its ``country <CC>:`` line. Without a country code (kernel default
+    ``country 00``) hostapd uses the world regulatory domain - which
+    on 2.4 GHz means a 20 dBm TX-power cap *and* refuses to bring up
+    a 40 MHz channel width. Both silently undo other parts of the
+    create_ap speed patch, so making sure we pass *something* sensible
+    matters as much as picking the right value.
+
+    The output of ``iw reg get`` looks like::
+
+        global
+        country US: DFS-FCC
+            (902 - 904 @ 2), (N/A, 30), (N/A)
+            ...
+
+    We pull the 2-letter code from the first ``country <XX>:`` line
+    in the global block. Per-phy ``country <NN>: DFS-UNSET`` blocks
+    that follow are ignored - they're driver self-reports of the
+    cell-info-derived value, not the kernel's effective regdomain.
+    """
+    ok, out = await _run_host_command(
+        "iw reg get 2>/dev/null || sudo iw reg get 2>/dev/null"
+    )
+    if ok:
+        m = re.search(r"^country\s+([A-Z]{2}):", out, re.MULTILINE)
+        if m and m.group(1) != "00":
+            return m.group(1)
+    logger.info(
+        "System regdomain unset (or unreadable); falling back to '%s'",
+        _COUNTRY_CODE_FALLBACK,
+    )
+    return _COUNTRY_CODE_FALLBACK
+
+
 async def _install_create_ap_speed_patch() -> bool:
-    """Patch wifi-manager's ``create_ap`` invocation for max 2.4 GHz HT20.
+    """Patch wifi-manager's ``create_ap`` invocation for max 2.4 GHz HT40 + HE.
 
     Reads the in-container ``networkmanager.py``, picks the cleanest
-    2.4 GHz primary via :func:`_pick_24ghz_channel`, inserts the
-    HT20-with-full-caps flags after the ``--redirect-to-localhost``
-    anchor, and writes the result to
+    2.4 GHz primary via :func:`_pick_24ghz_channel`, sources the
+    country code from the live system regdomain via
+    :func:`_get_country_code`, inserts the HT40 + 802.11ax flags
+    (see :data:`_CREATE_AP_24GHZ_FLAGS_TEMPLATE`) after the
+    ``--redirect-to-localhost`` anchor, and writes the result to
     ``/usr/blueos/userdata/wifi-overrides/networkmanager.py`` so the
     bind mount in ``startup.json`` picks it up on the next
     ``blueos-core`` start.
@@ -783,6 +853,7 @@ async def _install_create_ap_speed_patch() -> bool:
 
     stripped = _strip_doris_patch(source)
     channel = await _pick_24ghz_channel()
+    country = await _get_country_code()
     anchor_match = _CREATE_AP_ANCHOR_RE.search(stripped)
     # We re-search post-strip because the strip can shift offsets, but
     # the anchor itself is never inside the stripped region; this match
@@ -795,7 +866,7 @@ async def _install_create_ap_speed_patch() -> bool:
     )
     indent = anchor_match.group("indent")
     flags = _CREATE_AP_24GHZ_FLAGS_TEMPLATE.format(
-        indent=indent, channel=channel
+        indent=indent, channel=channel, country=country,
     )
     insert_at = anchor_match.end()
     patched = stripped[:insert_at] + flags + stripped[insert_at:]
@@ -964,8 +1035,8 @@ async def _ensure_startup_bind() -> None:
 
 async def setup_hotspot_radio() -> None:
     """Install the host-side config that pins ``uap0`` to the USB MediaTek
-    *and* makes the AP come up on 2.4 GHz HT20 with the full set of HT
-    capabilities the radio supports.
+    *and* makes the AP come up on 2.4 GHz HT40 + 802.11ax with the full
+    set of HT/HE capabilities the radio supports.
 
     Idempotent: writes are skipped where existing host content already
     matches. Both the udev rename and the bind-mounted wifi override only
