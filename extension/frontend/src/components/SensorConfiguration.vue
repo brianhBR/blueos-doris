@@ -52,31 +52,68 @@ const isDetecting = ref(false)
 const moduleRefs = ref<Record<string, HTMLDivElement | null>>({})
 
 // ── Camera snapshot state ───────────────────────────────────────────
+// The preview hits /api/v1/camera/snapshot, which fetches a single JPEG
+// straight from the IP camera's built-in snapshot CGI (~200 ms, no MCM,
+// no ffmpeg, no RTSP).  That means the preview works whenever the
+// camera itself is reachable on the network — the BlueOS Camera Manager
+// stream does NOT need to be running.  The only time it is unavailable
+// is while the onboard recorder pipeline is active, in which case the
+// backend returns HTTP 409 and we render a "preview disabled while
+// recording" tile instead of polling.
+const SNAPSHOT_POLL_MS = 10000
+
 const snapshotUrl = ref<string | null>(null)
 const snapshotLoading = ref(false)
 const snapshotError = ref(false)
+/** Truth source for whether the camera is actually reachable.  Driven
+ *  by snapshot outcomes (not by MCM's stream.running, which lies for
+ *  the direct-CGI path).  null until the first probe completes; a 409
+ *  from the recorder does NOT change this -- it means the camera is
+ *  busy, not unreachable. */
+const cameraReachable = ref<boolean | null>(null)
 let snapshotInterval: number | undefined
 
-const hasConnectedCamera = computed(() =>
-  modules.value.some(m => m.type === 'camera' && m.connected)
-)
-
-/** Any camera tile from Camera Manager (running or not) — IP cam recorder does not need stream.running */
+/** Any camera tile from Camera Manager (running or not) — the direct-CGI
+ *  snapshot path does not require stream.running. */
 const hasCameraModule = computed(() => modules.value.some(m => m.type === 'camera'))
 
+function clearSnapshotImage() {
+  if (snapshotUrl.value) {
+    URL.revokeObjectURL(snapshotUrl.value)
+    snapshotUrl.value = null
+  }
+}
+
 async function refreshSnapshot() {
-  if (!hasConnectedCamera.value) return
-  if (ipcamRecording.value) return
+  if (!hasCameraModule.value) return
+  // While the recorder owns the camera's single RTSP/snapshot slot,
+  // skip polling entirely instead of hammering the backend with 409s.
+  // The recorder being busy does NOT mean the camera is unreachable,
+  // so leave cameraReachable alone.
+  if (ipcamRecording.value) {
+    clearSnapshotImage()
+    snapshotLoading.value = false
+    snapshotError.value = false
+    return
+  }
   snapshotLoading.value = !snapshotUrl.value
   snapshotError.value = false
   try {
     const resp = await fetch(`/api/v1/camera/snapshot?_t=${Date.now()}`)
+    if (resp.status === 409) {
+      // Backend says recorder is active; status pill is driven by
+      // ipcamRecording, so don't flip cameraReachable here either.
+      clearSnapshotImage()
+      return
+    }
     if (!resp.ok) throw new Error(resp.statusText)
     const blob = await resp.blob()
     if (snapshotUrl.value) URL.revokeObjectURL(snapshotUrl.value)
     snapshotUrl.value = URL.createObjectURL(blob)
+    cameraReachable.value = true
   } catch {
     snapshotError.value = true
+    cameraReachable.value = false
   } finally {
     snapshotLoading.value = false
   }
@@ -84,15 +121,71 @@ async function refreshSnapshot() {
 
 function startSnapshotPolling() {
   if (snapshotInterval) { clearInterval(snapshotInterval); snapshotInterval = undefined }
-  if (hasConnectedCamera.value) {
-    snapshotLoading.value = true
-    refreshSnapshot()
-    snapshotInterval = setInterval(refreshSnapshot, 10000) as unknown as number
+  if (hasCameraModule.value) {
+    snapshotLoading.value = !snapshotUrl.value
+    void refreshSnapshot()
+    snapshotInterval = setInterval(refreshSnapshot, SNAPSHOT_POLL_MS) as unknown as number
   } else {
-    if (snapshotUrl.value) { URL.revokeObjectURL(snapshotUrl.value); snapshotUrl.value = null }
+    clearSnapshotImage()
     snapshotError.value = false
+    cameraReachable.value = null
   }
 }
+
+/** Header-row state for a camera tile.  Replaces the misleading
+ *  mod.connected / mod.moduleStatus values (which derive from MCM
+ *  stream.running) with values that reflect actual camera reachability
+ *  via the snapshot endpoint plus the recorder's busy-state. */
+type CameraTileTone = 'good' | 'warn' | 'bad' | 'neutral'
+interface CameraTileStatus {
+  statusText: string
+  statusColor: string
+  pillText: string
+  pillColor: string
+  icon: 'wifi' | 'wifi-off' | 'video' | 'loader'
+  iconTone: CameraTileTone
+}
+
+const cameraTileStatus = computed<CameraTileStatus>(() => {
+  if (ipcamRecording.value) {
+    return {
+      statusText: 'Recording',
+      statusColor: '#86efac',
+      pillText: 'Busy (recorder)',
+      pillColor: '#86efac',
+      icon: 'video',
+      iconTone: 'good',
+    }
+  }
+  if (cameraReachable.value === true) {
+    return {
+      statusText: 'Ready: Preview live',
+      statusColor: '#FCD869',
+      pillText: 'Connected',
+      pillColor: '#FCD869',
+      icon: 'wifi',
+      iconTone: 'good',
+    }
+  }
+  if (cameraReachable.value === false) {
+    return {
+      statusText: 'No response from camera',
+      statusColor: '#DD2C1D',
+      pillText: 'Unreachable',
+      pillColor: '#DD2C1D',
+      icon: 'wifi-off',
+      iconTone: 'bad',
+    }
+  }
+  return {
+    statusText: 'Connecting...',
+    statusColor: 'rgba(150, 238, 242, 0.7)',
+    pillText: 'Connecting...',
+    pillColor: 'rgba(150, 238, 242, 0.7)',
+    icon: 'loader',
+    iconTone: 'neutral',
+  }
+})
 
 // ── IP camera extension recorder (ffmpeg RTSP → TS; no Lua) ───────────
 const IPCAM_RECORD_API = '/api/v1/ipcam/record'
@@ -525,7 +618,7 @@ async function triggerBaroCalibration() {
 // ── Module list sync ────────────────────────────────────────────────
 watch(apiModules, (newModules) => {
   if (newModules.length > 0) {
-    const hadCamera = hasConnectedCamera.value
+    const hadCamera = hasCameraModule.value
     modules.value = newModules.map((m: ApiSensorModule) => ({
       id: m.id,
       name: m.name,
@@ -535,14 +628,28 @@ watch(apiModules, (newModules) => {
       calibrationFile: m.firmware_version ?? undefined,
       moduleStatus: m.module_status,
     }))
-    if (!hadCamera && hasConnectedCamera.value) {
+    if (!hadCamera && hasCameraModule.value) {
       startSnapshotSidecar()
     }
   }
 }, { immediate: true })
 
-watch(hasConnectedCamera, startSnapshotSidecar)
-watch(hasCameraModule, startIpcamSidecar)
+watch(hasCameraModule, () => {
+  startSnapshotSidecar()
+  startIpcamSidecar()
+})
+
+// When recording starts, the next poll already short-circuits (see
+// refreshSnapshot); clear the stale image so the UI flips to the
+// "recorder is using the camera" tile.  When recording stops, kick a
+// fresh poll immediately instead of waiting for the next 10 s tick.
+watch(ipcamRecording, (recording) => {
+  if (recording) {
+    clearSnapshotImage()
+  } else if (hasCameraModule.value) {
+    void refreshSnapshot()
+  }
+})
 
 let pollInterval: number | undefined
 
@@ -727,7 +834,37 @@ const getStatusColor = (moduleStatus: string) => {
                   <h3 class="text-white">{{ mod.name }}</h3>
                 </div>
               </div>
+              <!--
+                Camera tiles: read-only indicator driven by snapshot
+                reachability (truth) plus recorder busy-state.  The
+                old Wifi toggle for cameras was misleading because it
+                flipped a cosmetic local boolean fed by MCM
+                stream.running, which is no longer the truth source.
+
+                Other tiles keep the existing local toggle.
+              -->
+              <div
+                v-if="mod.type === 'camera'"
+                class="p-2 rounded-lg flex items-center justify-center"
+                :title="cameraTileStatus.pillText"
+                :style="{
+                  backgroundColor:
+                    cameraTileStatus.iconTone === 'good' ? 'rgba(252, 216, 105, 0.2)' :
+                    cameraTileStatus.iconTone === 'bad'  ? 'rgba(221, 44, 29, 0.18)' :
+                    'rgba(14, 36, 70, 0.5)',
+                  color:
+                    cameraTileStatus.iconTone === 'good' ? '#FCD869' :
+                    cameraTileStatus.iconTone === 'bad'  ? '#DD2C1D' :
+                    '#96EEF2'
+                }"
+              >
+                <Wifi    v-if="cameraTileStatus.icon === 'wifi'"     class="w-5 h-5" />
+                <WifiOff v-else-if="cameraTileStatus.icon === 'wifi-off'" class="w-5 h-5" />
+                <Video   v-else-if="cameraTileStatus.icon === 'video'"    class="w-5 h-5" />
+                <Loader2 v-else-if="cameraTileStatus.icon === 'loader'"   class="w-5 h-5 animate-spin" />
+              </div>
               <button
+                v-else
                 @click.stop="toggleConnection(mod.id)"
                 class="p-2 rounded-lg transition-all"
                 :style="{
@@ -741,28 +878,60 @@ const getStatusColor = (moduleStatus: string) => {
             </div>
 
             <div class="space-y-2">
-              <div class="flex items-center justify-between text-sm">
-                <span :style="{ color: getStatusColor(mod.moduleStatus) }">
-                  {{ mod.moduleStatus }}
-                </span>
-              </div>
-              <div class="flex items-center justify-between text-sm">
-                <span style="color: #96EEF2">Connection</span>
-                <span :style="{ color: mod.connected ? '#FCD869' : '#DD2C1D' }">
-                  {{ mod.connected ? 'Connected' : 'Disconnected' }}
-                </span>
-              </div>
+              <!-- Camera: status + connection rows reflect actual reachability -->
+              <template v-if="mod.type === 'camera'">
+                <div class="flex items-center justify-between text-sm">
+                  <span :style="{ color: cameraTileStatus.statusColor }">
+                    {{ cameraTileStatus.statusText }}
+                  </span>
+                </div>
+                <div class="flex items-center justify-between text-sm">
+                  <span style="color: #96EEF2">Connection</span>
+                  <span :style="{ color: cameraTileStatus.pillColor }">
+                    {{ cameraTileStatus.pillText }}
+                  </span>
+                </div>
+              </template>
+              <template v-else>
+                <div class="flex items-center justify-between text-sm">
+                  <span :style="{ color: getStatusColor(mod.moduleStatus) }">
+                    {{ mod.moduleStatus }}
+                  </span>
+                </div>
+                <div class="flex items-center justify-between text-sm">
+                  <span style="color: #96EEF2">Connection</span>
+                  <span :style="{ color: mod.connected ? '#FCD869' : '#DD2C1D' }">
+                    {{ mod.connected ? 'Connected' : 'Disconnected' }}
+                  </span>
+                </div>
+              </template>
             </div>
 
-            <!-- Camera: preview only when BlueOS stream is running; recorder always (RTSP path is fixed in extension) -->
+            <!--
+              Camera preview tile.  Driven by /api/v1/camera/snapshot,
+              which fetches a JPEG straight from the camera's snapshot
+              CGI.  It works whether or not the BlueOS Camera Manager
+              stream is running — the only "off" state is while the
+              onboard recorder owns the camera's single RTSP slot.
+            -->
             <div v-if="mod.type === 'camera'" class="mt-3 space-y-3">
               <div
-                v-if="mod.connected"
                 class="rounded-lg overflow-hidden"
                 style="border: 1px solid rgba(65, 185, 195, 0.2)"
               >
                 <div
-                  v-if="snapshotLoading && !snapshotUrl"
+                  v-if="ipcamRecording"
+                  class="flex items-center justify-center gap-2 py-6 text-center px-4"
+                  style="background-color: rgba(0,0,0,0.35)"
+                >
+                  <Video class="w-4 h-4" style="color: #86efac" />
+                  <span class="text-xs" style="color: rgba(150, 238, 242, 0.7)">
+                    Preview paused — recorder is using the camera. Stop recording to resume preview.
+                  </span>
+                </div>
+
+                <div
+                  v-else-if="snapshotLoading && !snapshotUrl"
                   class="flex items-center justify-center py-10"
                   style="color: #96EEF2; background-color: rgba(0,0,0,0.3)"
                 >
@@ -791,18 +960,20 @@ const getStatusColor = (moduleStatus: string) => {
                     class="w-full object-contain"
                     style="max-height: 300px"
                   />
-                  <div class="flex items-center justify-end gap-1 px-2 py-1" style="background-color: rgba(14, 36, 70, 0.8)">
+                  <div class="flex items-center justify-between gap-2 px-2 py-1" style="background-color: rgba(14, 36, 70, 0.8)">
                     <span class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Snapshot updates every 10s</span>
+                    <button
+                      @click.stop="refreshSnapshot"
+                      :disabled="snapshotLoading"
+                      class="text-xs px-2 py-0.5 rounded hover:opacity-80 flex items-center gap-1 disabled:opacity-50"
+                      style="background-color: rgba(65, 185, 195, 0.15); color: #96EEF2; border: 1px solid rgba(65, 185, 195, 0.3)"
+                    >
+                      <Loader2 v-if="snapshotLoading" class="w-3 h-3 animate-spin" />
+                      <RefreshCw v-else class="w-3 h-3" />
+                      Refresh
+                    </button>
                   </div>
                 </div>
-              </div>
-
-              <div
-                v-else
-                class="rounded-lg px-3 py-2.5 text-xs leading-relaxed"
-                style="background-color: rgba(14, 36, 70, 0.45); border: 1px solid rgba(65, 185, 195, 0.2); color: rgba(150, 238, 242, 0.65)"
-              >
-                Video stream is not running in Camera Manager, so the live snapshot preview is unavailable. You can still start file recording below — it uses the extension’s RTSP path and does not depend on this stream.
               </div>
 
               <div class="rounded-lg p-3 space-y-2" style="background-color: rgba(14, 36, 70, 0.6); border: 1px solid rgba(65, 185, 195, 0.25)">
