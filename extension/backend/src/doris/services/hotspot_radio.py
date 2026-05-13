@@ -45,8 +45,7 @@ module inside ``blueos-core`` to add::
 
     "-c", "<auto-picked: 1 or 6>",
     "--ieee80211n",
-    "--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40][LDPC][RX-STBC1]"
-                  "[MAX-AMSDU-7935][DSSS_CCK-40]",
+    "--ht_capab", "[SHORT-GI-20][LDPC][RX-STBC1][MAX-AMSDU-7935]",
     "--country", "US",
 
 right before the SSID/password arguments. The patched module is written
@@ -57,17 +56,26 @@ re-reads ``startup.json`` on every boot, so the override survives
 ``blueos-core`` recreations and BlueOS upgrades that don't touch the
 target file.
 
-Even though the ht_capab line asks for ``[HT40+]``, hostapd is allowed
-(and required by 802.11n on 2.4 GHz) to fall back to HT20 if its OBSS
-coexistence scan finds neighbouring BSSes overlapping the would-be 40
-MHz band - this gives us "try HT40, fall back to HT20" for free. In
-practice the bundled ``88x2bu`` driver also silently downgrades HT40
-to HT20 in AP mode even in a clean OBSS environment (see the inline
-comment on :data:`_CREATE_AP_24GHZ_FLAGS_TEMPLATE` below for the
-empirical proof), so we always end up running HT20-with-full-caps -
-still about 3x stock throughput because the rich ``ht_capab`` flags
-add SHORT-GI, LDPC, RX-STBC, MAX-AMSDU and DSSS/CCK aggregation on
-top of the bare HT20 ``wifi-manager`` ships.
+The ht_capab line explicitly declares HT20-only capabilities. An
+earlier revision of this patch asked for ``[HT40+]`` on the theory
+that hostapd's "try HT40, OBSS-coex fall back to HT20" logic would
+get us the wider channel for free in clean RF environments and a
+graceful downgrade otherwise. In practice the bundled
+``morrownr/88x2bu-20210702`` driver's AP-mode firmware path cannot
+keep an HT40 BSS up: in a busy 2.4 GHz environment hostapd's OBSS
+scan downgrades to HT20 before the driver ever sees the request and
+things look fine, but in a clean RF environment hostapd actually
+issues the HT40 BSS request, the driver rejects it, and the BSS
+cycles ``INTERFACE-ENABLED`` → ``INTERFACE-DISABLED`` (end-user
+symptom: "AP shows up, you connect, it disappears, you lose
+connection"; ``iw dev uap0 info`` shows ``txpower -100.00 dBm`` and
+no ``channel/width/center`` line). Confirmed in field reports May
+2026 on a unit with no 2.4 GHz neighbours on the picker-chosen
+channel. Asking for HT20 directly removes the failure mode at the
+cost of nothing - the driver was downgrading to HT20 every time it
+actually completed a BSS bring-up anyway. The other capabilities
+(LDPC, SHORT-GI-20, RX-STBC1, MAX-AMSDU-7935) still lift real TCP
+throughput from ~25 Mbps (stock) to ~80 Mbps on this radio.
 
 Channel auto-selection
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -228,31 +236,50 @@ _CREATE_AP_ANCHOR_RE = re.compile(
 # :data:`_CREATE_AP_ANCHOR_RE` so the inserted lines line up with the
 # surrounding argv entries regardless of upstream indentation choice.
 #
-# Why HT20 and not HT40?  The ``morrownr/88x2bu-20210702`` driver
-# advertises HT40 in ``iw phy phy1 info`` but its AP-mode firmware path
-# silently downgrades any HT40 BSS to HT20.  Confirmed on May 2026 with
-# a deliberately-cleaned RF environment (test owner moved all 2.4 GHz
-# neighbours out of ch 11 HT40-'s affected band of 2442-2482 MHz, then
-# hot-deployed ``-c 11 --ht_capab [HT40-]`` straight into the live
-# wifi-manager).  hostapd reached ``state=ENABLED`` cleanly but reported
-# ``secondary_channel=0`` and ``iw dev uap0 info`` showed
-# ``width: 20 MHz`` - i.e. the downgrade is happening below hostapd's
-# OBSS coexistence check, in the driver itself.  Same class of
-# AP-mode firmware-path issue as the 5 GHz failure noted in the module
-# docstring ("Why no 5 GHz mode" section).
+# Why HT20 explicitly and not HT40?  The ``morrownr/88x2bu-20210702``
+# driver advertises HT40 capability but its AP-mode firmware path
+# cannot keep an HT40 BSS up.  May 2026 lab testing on a deliberately
+# cleaned RF environment (test owner moved all 2.4 GHz neighbours out
+# of ch 11 HT40-'s affected 2442-2482 MHz band, then hot-deployed
+# ``-c 11 --ht_capab [HT40-]`` into the live wifi-manager) showed
+# hostapd reach ``state=ENABLED`` but report ``secondary_channel=0``
+# and ``iw dev uap0 info`` come back with ``width: 20 MHz`` - i.e.
+# when things "worked" the driver was silently dropping us to HT20
+# below hostapd's state machine, inside the driver/firmware seam.
 #
-# We still ask for ``[HT40+]`` in the ht_capab line because (a) it
-# advertises the wider capability to clients that might benefit if a
-# future driver fixes this, and (b) hostapd's standard "try HT40, fall
-# back to HT20 if OBSS coexistence scan finds neighbours" logic remains
-# in effect for free.  The other capabilities (LDPC, both SGI rates,
-# RX-STBC1, MAX-AMSDU-7935, DSSS/CCK in HT40) all stick at HT20 and
-# lift real TCP throughput from ~25 Mbps (stock) to ~80 Mbps.
+# An earlier revision of this patch asked for ``[HT40+]`` anyway,
+# betting on (a) "the driver downgrades for us" and (b) "hostapd's
+# OBSS coex scan downgrades to HT20 if any 2.4 GHz neighbour overlaps
+# the secondary 40 MHz band, so HT40+ falls back gracefully for free."
+# A field report in May 2026 broke that bet: a unit with no 2.4 GHz
+# neighbours on the auto-picked channel saw hostapd actually issue
+# the HT40 BSS request (no OBSS neighbours to coex-downgrade off of),
+# the driver rejected it inside the firmware path, and the BSS
+# entered an ``INTERFACE-ENABLED`` -> ``INTERFACE-DISABLED`` cycle
+# on every client association attempt.  The user-visible signature
+# is "AP appears, you connect, it disappears, you lose connection"
+# and ``iw dev uap0 info`` shows ``txpower -100.00 dBm`` (the
+# firmware-unset sentinel) with no ``channel/width/center`` line -
+# distinct from the "stable HT20" signature where the same command
+# reports ``channel <N>, width: 20 MHz, txpower 20.00 dBm`` cleanly.
+#
+# Same class of AP-mode firmware-path issue as the 5 GHz failure
+# noted in the module docstring ("Why no 5 GHz mode" section): the
+# driver advertises a capability it cannot actually sustain.
+#
+# We therefore advertise HT20 only.  This costs nothing: every unit
+# that "worked" with the previous patch was running HT20 internally
+# already (per the lab measurement above).  The ht_capab caps we
+# keep - SHORT-GI-20, LDPC, RX-STBC1, MAX-AMSDU-7935 - are all
+# HT20-valid and lift real TCP throughput from ~25 Mbps stock to
+# ~80 Mbps.  The HT40-specific caps ([HT40+], SHORT-GI-40,
+# DSSS_CCK-40) are removed both because they would be ignored at
+# HT20 and to make sure hostapd has no path back to attempting an
+# HT40 BSS.
 _CREATE_AP_24GHZ_FLAGS_TEMPLATE = (
     '{indent}"-c", "{channel}",\n'
     '{indent}"--ieee80211n",\n'
-    '{indent}"--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40]'
-    '[LDPC][RX-STBC1][MAX-AMSDU-7935][DSSS_CCK-40]",\n'
+    '{indent}"--ht_capab", "[SHORT-GI-20][LDPC][RX-STBC1][MAX-AMSDU-7935]",\n'
     '{indent}"--country", "US",\n'
 )
 
