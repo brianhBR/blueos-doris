@@ -730,7 +730,6 @@ class NetworkService:
             await self._client.connect(ssid, password, interface=iface)
         except Exception as e:
             logger.warning("Connect call to %r failed: %s", ssid, e)
-            await self._client.forget_network(ssid)
             await self._restore_ap_after_failure(iface)
             self._record_failure(ssid, f"Connect rejected: {e}")
             return
@@ -753,7 +752,13 @@ class NetworkService:
                 "STA association to %r timed out after %.0fs (last status=%s)",
                 ssid, STA_CONNECT_TIMEOUT_S, last_status,
             )
-            await self._client.forget_network(ssid)
+            # Deliberately NOT calling forget_network(ssid) here. Saved
+            # networks in BlueOS WiFi Manager are global, not per-
+            # interface — so forgetting the SSID we just tried would
+            # also clear it from wlan0's saved list, silently breaking
+            # any lab-internet connection the user has set up there.
+            # The user can clean stale credentials manually via the
+            # BlueOS UI if they really need to.
             await self._restore_ap_after_failure(iface)
             self._record_failure(
                 ssid,
