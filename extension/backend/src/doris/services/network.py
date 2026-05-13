@@ -17,6 +17,7 @@ from ..models.network import (
 )
 from .base import BlueOSClient
 from .blueos.network import NetworkClient
+from .hotspot_radio import _run_host_command
 from .storage import DATA_ROOT
 
 logger = logging.getLogger(__name__)
@@ -37,6 +38,19 @@ WLAN_INTENT_FILE = DATA_ROOT / "network_intent.json"
 # typical home router. 60s is a comfortable upper bound.
 STA_CONNECT_TIMEOUT_S = 60.0
 STA_POLL_INTERVAL_S = 2.0
+
+# ── v1 fallback constants ────────────────────────────────────────────
+#
+# BlueOS WiFi Manager v1 has no per-interface mode API, so on v1 we
+# bypass it: we briefly transfer ``uap0`` from create_ap (hostapd) over
+# to NetworkManager + nmcli for the duration of the STA session, then
+# hand it back. The unmanaged-devices conf file has to move out of the
+# way for NM to be willing to drive the interface; we stash it in /tmp
+# and put it back when we restore the hotspot.
+V1_NM_UNMANAGED_CONF = "/etc/NetworkManager/conf.d/99-blueos-hotspot-uap0.conf"
+V1_NM_UNMANAGED_STASH = "/tmp/doris-99-blueos-hotspot-uap0.conf.stash"
+V1_UAP0_CONNECTION_PREFIX = "doris-uap0-sta-"
+V1_DHCP_TIMEOUT_S = 30
 
 
 class NetworkService:
@@ -568,13 +582,27 @@ class NetworkService:
             logger.warning("Could not persist WLAN intent: %s", e)
 
     async def get_wlan_state(self) -> WlanState:
-        """Return the current AP/STA state, refreshing IP from the
-        WiFi Manager if we're in an STA mode."""
+        """Return the current AP/STA state, refreshing IP / liveness
+        from the appropriate place for the active code path.
+
+        v2 path: BlueOS WiFi Manager ``/status`` is interface-aware and
+        reports the right thing.
+
+        v1 path: ``/v1.0/status`` reflects whatever interface BlueOS
+        treats as primary (typically ``wlan0``), which would lie to us
+        about ``uap0``. We probe the host directly via ``ip``/``iw``
+        instead.
+        """
         if self._wlan_state is None:
             self._wlan_state = self._load_wlan_state()
 
         state = self._wlan_state
-        if state.mode == "sta_connected":
+        if state.mode != "sta_connected":
+            return state
+
+        # v2 first.
+        v2_iface = await self._resolve_hotspot_interface_name()
+        if v2_iface:
             try:
                 status = await self._client.get_status()
                 if status.get("state") == "connected":
@@ -586,9 +614,6 @@ class NetworkService:
                         )
                         self._wlan_state = state
                 else:
-                    # Connection dropped out from under us. The user
-                    # would otherwise see "connected" in the UI forever
-                    # while actually being unreachable.
                     logger.warning(
                         "STA connection lost (status=%s), treating as ap",
                         status.get("state"),
@@ -597,7 +622,31 @@ class NetworkService:
                     self._wlan_state = state
                     self._save_wlan_state(state)
             except Exception as e:
-                logger.debug("get_wlan_state status refresh failed: %s", e)
+                logger.debug("get_wlan_state v2 status refresh failed: %s", e)
+            return state
+
+        # v1: probe host directly.
+        v1_iface = await self._resolve_external_iface_v1()
+        if not v1_iface:
+            return state
+        try:
+            ok, ip_out = await _run_host_command(
+                f"ip -4 -o addr show dev {v1_iface} 2>/dev/null "
+                f"| awk '{{print $4}}' | cut -d/ -f1 | head -1"
+            )
+            ip = ip_out.strip() if ok else ""
+            if not ip:
+                logger.warning(
+                    "[v1] STA on %s lost its IP, treating as ap", v1_iface,
+                )
+                state = WlanState(mode="ap", last_attempt=state.last_attempt)
+                self._wlan_state = state
+                self._save_wlan_state(state)
+            elif ip != state.ip_address:
+                state = state.model_copy(update={"ip_address": ip})
+                self._wlan_state = state
+        except Exception as e:
+            logger.debug("get_wlan_state v1 IP probe failed: %s", e)
 
         return state
 
@@ -625,8 +674,8 @@ class NetworkService:
         except Exception:
             pass
 
-        iface = await self._resolve_hotspot_interface_name()
-        if iface:
+        v2_iface = await self._resolve_hotspot_interface_name()
+        if v2_iface:
             try:
                 # Only disconnect if the external radio is actually
                 # associated to a STA. configure_hotspot() ran just
@@ -634,14 +683,48 @@ class NetworkService:
                 # hotspot mode and there's nothing to do here — but
                 # if a previous run left it in STA mode we want to
                 # break that association cleanly.
-                hs = await self._client._v2.wifi_hotspot_status(iface)
+                hs = await self._client._v2.wifi_hotspot_status(v2_iface)
                 if not hs.get("enabled"):
-                    await self._client.disconnect(interface=iface)
-                    logger.info("Boot-time STA disconnect issued on %s", iface)
+                    await self._client.disconnect(interface=v2_iface)
+                    logger.info("Boot-time STA disconnect issued on %s", v2_iface)
             except Exception as e:
                 logger.debug(
-                    "Boot-time WLAN disconnect skipped on %s: %s", iface, e,
+                    "Boot-time WLAN disconnect skipped on %s: %s", v2_iface, e,
                 )
+        else:
+            # v1 fallback: if a previous run crashed mid-switch we may
+            # still have an unmanaged-conf stash sitting in /tmp and a
+            # leftover doris-uap0-sta-* nmcli profile holding the
+            # interface. Roll back so configure_hotspot() (which the
+            # caller just ran) can actually drive create_ap.
+            v1_iface = await self._resolve_external_iface_v1()
+            if v1_iface:
+                # Tear down any stale doris-uap0-sta-* profiles.
+                ok, out = await _run_host_command(
+                    "nmcli -t -f NAME connection show 2>/dev/null"
+                )
+                if ok:
+                    for name in out.splitlines():
+                        name = name.strip()
+                        if name.startswith(V1_UAP0_CONNECTION_PREFIX):
+                            await _run_host_command(
+                                f"sudo nmcli connection down '{name}' 2>/dev/null; "
+                                f"sudo nmcli connection delete '{name}' 2>/dev/null; "
+                                f"true"
+                            )
+                            logger.info(
+                                "[v1] cleaned up leftover STA profile %r", name,
+                            )
+                # Restore stashed unmanaged conf if present.
+                ok, _ = await _run_host_command(
+                    f"test -f {V1_NM_UNMANAGED_STASH} && "
+                    f"sudo mv {V1_NM_UNMANAGED_STASH} {V1_NM_UNMANAGED_CONF} && "
+                    f"sudo nmcli general reload conf"
+                )
+                if ok:
+                    logger.info(
+                        "[v1] restored stashed unmanaged conf for %s", v1_iface,
+                    )
 
         self._wlan_state = WlanState(mode="ap", last_attempt=last_attempt)
         self._save_wlan_state(self._wlan_state)
@@ -707,14 +790,43 @@ class NetworkService:
             return current
 
     async def _run_switch_to_sta(self, ssid: str, password: str) -> None:
-        """Background task that performs the AP -> STA flip."""
-        iface = await self._resolve_hotspot_interface_name()
-        if not iface:
-            logger.warning("No external WiFi interface; aborting STA switch")
-            self._record_failure(ssid, "External WiFi interface not found")
+        """Background task that performs the AP -> STA flip.
+
+        Dispatches between the v2 path (BlueOS WiFi Manager v2 with
+        per-interface mode + connect APIs) and the v1 host-shell path
+        (nmcli driving uap0 directly while the BlueOS hotspot is paused).
+        """
+        # Fast path: if v2 is available, use it.
+        v2_iface = await self._resolve_hotspot_interface_name()
+        if v2_iface:
+            await self._v2_switch_to_sta(v2_iface, ssid, password)
             return
 
-        logger.info("Switching %s from AP to STA, target SSID=%r", iface, ssid)
+        # Slow path: v1 fallback driving uap0 ourselves via Commander.
+        v1_iface = await self._resolve_external_iface_v1()
+        if not v1_iface:
+            logger.warning("No external WiFi interface (v1 probe); aborting STA switch")
+            self._record_failure(ssid, "External WiFi interface not found")
+            return
+        await self._v1_switch_to_sta(v1_iface, ssid, password)
+
+    async def _run_switch_to_ap(self) -> None:
+        """Background task that performs the STA -> AP flip."""
+        v2_iface = await self._resolve_hotspot_interface_name()
+        if v2_iface:
+            await self._v2_switch_to_ap(v2_iface)
+            return
+
+        v1_iface = await self._resolve_external_iface_v1()
+        if not v1_iface:
+            logger.warning("No external WiFi interface (v1 probe); cannot restore AP")
+            return
+        await self._v1_switch_to_ap(v1_iface)
+
+    # ── v2 path (BlueOS WiFi Manager v2) ─────────────────────────────
+
+    async def _v2_switch_to_sta(self, iface: str, ssid: str, password: str) -> None:
+        logger.info("[v2] Switching %s from AP to STA, target SSID=%r", iface, ssid)
 
         try:
             await self._client.set_interface_mode(iface, "normal", timeout=30.0)
@@ -767,7 +879,7 @@ class NetworkService:
             return
 
         ip = last_status.get("ip_address")
-        logger.info("STA connected to %r (ip=%s)", ssid, ip)
+        logger.info("[v2] STA connected to %r (ip=%s)", ssid, ip)
         success = WlanLastAttempt(
             ssid=ssid,
             status="success",
@@ -781,14 +893,8 @@ class NetworkService:
         )
         self._save_wlan_state(self._wlan_state)
 
-    async def _run_switch_to_ap(self) -> None:
-        """Background task that performs the STA -> AP flip."""
-        iface = await self._resolve_hotspot_interface_name()
-        if not iface:
-            logger.warning("No external WiFi interface; cannot restore AP")
-            return
-
-        logger.info("Restoring %s to hotspot mode", iface)
+    async def _v2_switch_to_ap(self, iface: str) -> None:
+        logger.info("[v2] Restoring %s to hotspot mode", iface)
         try:
             await self._client.disconnect(interface=iface)
         except Exception as e:
@@ -801,6 +907,225 @@ class NetworkService:
             last_attempt=self._wlan_state.last_attempt if self._wlan_state else None,
         )
         self._save_wlan_state(self._wlan_state)
+
+    # ── v1 path (BlueOS WiFi Manager v1, nmcli on host) ──────────────
+
+    async def _resolve_external_iface_v1(self) -> str | None:
+        """Best-guess for the external WiFi interface on v1 systems.
+
+        On DORIS hardware the Realtek RTL88x2BU is renamed to ``uap0``
+        by udev (see services/hotspot_radio.py). On a stock setup it
+        would be ``wlan1``. Probe both via /sys/class/net.
+        """
+        for cand in ("uap0", "wlan1"):
+            ok, out = await _run_host_command(
+                f"test -d /sys/class/net/{cand} && echo {cand}"
+            )
+            if ok and cand in out:
+                return cand
+        return None
+
+    async def _v1_switch_to_sta(self, iface: str, ssid: str, password: str) -> None:
+        """Drive *iface* from AP mode to STA mode without the v2 mode API.
+
+        Sequence:
+
+          1. Stash ``unmanaged-devices=uap0`` NM conf so NM can take
+             ownership of the interface; reload NM.
+          2. Disable BlueOS hotspot (legacy v1 toggle) — this kills
+             ``create_ap`` / hostapd on the interface.
+          3. Bring the iface link down/up to clear hostapd state.
+          4. Create + activate an nmcli connection profile bound to
+             *iface*, autoconnect off so it never auto-rejoins on its
+             own.
+          5. Poll ``ip addr show`` for a DHCP lease.
+
+        Any failure step rolls back via :meth:`_v1_restore_hotspot`.
+        """
+        conn_name = f"{V1_UAP0_CONNECTION_PREFIX}{ssid}"
+        logger.info(
+            "[v1] Switching %s from AP to STA, target SSID=%r (conn=%r)",
+            iface, ssid, conn_name,
+        )
+
+        # 1. Stash unmanaged conf and reload NM so NM is willing to drive uap0.
+        await _run_host_command(
+            f"if [ -f {V1_NM_UNMANAGED_CONF} ]; then "
+            f"  sudo mv {V1_NM_UNMANAGED_CONF} {V1_NM_UNMANAGED_STASH}; "
+            f"fi"
+        )
+        await _run_host_command("sudo nmcli general reload conf")
+        await asyncio.sleep(1)
+
+        # 2. Disable BlueOS hotspot (kills create_ap on uap0).
+        try:
+            await self._client.set_hotspot(False)
+        except Exception as e:
+            logger.warning("[v1] set_hotspot(False) failed: %s", e)
+            await self._v1_restore_hotspot(iface, conn_name)
+            self._record_failure(ssid, f"Could not disable hotspot: {e}")
+            return
+
+        await asyncio.sleep(3)
+
+        # 3. Force the link down/up to flush hostapd state cleanly.
+        await _run_host_command(
+            f"sudo ip link set {iface} down; sleep 1; sudo ip link set {iface} up"
+        )
+        await asyncio.sleep(2)
+
+        # 4. Create + activate the nmcli connection.
+        # Single-quote-escape SSID/password by replacing ' with '\''
+        safe_ssid = ssid.replace("'", "'\\''")
+        safe_pwd = password.replace("'", "'\\''")
+
+        # Clean any prior profile with the same name (e.g. from a
+        # previous failed attempt to the same SSID).
+        await _run_host_command(
+            f"sudo nmcli connection delete '{conn_name}' 2>/dev/null; true"
+        )
+
+        if password:
+            add_cmd = (
+                f"sudo nmcli connection add type wifi ifname {iface} "
+                f"con-name '{conn_name}' ssid '{safe_ssid}' "
+                f"connection.autoconnect no "
+                f"wifi-sec.key-mgmt wpa-psk wifi-sec.psk '{safe_pwd}'"
+            )
+        else:
+            add_cmd = (
+                f"sudo nmcli connection add type wifi ifname {iface} "
+                f"con-name '{conn_name}' ssid '{safe_ssid}' "
+                f"connection.autoconnect no"
+            )
+        ok, err = await _run_host_command(add_cmd)
+        if not ok:
+            logger.warning("[v1] nmcli connection add failed: %s", err)
+            await self._v1_restore_hotspot(iface, conn_name)
+            self._record_failure(ssid, f"nmcli add failed: {err[:200]}")
+            return
+
+        ok, err = await _run_host_command(
+            f"sudo nmcli --wait 30 connection up '{conn_name}'", timeout=45.0,
+        )
+        if not ok:
+            logger.warning("[v1] nmcli connection up failed: %s", err)
+            await _run_host_command(
+                f"sudo nmcli connection delete '{conn_name}' 2>/dev/null; true"
+            )
+            await self._v1_restore_hotspot(iface, conn_name)
+            self._record_failure(
+                ssid,
+                f"Association failed — check password / signal: {err[:200]}",
+            )
+            return
+
+        # 5. Poll for DHCP lease.
+        ip: str | None = None
+        deadline = asyncio.get_event_loop().time() + V1_DHCP_TIMEOUT_S
+        while asyncio.get_event_loop().time() < deadline:
+            ok, ip_out = await _run_host_command(
+                f"ip -4 -o addr show dev {iface} 2>/dev/null "
+                f"| awk '{{print $4}}' | cut -d/ -f1 | head -1"
+            )
+            if ok and ip_out.strip():
+                ip = ip_out.strip()
+                break
+            await asyncio.sleep(STA_POLL_INTERVAL_S)
+
+        if not ip:
+            logger.warning(
+                "[v1] %s associated to %r but never got a DHCP lease",
+                iface, ssid,
+            )
+            await _run_host_command(
+                f"sudo nmcli connection down '{conn_name}' 2>/dev/null; true"
+            )
+            await _run_host_command(
+                f"sudo nmcli connection delete '{conn_name}' 2>/dev/null; true"
+            )
+            await self._v1_restore_hotspot(iface, conn_name)
+            self._record_failure(ssid, "Associated but no DHCP lease in 30s")
+            return
+
+        logger.info("[v1] STA on %s connected to %r (ip=%s)", iface, ssid, ip)
+        success = WlanLastAttempt(
+            ssid=ssid,
+            status="success",
+            timestamp=datetime.now(timezone.utc),
+        )
+        self._wlan_state = WlanState(
+            mode="sta_connected",
+            target_ssid=ssid,
+            ip_address=ip,
+            last_attempt=success,
+        )
+        self._save_wlan_state(self._wlan_state)
+
+    async def _v1_switch_to_ap(self, iface: str) -> None:
+        """Tear down the nmcli STA connection on *iface* and restart
+        the BlueOS hotspot."""
+        logger.info("[v1] Restoring %s to hotspot mode", iface)
+
+        # Find any active nmcli connection on iface to bring down.
+        # Format from `nmcli -t -f NAME,DEVICE connection show --active`
+        # is one ``NAME:DEVICE`` per line.
+        ok, out = await _run_host_command(
+            "nmcli -t -f NAME,DEVICE connection show --active 2>/dev/null"
+        )
+        conn_name = ""
+        if ok:
+            for line in out.splitlines():
+                parts = line.rsplit(":", 1)
+                if len(parts) == 2 and parts[1].strip() == iface:
+                    conn_name = parts[0].strip()
+                    break
+
+        await self._v1_restore_hotspot(iface, conn_name)
+
+        self._wlan_state = WlanState(
+            mode="ap",
+            last_attempt=self._wlan_state.last_attempt if self._wlan_state else None,
+        )
+        self._save_wlan_state(self._wlan_state)
+
+    async def _v1_restore_hotspot(self, iface: str, conn_name: str = "") -> None:
+        """Roll back any v1 STA state on *iface* and re-enable the
+        BlueOS hotspot. Used both in failure paths and from
+        :meth:`_v1_switch_to_ap`. Idempotent — safe to call when
+        nothing was set up yet."""
+        if conn_name:
+            await _run_host_command(
+                f"sudo nmcli connection down '{conn_name}' 2>/dev/null; true"
+            )
+            await _run_host_command(
+                f"sudo nmcli connection delete '{conn_name}' 2>/dev/null; true"
+            )
+
+        # Restore the unmanaged-devices conf so future NM reloads
+        # leave uap0 alone for create_ap to drive.
+        await _run_host_command(
+            f"if [ -f {V1_NM_UNMANAGED_STASH} ]; then "
+            f"  sudo mv {V1_NM_UNMANAGED_STASH} {V1_NM_UNMANAGED_CONF}; "
+            f"fi"
+        )
+        await _run_host_command("sudo nmcli general reload conf")
+        await asyncio.sleep(1)
+
+        # Bounce the link to clear any nmcli-supplicant state still
+        # attached so create_ap can take over cleanly.
+        await _run_host_command(
+            f"sudo ip addr flush dev {iface} 2>/dev/null; "
+            f"sudo ip link set {iface} down; sleep 1; "
+            f"sudo ip link set {iface} up"
+        )
+        await asyncio.sleep(2)
+
+        try:
+            await self._client.set_hotspot(True)
+            logger.info("[v1] BlueOS hotspot re-enabled on %s", iface)
+        except Exception as e:
+            logger.warning("[v1] set_hotspot(True) failed: %s", e)
 
     async def _restore_ap_after_failure(self, iface: str) -> None:
         """Best-effort: put ``iface`` back into hotspot mode. Used both

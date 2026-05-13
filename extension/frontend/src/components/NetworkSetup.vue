@@ -317,15 +317,10 @@ const formatTimestamp = (iso: string): string => {
           <AlertCircle class="w-5 h-5 flex-shrink-0 mt-0.5" style="color: #41B9C3" />
           <div class="space-y-2">
             <p class="text-sm" style="color: #96EEF2">
-              This page controls the <strong>external</strong> WiFi radio only. That radio can
-              either broadcast the DORIS hotspot <strong>or</strong> connect to a local WLAN —
-              not both at the same time. Joining a local network gives DORIS internet access at
-              the cost of taking the hotspot down for the duration of the session.
-            </p>
-            <p class="text-sm" style="color: #96EEF2">
-              <strong>The Pi's built-in WiFi adapter is not touched here.</strong> Use the BlueOS
-              WiFi page if you want to connect that adapter to a lab network for updates or
-              debugging — it operates independently and the DORIS extension will leave it alone.
+              The DORIS hotspot radio can either broadcast the DORIS hotspot <strong>or</strong>
+              connect to a local WLAN — not both at the same time. Joining a local network gives
+              DORIS internet access at the cost of taking the hotspot down for the duration of
+              the session.
             </p>
             <p class="text-sm" style="color: #96EEF2">
               <strong>2.4 GHz networks only.</strong> The external antenna is single-band 2.4 GHz,
@@ -334,7 +329,7 @@ const formatTimestamp = (iso: string): string => {
               2.4 GHz radio is enabled.
             </p>
             <p class="text-sm" style="color: #96EEF2">
-              <strong>Startup behavior:</strong> Every time DORIS is restarted, the external radio
+              <strong>Startup behavior:</strong> Every time DORIS is restarted, the hotspot radio
               reverts to hotspot mode. Saved networks are kept and will appear in the scan list,
               but they are never auto-joined.
             </p>
