@@ -603,13 +603,20 @@ class NetworkService:
 
     async def reset_wlan_to_ap_on_boot(self) -> None:
         """Force WLAN intent back to ``ap`` and proactively disconnect
-        any client association so NetworkManager can't quietly auto-join
-        a saved network behind our back. Called once at startup *after*
-        ``configure_hotspot()``.
+        any STA association *on the external interface only*. Called
+        once at startup *after* ``configure_hotspot()``.
 
         Saved networks are *kept* (option (b)) so the user can pick a
         previously-used SSID from the scan list and reconnect with one
         click during the same session.
+
+        IMPORTANT: This must NEVER use the legacy global disconnect
+        endpoint. On a vehicle where the onboard radio (``wlan0``) is
+        actively connected upstream — common during development and
+        possible in production if the user wires it up — that endpoint
+        can disconnect ``wlan0`` and silently nuke the only management
+        link to the vehicle. Always pass an explicit interface so the
+        scope is unambiguous.
         """
         last_attempt: WlanLastAttempt | None = None
         try:
@@ -618,10 +625,23 @@ class NetworkService:
         except Exception:
             pass
 
-        try:
-            await self._client.disconnect()
-        except Exception as e:
-            logger.debug("Boot-time WLAN disconnect failed (likely no STA): %s", e)
+        iface = await self._resolve_hotspot_interface_name()
+        if iface:
+            try:
+                # Only disconnect if the external radio is actually
+                # associated to a STA. configure_hotspot() ran just
+                # before us so under normal startup it's already in
+                # hotspot mode and there's nothing to do here — but
+                # if a previous run left it in STA mode we want to
+                # break that association cleanly.
+                hs = await self._client._v2.wifi_hotspot_status(iface)
+                if not hs.get("enabled"):
+                    await self._client.disconnect(interface=iface)
+                    logger.info("Boot-time STA disconnect issued on %s", iface)
+            except Exception as e:
+                logger.debug(
+                    "Boot-time WLAN disconnect skipped on %s: %s", iface, e,
+                )
 
         self._wlan_state = WlanState(mode="ap", last_attempt=last_attempt)
         self._save_wlan_state(self._wlan_state)
