@@ -235,20 +235,46 @@ type IridiumState = 'idle' | 'sending' | 'running' | 'passed' | 'failed'
 interface IridiumMessage {
   id: number
   text: string
-  severity: number
+  severity: number  // MAV_SEVERITY: 0=EMERGENCY .. 3=ERROR, 4=WARNING, 6=INFO
   timestamp: string
 }
 const iridiumState = ref<IridiumState>('idle')
 const iridiumMessage = ref('')
+const iridiumElapsedMs = ref(0)
+// Transcript of messages observed during the current test (IRIDIUM:* and recent GPS/RTC context).
+// Capped at 50 to avoid unbounded growth on a long test.
+const iridiumTranscript = ref<IridiumMessage[]>([])
+const iridiumDetailsOpen = ref(false)
 let iridiumPollInterval: number | undefined
+let iridiumElapsedTimer: number | undefined
 let iridiumLastSeenId = 0
+let iridiumStartedAt = 0
 let iridiumDeadline = 0
 const IRIDIUM_TEST_MAX_MS = 12 * 60 * 1000  // hard cap; AGT should resolve in <10 min
+
+function formatElapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  const m = Math.floor(total / 60)
+  const s = total % 60
+  return `${m}:${s.toString().padStart(2, '0')}`
+}
+
+function pushTranscript(m: IridiumMessage) {
+  // Only keep IRIDIUM:* and short context (GPS/RTC) so the panel stays useful.
+  if (!/^(IRIDIUM|GPS|RTC):/i.test(m.text)) return
+  iridiumTranscript.value.push(m)
+  if (iridiumTranscript.value.length > 50) {
+    iridiumTranscript.value.splice(0, iridiumTranscript.value.length - 50)
+  }
+}
 
 async function triggerIridiumTest() {
   if (iridiumState.value === 'sending' || iridiumState.value === 'running') return
   iridiumState.value = 'sending'
   iridiumMessage.value = ''
+  iridiumTranscript.value = []
+  iridiumElapsedMs.value = 0
+  iridiumDetailsOpen.value = false
 
   try {
     const resp = await fetch('/api/v1/tracker/iridium-test', { method: 'POST' })
@@ -260,10 +286,12 @@ async function triggerIridiumTest() {
       return
     }
     iridiumLastSeenId = typeof result.latest_id === 'number' ? result.latest_id : 0
-    iridiumDeadline = Date.now() + IRIDIUM_TEST_MAX_MS
+    iridiumStartedAt = Date.now()
+    iridiumDeadline = iridiumStartedAt + IRIDIUM_TEST_MAX_MS
     iridiumState.value = 'running'
     iridiumMessage.value = 'Test starting — this may take 2–10 minutes…'
     startIridiumPolling()
+    startIridiumElapsedTimer()
   } catch {
     iridiumState.value = 'failed'
     iridiumMessage.value = 'Failed to send command'
@@ -279,11 +307,28 @@ function stopIridiumPolling() {
   if (iridiumPollInterval) { clearInterval(iridiumPollInterval); iridiumPollInterval = undefined }
 }
 
+function startIridiumElapsedTimer() {
+  stopIridiumElapsedTimer()
+  iridiumElapsedTimer = setInterval(() => {
+    if (iridiumStartedAt) iridiumElapsedMs.value = Date.now() - iridiumStartedAt
+  }, 1000) as unknown as number
+}
+
+function stopIridiumElapsedTimer() {
+  if (iridiumElapsedTimer) { clearInterval(iridiumElapsedTimer); iridiumElapsedTimer = undefined }
+}
+
+function finishIridiumTest(state: 'passed' | 'failed', summary: string) {
+  if (iridiumStartedAt) iridiumElapsedMs.value = Date.now() - iridiumStartedAt
+  iridiumState.value = state
+  iridiumMessage.value = summary
+  stopIridiumPolling()
+  stopIridiumElapsedTimer()
+}
+
 async function pollIridiumStatus() {
   if (iridiumDeadline && Date.now() > iridiumDeadline) {
-    iridiumState.value = 'failed'
-    iridiumMessage.value = 'Test timed out (no result after 12 min)'
-    stopIridiumPolling()
+    finishIridiumTest('failed', 'Timed out — no AGT result after 12 min')
     return
   }
   try {
@@ -295,31 +340,56 @@ async function pollIridiumStatus() {
       iridiumLastSeenId = data.latest_id
     }
     for (const m of messages) {
+      pushTranscript(m)
       const text = m.text || ''
-      if (text.includes('IRIDIUM')) {
-        if (text.includes('PASSED')) {
-          iridiumState.value = 'passed'
-          iridiumMessage.value = text
-          stopIridiumPolling()
-          return
-        }
-        if (text.includes('FAILED')) {
-          iridiumState.value = 'failed'
-          iridiumMessage.value = text
-          stopIridiumPolling()
-          return
-        }
-        iridiumMessage.value = text
+      if (!text.startsWith('IRIDIUM')) continue
+      // Treat anything emitted at WARNING (4) or worse as a terminal failure;
+      // only PASSED at INFO (6) is success. Everything else (e.g. "Test
+      // starting") is interim progress.
+      if (text.includes('PASSED')) {
+        finishIridiumTest('passed', text)
+        return
       }
+      if (text.includes('FAILED') || (typeof m.severity === 'number' && m.severity <= 4 && !text.includes('starting'))) {
+        finishIridiumTest('failed', text)
+        return
+      }
+      iridiumMessage.value = text
     }
   } catch { /* best effort */ }
 }
 
 function resetIridiumTest() {
   stopIridiumPolling()
+  stopIridiumElapsedTimer()
   iridiumState.value = 'idle'
   iridiumMessage.value = ''
+  iridiumStartedAt = 0
   iridiumDeadline = 0
+  iridiumElapsedMs.value = 0
+  iridiumTranscript.value = []
+  iridiumDetailsOpen.value = false
+}
+
+function severityLabel(sev: number): string {
+  // MAVLink MAV_SEVERITY enum
+  switch (sev) {
+    case 0: return 'EMERG'
+    case 1: return 'ALERT'
+    case 2: return 'CRIT'
+    case 3: return 'ERROR'
+    case 4: return 'WARN'
+    case 5: return 'NOTICE'
+    case 6: return 'INFO'
+    case 7: return 'DEBUG'
+    default: return `sev${sev}`
+  }
+}
+
+function severityColor(sev: number): string {
+  if (sev <= 3) return '#ef4444'      // ERROR or worse — red
+  if (sev === 4) return '#FCD869'     // WARNING — amber
+  return 'rgba(150, 238, 242, 0.7)'   // info/debug — cyan tint
 }
 
 // ── Light test button ───────────────────────────────────────────────
@@ -829,12 +899,38 @@ const getStatusColor = (moduleStatus: string) => {
                 </svg>
                 <span v-if="iridiumState === 'idle'">Iridium Test</span>
                 <span v-else-if="iridiumState === 'sending'">Sending…</span>
-                <span v-else-if="iridiumState === 'running'">Testing…</span>
-                <span v-else-if="iridiumState === 'passed' || iridiumState === 'failed'">{{ iridiumMessage || 'Done' }} — Tap to reset</span>
+                <span v-else-if="iridiumState === 'running'">Testing… {{ formatElapsed(iridiumElapsedMs) }}</span>
+                <span v-else-if="iridiumState === 'passed' || iridiumState === 'failed'">
+                  {{ iridiumMessage || 'Done' }}
+                  <span v-if="iridiumElapsedMs > 0" style="opacity: 0.7"> ({{ formatElapsed(iridiumElapsedMs) }})</span>
+                  — Tap to reset
+                </span>
               </button>
               <p v-if="iridiumState === 'running' && iridiumMessage" class="mt-1 text-xs text-center" style="color: rgba(252, 216, 105, 0.7)">
                 {{ iridiumMessage }}
               </p>
+              <!-- Expandable transcript: useful for diagnosing why a test failed -->
+              <div v-if="iridiumTranscript.length > 0 && (iridiumState === 'failed' || iridiumState === 'passed' || iridiumState === 'running')" class="mt-2">
+                <button
+                  type="button"
+                  class="text-xs underline transition-opacity hover:opacity-100"
+                  style="color: rgba(150, 238, 242, 0.7); opacity: 0.85"
+                  @click="iridiumDetailsOpen = !iridiumDetailsOpen"
+                >
+                  {{ iridiumDetailsOpen ? 'Hide details' : `Show details (${iridiumTranscript.length} message${iridiumTranscript.length === 1 ? '' : 's'})` }}
+                </button>
+                <div
+                  v-if="iridiumDetailsOpen"
+                  class="mt-1 rounded p-2 text-xs font-mono overflow-y-auto"
+                  style="max-height: 12rem; background-color: rgba(0, 0, 0, 0.25); border: 1px solid rgba(65, 185, 195, 0.2)"
+                >
+                  <div v-for="m in iridiumTranscript" :key="m.id" class="py-0.5">
+                    <span style="color: rgba(150, 238, 242, 0.5)">{{ m.timestamp.substring(11, 19) }}</span>
+                    <span class="ml-2 inline-block w-12 text-center rounded text-[10px]" :style="{ color: severityColor(m.severity), border: `1px solid ${severityColor(m.severity)}40` }">{{ severityLabel(m.severity) }}</span>
+                    <span class="ml-2" :style="{ color: severityColor(m.severity) }">{{ m.text }}</span>
+                  </div>
+                </div>
+              </div>
             </div>
           </div>
 

@@ -1,10 +1,11 @@
-param([int]$MaxMin = 14)
+param([int]$MaxMin = 14, [int]$SinceId = -1)
 
 $base = "http://192.168.68.75:8095"
 $since = 0
 
-# Show what's currently buffered
-$resp = curl.exe -s --max-time 8 "$base/api/v1/tracker/iridium-status?since_id=0"
+# Show what's currently buffered (if no SinceId provided, dump everything)
+$dumpFrom = if ($SinceId -ge 0) { $SinceId } else { 0 }
+$resp = curl.exe -s --max-time 8 "$base/api/v1/tracker/iridium-status?since_id=$dumpFrom"
 $data = $resp | ConvertFrom-Json
 foreach ($m in $data.messages) {
   $ts = $m.timestamp.Substring(11, 8)
