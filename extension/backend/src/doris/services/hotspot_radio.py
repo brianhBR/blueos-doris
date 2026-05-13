@@ -195,16 +195,38 @@ BOOTSTRAP_STARTUP_JSON = "/root/.config/blueos/bootstrap/startup.json"
 # ends ``--redirect-to-localhost`` and continues with the SSID/password.
 # We insert our HT20-with-full-caps flags between the anchor and the SSID
 # line.
-_CREATE_AP_ANCHOR = (
-    '            "--redirect-to-localhost",'
-    "  # Redirect all traffic to localhost, captive-portal style\n"
+#
+# Anchor strategy is *regex on the argv token* rather than exact match
+# on the line including its trailing comment. The previous
+# implementation pinned the anchor to ``            "--redirect-to-
+# localhost",  # Redirect all traffic ...`` - exactly 12 leading
+# spaces, exactly that comment, exactly that wording. Any upstream
+# reformat (reindent, comment edit, comma-then-trailing-comment, comma
+# alone, no comma at end of list) silently broke the patch with no
+# loud signal and the install fell through to stock ``create_ap``
+# args. We now match on just the argv-token line and capture the
+# leading whitespace so the inserted flags re-emit with the same
+# indentation regardless of upstream formatting changes.
+#
+# The regex requires *some* leading whitespace because a top-level
+# occurrence of the string ``"--redirect-to-localhost"`` (e.g. in a
+# docstring or comment) would not be inside the argv list and would
+# be the wrong place to inject flags. We accept both ``,`` and a bare
+# end of line after the token so a future upstream that drops the
+# trailing comma still matches.
+_CREATE_AP_ANCHOR_RE = re.compile(
+    r'^(?P<indent>[ \t]+)"--redirect-to-localhost",?(?:[ \t]*#[^\n]*)?\n',
+    re.MULTILINE,
 )
 
-# Maxed-out 2.4 GHz HT20 configuration. The ``{channel}`` placeholder is
-# filled at install time by :func:`_pick_24ghz_channel` so the AP lands
-# on whichever of channels 1/6 is least crowded.  Channel 11 is left
+# Maxed-out 2.4 GHz HT20 configuration. ``{channel}`` is filled at
+# install time by :func:`_pick_24ghz_channel` so the AP lands on
+# whichever of channels 1/6 is least crowded.  Channel 11 is left
 # out because the DORIS potted external antenna's SWR sweet spot is
 # the lower half of the 2.4 GHz band; see :func:`_pick_24ghz_channel`.
+# ``{indent}`` is filled with the whitespace captured by
+# :data:`_CREATE_AP_ANCHOR_RE` so the inserted lines line up with the
+# surrounding argv entries regardless of upstream indentation choice.
 #
 # Why HT20 and not HT40?  The ``morrownr/88x2bu-20210702`` driver
 # advertises HT40 in ``iw phy phy1 info`` but its AP-mode firmware path
@@ -227,21 +249,22 @@ _CREATE_AP_ANCHOR = (
 # RX-STBC1, MAX-AMSDU-7935, DSSS/CCK in HT40) all stick at HT20 and
 # lift real TCP throughput from ~25 Mbps (stock) to ~80 Mbps.
 _CREATE_AP_24GHZ_FLAGS_TEMPLATE = (
-    '            "-c", "{channel}",\n'
-    '            "--ieee80211n",\n'
-    '            "--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40]'
+    '{indent}"-c", "{channel}",\n'
+    '{indent}"--ieee80211n",\n'
+    '{indent}"--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40]'
     '[LDPC][RX-STBC1][MAX-AMSDU-7935][DSSS_CCK-40]",\n'
-    '            "--country", "US",\n'
+    '{indent}"--country", "US",\n'
 )
 
 # Matches *any* DORIS create_ap insertion that may already follow
-# ``_CREATE_AP_ANCHOR`` - either the legacy 5 GHz attempt (with
-# ``--freq-band 5`` and ``--vht_capab``) or the current 2.4 GHz patch
-# with any auto-picked channel. Used at install time so re-running the
-# patch on an upgraded install converges to the current canonical block
-# instead of stacking flags. Anchored via ``re.match`` from the position
-# right after ``_CREATE_AP_ANCHOR``, never used as a free search, so
-# false positives outside our managed region are impossible.
+# the anchor matched by :data:`_CREATE_AP_ANCHOR_RE` - either the
+# legacy 5 GHz attempt (with ``--freq-band 5`` and ``--vht_capab``)
+# or the current 2.4 GHz patch with any auto-picked channel. Used at
+# install time so re-running the patch on an upgraded install
+# converges to the current canonical block instead of stacking flags.
+# Anchored via ``re.match`` from the position right after the
+# anchor match, never used as a free search, so false positives
+# outside our managed region are impossible.
 _DORIS_PATCH_BLOCK_RE = re.compile(
     r'(?:[ \t]*"--freq-band", "[0-9]+",\n)?'        # legacy 5 GHz only
     r'[ \t]*"-c", "[0-9]+",\n'                      # always present
@@ -593,23 +616,24 @@ async def _pick_24ghz_channel() -> int:
 
 def _strip_doris_patch(source: str) -> str:
     """Remove any prior DORIS ``create_ap`` insertion that immediately
-    follows :data:`_CREATE_AP_ANCHOR`. No-op if no such block is present.
+    follows the anchor line matched by :data:`_CREATE_AP_ANCHOR_RE`.
+    No-op if no such block is present.
 
     Anchored to the position right after the anchor line so we can never
     accidentally strip something else that happens to look like our
     flags elsewhere in the file.
     """
-    anchor_idx = source.find(_CREATE_AP_ANCHOR)
-    if anchor_idx < 0:
+    anchor_match = _CREATE_AP_ANCHOR_RE.search(source)
+    if anchor_match is None:
         return source
-    end_of_anchor = anchor_idx + len(_CREATE_AP_ANCHOR)
-    m = _DORIS_PATCH_BLOCK_RE.match(source, end_of_anchor)
-    if not m:
+    end_of_anchor = anchor_match.end()
+    block_match = _DORIS_PATCH_BLOCK_RE.match(source, end_of_anchor)
+    if not block_match:
         return source
-    return source[:end_of_anchor] + source[m.end():]
+    return source[:end_of_anchor] + source[block_match.end():]
 
 
-async def _install_create_ap_speed_patch() -> None:
+async def _install_create_ap_speed_patch() -> bool:
     """Patch wifi-manager's ``create_ap`` invocation for max 2.4 GHz HT20.
 
     Reads the in-container ``networkmanager.py``, picks the cleanest
@@ -619,6 +643,19 @@ async def _install_create_ap_speed_patch() -> None:
     ``/usr/blueos/userdata/wifi-overrides/networkmanager.py`` so the
     bind mount in ``startup.json`` picks it up on the next
     ``blueos-core`` start.
+
+    Returns ``True`` iff the host override file is in place with the
+    canonical patch applied (either because we just wrote it, or
+    because :func:`_write_host_file` short-circuited a no-op when the
+    on-disk content already matched). Returns ``False`` on every
+    failure path: source unreadable, source corrupt (self-heal path),
+    anchor missing, or chunked write failed. Callers MUST treat
+    ``False`` as "do not add or keep the bind entry in
+    ``startup.json``" because pointing a bind at a missing/un-patched
+    source is the factory-revert footgun documented in the module
+    docstring - and the self-heal path here actively removes the
+    entry, which gets undone if a subsequent
+    :func:`_ensure_startup_bind` re-adds it.
 
     Upgrade-safe and re-run-safe: any prior DORIS patch (legacy 5 GHz
     attempt, or current 2.4 GHz patch with a different auto-picked
@@ -647,7 +684,7 @@ async def _install_create_ap_speed_patch() -> None:
             WIFI_OVERRIDE_CONTAINER_PATH,
             BLUEOS_CORE_CONTAINER,
         )
-        return
+        return False
 
     try:
         ast.parse(source)
@@ -676,26 +713,67 @@ async def _install_create_ap_speed_patch() -> None:
         # steps are non-negotiable here.
         await _remove_startup_bind()
         await _run_host_command(f"sudo rm -f {WIFI_OVERRIDE_HOST_PATH}")
-        return
+        return False
 
-    if _CREATE_AP_ANCHOR not in source:
+    if _CREATE_AP_ANCHOR_RE.search(source) is None:
         logger.warning(
             "create_ap anchor not found in %s; BlueOS upstream may have "
             "changed - skipping create_ap speed patch (hotspot will still "
-            "work, at default 2.4 GHz / 802.11g speeds)",
+            "work, at default 2.4 GHz / 802.11g speeds). Bind-mount install "
+            "is also skipped this run; an un-patched override file is the "
+            "same factory-revert footgun as a missing one.",
             WIFI_OVERRIDE_CONTAINER_PATH,
         )
-        return
+        return False
 
     stripped = _strip_doris_patch(source)
     channel = await _pick_24ghz_channel()
-    flags = _CREATE_AP_24GHZ_FLAGS_TEMPLATE.format(channel=channel)
-    patched = stripped.replace(
-        _CREATE_AP_ANCHOR, _CREATE_AP_ANCHOR + flags, 1
+    anchor_match = _CREATE_AP_ANCHOR_RE.search(stripped)
+    # We re-search post-strip because the strip can shift offsets, but
+    # the anchor itself is never inside the stripped region; this match
+    # is guaranteed to succeed here, since we already confirmed the
+    # anchor exists pre-strip and strip only removes content *after* it.
+    assert anchor_match is not None, (
+        "anchor disappeared after _strip_doris_patch; this is a bug in "
+        "the strip regex - the anchor should never be inside the "
+        "stripped span"
     )
+    indent = anchor_match.group("indent")
+    flags = _CREATE_AP_24GHZ_FLAGS_TEMPLATE.format(
+        indent=indent, channel=channel
+    )
+    insert_at = anchor_match.end()
+    patched = stripped[:insert_at] + flags + stripped[insert_at:]
 
     await _run_host_command(f"sudo mkdir -p {WIFI_OVERRIDE_DIR}")
-    await _write_host_file(WIFI_OVERRIDE_HOST_PATH, patched)
+    return await _write_host_file(WIFI_OVERRIDE_HOST_PATH, patched)
+
+
+def _binds_dict_or_none(data: object) -> dict | None:
+    """Return the binds dict inside a parsed ``startup.json`` payload,
+    or ``None`` if the expected ``data["core"]["binds"]`` shape isn't
+    there.
+
+    Defensive helper for both :func:`_ensure_startup_bind` and
+    :func:`_remove_startup_bind`. ``blueos-bootstrap`` major-version
+    upgrades have historically re-templated this file in place; if it
+    ever renames the schema (e.g. ``core`` → ``containers/core``) or
+    changes the bind structure from a dict to a list, blindly calling
+    ``data.setdefault("core", {}).setdefault("binds", {})`` would
+    create a parallel orphan key that bootstrap never reads while
+    silently looking like success. Returning ``None`` here lets the
+    callers log loudly and skip the write rather than corrupt the
+    file with an unrecognised top-level key.
+    """
+    if not isinstance(data, dict):
+        return None
+    core = data.get("core")
+    if not isinstance(core, dict):
+        return None
+    binds = core.get("binds")
+    if not isinstance(binds, dict):
+        return None
+    return binds
 
 
 async def _remove_startup_bind() -> None:
@@ -718,8 +796,9 @@ async def _remove_startup_bind() -> None:
     at that path; on a subsequent DORIS run we add the bind back and
     install a fresh override.
 
-    No-op if the entry isn't present or the JSON can't be parsed -
-    matches the conservative shape of :func:`_ensure_startup_bind`.
+    No-op if the entry isn't present, the JSON can't be parsed, or
+    the schema doesn't match the shape we know how to walk - matches
+    the conservative shape of :func:`_ensure_startup_bind`.
     """
     raw = await _read_host_file(BOOTSTRAP_STARTUP_JSON)
     if raw is None:
@@ -737,7 +816,16 @@ async def _remove_startup_bind() -> None:
         )
         return
 
-    binds = data.get("core", {}).get("binds", {})
+    binds = _binds_dict_or_none(data)
+    if binds is None:
+        logger.warning(
+            "Bootstrap %s does not contain a 'core.binds' dict; bootstrap "
+            "schema may have migrated. Skipping bind removal to avoid "
+            "corrupting the file with an unrecognised top-level key.",
+            BOOTSTRAP_STARTUP_JSON,
+        )
+        return
+
     if WIFI_OVERRIDE_HOST_PATH not in binds:
         logger.info(
             "No wifi-override bind in %s; nothing to remove",
@@ -763,6 +851,16 @@ async def _ensure_startup_bind() -> None:
     effect at the next reboot (or after manually restarting
     ``blueos-bootstrap``); we do not auto-restart anything to avoid an
     unexpected outage.
+
+    Refuses to install when the on-disk schema doesn't match the
+    shape we know how to safely modify (``core.binds`` is a dict).
+    The previous implementation used :func:`dict.setdefault` to
+    silently create those keys if missing - which would survive a
+    schema migration that renamed ``core`` (or restructured ``binds``)
+    but would write our entry into a section bootstrap never reads,
+    so the bind would never become active and we'd have no signal.
+    The explicit guard surfaces a migration via a loud warning, then
+    leaves the file untouched.
     """
     raw = await _read_host_file(BOOTSTRAP_STARTUP_JSON)
     if raw is None:
@@ -778,7 +876,16 @@ async def _ensure_startup_bind() -> None:
         logger.warning("Bootstrap %s is not valid JSON: %s", BOOTSTRAP_STARTUP_JSON, e)
         return
 
-    binds = data.setdefault("core", {}).setdefault("binds", {})
+    binds = _binds_dict_or_none(data)
+    if binds is None:
+        logger.warning(
+            "Bootstrap %s does not contain a 'core.binds' dict; bootstrap "
+            "schema may have migrated. Skipping bind install rather than "
+            "creating a parallel orphan key bootstrap won't read.",
+            BOOTSTRAP_STARTUP_JSON,
+        )
+        return
+
     existing = binds.get(WIFI_OVERRIDE_HOST_PATH)
     if (
         isinstance(existing, dict)
@@ -827,8 +934,26 @@ async def setup_hotspot_radio() -> None:
     await _reload_udev()
     await _reload_network_manager()
 
-    await _install_create_ap_speed_patch()
-    await _ensure_startup_bind()
+    # Ordering contract: only add (or re-add) the bind entry in
+    # startup.json AFTER we've confirmed the host override file is in
+    # place and patched. Otherwise we re-arm exactly the May 2026
+    # factory-revert trap that PR #18 closed - the self-heal path
+    # inside _install_create_ap_speed_patch removes the bind entry
+    # when it has to delete a corrupt override, and an unconditional
+    # _ensure_startup_bind() right after would silently put it back,
+    # leaving startup.json pointing at a missing source on next boot.
+    patch_ok = await _install_create_ap_speed_patch()
+    if patch_ok:
+        await _ensure_startup_bind()
+    else:
+        logger.warning(
+            "create_ap speed patch did not install this run; skipping "
+            "startup.json bind install to avoid pointing a bind-mount at a "
+            "missing or un-patched host file (would trigger Docker to auto-"
+            "create a directory at the source path on next blueos-core "
+            "restart, then 'not a directory' container init failure, then "
+            "blueos-bootstrap factory revert)."
+        )
 
     # Heads-up if the rename hasn't taken effect on this boot.
     ok, out = await _run_host_command(
