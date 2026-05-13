@@ -242,17 +242,40 @@ async def start_hotspot_dns() -> None:
         "no-resolv\n"
         "no-hosts\n"
     )
-    cmd = (
+    # Commander's ssh transport returns rc=255 unpredictably on
+    # short multi-step commands even when the underlying shell ran
+    # to completion (we proved this in live testing: ``pkill ...;
+    # true`` reliably returned rc=255 yet the kill happened, and
+    # ``setsid dnsmasq ...`` reliably returned rc=255 yet the daemon
+    # started). We therefore split the work into two short Commander
+    # calls and ignore their rc - the real success signal is the
+    # post-start pid-file check, not the launcher's exit code.
+    write_cmd = (
         f"echo '{conf_content}' | sudo tee {HOTSPOT_DNS_CONF} > /dev/null && "
-        f"sudo pkill -f 'dnsmasq.*{HOTSPOT_DNS_CONF}' 2>/dev/null; sleep 1; "
-        f"sudo /usr/sbin/dnsmasq --conf-file={HOTSPOT_DNS_CONF} "
-        f"--pid-file={HOTSPOT_DNS_PID}"
+        f"sudo pkill -f 'dnsmasq.*{HOTSPOT_DNS_CONF}' 2>/dev/null; true"
     )
-    ok, _ = await _run_host_command(cmd)
-    if ok:
+    await _run_host_command(write_cmd)
+
+    # Detach dnsmasq from the Commander ssh session: ``setsid`` gives
+    # it a new session, the stdio redirects close the inherited
+    # ssh-side fds, and ``&`` runs it in the shell background so the
+    # outer Commander call exits as soon as the fork succeeds.
+    start_cmd = (
+        f"sudo setsid /usr/sbin/dnsmasq --conf-file={HOTSPOT_DNS_CONF} "
+        f"--pid-file={HOTSPOT_DNS_PID} "
+        f"< /dev/null > /dev/null 2>&1 & "
+        f"sleep 1; "
+        f"sudo test -f {HOTSPOT_DNS_PID} && echo running || echo missing"
+    )
+    _, start_out = await _run_host_command(start_cmd)
+    if "running" in start_out:
         logger.info("Hotspot DNS started on %s:53 (doris.local)", gateway)
     else:
-        logger.warning("Failed to start hotspot DNS server (gateway=%s)", gateway)
+        logger.warning(
+            "Failed to start hotspot DNS server (gateway=%s, out=%r)",
+            gateway,
+            start_out,
+        )
 
 
 async def restart_avahi(force: bool = False) -> None:

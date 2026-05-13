@@ -110,29 +110,94 @@ async def test_start_hotspot_dns_uses_detected_gateway(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """The config written must use whatever ``_detect_hotspot_gateway``
-    returns, NOT the fallback constant when detection succeeds."""
+    returns, NOT the fallback constant when detection succeeds.
+
+    start_hotspot_dns issues THREE Commander calls now:
+      1. ``ip addr show uap0`` (detect gateway)
+      2. write conf + pkill prior daemon
+      3. launch dnsmasq + verify pid file
+    """
     rec = _RunHostCommandRecorder()
-    # First call is _detect_hotspot_gateway (ip addr show); second is
-    # the actual dnsmasq setup tee+start command.
+    rec.respond(
+        True,
+        "5: uap0    inet 192.168.42.1/24 brd 192.168.42.255 "
+        "scope global uap0\n",
+    )
+    rec.respond(True, "")          # write_cmd
+    rec.respond(True, "running")   # start_cmd
+    monkeypatch.setattr(mdns, "_run_host_command", rec)
+
+    await mdns.start_hotspot_dns()
+
+    assert len(rec.calls) == 3
+    write_cmd = rec.calls[1]
+    assert "listen-address=192.168.42.1" in write_cmd, write_cmd
+    assert "address=/doris.local/192.168.42.1" in write_cmd, write_cmd
+    assert "address=/blueos-wifi.local/192.168.42.1" in write_cmd, write_cmd
+    # No-dhcp-interface MUST point at uap0 (the post-rename name), not
+    # the upstream-default wlan1.
+    assert "no-dhcp-interface=uap0" in write_cmd, write_cmd
+    assert "no-dhcp-interface=wlan1" not in write_cmd, write_cmd
+
+
+async def test_start_hotspot_dns_detaches_dnsmasq_from_ssh(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """dnsmasq must be invoked in a way that lets Commander's ssh
+    session return immediately after the daemon forks - inheriting
+    open stdin/stdout/stderr keeps the ssh hanging until timeout
+    (rc=255 with empty output), which we observed in live testing
+    after fixing the gateway IP. The fix uses setsid + redirect to
+    /dev/null + ``&`` to background the launcher."""
+    rec = _RunHostCommandRecorder()
     rec.respond(
         True,
         "5: uap0    inet 192.168.42.1/24 brd 192.168.42.255 "
         "scope global uap0\n",
     )
     rec.respond(True, "")
+    rec.respond(True, "running")
     monkeypatch.setattr(mdns, "_run_host_command", rec)
 
     await mdns.start_hotspot_dns()
 
-    assert len(rec.calls) == 2
-    dnsmasq_cmd = rec.calls[1]
-    assert "listen-address=192.168.42.1" in dnsmasq_cmd, dnsmasq_cmd
-    assert "address=/doris.local/192.168.42.1" in dnsmasq_cmd, dnsmasq_cmd
-    assert "address=/blueos-wifi.local/192.168.42.1" in dnsmasq_cmd, dnsmasq_cmd
-    # No-dhcp-interface MUST point at uap0 (the post-rename name), not
-    # the upstream-default wlan1.
-    assert "no-dhcp-interface=uap0" in dnsmasq_cmd, dnsmasq_cmd
-    assert "no-dhcp-interface=wlan1" not in dnsmasq_cmd, dnsmasq_cmd
+    start_cmd = rec.calls[2]
+    assert "setsid" in start_cmd, start_cmd
+    assert "< /dev/null" in start_cmd, start_cmd
+    assert "> /dev/null" in start_cmd, start_cmd
+    # Backgrounded so the shell exits even if the daemon hasn't
+    # closed its fds in time.
+    assert " & " in start_cmd, start_cmd
+    # Real signal of success is the pid file existing, not the
+    # launcher's rc.
+    assert "test -f" in start_cmd and "running" in start_cmd, start_cmd
+
+
+async def test_start_hotspot_dns_ignores_unreliable_commander_rc(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Commander's ssh transport returns rc=255 spuriously on short
+    multi-step commands - we observed this in live testing where the
+    underlying shell had run to completion. start_hotspot_dns must
+    therefore NOT abort on a write_cmd / start_cmd rc=False; the
+    real signal is "did the pid file get created"."""
+    rec = _RunHostCommandRecorder()
+    rec.respond(
+        True,
+        "5: uap0    inet 192.168.42.1/24 brd 192.168.42.255 "
+        "scope global uap0\n",
+    )
+    # Both subsequent calls report False, but the second one's stdout
+    # says ``running`` (because the shell-level pid-file check did
+    # succeed on the host, even though ssh's wrapper rc was 255).
+    rec.respond(False, "")
+    rec.respond(False, "running\n")
+    monkeypatch.setattr(mdns, "_run_host_command", rec)
+
+    await mdns.start_hotspot_dns()
+
+    # Must still issue all three calls and not bail early.
+    assert len(rec.calls) == 3
 
 
 async def test_start_hotspot_dns_falls_back_when_uap0_has_no_ip(
@@ -143,12 +208,13 @@ async def test_start_hotspot_dns_falls_back_when_uap0_has_no_ip(
     rec = _RunHostCommandRecorder()
     rec.respond(True, "5: uap0    <NO-CARRIER>\n")
     rec.respond(True, "")
+    rec.respond(True, "running")
     monkeypatch.setattr(mdns, "_run_host_command", rec)
 
     await mdns.start_hotspot_dns()
 
-    assert len(rec.calls) == 2
-    dnsmasq_cmd = rec.calls[1]
+    assert len(rec.calls) == 3
+    write_cmd = rec.calls[1]
     assert (
-        f"listen-address={mdns.HOTSPOT_GATEWAY_FALLBACK}" in dnsmasq_cmd
-    ), dnsmasq_cmd
+        f"listen-address={mdns.HOTSPOT_GATEWAY_FALLBACK}" in write_cmd
+    ), write_cmd
