@@ -1,14 +1,21 @@
 """Tests for `doris.services.mdns`.
 
-Focused on the dynamic hotspot-gateway detection introduced in
-bh-wifi-hardening. Previously :data:`HOTSPOT_GATEWAY` was hardcoded
-to ``192.168.43.1`` while BlueOS 1.5.x assigns ``192.168.42.1`` to
-``uap0`` - the mismatch made the auxiliary dnsmasq fail
-``bind-interfaces`` every start, leaving ``doris.local`` unresolvable
-for hotspot clients that lack mDNS.
+Focused on:
+ - the dynamic hotspot-gateway detection introduced in bh-wifi-hardening
+   (previously :data:`HOTSPOT_GATEWAY` was hardcoded to ``192.168.43.1``
+   while BlueOS 1.5.x assigns ``192.168.42.1`` to ``uap0`` - the
+   mismatch made the auxiliary dnsmasq fail ``bind-interfaces`` every
+   start, leaving ``doris.local`` unresolvable for hotspot clients
+   that lack mDNS), and
+ - the four hardening fixes to ``_upload_nginx_redirect`` in
+   bh-nginx-redirect-hardening (mkdir race, DEBUG->WARNING, reload
+   rc check, post-PUT verification).
 """
 
 from __future__ import annotations
+
+import logging
+from typing import Any
 
 import pytest
 
@@ -218,3 +225,326 @@ async def test_start_hotspot_dns_falls_back_when_uap0_has_no_ip(
     assert (
         f"listen-address={mdns.HOTSPOT_GATEWAY_FALLBACK}" in write_cmd
     ), write_cmd
+
+
+# ---------------------------------------------------------------------
+# _upload_nginx_redirect: the four hardening fixes.
+#
+# Background: live testing on Tony's unit produced "nginx redirect
+# attempt N/5 failed" logs with no exception text because the upload
+# helper logged at DEBUG. The function also had a fire-and-forget
+# mkdir (Detach=True) that raced the archive PUT, ignored the
+# ``nginx -s reload`` return code outright, and never verified the
+# PUT actually landed. These tests pin each of those down so they
+# can't silently regress.
+# ---------------------------------------------------------------------
+
+
+class _FakeHttpResponse:
+    """Minimal stand-in for ``httpx.Response`` for the surface we use."""
+
+    def __init__(
+        self,
+        status_code: int = 200,
+        json_data: dict | None = None,
+        text: str = "",
+    ) -> None:
+        self.status_code = status_code
+        self._json_data = json_data or {}
+        self.text = text
+
+    def raise_for_status(self) -> None:
+        if self.status_code >= 400:
+            raise RuntimeError(
+                f"HTTP {self.status_code} (faked raise_for_status)"
+            )
+
+    def json(self) -> dict:
+        return self._json_data
+
+
+class _FakeAsyncClient:
+    """Records every HTTP call ``_upload_nginx_redirect`` makes and
+    dispatches canned responses based on URL fragments.
+
+    Records ``calls`` as a list of ``(method, url)`` tuples in the
+    order issued so tests can assert ordering (mkdir-inspect MUST
+    happen before the archive PUT - that's the race the new code
+    closes).
+    """
+
+    def __init__(
+        self,
+        *,
+        exec_create_status: int = 201,
+        exec_inspect_exit_code: int = 0,
+        archive_put_status: int = 200,
+        archive_put_text: str = "",
+    ) -> None:
+        self.exec_create_status = exec_create_status
+        self.exec_inspect_exit_code = exec_inspect_exit_code
+        self.archive_put_status = archive_put_status
+        self.archive_put_text = archive_put_text
+        self.calls: list[tuple[str, str]] = []
+        self.start_request_bodies: list[dict[str, Any]] = []
+
+    async def __aenter__(self) -> "_FakeAsyncClient":
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        return None
+
+    async def post(self, url: str, **kwargs: Any) -> _FakeHttpResponse:
+        self.calls.append(("POST", url))
+        if url.endswith("/start"):
+            self.start_request_bodies.append(kwargs.get("json") or {})
+            return _FakeHttpResponse(200, {})
+        if "/exec" in url:
+            return _FakeHttpResponse(
+                self.exec_create_status, {"Id": "execid000000"}
+            )
+        return _FakeHttpResponse(200, {})
+
+    async def get(self, url: str, **_kwargs: Any) -> _FakeHttpResponse:
+        self.calls.append(("GET", url))
+        if "/exec/" in url and url.endswith("/json"):
+            return _FakeHttpResponse(
+                200, {"ExitCode": self.exec_inspect_exit_code}
+            )
+        return _FakeHttpResponse(200, {})
+
+    async def put(self, url: str, **_kwargs: Any) -> _FakeHttpResponse:
+        self.calls.append(("PUT", url))
+        return _FakeHttpResponse(
+            self.archive_put_status, text=self.archive_put_text
+        )
+
+
+def _install_nginx_redirect_mocks(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    client: _FakeAsyncClient,
+    cid: str | None = "abcdef012345",
+    exists_after_put: bool = True,
+    reload_response: tuple[bool, str] = (True, ""),
+) -> _RunHostCommandRecorder:
+    """Install the standard set of monkeypatches for an
+    ``_upload_nginx_redirect`` test. Returns the ``_run_host_command``
+    recorder so tests can assert on the reload invocation."""
+
+    def fake_async_client(*_a: Any, **_kw: Any) -> _FakeAsyncClient:
+        return client
+
+    async def fake_find_cid(_c: _FakeAsyncClient) -> str | None:
+        return cid
+
+    async def fake_exists() -> bool:
+        return exists_after_put
+
+    rec = _RunHostCommandRecorder()
+    rec.respond(*reload_response)
+
+    monkeypatch.setattr(mdns.httpx, "AsyncClient", fake_async_client)
+    monkeypatch.setattr(mdns, "_find_core_container_id", fake_find_cid)
+    monkeypatch.setattr(mdns, "_nginx_redirect_exists", fake_exists)
+    monkeypatch.setattr(mdns, "_run_host_command", rec)
+    return rec
+
+
+async def test_upload_nginx_redirect_happy_path_returns_true(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = _FakeAsyncClient()
+    rec = _install_nginx_redirect_mocks(monkeypatch, client=client)
+
+    assert await mdns._upload_nginx_redirect() is True
+
+    # One ``nginx -s reload`` call must have been issued.
+    assert len(rec.calls) == 1
+    assert "nginx -s reload" in rec.calls[0]
+    assert mdns.CORE_CONTAINER in rec.calls[0]
+
+
+async def test_upload_nginx_redirect_returns_false_when_core_missing(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Container not found is a WARNING, not a silent DEBUG."""
+    client = _FakeAsyncClient()
+    _install_nginx_redirect_mocks(monkeypatch, client=client, cid=None)
+
+    with caplog.at_level(logging.WARNING, logger="doris.services.mdns"):
+        result = await mdns._upload_nginx_redirect()
+
+    assert result is False
+    assert any(
+        "container not found" in r.message for r in caplog.records
+    ), caplog.records
+
+
+async def test_upload_nginx_redirect_waits_for_mkdir_before_put(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The mkdir exec must run with ``Detach=False`` and we must
+    inspect the exec result BEFORE issuing the archive PUT.
+
+    The original code used ``Detach=True`` (fire-and-forget) and then
+    PUT'd immediately, meaning on a slow blueos-core boot the mkdir
+    hadn't actually created the destination directory yet. This test
+    pins the new ordering: POST /exec, POST /exec/.../start, GET
+    /exec/.../json, *then* PUT /archive.
+    """
+    client = _FakeAsyncClient()
+    _install_nginx_redirect_mocks(monkeypatch, client=client)
+
+    await mdns._upload_nginx_redirect()
+
+    method_order = [m for (m, _u) in client.calls]
+    # Find the indices of the archive PUT vs the mkdir inspect GET.
+    archive_put_idx = next(
+        i for i, (m, u) in enumerate(client.calls)
+        if m == "PUT" and "/archive" in u
+    )
+    inspect_idx = next(
+        i for i, (m, u) in enumerate(client.calls)
+        if m == "GET" and "/exec/" in u and u.endswith("/json")
+    )
+    assert inspect_idx < archive_put_idx, (
+        f"archive PUT (idx={archive_put_idx}) must happen AFTER the "
+        f"mkdir inspect GET (idx={inspect_idx}); otherwise we re-arm "
+        f"the Detach=True race. Call sequence was {method_order}"
+    )
+
+    # And the exec start body must explicitly NOT detach - otherwise
+    # the subsequent GET /exec/.../json returns a stale ExitCode.
+    assert client.start_request_bodies, "no exec start call recorded"
+    start_body = client.start_request_bodies[0]
+    assert start_body.get("Detach") is False, start_body
+
+
+async def test_upload_nginx_redirect_returns_false_when_mkdir_nonzero(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """mkdir reporting a non-zero exit code must abort the upload
+    before the PUT (PUTting into a missing path would 404 anyway)."""
+    client = _FakeAsyncClient(exec_inspect_exit_code=1)
+    _install_nginx_redirect_mocks(monkeypatch, client=client)
+
+    with caplog.at_level(logging.WARNING, logger="doris.services.mdns"):
+        result = await mdns._upload_nginx_redirect()
+
+    assert result is False
+    # No PUT should have been issued.
+    assert not any(m == "PUT" for (m, _u) in client.calls), client.calls
+    assert any(
+        "mkdir" in r.message and "exited" in r.message for r in caplog.records
+    ), caplog.records
+
+
+async def test_upload_nginx_redirect_returns_false_when_put_non_200(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Archive PUT failing must surface as a WARNING+False, not the
+    silent DEBUG the old code used."""
+    client = _FakeAsyncClient(
+        archive_put_status=500, archive_put_text="internal error"
+    )
+    _install_nginx_redirect_mocks(monkeypatch, client=client)
+
+    with caplog.at_level(logging.WARNING, logger="doris.services.mdns"):
+        result = await mdns._upload_nginx_redirect()
+
+    assert result is False
+    assert any(
+        "archive PUT" in r.message and "500" in r.message
+        for r in caplog.records
+    ), caplog.records
+
+
+async def test_upload_nginx_redirect_returns_false_when_post_put_verify_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """PUT can return 200 but the tar may not have landed where we
+    expected (e.g. extraction quirk). Post-PUT verification via
+    ``_nginx_redirect_exists`` catches that case."""
+    client = _FakeAsyncClient()
+    rec = _install_nginx_redirect_mocks(
+        monkeypatch, client=client, exists_after_put=False
+    )
+
+    with caplog.at_level(logging.WARNING, logger="doris.services.mdns"):
+        result = await mdns._upload_nginx_redirect()
+
+    assert result is False
+    # Reload MUST NOT be issued when verification failed - reloading
+    # against a conf we couldn't observe is wasted effort.
+    assert rec.calls == [], rec.calls
+    assert any(
+        "not observable" in r.message for r in caplog.records
+    ), caplog.records
+
+
+async def test_upload_nginx_redirect_returns_false_when_reload_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Previously ``nginx -s reload``'s rc was explicitly ignored
+    ('errors surface via 502 from the redirect itself'). That's
+    user-visible failure instead of caller-visible failure; the new
+    code checks the rc and returns False so the retry loop /
+    watchdog can try again."""
+    client = _FakeAsyncClient()
+    _install_nginx_redirect_mocks(
+        monkeypatch,
+        client=client,
+        reload_response=(False, "[emerg] open() ... failed"),
+    )
+
+    with caplog.at_level(logging.WARNING, logger="doris.services.mdns"):
+        result = await mdns._upload_nginx_redirect()
+
+    assert result is False
+    assert any(
+        "nginx -s reload" in r.message and "failed" in r.message
+        for r in caplog.records
+    ), caplog.records
+
+
+async def test_upload_nginx_redirect_logs_exception_type_at_warning(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """Outer except must log at WARNING and include the exception's
+    class name so that field reports like 'attempt N/5 failed'
+    actually point at a cause instead of being information-free."""
+
+    class _BoomClient:
+        async def __aenter__(self) -> "_BoomClient":
+            return self
+
+        async def __aexit__(self, *_exc: object) -> None:
+            return None
+
+        async def post(self, *_a: Any, **_kw: Any) -> _FakeHttpResponse:
+            raise ConnectionError("kaboom")
+
+    def fake_async_client(*_a: Any, **_kw: Any) -> _BoomClient:
+        return _BoomClient()
+
+    async def fake_find_cid(_c: object) -> str:
+        return "abcdef012345"
+
+    monkeypatch.setattr(mdns.httpx, "AsyncClient", fake_async_client)
+    monkeypatch.setattr(mdns, "_find_core_container_id", fake_find_cid)
+
+    with caplog.at_level(logging.WARNING, logger="doris.services.mdns"):
+        result = await mdns._upload_nginx_redirect()
+
+    assert result is False
+    assert any(
+        "ConnectionError" in r.message and "kaboom" in r.message
+        for r in caplog.records
+    ), caplog.records

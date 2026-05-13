@@ -326,30 +326,60 @@ async def _nginx_redirect_exists() -> bool:
 async def _upload_nginx_redirect() -> bool:
     """Upload doris-redirect.conf into blueos-core and reload nginx.
 
-    Returns True on success.
+    Returns True only when:
+      1. The destination directory exists (or was created), AND
+      2. The tar PUT to ``/archive`` returned 200, AND
+      3. The conf file is observable inside blueos-core after PUT, AND
+      4. ``nginx -s reload`` returned rc=0.
+
+    Any earlier failure logs a WARNING with the failing step so retry
+    loops produce actionable signal (the previous version logged at
+    DEBUG, which is why field reports of "attempt N/5 failed" were
+    uninformative).
     """
     try:
         async with httpx.AsyncClient(timeout=15.0) as client:
             cid = await _find_core_container_id(client)
             if not cid:
-                raise RuntimeError(f"{CORE_CONTAINER} container not found")
+                logger.warning(
+                    "nginx redirect upload: %s container not found",
+                    CORE_CONTAINER,
+                )
+                return False
 
-            exec_body = {
-                "Cmd": ["mkdir", "-p", NGINX_CONF_DIR],
-                "AttachStdout": False,
-                "AttachStderr": False,
-            }
+            # Step 1: mkdir -p NGINX_CONF_DIR, *synchronously*. The old
+            # path used Detach=True (fire-and-forget) and immediately
+            # PUT'd the archive below. On a slow blueos-core boot the
+            # mkdir hadn't actually run yet and the PUT failed against
+            # a missing path. We now wait for the exec to finish and
+            # check its exit code before continuing.
             exec_resp = await client.post(
                 f"{_docker_base_url()}/containers/{cid}/exec",
-                json=exec_body,
+                json={
+                    "Cmd": ["mkdir", "-p", NGINX_CONF_DIR],
+                    "AttachStdout": True,
+                    "AttachStderr": True,
+                },
             )
             exec_resp.raise_for_status()
             exec_id = exec_resp.json()["Id"]
             await client.post(
                 f"{_docker_base_url()}/exec/{exec_id}/start",
-                json={"Detach": True},
+                json={"Detach": False, "Tty": False},
             )
+            inspect_resp = await client.get(
+                f"{_docker_base_url()}/exec/{exec_id}/json"
+            )
+            inspect_resp.raise_for_status()
+            mkdir_rc = inspect_resp.json().get("ExitCode")
+            if mkdir_rc != 0:
+                logger.warning(
+                    "nginx redirect upload: mkdir -p %s exited %s",
+                    NGINX_CONF_DIR, mkdir_rc,
+                )
+                return False
 
+            # Step 2: PUT the tar archive.
             tar_buf = io.BytesIO()
             with tarfile.open(fileobj=tar_buf, mode="w") as tar:
                 data = NGINX_REDIRECT_CONTENT.encode()
@@ -364,14 +394,48 @@ async def _upload_nginx_redirect() -> bool:
                 content=tar_buf.read(),
                 headers={"Content-Type": "application/x-tar"},
             )
-            resp.raise_for_status()
+            if resp.status_code != 200:
+                logger.warning(
+                    "nginx redirect upload: archive PUT to %s returned %d: %s",
+                    NGINX_CONF_DIR, resp.status_code, resp.text[:200],
+                )
+                return False
 
-        await _run_host_command(
+        # Step 3: verify the conf file actually landed where we expect.
+        # Catches the edge case where the PUT returned 200 but the tar
+        # extraction landed somewhere unexpected (e.g. path traversal,
+        # or Docker silently extracting to a parent dir).
+        if not await _nginx_redirect_exists():
+            logger.warning(
+                "nginx redirect upload: archive PUT succeeded but %s "
+                "is not observable in %s after upload",
+                NGINX_CONF_DST, CORE_CONTAINER,
+            )
+            return False
+
+        # Step 4: reload nginx and *check* the return code. The
+        # previous comment said "return ignored; nginx reload errors
+        # surface via 502 from the redirect itself" - but that
+        # surfaces the failure to the *user* via a broken page rather
+        # than to *us* via a retry, and a permanent reload failure
+        # (e.g. syntax error in some other conf) would silently leave
+        # nginx running the old config forever.
+        reload_ok, reload_out = await _run_host_command(
             f"docker exec {CORE_CONTAINER} nginx -s reload"
-        )  # return ignored; nginx reload errors surface via 502 from the redirect itself
+        )
+        if not reload_ok:
+            logger.warning(
+                "nginx redirect upload: 'nginx -s reload' failed: %s",
+                reload_out[:200],
+            )
+            return False
+
         return True
     except Exception as exc:
-        logger.debug("nginx redirect upload failed: %s", exc)
+        logger.warning(
+            "nginx redirect upload raised %s: %s",
+            type(exc).__name__, exc,
+        )
         return False
 
 
