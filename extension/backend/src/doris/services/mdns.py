@@ -25,8 +25,18 @@ logger = logging.getLogger(__name__)
 
 AVAHI_CONF = Path("/tmp/avahi/avahi-daemon.conf")
 
-# create_ap assigns this gateway IP to the hotspot interface (wlan1).
-HOTSPOT_GATEWAY = "192.168.43.1"
+# The host-side AP interface. ``hotspot_radio`` renames the Realtek
+# USB radio from ``wlan1`` to ``uap0`` via udev, then ``create_ap``
+# brings the AP up on ``uap0`` and assigns it the gateway IP.
+HOTSPOT_INTERFACE = "uap0"
+
+# Fallback gateway IP if the live detection from ``ip addr show
+# uap0`` fails. This is the value BlueOS 1.5.x assigns; older 1.4.x
+# builds used 192.168.43.1. ``_detect_hotspot_gateway()`` reads it
+# live at call time so a future BlueOS renumber doesn't silently
+# break our DNS setup again - we only fall back to this constant
+# when the live read returns nothing (e.g. AP hasn't come up yet).
+HOTSPOT_GATEWAY_FALLBACK = "192.168.42.1"
 
 # Separate dnsmasq instance for standard DNS (port 53) on the hotspot.
 # create_ap's own dnsmasq only listens on port 5353 (mDNS), so clients
@@ -72,11 +82,15 @@ async def _find_core_container_id(client: httpx.AsyncClient) -> str | None:
     return None
 
 
-async def _run_host_command(command: str, timeout: float = 30.0) -> bool:
+async def _run_host_command(
+    command: str, timeout: float = 30.0
+) -> tuple[bool, str]:
     """Execute a command on the host via the Commander API.
 
     Commander always returns HTTP 200; the actual exit code is in the
-    JSON body's ``return_code`` field.
+    JSON body's ``return_code`` field. Returns ``(ok, stdout)`` so
+    callers that need the output (e.g. ``_detect_hotspot_gateway``
+    parsing ``ip addr show uap0``) don't need a second helper.
     """
     url = f"{blueos_services.commander}/v1.0/command/host"
     params = {"command": command, "i_know_what_i_am_doing": "true"}
@@ -86,18 +100,57 @@ async def _run_host_command(command: str, timeout: float = 30.0) -> bool:
             resp.raise_for_status()
             data = resp.json()
             rc = data.get("return_code", -1)
+            out = data.get("stdout", "") or ""
+            err = data.get("stderr", "") or ""
             if rc != 0:
-                out = data.get("stdout", "")
-                err = data.get("stderr", "")
                 logger.warning(
                     "Host command returned %d: %s %s",
                     rc, out[:200], err[:200],
                 )
-                return False
-        return True
+                return False, out
+            return True, out
     except Exception as e:
         logger.warning("Commander command failed (%s): %s", command[:60], e)
-        return False
+        return False, ""
+
+
+_IP_ADDR_RE = re.compile(r"inet\s+(\d{1,3}(?:\.\d{1,3}){3})")
+
+
+async def _detect_hotspot_gateway() -> str:
+    """Return the IPv4 currently bound to :data:`HOTSPOT_INTERFACE`.
+
+    BlueOS has rotated the create_ap gateway between versions
+    (192.168.43.1 in older builds, 192.168.42.1 since 1.5.x). Reading
+    it live is more durable than tracking the upstream change in a
+    constant. Falls back to :data:`HOTSPOT_GATEWAY_FALLBACK` when the
+    detection fails - typically because the AP hasn't finished coming
+    up at the moment this runs - so DNS still has *an* IP to use even
+    if it might be slightly off (the watchdog at the next tick will
+    overwrite with the right value once the AP is up).
+    """
+    ok, out = await _run_host_command(
+        f"ip -4 -o addr show {HOTSPOT_INTERFACE}"
+    )
+    if not ok:
+        logger.warning(
+            "Could not read %s addresses; falling back to %s for hotspot DNS",
+            HOTSPOT_INTERFACE,
+            HOTSPOT_GATEWAY_FALLBACK,
+        )
+        return HOTSPOT_GATEWAY_FALLBACK
+    m = _IP_ADDR_RE.search(out)
+    if not m:
+        logger.warning(
+            "No IPv4 visible on %s yet (output: %r); falling back to %s",
+            HOTSPOT_INTERFACE,
+            out[:160],
+            HOTSPOT_GATEWAY_FALLBACK,
+        )
+        return HOTSPOT_GATEWAY_FALLBACK
+    addr = m.group(1)
+    logger.info("Detected hotspot gateway %s on %s", addr, HOTSPOT_INTERFACE)
+    return addr
 
 
 def _setup_avahi_hostname() -> bool:
@@ -168,18 +221,24 @@ async def start_hotspot_dns() -> None:
     ``blueos-wifi.local``) to that same gateway.
 
     Must be called AFTER configure_hotspot() so the hotspot interface
-    actually has the gateway IP assigned.
+    actually has the gateway IP assigned. The gateway IP is detected
+    live from :data:`HOTSPOT_INTERFACE` rather than hardcoded - BlueOS
+    has renumbered the AP subnet between versions (192.168.43.1 →
+    192.168.42.1 between 1.4.x and 1.5.x) and a stale hardcoded value
+    made dnsmasq's ``bind-interfaces`` fail on every start, leaving
+    ``doris.local`` unresolvable for hotspot clients that lack mDNS.
 
     Uses ``sudo`` so that /usr/sbin is in the PATH (Commander's default
     shell PATH omits /usr/sbin where dnsmasq lives).
     """
+    gateway = await _detect_hotspot_gateway()
     conf_content = (
-        f"listen-address={HOTSPOT_GATEWAY}\n"
+        f"listen-address={gateway}\n"
         "port=53\n"
         "bind-interfaces\n"
-        "no-dhcp-interface=wlan1\n"
-        f"address=/doris.local/{HOTSPOT_GATEWAY}\n"
-        f"address=/blueos-wifi.local/{HOTSPOT_GATEWAY}\n"
+        f"no-dhcp-interface={HOTSPOT_INTERFACE}\n"
+        f"address=/doris.local/{gateway}\n"
+        f"address=/blueos-wifi.local/{gateway}\n"
         "no-resolv\n"
         "no-hosts\n"
     )
@@ -189,11 +248,11 @@ async def start_hotspot_dns() -> None:
         f"sudo /usr/sbin/dnsmasq --conf-file={HOTSPOT_DNS_CONF} "
         f"--pid-file={HOTSPOT_DNS_PID}"
     )
-    ok = await _run_host_command(cmd)
+    ok, _ = await _run_host_command(cmd)
     if ok:
-        logger.info("Hotspot DNS started on %s:53 (doris.local)", HOTSPOT_GATEWAY)
+        logger.info("Hotspot DNS started on %s:53 (doris.local)", gateway)
     else:
-        logger.warning("Failed to start hotspot DNS server")
+        logger.warning("Failed to start hotspot DNS server (gateway=%s)", gateway)
 
 
 async def restart_avahi(force: bool = False) -> None:
@@ -216,7 +275,7 @@ async def restart_avahi(force: bool = False) -> None:
         logger.info("Avahi config unchanged, skipping restart")
         return
 
-    ok = await _run_host_command(
+    ok, _ = await _run_host_command(
         "sudo systemctl stop avahi-daemon && sleep 5 && sudo systemctl start avahi-daemon"
     )
     if ok:
@@ -286,7 +345,7 @@ async def _upload_nginx_redirect() -> bool:
 
         await _run_host_command(
             f"docker exec {CORE_CONTAINER} nginx -s reload"
-        )
+        )  # return ignored; nginx reload errors surface via 502 from the redirect itself
         return True
     except Exception as exc:
         logger.debug("nginx redirect upload failed: %s", exc)
