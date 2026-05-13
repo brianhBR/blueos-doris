@@ -3,14 +3,30 @@
 Detects the SparkFun Artemis Global Tracker by checking for its
 HEARTBEAT on MAVLink component 191 (MAV_COMP_ID_ONBOARD_COMPUTER).
 Reads GPS_RAW_INT from the same component for position data.
-Supports triggering an Iridium test via COMMAND_LONG and polling
-STATUSTEXT for the result.
+
+Iridium test support
+--------------------
+The AGT emits ``IRIDIUM: …`` STATUSTEXT messages while running an
+Iridium SBD test, but the test takes 2-10 minutes and the AGT emits
+unrelated STATUSTEXT messages (``GPS: PVT watchdog reinit`` etc.) in
+between.  mavlink2rest only caches the *latest* STATUSTEXT, so HTTP
+polling regularly loses the ``IRIDIUM: …PASSED/FAILED`` message.
+
+To fix this we subscribe to the mavlink2rest STATUSTEXT WebSocket on
+first use, filter to component 191, and buffer the last 100 messages
+with a monotonic id.  The frontend polls with ``?since_id=<n>`` and
+scans every new message for the test outcome — no STATUSTEXT can be
+missed even if the AGT emits dozens of messages between polls.
 """
 
+import asyncio
+import json
 import logging
-from datetime import datetime
+from collections import deque
+from datetime import datetime, timezone
 
 import httpx
+import websockets
 
 from ..config import blueos_services
 from ..models.sensors import ModuleInfo
@@ -30,9 +46,69 @@ GPS_FIX_TYPE_MAP: dict[str, int] = {
     "GPS_FIX_TYPE_RTK_FIXED": 6,
 }
 
+SEVERITY_MAP: dict[str, int] = {
+    "MAV_SEVERITY_EMERGENCY": 0, "MAV_SEVERITY_ALERT": 1,
+    "MAV_SEVERITY_CRITICAL": 2, "MAV_SEVERITY_ERROR": 3,
+    "MAV_SEVERITY_WARNING": 4, "MAV_SEVERITY_NOTICE": 5,
+    "MAV_SEVERITY_INFO": 6, "MAV_SEVERITY_DEBUG": 7,
+}
+
+STATUSTEXT_BUFFER_SIZE = 100
+WS_RECONNECT_DELAY_S = 2.0
+TRIGGER_POST_TIMEOUT_S = 15.0  # mavlink2rest POST commonly takes 4-5s
+
 
 def _m2r_base() -> str:
     return blueos_services.mavlink2rest
+
+
+def _statustext_ws_url() -> str:
+    base = blueos_services.mavlink2rest
+    ws_base = base.replace("http://", "ws://").replace("https://", "wss://")
+    return f"{ws_base}/ws/mavlink?filter=STATUSTEXT"
+
+
+def _decode_text(raw_text) -> str:
+    """STATUSTEXT.text is sent as a list of single-char strings padded with \\x00."""
+    if isinstance(raw_text, list):
+        raw_text = "".join(c for c in raw_text if c != "\x00")
+    return (raw_text or "").strip()
+
+
+def _decode_severity(raw_severity) -> int:
+    if isinstance(raw_severity, dict):
+        return SEVERITY_MAP.get(raw_severity.get("type", ""), 6)
+    if isinstance(raw_severity, int):
+        return raw_severity
+    return 6
+
+
+class _StatusTextBuffer:
+    """In-memory ring buffer of recent AGT STATUSTEXT messages."""
+
+    def __init__(self, max_size: int = STATUSTEXT_BUFFER_SIZE) -> None:
+        self._messages: deque[dict] = deque(maxlen=max_size)
+        self._next_id: int = 1
+        self._lock = asyncio.Lock()
+
+    async def add(self, text: str, severity: int) -> None:
+        async with self._lock:
+            self._messages.append({
+                "id": self._next_id,
+                "text": text,
+                "severity": severity,
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            })
+            self._next_id += 1
+
+    async def since(self, since_id: int) -> tuple[list[dict], int]:
+        async with self._lock:
+            new = [m for m in self._messages if m["id"] > since_id]
+            return new, self._next_id - 1
+
+    async def latest_id(self) -> int:
+        async with self._lock:
+            return self._next_id - 1
 
 
 class ArtemisTrackerService:
@@ -40,6 +116,8 @@ class ArtemisTrackerService:
 
     def __init__(self) -> None:
         self._client: httpx.AsyncClient | None = None
+        self._statustext = _StatusTextBuffer()
+        self._ws_task: asyncio.Task | None = None
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -151,13 +229,75 @@ class ArtemisTrackerService:
             logger.debug("No Artemis heartbeat: %s", e)
             return None
 
+    # ── STATUSTEXT subscriber ───────────────────────────────────────
+
+    def _ensure_statustext_subscriber(self) -> None:
+        """Lazily start the background WebSocket subscriber."""
+        if self._ws_task is None or self._ws_task.done():
+            self._ws_task = asyncio.create_task(
+                self._statustext_ws_loop(),
+                name="agt-statustext-subscriber",
+            )
+
+    async def _statustext_ws_loop(self) -> None:
+        """Forever-loop that streams STATUSTEXT into the buffer.
+
+        Reconnects on disconnect with a fixed backoff so a transient
+        mavlink2rest restart can't permanently break the iridium UI.
+        """
+        url = _statustext_ws_url()
+        logger.info("AGT STATUSTEXT subscriber starting (%s)", url)
+        while True:
+            try:
+                async with websockets.connect(url, close_timeout=5) as ws:
+                    async for raw in ws:
+                        if isinstance(raw, bytes):
+                            try:
+                                raw = raw.decode("utf-8")
+                            except UnicodeDecodeError:
+                                continue
+                        if not raw.startswith("{"):
+                            continue
+                        try:
+                            data = json.loads(raw)
+                        except json.JSONDecodeError:
+                            continue
+
+                        header = data.get("header", {}) or {}
+                        if header.get("component_id") != ARTEMIS_COMPONENT_ID:
+                            continue
+
+                        msg = data.get("message", {}) or {}
+                        if msg.get("type") != "STATUSTEXT":
+                            continue
+
+                        text = _decode_text(msg.get("text", ""))
+                        if not text:
+                            continue
+                        sev = _decode_severity(msg.get("severity"))
+                        await self._statustext.add(text, sev)
+            except asyncio.CancelledError:
+                logger.info("AGT STATUSTEXT subscriber cancelled")
+                raise
+            except Exception as e:
+                logger.debug(
+                    "AGT STATUSTEXT WS disconnected (%s); reconnecting in %.1fs",
+                    e, WS_RECONNECT_DELAY_S,
+                )
+                await asyncio.sleep(WS_RECONNECT_DELAY_S)
+
     # ── Iridium test ────────────────────────────────────────────────
 
     async def send_iridium_test(self) -> dict:
         """Send COMMAND_LONG (MAV_CMD_USER_4) to trigger Iridium test.
 
-        Returns {"accepted": bool, "error": str|None}.
+        Returns ``{accepted, error, latest_id}`` where ``latest_id`` is
+        the buffer id at the moment the command was sent so the frontend
+        can poll for messages newer than that.
         """
+        self._ensure_statustext_subscriber()
+        baseline_id = await self._statustext.latest_id()
+
         base = _m2r_base()
         post_url = f"{base}/mavlink"
         payload = {
@@ -178,54 +318,42 @@ class ArtemisTrackerService:
             },
         }
         try:
-            resp = await self.client.post(post_url, json=payload)
+            resp = await self.client.post(
+                post_url, json=payload, timeout=TRIGGER_POST_TIMEOUT_S,
+            )
             resp.raise_for_status()
-            logger.info("Iridium test command sent to AGT")
-            return {"accepted": True, "error": None}
+            logger.info("Iridium test command sent to AGT (baseline_id=%d)", baseline_id)
+            return {"accepted": True, "error": None, "latest_id": baseline_id}
         except Exception as e:
             logger.warning("Failed to send Iridium test command: %s", e)
-            return {"accepted": False, "error": str(e)}
+            return {"accepted": False, "error": str(e), "latest_id": baseline_id}
 
-    async def get_iridium_status(self) -> dict:
-        """Poll STATUSTEXT from the AGT for Iridium test result.
+    async def get_iridium_status(self, since_id: int = 0) -> dict:
+        """Return all AGT STATUSTEXT messages newer than ``since_id``.
 
-        Returns {"text": str|None, "severity": int|None, "counter": int}.
+        Response shape::
+
+            {
+              "messages": [
+                {"id": 7, "text": "IRIDIUM: Test starting", "severity": 6,
+                 "timestamp": "..."},
+                ...
+              ],
+              "latest_id": 7
+            }
         """
-        base = _m2r_base()
-        url = f"{base}/mavlink/vehicles/1/components/{ARTEMIS_COMPONENT_ID}/messages/STATUSTEXT"
-        try:
-            resp = await self.client.get(url)
-            if resp.status_code == 404:
-                return {"text": None, "severity": None, "counter": 0}
-            resp.raise_for_status()
-            data = resp.json()
-            msg = data.get("message", {})
-            if msg.get("type") != "STATUSTEXT":
-                return {"text": None, "severity": None, "counter": 0}
-
-            raw_text = msg.get("text", "")
-            if isinstance(raw_text, list):
-                raw_text = "".join(c for c in raw_text if c != "\x00")
-            text = raw_text.strip()
-
-            severity = msg.get("severity", {})
-            if isinstance(severity, dict):
-                sev_type = severity.get("type", "")
-                sev_map = {
-                    "MAV_SEVERITY_EMERGENCY": 0, "MAV_SEVERITY_ALERT": 1,
-                    "MAV_SEVERITY_CRITICAL": 2, "MAV_SEVERITY_ERROR": 3,
-                    "MAV_SEVERITY_WARNING": 4, "MAV_SEVERITY_NOTICE": 5,
-                    "MAV_SEVERITY_INFO": 6, "MAV_SEVERITY_DEBUG": 7,
-                }
-                severity = sev_map.get(sev_type, 6)
-
-            counter = data.get("status", {}).get("time", {}).get("counter", 0)
-            return {"text": text, "severity": severity, "counter": counter}
-        except Exception as e:
-            logger.debug("Failed to read AGT STATUSTEXT: %s", e)
-            return {"text": None, "severity": None, "counter": 0}
+        self._ensure_statustext_subscriber()
+        messages, latest_id = await self._statustext.since(since_id)
+        return {"messages": messages, "latest_id": latest_id}
 
     async def close(self) -> None:
+        if self._ws_task is not None and not self._ws_task.done():
+            self._ws_task.cancel()
+            try:
+                await self._ws_task
+            except (asyncio.CancelledError, Exception):
+                pass
+            self._ws_task = None
         if self._client is not None and not self._client.is_closed:
             await self._client.aclose()
             self._client = None

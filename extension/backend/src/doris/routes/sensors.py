@@ -153,9 +153,20 @@ def register_sensor_routes(app: Robyn) -> None:
 
     @app.get("/api/v1/tracker/iridium-status")
     async def get_iridium_status(request):
-        """Poll AGT STATUSTEXT for Iridium test result."""
+        """Poll AGT STATUSTEXT messages newer than ``since_id``.
+
+        Returns ``{messages: [...], latest_id: int}`` where each message
+        has ``{id, text, severity, timestamp}``.  The frontend feeds the
+        returned ``latest_id`` back as ``since_id`` on the next call so
+        no STATUSTEXT can be missed even if mavlink2rest's HTTP cache
+        moves on between polls.
+        """
         try:
-            status = await tracker_service.get_iridium_status()
+            try:
+                since_id = int(request.query_params.get("since_id", "0"))
+            except (TypeError, ValueError):
+                since_id = 0
+            status = await tracker_service.get_iridium_status(since_id=since_id)
             return json.dumps(status)
         except Exception as e:
             return Response(
