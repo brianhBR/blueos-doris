@@ -1,33 +1,59 @@
-"""Pin the BlueOS hotspot to the USB Realtek RTL88x2BU radio at full speed.
+"""Pin the BlueOS hotspot to the USB MediaTek MT7921U radio at full speed.
 
 Why this exists
 ---------------
-On a Pi 5 with the onboard Broadcom radio + a USB Realtek RTL88x2BU dongle,
-out of the box BlueOS:
+On a Pi 5 with the onboard Broadcom radio + a USB MediaTek MT7921U
+dongle, out of the box BlueOS:
 
   1. **Layers the hotspot on the wrong radio.** ``wifi-manager`` creates a
      virtual ``__ap`` interface called ``uap0`` *on top of* the onboard
      Broadcom radio (``brcmfmac`` supports concurrent STA + AP), so the
-     Broadcom chip is forced to be both client and AP at the same time and
-     the Realtek (with its external antenna) sits idle.
+     Broadcom chip is forced to be both client and AP at the same time -
+     and stuck on whatever home-WiFi channel ``wlan0`` happens to be
+     associated to. The MediaTek (with its external 2.4 GHz antenna)
+     sits idle.
 
   2. **Brings the AP up at 802.11g / 2.4 GHz / channel 1**, which caps real
-     throughput around 15-25 Mbps even on hardware capable of ~400 Mbps.
+     throughput around 15-25 Mbps even on hardware capable of much more
+     (the MT7921U does HT40 / 802.11ax on 2.4 GHz, ~150-180 Mbps real).
 
-This module fixes both. We can't simply re-parent ``uap0`` onto the
-Realtek - the out-of-tree ``rtl88x2bu`` driver does not support virtual
-interfaces (``iw dev wlan1 interface add testap type __ap`` returns
-``-ENODEV``). So instead:
+This module fixes both. Unlike the previous Realtek RTL88x2BU - whose
+out-of-tree ``rtl88x2bu`` driver couldn't add a virtual AP interface
+at all (``iw dev wlan1 interface add testap type __ap`` returned
+``-ENODEV``) - the in-tree ``mt7921u`` driver supports AP mode
+natively. But the chip's interface-combination matrix only allows
+**one AP per phy**::
 
-Part 1: rename the Realtek to ``uap0`` via udev
------------------------------------------------
+    valid interface combinations:
+        #{ managed, P2P-client } <= 2, #{ AP, P2P-GO } <= 1,
+        total <= 2, #channels <= 2
+
+So we still can't let ``create_ap`` use its default
+"add a virtual ``__ap`` iface on top of the managed one" mode -
+the chip's firmware refuses (``ERROR: Maybe your WiFi adapter does
+not fully support virtual interfaces``). The fix is to drive
+``create_ap`` with ``--no-virt``, which **converts** the existing
+``uap0`` from managed to AP in place rather than adding a second
+iface. That keeps us cleanly inside ``#{ AP, P2P-GO } <= 1``.
+``--no-virt`` lands in the create_ap-tuning patch in
+:func:`_install_create_ap_speed_patch` below; this section is just
+about the iface name.
+
+Part 1: rename the MediaTek to ``uap0`` via udev
+------------------------------------------------
 BlueOS's ``_create_virtual_interface()`` short-circuits if ``uap0``
 already exists at startup. We make it exist *before* BlueOS sees it by
-renaming the Realtek's net device from ``wlan1`` to ``uap0`` straight
+renaming the MediaTek's net device from ``wlan1`` to ``uap0`` straight
 from the kernel:
 
-    SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="0bda",
-        ATTRS{idProduct}=="b812", NAME="uap0"
+    SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="0e8d",
+        ATTRS{idProduct}=="7961", NAME="uap0"
+
+This serves two purposes: (a) BlueOS finds the AP iface under the
+exact name its endpoints hardcode, and (b) it short-circuits BlueOS's
+fallback path that would otherwise create the doomed
+"virtual ``__ap`` on the Broadcom" iface described in problem #1
+above.
 
 We also tell NetworkManager to leave ``uap0`` alone so hostapd /
 ``create_ap`` can drive it:
@@ -132,7 +158,7 @@ cleanly migrated to the 2.4 GHz config.
 
 Boot order
 ----------
-  1. Kernel + USB enumeration -> ``rtl88x2bu`` loads -> udev rule renames
+  1. Kernel + USB enumeration -> ``mt7921u`` loads -> udev rule renames
      the net device to ``uap0``.
   2. NetworkManager starts, reads ``conf.d``, marks ``uap0`` unmanaged.
   3. ``blueos-bootstrap`` reads ``startup.json``, mounts the patched
@@ -142,11 +168,11 @@ Boot order
      previous DORIS extension start -> hostapd brings the AP up on the
      auto-picked channel (1 or 6) with the rich ``ht_capab`` set.
 
-Result: hotspot broadcast from the Realtek's external antenna at 2.4
-GHz HT20 with the full set of HT capabilities the radio supports;
-~80 Mbps real-world TCP throughput, ~3x what stock ``wifi-manager``
-delivers. Onboard Broadcom is STA-only on ``wlan0``; in our testing
-its retransmit count dropped from ~14,900/min to ~30/min.
+Result: hotspot broadcast from the MediaTek's external antenna at 2.4
+GHz HT20 with the full set of HT capabilities the radio supports.
+Onboard Broadcom is STA-only on ``wlan0``; in our testing its
+retransmit count dropped from ~14,900/min to ~30/min once the AP
+moved off it.
 
 Note on ``sudo``: the BlueOS Commander API's shell PATH does not include
 ``/sbin`` or ``/usr/sbin``, so ``udevadm`` and friends are only reachable
@@ -182,9 +208,10 @@ from ..config import blueos_services
 logger = logging.getLogger(__name__)
 
 
-# Realtek RTL88x2BU (AC1200) USB IDs - matches the dongle we ship.
-USB_VENDOR_ID = "0bda"
-USB_PRODUCT_ID = "b812"
+# MediaTek MT7921U (AX1800, WiFi 6) USB IDs - matches the dongle we ship.
+# Driver: in-tree ``mt7921u`` (Pi kernel 6.6+).
+USB_VENDOR_ID = "0e8d"
+USB_PRODUCT_ID = "7961"
 
 UDEV_RULE_PATH = "/etc/udev/rules.d/72-blueos-hotspot.rules"
 NM_CONF_PATH = "/etc/NetworkManager/conf.d/99-blueos-hotspot-uap0.conf"
@@ -304,9 +331,10 @@ _DORIS_PATCH_BLOCK_RE = re.compile(
 
 UDEV_RULE_CONTENT = (
     "# Managed by DORIS extension (services/hotspot_radio.py).\n"
-    "# Rename the Realtek RTL88x2BU USB Wi-Fi adapter's net device to uap0\n"
-    "# so BlueOS uses it as the hotspot AP without trying to create a virtual\n"
-    "# __ap interface (rtl88x2bu does not support virtual interfaces).\n"
+    "# Rename the MediaTek MT7921U USB Wi-Fi adapter's net device to uap0\n"
+    "# so BlueOS finds it under the exact name its hotspot endpoints expect,\n"
+    "# instead of falling back to creating a virtual __ap on the onboard\n"
+    "# Broadcom (which would force STA + AP to share the home-WiFi channel).\n"
     f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{USB_VENDOR_ID}",'
     f' ATTRS{{idProduct}}=="{USB_PRODUCT_ID}", NAME="uap0"\n'
 )
@@ -935,7 +963,7 @@ async def _ensure_startup_bind() -> None:
 
 
 async def setup_hotspot_radio() -> None:
-    """Install the host-side config that pins ``uap0`` to the USB Realtek
+    """Install the host-side config that pins ``uap0`` to the USB MediaTek
     *and* makes the AP come up on 2.4 GHz HT20 with the full set of HT
     capabilities the radio supports.
 
