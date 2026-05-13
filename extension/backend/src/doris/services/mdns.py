@@ -24,12 +24,14 @@ logger = logging.getLogger(__name__)
 AVAHI_CONF = Path("/tmp/avahi/avahi-daemon.conf")
 
 # Candidate names for the BlueOS AP/hotspot interface, in priority order.
-# Older BlueOS used ``wlan1``/``wifi1``; the tony-wifi udev rule renames the
-# USB Realtek to ``uap0`` so that BlueOS ``wifi-manager`` runs the AP on it
-# instead of layering a virtual ``__ap`` on the onboard Broadcom. Discovering
-# at runtime keeps this responder working across BlueOS upgrades that change
-# either the iface name or the AP subnet (BlueOS 1.5.0-beta.36 moved from
-# 192.168.43.0/24 to 192.168.42.0/24).
+# The DORIS udev rule (services/hotspot_radio.py) renames the USB MediaTek
+# MT7921U to ``uap0`` so that BlueOS ``wifi-manager`` runs the AP on it
+# instead of layering a virtual ``__ap`` on the onboard Broadcom. ``wlan1``
+# / ``wifi1`` remain in the candidate list so this responder still finds
+# the AP if the rename hasn't taken effect yet (e.g. first boot before
+# udev fires) or in legacy BlueOS images where the rename is absent.
+# Discovering at runtime also covers BlueOS subnet renumbers (1.5.0-beta.36
+# moved from 192.168.43.0/24 to 192.168.42.0/24).
 HOTSPOT_IFACE_CANDIDATES = ("uap0", "wlan1", "wifi1")
 
 # Separate dnsmasq instance for standard DNS (port 53) on the hotspot.

@@ -120,83 +120,9 @@ rm -f {remote_tgz}
         client.close()
         return rc
 
-    print("Checking WiFi driver (88x2bu for Realtek RTL8822BU)...")
-    driver_script = r"""
-set +e
-KVER=$(uname -r)
-DRIVER_REPO="https://github.com/morrownr/88x2bu-20210702.git"
-DRIVER_DIR="/opt/doris-drivers/88x2bu"
-BLACKLIST="/etc/modprobe.d/blacklist-rtw88.conf"
-
-# Skip if 88x2bu is already loaded
-if lsmod | grep -q 88x2bu; then
-    echo "88x2bu driver already loaded, skipping."
-    exit 0
-fi
-
-# Skip if the module is already installed for this kernel
-if sudo modprobe -n 88x2bu 2>/dev/null; then
-    echo "88x2bu module available for kernel $KVER, loading..."
-    sudo modprobe 88x2bu 2>/dev/null
-    # Blacklist the in-kernel driver
-    grep -q 'blacklist rtw88_8822bu' "$BLACKLIST" 2>/dev/null || {
-        echo 'blacklist rtw88_8822bu' | sudo tee "$BLACKLIST" > /dev/null
-        echo 'blacklist rtw88_8822b'  | sudo tee -a "$BLACKLIST" > /dev/null
-        echo 'blacklist rtw88_usb'    | sudo tee -a "$BLACKLIST" > /dev/null
-    }
-    echo "88x2bu loaded from installed module."
-    exit 0
-fi
-
-# Check build tools
-if ! command -v gcc >/dev/null || ! command -v make >/dev/null; then
-    echo "WARN: gcc/make not found, cannot build WiFi driver."
-    exit 0
-fi
-if [ ! -d "/lib/modules/$KVER/build" ]; then
-    echo "WARN: Kernel headers not found for $KVER, cannot build WiFi driver."
-    exit 0
-fi
-
-echo "Building 88x2bu driver for kernel $KVER..."
-sudo rm -rf "$DRIVER_DIR"
-sudo mkdir -p /opt/doris-drivers
-sudo git clone --depth 1 "$DRIVER_REPO" "$DRIVER_DIR" 2>&1 | tail -3
-cd "$DRIVER_DIR"
-sudo make -j4 KSRC="/lib/modules/$KVER/build" 2>&1 | tail -5
-if [ $? -ne 0 ]; then
-    echo "WARN: 88x2bu build failed."
-    exit 0
-fi
-sudo make install KSRC="/lib/modules/$KVER/build" 2>&1 | tail -3
-
-# Blacklist the in-kernel rtw88 driver
-echo 'blacklist rtw88_8822bu' | sudo tee "$BLACKLIST" > /dev/null
-echo 'blacklist rtw88_8822b'  | sudo tee -a "$BLACKLIST" > /dev/null
-echo 'blacklist rtw88_usb'    | sudo tee -a "$BLACKLIST" > /dev/null
-
-# Try to swap drivers now (if adapter is present)
-if [ -d /sys/bus/usb/devices/1-1 ]; then
-    sudo rmmod rtw88_8822bu 2>/dev/null
-    echo 0 | sudo tee /sys/bus/usb/devices/1-1/authorized > /dev/null
-    sleep 2
-    echo 1 | sudo tee /sys/bus/usb/devices/1-1/authorized > /dev/null
-    sleep 4
-    if lsmod | grep -q 88x2bu; then
-        echo "88x2bu driver installed and loaded successfully."
-    else
-        echo "88x2bu installed but not yet loaded (will activate on next reboot)."
-    fi
-else
-    echo "88x2bu installed (USB adapter not detected, will load on next boot)."
-fi
-"""
-    rc, out, err = ssh_exec(client, driver_script, timeout=600)
-    print(out)
-    if err.strip():
-        for line in err.strip().split("\n"):
-            if "warning" not in line.lower():
-                print(line, file=sys.stderr)
+    # No host-side WiFi driver install. The MediaTek MT7921U USB adapter
+    # uses the in-tree mainline ``mt7921u`` driver shipped with the Pi
+    # kernel; nothing needs to be built or DKMS'd from this script.
 
     print("Replacing container...")
     stop_script = f"""

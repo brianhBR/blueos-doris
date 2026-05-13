@@ -77,9 +77,6 @@ COPY backend/src ./src
 COPY backend/scripts ./scripts
 COPY backend/frames ./frames
 
-# Copy WiFi driver (morrownr/88x2bu out-of-tree for RTL88x2BU USB WiFi adapter)
-COPY driver/ ./driver/
-
 # Copy built frontend to be served by backend
 COPY --from=frontend-builder /frontend/dist ./frontend/dist
 
