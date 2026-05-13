@@ -48,6 +48,17 @@ def _wrap(payload: str, *, anchor: str = CANONICAL_ANCHOR_LINE) -> str:
 CURRENT_24GHZ_PATCH = (
     '            "-c", "6",\n'
     '            "--ieee80211n",\n'
+    '            "--ht_capab", "[SHORT-GI-20][LDPC][RX-STBC1][MAX-AMSDU-7935]",\n'
+    '            "--country", "US",\n'
+)
+
+
+# The previous shipped revision asked for HT40+. We keep it as test
+# data so the strip path can prove it still cleans up old overrides
+# on units that installed bh-0.4.x before the HT20-only change.
+LEGACY_24GHZ_HT40_PATCH = (
+    '            "-c", "1",\n'
+    '            "--ieee80211n",\n'
     '            "--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40]'
     '[LDPC][RX-STBC1][MAX-AMSDU-7935][DSSS_CCK-40]",\n'
     '            "--country", "US",\n'
@@ -75,6 +86,19 @@ def test_strip_doris_patch_removes_current_24ghz_block() -> None:
     stripped = hotspot_radio._strip_doris_patch(src)
     assert stripped == _wrap("")
     assert "--ht_capab" not in stripped
+
+
+def test_strip_doris_patch_removes_legacy_ht40_block() -> None:
+    """A unit upgrading from a previous bh-0.4.x release will still
+    have an HT40+ override on disk. The strip pass at install time
+    must recognise and remove it so the fresh HT20-only block is
+    written cleanly on top, with no stacked flags."""
+    src = _wrap(LEGACY_24GHZ_HT40_PATCH)
+    stripped = hotspot_radio._strip_doris_patch(src)
+    assert stripped == _wrap("")
+    assert "[HT40+]" not in stripped
+    assert "SHORT-GI-40" not in stripped
+    assert "DSSS_CCK-40" not in stripped
 
 
 def test_strip_doris_patch_removes_legacy_5ghz_block() -> None:
@@ -309,6 +333,74 @@ async def test_install_patch_writes_when_source_is_clean(
     assert path == hotspot_radio.WIFI_OVERRIDE_HOST_PATH
     assert '"-c", "6"' in content
     assert "--ht_capab" in content
+
+
+async def test_install_patch_emits_ht20_only_caps(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Regression for the May 2026 field report: an earlier revision
+    of this patch asked for ``[HT40+]`` and a field unit with a clean
+    RF environment hit a morrownr 88x2bu AP-mode firmware bug, cycling
+    the BSS INTERFACE-ENABLED/DISABLED on every client association.
+    The fix is to advertise HT20 only so hostapd has no path to ever
+    request an HT40 BSS. Asserts both the positive (HT20 caps present,
+    correct order) and the negative (none of the HT40-specific caps
+    are emitted, regardless of channel)."""
+    captured: dict[str, str] = {}
+
+    async def fake_read(_c: str, _p: str) -> str | None:
+        return _wrap("")
+
+    async def fake_write(_path: str, content: str) -> bool:
+        captured["content"] = content
+        return True
+
+    async def fake_pick() -> int:
+        # Channel 1 is the case that broke in the field - HT40+ on
+        # ch 1 was the specific failure trigger - so we exercise it
+        # here to make sure HT20-only is emitted for that channel
+        # too, not just the docstring's example channel 6.
+        return 1
+
+    monkeypatch.setattr(hotspot_radio, "_read_container_file", fake_read)
+    monkeypatch.setattr(hotspot_radio, "_write_host_file", fake_write)
+    monkeypatch.setattr(hotspot_radio, "_pick_24ghz_channel", fake_pick)
+
+    result = await hotspot_radio._install_create_ap_speed_patch()
+    assert result is True
+
+    content = captured["content"]
+    # HT20-valid caps we keep
+    assert "[SHORT-GI-20]" in content
+    assert "[LDPC]" in content
+    assert "[RX-STBC1]" in content
+    assert "[MAX-AMSDU-7935]" in content
+    # HT40-specific caps that broke Tony's unit. Each one is checked
+    # individually so a regression that brings back just one of them
+    # fails with a specific message.
+    assert "[HT40+]" not in content, (
+        "HT40+ must not be re-introduced - it caused INTERFACE-DISABLED "
+        "cycling on the morrownr 88x2bu AP-mode firmware path on units "
+        "with clean RF environments. See May 2026 field report."
+    )
+    assert "[HT40-]" not in content, "HT40- has the same driver issue as HT40+"
+    assert "SHORT-GI-40" not in content, (
+        "SHORT-GI-40 only applies inside an HT40 BSS; emitting it "
+        "implies an HT40 path we explicitly removed."
+    )
+    assert "DSSS_CCK-40" not in content, (
+        "DSSS_CCK-40 only applies inside an HT40 BSS; same reason."
+    )
+    # Channel and country must also be present and correct for the
+    # picked channel.
+    assert '"-c", "1"' in content
+    assert '"--country", "US"' in content
+    assert '"--ieee80211n"' in content
+    # And nothing about ac/VHT should sneak in - that's the 5 GHz
+    # path we deliberately abandoned.
+    assert "--ieee80211ac" not in content
+    assert "--vht_capab" not in content
+    assert "--freq-band" not in content
 
 
 # ---------------------------------------------------------------------
