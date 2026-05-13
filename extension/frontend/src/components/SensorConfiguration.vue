@@ -245,6 +245,25 @@ const iridiumElapsedMs = ref(0)
 // Capped at 50 to avoid unbounded growth on a long test.
 const iridiumTranscript = ref<IridiumMessage[]>([])
 const iridiumDetailsOpen = ref(false)
+const iridiumDetailsEl = ref<HTMLElement | null>(null)
+// Push order can interleave (synthetic "triggered" lands first, then async
+// seed back-fills boot/GPS rows that have OLDER timestamps, then live polls
+// append). Sort by timestamp so the panel always reads chronologically.
+const sortedIridiumTranscript = computed(() => {
+  return [...iridiumTranscript.value].sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+})
+// AGT firmware fast-fails an SBD attempt with no GPS fix anyway
+// ("IRIDIUM: Test skipped (no GPS fix)"), so block the test up front
+// and tell the user why.  The AGT also uses 2D fix as the threshold.
+const iridiumGpsBlocked = computed(() => {
+  const fix = trackerGps.value?.fix_type ?? 0
+  return fix < 2
+})
+const iridiumButtonDisabled = computed(() => {
+  return iridiumState.value === 'sending'
+    || iridiumState.value === 'running'
+    || (iridiumState.value === 'idle' && iridiumGpsBlocked.value)
+})
 let iridiumPollInterval: number | undefined
 let iridiumElapsedTimer: number | undefined
 let iridiumLastSeenId = 0
@@ -266,6 +285,11 @@ function pushTranscript(m: IridiumMessage) {
   if (iridiumTranscript.value.length > 50) {
     iridiumTranscript.value.splice(0, iridiumTranscript.value.length - 50)
   }
+  // Defer scroll until Vue rerenders the (sorted) list.
+  nextTick(() => {
+    const el = iridiumDetailsEl.value
+    if (el) el.scrollTop = el.scrollHeight
+  })
 }
 
 async function triggerIridiumTest() {
@@ -290,12 +314,37 @@ async function triggerIridiumTest() {
     iridiumDeadline = iridiumStartedAt + IRIDIUM_TEST_MAX_MS
     iridiumState.value = 'running'
     iridiumMessage.value = 'Test starting — this may take 2–10 minutes…'
+    // Seed the transcript with recent context (boot, GPS lock, RTC sync) so
+    // the user can open the details panel immediately. The AGT typically
+    // goes silent during the SBD attempt itself, so without seeding the
+    // panel would stay empty for ~10 minutes.
+    seedTranscriptFromBuffer().catch(() => { /* best effort */ })
+    // Always show at least a "Test triggered" row so the details panel
+    // never appears empty.
+    iridiumTranscript.value.push({
+      id: 0,
+      text: `IRIDIUM: Test triggered from UI`,
+      severity: 6,
+      timestamp: new Date().toISOString(),
+    })
     startIridiumPolling()
     startIridiumElapsedTimer()
   } catch {
     iridiumState.value = 'failed'
     iridiumMessage.value = 'Failed to send command'
   }
+}
+
+async function seedTranscriptFromBuffer() {
+  // Fetch the last ~10 messages currently in the backend buffer and prepend
+  // any IRIDIUM/GPS/RTC ones to the transcript (without advancing
+  // iridiumLastSeenId — the polling loop still owns that).
+  const resp = await fetch('/api/v1/tracker/iridium-status?since_id=0')
+  if (!resp.ok) return
+  const data = await resp.json()
+  const messages: IridiumMessage[] = Array.isArray(data.messages) ? data.messages : []
+  const recent = messages.slice(-10)
+  for (const m of recent) pushTranscript(m)
 }
 
 function startIridiumPolling() {
@@ -873,23 +922,27 @@ const getStatusColor = (moduleStatus: string) => {
             <!-- Iridium test button -->
             <div v-if="mod.type === 'tracker' && mod.connected" class="mt-3">
               <button
-                :disabled="iridiumState === 'sending' || iridiumState === 'running'"
+                :disabled="iridiumButtonDisabled"
+                :title="iridiumState === 'idle' && iridiumGpsBlocked ? 'Waiting for AGT GPS fix — the test would be skipped' : ''"
                 class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm transition-all"
                 :style="{
                   backgroundColor: iridiumState === 'passed' ? 'rgba(34, 197, 94, 0.2)'
                     : iridiumState === 'failed' ? 'rgba(239, 68, 68, 0.2)'
                     : iridiumState === 'running' || iridiumState === 'sending' ? 'rgba(252, 216, 105, 0.15)'
+                    : iridiumGpsBlocked ? 'rgba(14, 36, 70, 0.3)'
                     : 'rgba(14, 36, 70, 0.5)',
                   border: iridiumState === 'passed' ? '1px solid rgba(34, 197, 94, 0.5)'
                     : iridiumState === 'failed' ? '1px solid rgba(239, 68, 68, 0.5)'
                     : iridiumState === 'running' || iridiumState === 'sending' ? '1px solid rgba(252, 216, 105, 0.4)'
+                    : iridiumGpsBlocked ? '1px solid rgba(150, 238, 242, 0.1)'
                     : '1px solid rgba(65, 185, 195, 0.2)',
                   color: iridiumState === 'passed' ? '#22c55e'
                     : iridiumState === 'failed' ? '#ef4444'
                     : iridiumState === 'running' || iridiumState === 'sending' ? '#FCD869'
+                    : iridiumGpsBlocked ? 'rgba(150, 238, 242, 0.4)'
                     : '#96EEF2',
-                  opacity: iridiumState === 'sending' || iridiumState === 'running' ? '0.85' : '1',
-                  cursor: iridiumState === 'sending' || iridiumState === 'running' ? 'not-allowed' : 'pointer',
+                  opacity: iridiumButtonDisabled ? '0.6' : '1',
+                  cursor: iridiumButtonDisabled ? 'not-allowed' : 'pointer',
                 }"
                 @click="iridiumState === 'passed' || iridiumState === 'failed' ? resetIridiumTest() : triggerIridiumTest()"
               >
@@ -897,7 +950,8 @@ const getStatusColor = (moduleStatus: string) => {
                 <svg v-else class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
                   <path :d="mdiSatelliteUplink" />
                 </svg>
-                <span v-if="iridiumState === 'idle'">Iridium Test</span>
+                <span v-if="iridiumState === 'idle' && iridiumGpsBlocked">Iridium Test — waiting for GPS fix</span>
+                <span v-else-if="iridiumState === 'idle'">Iridium Test</span>
                 <span v-else-if="iridiumState === 'sending'">Sending…</span>
                 <span v-else-if="iridiumState === 'running'">Testing… {{ formatElapsed(iridiumElapsedMs) }}</span>
                 <span v-else-if="iridiumState === 'passed' || iridiumState === 'failed'">
@@ -908,6 +962,9 @@ const getStatusColor = (moduleStatus: string) => {
               </button>
               <p v-if="iridiumState === 'running' && iridiumMessage" class="mt-1 text-xs text-center" style="color: rgba(252, 216, 105, 0.7)">
                 {{ iridiumMessage }}
+              </p>
+              <p v-else-if="iridiumState === 'idle' && iridiumGpsBlocked" class="mt-1 text-xs text-center" style="color: rgba(150, 238, 242, 0.5)">
+                AGT has no GPS fix yet ({{ trackerGps?.fix_type_name || 'No GPS' }}, {{ trackerGps?.satellites ?? 0 }} sats). The AGT firmware would skip the test.
               </p>
               <!-- Expandable transcript: useful for diagnosing why a test failed -->
               <div v-if="iridiumTranscript.length > 0 && (iridiumState === 'failed' || iridiumState === 'passed' || iridiumState === 'running')" class="mt-2">
@@ -921,10 +978,11 @@ const getStatusColor = (moduleStatus: string) => {
                 </button>
                 <div
                   v-if="iridiumDetailsOpen"
+                  ref="iridiumDetailsEl"
                   class="mt-1 rounded p-2 text-xs font-mono overflow-y-auto"
                   style="max-height: 12rem; background-color: rgba(0, 0, 0, 0.25); border: 1px solid rgba(65, 185, 195, 0.2)"
                 >
-                  <div v-for="m in iridiumTranscript" :key="m.id" class="py-0.5">
+                  <div v-for="(m, idx) in sortedIridiumTranscript" :key="`${m.id}-${idx}`" class="py-0.5">
                     <span style="color: rgba(150, 238, 242, 0.5)">{{ m.timestamp.substring(11, 19) }}</span>
                     <span class="ml-2 inline-block w-12 text-center rounded text-[10px]" :style="{ color: severityColor(m.severity), border: `1px solid ${severityColor(m.severity)}40` }">{{ severityLabel(m.severity) }}</span>
                     <span class="ml-2" :style="{ color: severityColor(m.severity) }">{{ m.text }}</span>
