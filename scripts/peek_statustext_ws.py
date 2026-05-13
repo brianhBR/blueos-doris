@@ -7,7 +7,7 @@ import sys
 
 import websockets
 
-URL = "ws://blueos-wifi.local:6040/ws/mavlink?filter=STATUSTEXT"
+URL = "ws://192.168.68.75:6040/ws/mavlink?filter=STATUSTEXT"
 
 
 async def main():
