@@ -844,7 +844,7 @@ def clear_snapshot_state() -> None:
     _dive_cycle_seq = 0
 
 
-async def _fetch_camera_jpeg() -> tuple[bytes | None, str]:
+async def fetch_camera_jpeg() -> tuple[bytes | None, str]:
     """GET a single JPEG straight from the IP camera at IPCAM_SNAPSHOT_URL.
 
     No MCM, no auth, no ffmpeg.  Just a plain HTTP GET against the
@@ -854,6 +854,10 @@ async def _fetch_camera_jpeg() -> tuple[bytes | None, str]:
     Times out after :data:`_SNAPSHOT_TIMEOUT_S` seconds and tolerates
     minor connection errors by returning ``(None, message)`` so the
     caller can decide what to do.
+
+    Public helper -- used by both :func:`take_phase_snapshot` (which
+    writes the JPEG to a per-dive folder) and the sensor-page preview
+    route (which streams the JPEG straight back to the browser).
     """
     import httpx
     try:
@@ -869,6 +873,11 @@ async def _fetch_camera_jpeg() -> tuple[bytes | None, str]:
     if not resp.content or not resp.content.startswith(b"\xff\xd8"):
         return None, "not_jpeg_magic"
     return resp.content, "ok"
+
+
+# Backwards-compatible private alias for in-module callers; new code
+# should use the public name above.
+_fetch_camera_jpeg = fetch_camera_jpeg
 
 
 async def take_phase_snapshot(phase: str | None) -> dict:

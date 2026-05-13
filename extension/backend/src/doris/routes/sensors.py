@@ -47,23 +47,40 @@ def register_sensor_routes(app: Robyn) -> None:
 
     @app.get("/api/v1/camera/snapshot")
     async def camera_snapshot(request):
-        """Proxy a JPEG snapshot from the Camera Manager for the sensor page preview."""
+        """Single JPEG frame from the IP camera for the sensor-page preview.
+
+        Uses the camera's built-in HTTP snapshot CGI directly (the same
+        path :func:`ip_camera_recorder.take_phase_snapshot` uses for the
+        TIMELAPSE mode).  No MCM, no ffmpeg, no RTSP -- a plain HTTP GET
+        that returns in ~200 ms.  This means the preview works even
+        when the BlueOS Camera Manager stream is stopped, as long as
+        the camera itself is reachable on the network.
+
+        Returns 409 while the IP camera recorder is active because the
+        camera serves only one RTSP/snapshot session at a time and a
+        preview poll would interrupt the recording.
+        """
         from doris.services import ip_camera_recorder as _iprec
         if _iprec.is_recording():
             return Response(
                 status_code=409,
-                description=json.dumps({"error": "Snapshot disabled while IP camera recorder is active"}),
+                description=json.dumps({
+                    "error": "Snapshot disabled while IP camera recorder is active",
+                    "reason": "recorder_active",
+                }),
                 headers={"Content-Type": "application/json"},
             )
-        source = request.query_params.get("source", None)
         try:
-            data = await camera_service.get_snapshot(source=source)
-        except Exception:
-            data = None
+            data, reason = await _iprec.fetch_camera_jpeg()
+        except Exception as e:  # pragma: no cover - defensive
+            data, reason = None, f"unexpected_error: {e}"
         if data is None:
             return Response(
                 status_code=502,
-                description=json.dumps({"error": "No snapshot available from camera"}),
+                description=json.dumps({
+                    "error": f"Camera snapshot failed: {reason}",
+                    "url": _iprec.IPCAM_SNAPSHOT_URL,
+                }),
                 headers={"Content-Type": "application/json"},
             )
         return Response(
