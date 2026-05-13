@@ -65,6 +65,12 @@ const SNAPSHOT_POLL_MS = 10000
 const snapshotUrl = ref<string | null>(null)
 const snapshotLoading = ref(false)
 const snapshotError = ref(false)
+/** Truth source for whether the camera is actually reachable.  Driven
+ *  by snapshot outcomes (not by MCM's stream.running, which lies for
+ *  the direct-CGI path).  null until the first probe completes; a 409
+ *  from the recorder does NOT change this -- it means the camera is
+ *  busy, not unreachable. */
+const cameraReachable = ref<boolean | null>(null)
 let snapshotInterval: number | undefined
 
 /** Any camera tile from Camera Manager (running or not) — the direct-CGI
@@ -82,6 +88,8 @@ async function refreshSnapshot() {
   if (!hasCameraModule.value) return
   // While the recorder owns the camera's single RTSP/snapshot slot,
   // skip polling entirely instead of hammering the backend with 409s.
+  // The recorder being busy does NOT mean the camera is unreachable,
+  // so leave cameraReachable alone.
   if (ipcamRecording.value) {
     clearSnapshotImage()
     snapshotLoading.value = false
@@ -93,6 +101,8 @@ async function refreshSnapshot() {
   try {
     const resp = await fetch(`/api/v1/camera/snapshot?_t=${Date.now()}`)
     if (resp.status === 409) {
+      // Backend says recorder is active; status pill is driven by
+      // ipcamRecording, so don't flip cameraReachable here either.
       clearSnapshotImage()
       return
     }
@@ -100,8 +110,10 @@ async function refreshSnapshot() {
     const blob = await resp.blob()
     if (snapshotUrl.value) URL.revokeObjectURL(snapshotUrl.value)
     snapshotUrl.value = URL.createObjectURL(blob)
+    cameraReachable.value = true
   } catch {
     snapshotError.value = true
+    cameraReachable.value = false
   } finally {
     snapshotLoading.value = false
   }
@@ -116,8 +128,64 @@ function startSnapshotPolling() {
   } else {
     clearSnapshotImage()
     snapshotError.value = false
+    cameraReachable.value = null
   }
 }
+
+/** Header-row state for a camera tile.  Replaces the misleading
+ *  mod.connected / mod.moduleStatus values (which derive from MCM
+ *  stream.running) with values that reflect actual camera reachability
+ *  via the snapshot endpoint plus the recorder's busy-state. */
+type CameraTileTone = 'good' | 'warn' | 'bad' | 'neutral'
+interface CameraTileStatus {
+  statusText: string
+  statusColor: string
+  pillText: string
+  pillColor: string
+  icon: 'wifi' | 'wifi-off' | 'video' | 'loader'
+  iconTone: CameraTileTone
+}
+
+const cameraTileStatus = computed<CameraTileStatus>(() => {
+  if (ipcamRecording.value) {
+    return {
+      statusText: 'Recording',
+      statusColor: '#86efac',
+      pillText: 'Busy (recorder)',
+      pillColor: '#86efac',
+      icon: 'video',
+      iconTone: 'good',
+    }
+  }
+  if (cameraReachable.value === true) {
+    return {
+      statusText: 'Ready: Preview live',
+      statusColor: '#FCD869',
+      pillText: 'Connected',
+      pillColor: '#FCD869',
+      icon: 'wifi',
+      iconTone: 'good',
+    }
+  }
+  if (cameraReachable.value === false) {
+    return {
+      statusText: 'No response from camera',
+      statusColor: '#DD2C1D',
+      pillText: 'Unreachable',
+      pillColor: '#DD2C1D',
+      icon: 'wifi-off',
+      iconTone: 'bad',
+    }
+  }
+  return {
+    statusText: 'Connecting...',
+    statusColor: 'rgba(150, 238, 242, 0.7)',
+    pillText: 'Connecting...',
+    pillColor: 'rgba(150, 238, 242, 0.7)',
+    icon: 'loader',
+    iconTone: 'neutral',
+  }
+})
 
 // ── IP camera extension recorder (ffmpeg RTSP → TS; no Lua) ───────────
 const IPCAM_RECORD_API = '/api/v1/ipcam/record'
@@ -766,7 +834,37 @@ const getStatusColor = (moduleStatus: string) => {
                   <h3 class="text-white">{{ mod.name }}</h3>
                 </div>
               </div>
+              <!--
+                Camera tiles: read-only indicator driven by snapshot
+                reachability (truth) plus recorder busy-state.  The
+                old Wifi toggle for cameras was misleading because it
+                flipped a cosmetic local boolean fed by MCM
+                stream.running, which is no longer the truth source.
+
+                Other tiles keep the existing local toggle.
+              -->
+              <div
+                v-if="mod.type === 'camera'"
+                class="p-2 rounded-lg flex items-center justify-center"
+                :title="cameraTileStatus.pillText"
+                :style="{
+                  backgroundColor:
+                    cameraTileStatus.iconTone === 'good' ? 'rgba(252, 216, 105, 0.2)' :
+                    cameraTileStatus.iconTone === 'bad'  ? 'rgba(221, 44, 29, 0.18)' :
+                    'rgba(14, 36, 70, 0.5)',
+                  color:
+                    cameraTileStatus.iconTone === 'good' ? '#FCD869' :
+                    cameraTileStatus.iconTone === 'bad'  ? '#DD2C1D' :
+                    '#96EEF2'
+                }"
+              >
+                <Wifi    v-if="cameraTileStatus.icon === 'wifi'"     class="w-5 h-5" />
+                <WifiOff v-else-if="cameraTileStatus.icon === 'wifi-off'" class="w-5 h-5" />
+                <Video   v-else-if="cameraTileStatus.icon === 'video'"    class="w-5 h-5" />
+                <Loader2 v-else-if="cameraTileStatus.icon === 'loader'"   class="w-5 h-5 animate-spin" />
+              </div>
               <button
+                v-else
                 @click.stop="toggleConnection(mod.id)"
                 class="p-2 rounded-lg transition-all"
                 :style="{
@@ -780,17 +878,33 @@ const getStatusColor = (moduleStatus: string) => {
             </div>
 
             <div class="space-y-2">
-              <div class="flex items-center justify-between text-sm">
-                <span :style="{ color: getStatusColor(mod.moduleStatus) }">
-                  {{ mod.moduleStatus }}
-                </span>
-              </div>
-              <div class="flex items-center justify-between text-sm">
-                <span style="color: #96EEF2">Connection</span>
-                <span :style="{ color: mod.connected ? '#FCD869' : '#DD2C1D' }">
-                  {{ mod.connected ? 'Connected' : 'Disconnected' }}
-                </span>
-              </div>
+              <!-- Camera: status + connection rows reflect actual reachability -->
+              <template v-if="mod.type === 'camera'">
+                <div class="flex items-center justify-between text-sm">
+                  <span :style="{ color: cameraTileStatus.statusColor }">
+                    {{ cameraTileStatus.statusText }}
+                  </span>
+                </div>
+                <div class="flex items-center justify-between text-sm">
+                  <span style="color: #96EEF2">Connection</span>
+                  <span :style="{ color: cameraTileStatus.pillColor }">
+                    {{ cameraTileStatus.pillText }}
+                  </span>
+                </div>
+              </template>
+              <template v-else>
+                <div class="flex items-center justify-between text-sm">
+                  <span :style="{ color: getStatusColor(mod.moduleStatus) }">
+                    {{ mod.moduleStatus }}
+                  </span>
+                </div>
+                <div class="flex items-center justify-between text-sm">
+                  <span style="color: #96EEF2">Connection</span>
+                  <span :style="{ color: mod.connected ? '#FCD869' : '#DD2C1D' }">
+                    {{ mod.connected ? 'Connected' : 'Disconnected' }}
+                  </span>
+                </div>
+              </template>
             </div>
 
             <!--
