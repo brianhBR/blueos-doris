@@ -55,6 +55,7 @@ SEVERITY_MAP: dict[str, int] = {
 
 STATUSTEXT_BUFFER_SIZE = 100
 WS_RECONNECT_DELAY_S = 2.0
+WS_FIRST_CONNECT_TIMEOUT_S = 5.0  # max wait before sending first MAV_CMD_USER_4
 TRIGGER_POST_TIMEOUT_S = 15.0  # mavlink2rest POST commonly takes 4-5s
 
 
@@ -118,6 +119,12 @@ class ArtemisTrackerService:
         self._client: httpx.AsyncClient | None = None
         self._statustext = _StatusTextBuffer()
         self._ws_task: asyncio.Task | None = None
+        # Set when the WebSocket has connected to mavlink2rest at least once
+        # this process. send_iridium_test() awaits this so the first
+        # MAV_CMD_USER_4 isn't sent before we're listening — otherwise the
+        # AGT's "IRIDIUM: Test starting" reply (and possibly PASSED/FAILED
+        # if the test resolves quickly) gets dropped on the floor.
+        self._ws_connected: asyncio.Event = asyncio.Event()
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -234,6 +241,10 @@ class ArtemisTrackerService:
     def _ensure_statustext_subscriber(self) -> None:
         """Lazily start the background WebSocket subscriber."""
         if self._ws_task is None or self._ws_task.done():
+            # Clear so callers waiting on the event don't get stale True
+            # from a previous subscriber that has since crashed.  The new
+            # subscriber will set() it again as soon as it connects.
+            self._ws_connected.clear()
             self._ws_task = asyncio.create_task(
                 self._statustext_ws_loop(),
                 name="agt-statustext-subscriber",
@@ -250,6 +261,10 @@ class ArtemisTrackerService:
         while True:
             try:
                 async with websockets.connect(url, close_timeout=5) as ws:
+                    # Signal callers waiting on first connect that we're now
+                    # listening.  Stays set across reconnects so transient
+                    # mavlink2rest blips don't re-stall send_iridium_test().
+                    self._ws_connected.set()
                     async for raw in ws:
                         if isinstance(raw, bytes):
                             try:
@@ -296,6 +311,23 @@ class ArtemisTrackerService:
         can poll for messages newer than that.
         """
         self._ensure_statustext_subscriber()
+        # Wait until the STATUSTEXT WebSocket subscriber is actually
+        # connected to mavlink2rest before dispatching the command.
+        # Without this, on the very first invocation per process the
+        # MAV_CMD_USER_4 goes out tens to hundreds of milliseconds before
+        # the WS handshake completes, and the AGT's near-immediate reply
+        # ("IRIDIUM: Test starting", and on a fast PASSED the result too)
+        # arrives at mavlink2rest with no listener and is lost.
+        try:
+            await asyncio.wait_for(
+                self._ws_connected.wait(), timeout=WS_FIRST_CONNECT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "STATUSTEXT subscriber did not connect within %.1fs; "
+                "test command will be sent anyway but reply may be lost",
+                WS_FIRST_CONNECT_TIMEOUT_S,
+            )
         baseline_id = await self._statustext.latest_id()
 
         base = _m2r_base()
