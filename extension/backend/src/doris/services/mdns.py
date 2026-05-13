@@ -9,13 +9,11 @@ On startup, configures:
 """
 
 import asyncio
-import io
+import base64
 import logging
 import os
 import re
-import tarfile
 from pathlib import Path
-from urllib.parse import urlparse
 
 import httpx
 
@@ -25,24 +23,21 @@ logger = logging.getLogger(__name__)
 
 AVAHI_CONF = Path("/tmp/avahi/avahi-daemon.conf")
 
-# The host-side AP interface. ``hotspot_radio`` renames the Realtek
-# USB radio from ``wlan1`` to ``uap0`` via udev, then ``create_ap``
-# brings the AP up on ``uap0`` and assigns it the gateway IP.
-HOTSPOT_INTERFACE = "uap0"
-
-# Fallback gateway IP if the live detection from ``ip addr show
-# uap0`` fails. This is the value BlueOS 1.5.x assigns; older 1.4.x
-# builds used 192.168.43.1. ``_detect_hotspot_gateway()`` reads it
-# live at call time so a future BlueOS renumber doesn't silently
-# break our DNS setup again - we only fall back to this constant
-# when the live read returns nothing (e.g. AP hasn't come up yet).
-HOTSPOT_GATEWAY_FALLBACK = "192.168.42.1"
+# Candidate names for the BlueOS AP/hotspot interface, in priority order.
+# Older BlueOS used ``wlan1``/``wifi1``; the tony-wifi udev rule renames the
+# USB Realtek to ``uap0`` so that BlueOS ``wifi-manager`` runs the AP on it
+# instead of layering a virtual ``__ap`` on the onboard Broadcom. Discovering
+# at runtime keeps this responder working across BlueOS upgrades that change
+# either the iface name or the AP subnet (BlueOS 1.5.0-beta.36 moved from
+# 192.168.43.0/24 to 192.168.42.0/24).
+HOTSPOT_IFACE_CANDIDATES = ("uap0", "wlan1", "wifi1")
 
 # Separate dnsmasq instance for standard DNS (port 53) on the hotspot.
 # create_ap's own dnsmasq only listens on port 5353 (mDNS), so clients
 # that query doris.local via normal DNS get no answer.
 HOTSPOT_DNS_CONF = "/tmp/doris-hotspot-dns.conf"
 HOTSPOT_DNS_PID = "/tmp/doris-hotspot-dns.pid"
+HOTSPOT_DNS_WATCHDOG_INTERVAL_S = 30
 
 # Redirect any request to doris.local to the extension UI on port 8095.
 # BlueOS runs nginx with a custom config (/home/pi/tools/nginx/nginx.conf)
@@ -57,7 +52,6 @@ if ($host = "doris.local") {
 
 NGINX_CONF_DST = "/home/pi/tools/nginx/extensions/doris-redirect.conf"
 NGINX_CONF_DIR = os.path.dirname(NGINX_CONF_DST)
-NGINX_CONF_NAME = os.path.basename(NGINX_CONF_DST)
 CORE_CONTAINER = "blueos-core"
 
 NGINX_WATCHDOG_INTERVAL_S = 30
@@ -65,32 +59,11 @@ NGINX_WATCHDOG_INTERVAL_S = 30
 _avahi_config_changed: bool = False
 
 
-def _docker_base_url() -> str:
-    """Return the Docker API base URL derived from the BlueOS address."""
-    host = urlparse(blueos_services.base_url).hostname
-    return f"http://{host}:2375"
+async def _commander_post(command: str, timeout: float = 30.0) -> dict | None:
+    """POST a host command to the BlueOS Commander API.
 
-
-async def _find_core_container_id(client: httpx.AsyncClient) -> str | None:
-    """Return the short container ID of blueos-core, or None."""
-    resp = await client.get(f"{_docker_base_url()}/containers/json")
-    resp.raise_for_status()
-    for c in resp.json():
-        for name in c.get("Names", []):
-            if CORE_CONTAINER in name:
-                return c["Id"][:12]
-    return None
-
-
-async def _run_host_command(
-    command: str, timeout: float = 30.0
-) -> tuple[bool, str]:
-    """Execute a command on the host via the Commander API.
-
-    Commander always returns HTTP 200; the actual exit code is in the
-    JSON body's ``return_code`` field. Returns ``(ok, stdout)`` so
-    callers that need the output (e.g. ``_detect_hotspot_gateway``
-    parsing ``ip addr show uap0``) don't need a second helper.
+    Returns the parsed JSON body on transport success (regardless of the
+    inner ``return_code``), or None on transport failure.
     """
     url = f"{blueos_services.commander}/v1.0/command/host"
     params = {"command": command, "i_know_what_i_am_doing": "true"}
@@ -98,59 +71,61 @@ async def _run_host_command(
         async with httpx.AsyncClient(timeout=timeout) as client:
             resp = await client.post(url, params=params)
             resp.raise_for_status()
-            data = resp.json()
-            rc = data.get("return_code", -1)
-            out = data.get("stdout", "") or ""
-            err = data.get("stderr", "") or ""
-            if rc != 0:
-                logger.warning(
-                    "Host command returned %d: %s %s",
-                    rc, out[:200], err[:200],
-                )
-                return False, out
-            return True, out
+            return resp.json()
     except Exception as e:
-        logger.warning("Commander command failed (%s): %s", command[:60], e)
-        return False, ""
+        logger.warning("Commander POST failed (%s): %s", command[:60], e)
+        return None
 
 
-_IP_ADDR_RE = re.compile(r"inet\s+(\d{1,3}(?:\.\d{1,3}){3})")
+async def _run_host_command(command: str, timeout: float = 30.0) -> bool:
+    """Execute a command on the host via Commander. True iff rc == 0."""
+    data = await _commander_post(command, timeout)
+    if data is None:
+        return False
+    rc = data.get("return_code", -1)
+    if rc != 0:
+        out = data.get("stdout", "")
+        err = data.get("stderr", "")
+        logger.warning(
+            "Host command returned %d: %s %s",
+            rc, str(out)[:200], str(err)[:200],
+        )
+        return False
+    return True
 
 
-async def _detect_hotspot_gateway() -> str:
-    """Return the IPv4 currently bound to :data:`HOTSPOT_INTERFACE`.
+async def _run_host_command_capture(
+    command: str, timeout: float = 30.0,
+) -> tuple[bool, str]:
+    """Execute a command on the host via Commander, returning (ok, stdout).
 
-    BlueOS has rotated the create_ap gateway between versions
-    (192.168.43.1 in older builds, 192.168.42.1 since 1.5.x). Reading
-    it live is more durable than tracking the upstream change in a
-    constant. Falls back to :data:`HOTSPOT_GATEWAY_FALLBACK` when the
-    detection fails - typically because the AP hasn't finished coming
-    up at the moment this runs - so DNS still has *an* IP to use even
-    if it might be slightly off (the watchdog at the next tick will
-    overwrite with the right value once the AP is up).
+    Commander wraps stdout in a quoted string with literal ``\\n`` sequences;
+    this normalises the result so callers can compare on plain text.
     """
-    ok, out = await _run_host_command(
-        f"ip -4 -o addr show {HOTSPOT_INTERFACE}"
-    )
-    if not ok:
-        logger.warning(
-            "Could not read %s addresses; falling back to %s for hotspot DNS",
-            HOTSPOT_INTERFACE,
-            HOTSPOT_GATEWAY_FALLBACK,
+    data = await _commander_post(command, timeout)
+    if data is None:
+        return False, ""
+    rc = data.get("return_code", -1)
+    out = str(data.get("stdout", "") or "")
+    out = out.strip("'\"").replace("\\n", "\n").strip()
+    return rc == 0, out
+
+
+async def _discover_hotspot_iface_and_ip() -> tuple[str, str] | None:
+    """Find the AP interface name and its IPv4 by probing the host.
+
+    Tries ``HOTSPOT_IFACE_CANDIDATES`` in order; returns ``(iface, ip)``
+    for the first one with an IPv4 assigned, or ``None`` if none is up.
+    """
+    for iface in HOTSPOT_IFACE_CANDIDATES:
+        cmd = (
+            f"ip -4 -o addr show dev {iface} 2>/dev/null"
+            " | awk '{print $4}' | cut -d/ -f1 | head -1"
         )
-        return HOTSPOT_GATEWAY_FALLBACK
-    m = _IP_ADDR_RE.search(out)
-    if not m:
-        logger.warning(
-            "No IPv4 visible on %s yet (output: %r); falling back to %s",
-            HOTSPOT_INTERFACE,
-            out[:160],
-            HOTSPOT_GATEWAY_FALLBACK,
-        )
-        return HOTSPOT_GATEWAY_FALLBACK
-    addr = m.group(1)
-    logger.info("Detected hotspot gateway %s on %s", addr, HOTSPOT_INTERFACE)
-    return addr
+        ok, ip = await _run_host_command_capture(cmd)
+        if ok and ip:
+            return iface, ip
+    return None
 
 
 def _setup_avahi_hostname() -> bool:
@@ -211,71 +186,126 @@ def _setup_avahi_hostname() -> bool:
 
 
 
-async def start_hotspot_dns() -> None:
-    """Start a DNS-only dnsmasq on port 53 for the hotspot interface.
-
-    create_ap's own dnsmasq listens on port 5353 (mDNS), not 53, so
-    standard DNS queries from hotspot clients go unanswered.  This
-    starts a second, minimal dnsmasq that *only* serves DNS on port 53
-    bound to the hotspot gateway IP, resolving ``doris.local`` (and
-    ``blueos-wifi.local``) to that same gateway.
-
-    Must be called AFTER configure_hotspot() so the hotspot interface
-    actually has the gateway IP assigned. The gateway IP is detected
-    live from :data:`HOTSPOT_INTERFACE` rather than hardcoded - BlueOS
-    has renumbered the AP subnet between versions (192.168.43.1 →
-    192.168.42.1 between 1.4.x and 1.5.x) and a stale hardcoded value
-    made dnsmasq's ``bind-interfaces`` fail on every start, leaving
-    ``doris.local`` unresolvable for hotspot clients that lack mDNS.
-
-    Uses ``sudo`` so that /usr/sbin is in the PATH (Commander's default
-    shell PATH omits /usr/sbin where dnsmasq lives).
-    """
-    gateway = await _detect_hotspot_gateway()
-    conf_content = (
+def _expected_dns_conf(iface: str, gateway: str) -> str:
+    """Render the dnsmasq config for the given AP iface and gateway IP."""
+    return (
         f"listen-address={gateway}\n"
         "port=53\n"
         "bind-interfaces\n"
-        f"no-dhcp-interface={HOTSPOT_INTERFACE}\n"
+        f"no-dhcp-interface={iface}\n"
         f"address=/doris.local/{gateway}\n"
         f"address=/blueos-wifi.local/{gateway}\n"
         "no-resolv\n"
         "no-hosts\n"
     )
-    # Commander's ssh transport returns rc=255 unpredictably on
-    # short multi-step commands even when the underlying shell ran
-    # to completion (we proved this in live testing: ``pkill ...;
-    # true`` reliably returned rc=255 yet the kill happened, and
-    # ``setsid dnsmasq ...`` reliably returned rc=255 yet the daemon
-    # started). We therefore split the work into two short Commander
-    # calls and ignore their rc - the real success signal is the
-    # post-start pid-file check, not the launcher's exit code.
-    write_cmd = (
-        f"echo '{conf_content}' | sudo tee {HOTSPOT_DNS_CONF} > /dev/null && "
-        f"sudo pkill -f 'dnsmasq.*{HOTSPOT_DNS_CONF}' 2>/dev/null; true"
-    )
-    await _run_host_command(write_cmd)
 
-    # Detach dnsmasq from the Commander ssh session: ``setsid`` gives
-    # it a new session, the stdio redirects close the inherited
-    # ssh-side fds, and ``&`` runs it in the shell background so the
-    # outer Commander call exits as soon as the fork succeeds.
-    start_cmd = (
-        f"sudo setsid /usr/sbin/dnsmasq --conf-file={HOTSPOT_DNS_CONF} "
-        f"--pid-file={HOTSPOT_DNS_PID} "
-        f"< /dev/null > /dev/null 2>&1 & "
-        f"sleep 1; "
-        f"sudo test -f {HOTSPOT_DNS_PID} && echo running || echo missing"
+
+async def _hotspot_dns_already_running(expected_conf: str) -> bool:
+    """True iff our dnsmasq is alive AND the on-disk conf matches.
+
+    Identifies the daemon via its PID file (``HOTSPOT_DNS_PID``) rather
+    than ``pgrep -f`` against the full command line, because the parent
+    shell that runs this very check has the substring ``dnsmasq`` and the
+    conf path in its own argv — a ``pgrep -f`` match would either give a
+    false positive here, or (worse, for ``pkill -f``) self-terminate the
+    spawn pipeline below and abort with exit 255 before dnsmasq launches.
+    """
+    cmd = (
+        f"[ -f {HOTSPOT_DNS_PID} ] && "
+        f"_pid=$(cat {HOTSPOT_DNS_PID} 2>/dev/null) && "
+        f'[ -n "$_pid" ] && kill -0 "$_pid" 2>/dev/null && '
+        f'tr "\\0" " " < /proc/$_pid/cmdline 2>/dev/null '
+        f"| grep -q doris-hotspot-dns"
     )
-    _, start_out = await _run_host_command(start_cmd)
-    if "running" in start_out:
-        logger.info("Hotspot DNS started on %s:53 (doris.local)", gateway)
-    else:
-        logger.warning(
-            "Failed to start hotspot DNS server (gateway=%s, out=%r)",
-            gateway,
-            start_out,
+    if not await _run_host_command(cmd):
+        return False
+    ok, on_disk = await _run_host_command_capture(
+        f"sudo cat {HOTSPOT_DNS_CONF} 2>/dev/null"
+    )
+    if not ok:
+        return False
+    return on_disk.strip() == expected_conf.strip()
+
+
+async def start_hotspot_dns() -> None:
+    """Start a DNS-only dnsmasq on port 53 for the hotspot interface.
+
+    ``create_ap``'s own dnsmasq listens on port 5353 (mDNS), not 53, so
+    standard DNS queries from hotspot clients go unanswered. This starts a
+    second, minimal dnsmasq that *only* serves DNS on port 53 bound to the
+    hotspot gateway IP, resolving ``doris.local`` (and ``blueos-wifi.local``)
+    to that same gateway.
+
+    The AP interface name and gateway IP are discovered at runtime — both
+    have moved across BlueOS versions (``wlan1`` -> ``uap0``, .43 -> .42)
+    and would otherwise drift out of sync with the rest of the system.
+
+    Idempotent: if a dnsmasq is already running with the expected conf,
+    this is a no-op, so a periodic watchdog can call it cheaply.
+
+    Uses ``sudo`` so that /usr/sbin is in the PATH (Commander's default
+    shell PATH omits /usr/sbin where dnsmasq lives).
+    """
+    discovered = await _discover_hotspot_iface_and_ip()
+    if discovered is None:
+        logger.info(
+            "Hotspot DNS: no AP interface up yet (tried %s); "
+            "watchdog will retry",
+            "/".join(HOTSPOT_IFACE_CANDIDATES),
         )
+        return
+    iface, gateway = discovered
+
+    expected = _expected_dns_conf(iface, gateway)
+    if await _hotspot_dns_already_running(expected):
+        logger.debug(
+            "Hotspot DNS already running on %s:53 (iface=%s)", gateway, iface,
+        )
+        return
+
+    # Kill any prior instance via the PID file — *not* ``pkill -f`` against
+    # the conf path, which would also match this very shell wrapper (its
+    # argv contains both "dnsmasq" and the conf path) and self-terminate
+    # before dnsmasq is spawned, surfacing as a confusing exit-255.
+    cmd = (
+        f"echo '{expected}' | sudo tee {HOTSPOT_DNS_CONF} > /dev/null && "
+        f"if [ -f {HOTSPOT_DNS_PID} ]; then "
+        f"  _pid=$(cat {HOTSPOT_DNS_PID} 2>/dev/null); "
+        f'  [ -n "$_pid" ] && sudo kill "$_pid" 2>/dev/null; '
+        f"  sleep 1; "
+        f"fi; "
+        f"sudo /usr/sbin/dnsmasq --conf-file={HOTSPOT_DNS_CONF} "
+        f"--pid-file={HOTSPOT_DNS_PID}"
+    )
+    ok = await _run_host_command(cmd)
+    if ok:
+        logger.info(
+            "Hotspot DNS started on %s:53 (iface=%s, doris.local)",
+            gateway, iface,
+        )
+    else:
+        logger.warning("Failed to start hotspot DNS server")
+
+
+async def _hotspot_dns_watchdog() -> None:
+    """Periodically re-assert the hotspot DNS responder.
+
+    Calls ``start_hotspot_dns()`` (which is idempotent) every
+    ``HOTSPOT_DNS_WATCHDOG_INTERVAL_S`` seconds. This catches:
+
+    * Early-boot races where the AP interface didn't have an IP yet at
+      first call.
+    * BlueOS upgrades that change the AP subnet or interface name without
+      restarting the DORIS extension.
+    * The AP coming back after a dive (hotspot watchdog brings it up,
+      we then re-bind dnsmasq to the now-present gateway IP).
+    """
+    while True:
+        await asyncio.sleep(HOTSPOT_DNS_WATCHDOG_INTERVAL_S)
+        try:
+            await start_hotspot_dns()
+        except Exception as exc:
+            logger.debug("hotspot DNS watchdog tick error: %s", exc)
 
 
 async def restart_avahi(force: bool = False) -> None:
@@ -298,7 +328,7 @@ async def restart_avahi(force: bool = False) -> None:
         logger.info("Avahi config unchanged, skipping restart")
         return
 
-    ok, _ = await _run_host_command(
+    ok = await _run_host_command(
         "sudo systemctl stop avahi-daemon && sleep 5 && sudo systemctl start avahi-daemon"
     )
     if ok:
@@ -308,71 +338,34 @@ async def restart_avahi(force: bool = False) -> None:
 
 
 async def _nginx_redirect_exists() -> bool:
-    """Return True if the redirect conf exists inside blueos-core."""
-    try:
-        async with httpx.AsyncClient(timeout=10.0) as client:
-            cid = await _find_core_container_id(client)
-            if not cid:
-                return False
-            resp = await client.head(
-                f"{_docker_base_url()}/containers/{cid}/archive",
-                params={"path": NGINX_CONF_DST},
-            )
-            return resp.status_code == 200
-    except Exception:
-        return False
+    """Return True if doris-redirect.conf exists inside blueos-core.
+
+    Uses ``docker exec`` over the Commander API. The new BlueOS no longer
+    exposes the Docker daemon on TCP ``2375``; the Commander shell on the
+    host can reach it through the unix socket.
+    """
+    return await _run_host_command(
+        f"sudo docker exec {CORE_CONTAINER} test -f {NGINX_CONF_DST}"
+    )
 
 
 async def _upload_nginx_redirect() -> bool:
-    """Upload doris-redirect.conf into blueos-core and reload nginx.
+    """Write doris-redirect.conf into blueos-core and reload nginx.
 
-    Returns True on success.
+    Streams the conf as base64 through ``docker exec`` via the Commander
+    API, replacing the old direct-to-Docker-TCP archive PUT (Docker is no
+    longer reachable on TCP under BlueOS 1.5.0-beta.x). Atomic: writes to
+    a ``.tmp`` sibling and ``mv``s into place before reloading nginx.
     """
-    try:
-        async with httpx.AsyncClient(timeout=15.0) as client:
-            cid = await _find_core_container_id(client)
-            if not cid:
-                raise RuntimeError(f"{CORE_CONTAINER} container not found")
-
-            exec_body = {
-                "Cmd": ["mkdir", "-p", NGINX_CONF_DIR],
-                "AttachStdout": False,
-                "AttachStderr": False,
-            }
-            exec_resp = await client.post(
-                f"{_docker_base_url()}/containers/{cid}/exec",
-                json=exec_body,
-            )
-            exec_resp.raise_for_status()
-            exec_id = exec_resp.json()["Id"]
-            await client.post(
-                f"{_docker_base_url()}/exec/{exec_id}/start",
-                json={"Detach": True},
-            )
-
-            tar_buf = io.BytesIO()
-            with tarfile.open(fileobj=tar_buf, mode="w") as tar:
-                data = NGINX_REDIRECT_CONTENT.encode()
-                info = tarfile.TarInfo(name=NGINX_CONF_NAME)
-                info.size = len(data)
-                tar.addfile(info, io.BytesIO(data))
-            tar_buf.seek(0)
-
-            resp = await client.put(
-                f"{_docker_base_url()}/containers/{cid}/archive"
-                f"?path={NGINX_CONF_DIR}",
-                content=tar_buf.read(),
-                headers={"Content-Type": "application/x-tar"},
-            )
-            resp.raise_for_status()
-
-        await _run_host_command(
-            f"docker exec {CORE_CONTAINER} nginx -s reload"
-        )  # return ignored; nginx reload errors surface via 502 from the redirect itself
-        return True
-    except Exception as exc:
-        logger.debug("nginx redirect upload failed: %s", exc)
-        return False
+    encoded = base64.b64encode(NGINX_REDIRECT_CONTENT.encode("utf-8")).decode("ascii")
+    inner = (
+        f"mkdir -p {NGINX_CONF_DIR}"
+        f" && echo {encoded} | base64 -d > {NGINX_CONF_DST}.tmp"
+        f" && mv {NGINX_CONF_DST}.tmp {NGINX_CONF_DST}"
+        " && nginx -s reload"
+    )
+    cmd = f"sudo docker exec {CORE_CONTAINER} sh -c '{inner}'"
+    return await _run_host_command(cmd)
 
 
 async def _ensure_nginx_redirect() -> None:
@@ -427,10 +420,13 @@ async def setup_doris_local() -> None:
     server (port 53) is started by ``start_hotspot_dns()`` after the
     hotspot interface is up.
 
-    Also starts a background watchdog that re-uploads the nginx conf
-    if blueos-core is ever recreated while DORIS is running.
+    Also starts two background watchdogs:
+      * nginx redirect — re-uploads the conf if blueos-core is recreated.
+      * hotspot DNS — re-asserts ``start_hotspot_dns()`` so a delayed AP
+        bring-up or a BlueOS subnet/iface change is self-healed.
     """
     global _avahi_config_changed
     _avahi_config_changed = _setup_avahi_hostname()
     await _ensure_nginx_redirect()
     asyncio.get_event_loop().create_task(_nginx_redirect_watchdog())
+    asyncio.get_event_loop().create_task(_hotspot_dns_watchdog())
