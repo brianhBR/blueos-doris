@@ -1,33 +1,66 @@
-"""Pin the BlueOS hotspot to the USB Realtek RTL88x2BU radio at full speed.
+"""Pin the BlueOS hotspot to any supported USB Wi-Fi radio at full speed.
 
 Why this exists
 ---------------
-On a Pi 5 with the onboard Broadcom radio + a USB Realtek RTL88x2BU dongle,
-out of the box BlueOS:
+On a Pi 5 with the onboard Broadcom radio + an external USB Wi-Fi
+dongle, out of the box BlueOS:
 
   1. **Layers the hotspot on the wrong radio.** ``wifi-manager`` creates a
      virtual ``__ap`` interface called ``uap0`` *on top of* the onboard
      Broadcom radio (``brcmfmac`` supports concurrent STA + AP), so the
      Broadcom chip is forced to be both client and AP at the same time and
-     the Realtek (with its external antenna) sits idle.
+     the USB Wi-Fi adapter (with its external antenna) sits idle.
 
   2. **Brings the AP up at 802.11g / 2.4 GHz / channel 1**, which caps real
-     throughput around 15-25 Mbps even on hardware capable of ~400 Mbps.
+     throughput around 15-25 Mbps even on hardware capable of much more.
 
 This module fixes both. We can't simply re-parent ``uap0`` onto the
-Realtek - the out-of-tree ``rtl88x2bu`` driver does not support virtual
-interfaces (``iw dev wlan1 interface add testap type __ap`` returns
-``-ENODEV``). So instead:
+USB radio for every chipset - some drivers (notably ``rtl88x2bu``)
+don't implement ``iw dev <X> interface add testap type __ap`` at all,
+others (MediaTek mt76 family) allow it on paper but the firmware
+rejects two AP-capable ifaces on the same phy. So instead:
 
-Part 1: rename the Realtek to ``uap0`` via udev
------------------------------------------------
+Supported chipsets
+------------------
+The dispatch is table-driven (see :data:`SUPPORTED_HOTSPOT_RADIOS`).
+Each row pairs a USB ``vendor:product`` ID with the chipset's
+hostapd-safe ``ht_capab`` set and any extra ``create_ap`` flags it
+needs (e.g. ``--ieee80211ax`` for HE-capable MT7921U). Currently:
+
+  * **Realtek RTL88x2BU** (``0bda:b812``) - the dongle DORIS originally
+    shipped, driven via the out-of-tree morrownr/88x2bu module (the
+    in-kernel ``rtw88_8822bu`` is not stable enough on the Pi 5 USB
+    controllers for AP mode). HT20 only (see "Why HT20 on Realtek but
+    not on others" below). The :mod:`doris.services.wifi_driver`
+    bootstrap only runs the morrownr install when this chip is on
+    the bus.
+  * **MediaTek MT7612U** (``0e8d:7612``) - in-kernel ``mt76x2u``,
+    2x2 802.11ac on a single chip. HT40 works in AP mode without
+    the firmware-path issue Realtek has.
+  * **MediaTek MT7921AU** (``0e8d:7961``) - in-kernel ``mt7921u``,
+    Wi-Fi 6 with ``HE Iftypes: AP`` on 2.4 GHz. Needs
+    ``--ieee80211ax``.
+  * **Atheros AR9271** (``0cf3:9271``) - in-kernel ``ath9k_htc``.
+    802.11n only, but historically the most stable USB Wi-Fi AP
+    chip on Linux. Useful as a known-good baseline when other USB
+    chipsets misbehave on Pi USB controllers. ``ht_capab`` for
+    this chip omits ``[LDPC]`` and ``[MAX-AMSDU-7935]`` because
+    the driver doesn't advertise them and hostapd refuses to start
+    with ``Driver does not support configured HT capability ...``.
+
+Part 1: rename the radio to ``uap0`` via udev
+----------------------------------------------
 BlueOS's ``_create_virtual_interface()`` short-circuits if ``uap0``
-already exists at startup. We make it exist *before* BlueOS sees it by
-renaming the Realtek's net device from ``wlan1`` to ``uap0`` straight
-from the kernel:
+already exists at startup. We make it exist *before* BlueOS sees it
+by renaming whichever supported USB Wi-Fi adapter is plugged in -
+straight from the kernel, by matching every supported
+``idVendor:idProduct`` pair:
 
     SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="0bda",
-        ATTRS{idProduct}=="b812", NAME="uap0"
+        ATTRS{idProduct}=="b812", NAME="uap0"          # Realtek
+    SUBSYSTEM=="net", ACTION=="add", ATTRS{idVendor}=="0e8d",
+        ATTRS{idProduct}=="7612", NAME="uap0"          # MediaTek MT7612U
+    ... and so on for every entry in :data:`SUPPORTED_HOTSPOT_RADIOS`.
 
 We also tell NetworkManager to leave ``uap0`` alone so hostapd /
 ``create_ap`` can drive it:
@@ -35,47 +68,67 @@ We also tell NetworkManager to leave ``uap0`` alone so hostapd /
     [keyfile]
     unmanaged-devices=interface-name:uap0
 
-Part 2: tell ``create_ap`` to max out 2.4 GHz HT20
---------------------------------------------------
+Part 2: tell ``create_ap`` to max out 2.4 GHz with chip-tuned flags
+-------------------------------------------------------------------
 ``wifi-manager`` invokes ``create_ap`` with no band/channel/HT/VHT flags,
 so hostapd defaults to ``hw_mode=g, channel=1`` with no HT capabilities
 advertised - real-world TCP throughput tops out around 25 Mbps in that
 mode even on hardware capable of much more. We patch the wifi-handler
-module inside ``blueos-core`` to add::
+module inside ``blueos-core`` to add a chip-tuned argv block right
+before the SSID/password arguments. The exact flags depend on which
+USB Wi-Fi chip is on the bus (see :func:`_detect_hotspot_radio` for
+matching against :data:`SUPPORTED_HOTSPOT_RADIOS`); a worked Realtek
+example is::
 
     "-c", "<auto-picked: 1 or 6>",
+    "--no-virt",
     "--ieee80211n",
     "--ht_capab", "[SHORT-GI-20][LDPC][RX-STBC1][MAX-AMSDU-7935]",
-    "--country", "US",
+    "--country", "<from system regdomain, fallback US>",
 
-right before the SSID/password arguments. The patched module is written
-to ``/usr/blueos/userdata/wifi-overrides/networkmanager.py`` on the host
+and an MT7921U (Wi-Fi 6) example with HE40 enabled::
+
+    "-c", "<auto-picked: 1 or 6>",
+    "--no-virt",
+    "--ieee80211n",
+    "--ieee80211ax",
+    "--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40][LDPC]"
+                  "[TX-STBC][RX-STBC1][MAX-AMSDU-7935]",
+    "--country", "<from system regdomain, fallback US>",
+
+The patched module is written to
+``/usr/blueos/userdata/wifi-overrides/networkmanager.py`` on the host
 and bind-mounted into the container by adding an entry to
 ``/root/.config/blueos/bootstrap/startup.json``. ``blueos-bootstrap``
 re-reads ``startup.json`` on every boot, so the override survives
 ``blueos-core`` recreations and BlueOS upgrades that don't touch the
 target file.
 
-The ht_capab line explicitly declares HT20-only capabilities. An
-earlier revision of this patch asked for ``[HT40+]`` on the theory
-that hostapd's "try HT40, OBSS-coex fall back to HT20" logic would
-get us the wider channel for free in clean RF environments and a
-graceful downgrade otherwise. In practice the bundled
-``morrownr/88x2bu-20210702`` driver's AP-mode firmware path cannot
-keep an HT40 BSS up: in a busy 2.4 GHz environment hostapd's OBSS
-scan downgrades to HT20 before the driver ever sees the request and
-things look fine, but in a clean RF environment hostapd actually
-issues the HT40 BSS request, the driver rejects it, and the BSS
-cycles ``INTERFACE-ENABLED`` → ``INTERFACE-DISABLED`` (end-user
-symptom: "AP shows up, you connect, it disappears, you lose
-connection"; ``iw dev uap0 info`` shows ``txpower -100.00 dBm`` and
-no ``channel/width/center`` line). Confirmed in field reports May
-2026 on a unit with no 2.4 GHz neighbours on the picker-chosen
-channel. Asking for HT20 directly removes the failure mode at the
-cost of nothing - the driver was downgrading to HT20 every time it
-actually completed a BSS bring-up anyway. The other capabilities
-(LDPC, SHORT-GI-20, RX-STBC1, MAX-AMSDU-7935) still lift real TCP
-throughput from ~25 Mbps (stock) to ~80 Mbps on this radio.
+Why HT20 on Realtek but HT40+ on every other supported chipset
+``````````````````````````````````````````````````````````````
+The :data:`SUPPORTED_HOTSPOT_RADIOS` table picks the appropriate
+``ht_capab`` per chip. For Realtek RTL88x2BU the value is HT20-only
+on purpose: the bundled ``morrownr/88x2bu-20210702`` driver's
+AP-mode firmware path cannot keep an HT40 BSS up. In a busy 2.4 GHz
+environment hostapd's OBSS scan downgrades to HT20 before the driver
+ever sees the request and things look fine, but in a clean RF
+environment hostapd actually issues the HT40 BSS request, the
+driver rejects it, and the BSS cycles ``INTERFACE-ENABLED`` →
+``INTERFACE-DISABLED`` (end-user symptom: "AP shows up, you connect,
+it disappears, you lose connection"; ``iw dev uap0 info`` shows
+``txpower -100.00 dBm`` and no ``channel/width/center`` line).
+Confirmed in field reports May 2026 on a unit with no 2.4 GHz
+neighbours on the picker-chosen channel. Asking for HT20 directly
+removes the failure mode at the cost of nothing - the driver was
+downgrading to HT20 every time it actually completed a BSS
+bring-up anyway. The HT20-valid caps we keep (LDPC, SHORT-GI-20,
+RX-STBC1, MAX-AMSDU-7935) still lift real TCP throughput from
+~25 Mbps (stock) to ~80 Mbps on this radio.
+
+MediaTek (mt76 family) and Atheros (ath9k_htc) don't have this
+problem: their AP-mode firmware/driver paths bring HT40 BSSes up
+cleanly, so their rows in the table keep ``[HT40+]`` and the
+HT40-specific companion caps the driver claims in ``iw phy``.
 
 Channel auto-selection
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -174,6 +227,7 @@ import base64
 import json
 import logging
 import re
+from dataclasses import dataclass
 
 import httpx
 
@@ -182,12 +236,206 @@ from ..config import blueos_services
 logger = logging.getLogger(__name__)
 
 
-# Realtek RTL88x2BU (AC1200) USB IDs - matches the dongle we ship.
-USB_VENDOR_ID = "0bda"
-USB_PRODUCT_ID = "b812"
+# ---------------------------------------------------------------------
+# Supported USB Wi-Fi radios.
+#
+# Each entry describes one chipset we can drive as the hotspot AP. The
+# table is the single source of truth for:
+#
+#   * udev: which USB ``idVendor:idProduct`` pairs get renamed to ``uap0``
+#     (see :data:`UDEV_RULE_CONTENT`).
+#   * runtime detection: :func:`_detect_hotspot_radio` reads ``lsusb`` on
+#     the host and returns the matching entry (or ``None`` for an
+#     unrecognised chip).
+#   * ``create_ap`` argv: the per-chip ``ht_capab`` string and any extra
+#     argv tokens (e.g. ``--ieee80211ax``) get baked into the patched
+#     ``networkmanager.py`` so hostapd starts cleanly on whichever radio
+#     is actually plugged in.
+#   * out-of-tree-driver install: :mod:`doris.services.wifi_driver` only
+#     runs the morrownr/88x2bu install when an entry with
+#     ``needs_out_of_tree_driver=True`` is currently present on the bus.
+#
+# Why one table and not 4 parallel branches sprinkled around the file:
+# the previous Realtek-only version had the chip's quirks (LDPC support,
+# MAX-AMSDU=7935, "AP-mode firmware can't keep HT40 up") baked into
+# constants and module text. Adding a second chipset that way meant
+# duplicating every constant and every comment, and the third chipset
+# would have been intractable. With the table, supporting a new chipset
+# is just an extra row.
+#
+# Why per-chip ``ht_capab`` strings instead of one "universal" string:
+# hostapd hard-fails (``Driver does not support configured HT capability
+# [LDPC]``) on capabilities the driver doesn't advertise. So an
+# ``ht_capab`` set tuned for Realtek (``[LDPC][MAX-AMSDU-7935]``)
+# breaks Atheros AR9271 outright (driver doesn't claim LDPC, max AMSDU
+# is 3839 not 7935), and an AR9271-safe set under-uses the Realtek. Per
+# chip is the only correct shape.
+# ---------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class HotspotRadio:
+    """One row in the supported-USB-Wi-Fi-radio table.
+
+    Attributes:
+        label: Human-readable name, used in logs only.
+        vendor_id: USB ``idVendor`` in lowercase 4-hex form.
+        product_id: USB ``idProduct`` in lowercase 4-hex form.
+        kernel_module: Name of the kernel module that binds to the
+            device (informational; used for log messages).
+        needs_out_of_tree_driver: ``True`` only for the Realtek
+            RTL88x2BU, which has no usable in-kernel driver on the
+            Pi 5 kernels we ship - :mod:`doris.services.wifi_driver`
+            checks this flag at startup and only installs
+            ``morrownr/88x2bu`` when a chip with this flag is on the
+            bus. Every other entry should be ``False`` (their drivers
+            are mainline and already in the kernel).
+        is_mt76_family: ``True`` for chips driven by the ``mt76`` USB
+            stack (MT7612U, MT7921U). When set, we install
+            ``options mt76_usb disable_usb_sg=1`` via modprobe.d - it
+            mitigates ``mt76x02u_mcu_wait_resp failed with -110`` MCU
+            timeouts that the morrownr/USB-WiFi project has documented
+            under sustained USB load (especially on Pi 4 VL805 ports,
+            harmless on Pi 5).
+        ht_capab: Exact value passed to ``create_ap --ht_capab`` for
+            this chip. *Only* include capabilities the driver
+            advertises in ``iw phy phy<N> info`` - hostapd refuses to
+            start if any are unsupported. HT40 caps are kept only on
+            chips whose AP-mode firmware path can actually sustain a
+            40 MHz BSS (excludes morrownr 88x2bu, see module
+            docstring).
+        extra_create_ap_argv_tokens: Bare argv tokens (without value)
+            inserted between ``--ieee80211n`` and ``--ht_capab``. Use
+            ``("--ieee80211ax",)`` for chips with HE/802.11ax AP
+            support (MT7921U), empty for n-only chips. ``--ieee80211ax``
+            requires ``--ieee80211n`` to also be set, which is always
+            emitted - upstream ``create_ap`` only writes
+            ``ieee80211n=1`` + ``ht_capab=`` into hostapd.conf when
+            ``IEEE80211N=1``, so the ``ht_capab`` line is silently
+            dropped without it.
+    """
+
+    label: str
+    vendor_id: str
+    product_id: str
+    kernel_module: str
+    needs_out_of_tree_driver: bool
+    is_mt76_family: bool
+    ht_capab: str
+    extra_create_ap_argv_tokens: tuple[str, ...] = ()
+
+
+# Order in the tuple is iteration order in ``lsusb`` matching: if a
+# host had two supported chips on the bus we'd take the first one
+# listed here. In practice DORIS only has one external USB port for
+# the hotspot radio so this never matters, but the deterministic
+# order keeps the udev rule output stable across regenerations.
+SUPPORTED_HOTSPOT_RADIOS: tuple[HotspotRadio, ...] = (
+    # Realtek RTL88x2BU (AC1200) - the dongle DORIS originally shipped.
+    # Drives via the out-of-tree morrownr/88x2bu module bundled in the
+    # extension. The driver's AP-mode firmware path cannot keep an
+    # HT40 BSS up on this chip (May 2026 field report), so the
+    # ``ht_capab`` here is HT20-only - see the module docstring's
+    # "Why HT20 explicitly and not HT40 on Realtek" section for the
+    # full diagnosis. The HT20 caps we keep still lift real TCP
+    # throughput from ~25 Mbps (stock hostapd defaults) to ~80 Mbps.
+    HotspotRadio(
+        label="Realtek RTL88x2BU",
+        vendor_id="0bda",
+        product_id="b812",
+        kernel_module="88x2bu",
+        needs_out_of_tree_driver=True,
+        is_mt76_family=False,
+        ht_capab="[SHORT-GI-20][LDPC][RX-STBC1][MAX-AMSDU-7935]",
+        extra_create_ap_argv_tokens=(),
+    ),
+    # MediaTek MT7612U (AC1200) - in-kernel ``mt76x2u``. Common 2x2
+    # USB module (e.g. Alfa AWUS036ACM, SparkLAN WUBM-273ACN). HT40
+    # works cleanly in AP mode on this chip - the mt76 driver
+    # consistently brings up 40 MHz BSSes without the firmware-path
+    # cycling we see on morrownr 88x2bu. We advertise the full
+    # HT40 cap set the chip claims in ``iw phy``.
+    HotspotRadio(
+        label="MediaTek MT7612U",
+        vendor_id="0e8d",
+        product_id="7612",
+        kernel_module="mt76x2u",
+        needs_out_of_tree_driver=False,
+        is_mt76_family=True,
+        ht_capab=(
+            "[HT40+][SHORT-GI-20][SHORT-GI-40][LDPC]"
+            "[RX-STBC1][MAX-AMSDU-7935][DSSS_CCK-40]"
+        ),
+        extra_create_ap_argv_tokens=(),
+    ),
+    # MediaTek MT7921AU - in-kernel ``mt7921u``. Wi-Fi 6 (HE) in AP
+    # mode on 2.4 GHz (``HE Iftypes: AP`` with ``HE40/2.4GHz``).
+    # Common single-chip Wi-Fi 6 USB module. ``--ieee80211ax`` is
+    # required to actually emit ``ieee80211ax=1`` into hostapd.conf
+    # and unlock HE rates. The ``ht_capab`` deliberately omits
+    # ``[DSSS_CCK-40]`` because this chip's ``iw phy`` reports ``No
+    # DSSS/CCK HT40`` and hostapd refuses to start with ``Driver does
+    # not support configured HT capability [DSSS_CCK-40]`` - tested
+    # and confirmed against MT7921U firmware May 2026.
+    HotspotRadio(
+        label="MediaTek MT7921AU",
+        vendor_id="0e8d",
+        product_id="7961",
+        kernel_module="mt7921u",
+        needs_out_of_tree_driver=False,
+        is_mt76_family=True,
+        ht_capab=(
+            "[HT40+][SHORT-GI-20][SHORT-GI-40][LDPC]"
+            "[TX-STBC][RX-STBC1][MAX-AMSDU-7935]"
+        ),
+        extra_create_ap_argv_tokens=("--ieee80211ax",),
+    ),
+    # Atheros AR9271 (Alfa AWUS036NHA and many compatible OEMs) -
+    # in-kernel ``ath9k_htc``. 802.11n single-stream only (no AC, no
+    # AX, no MU-MIMO). The most stable USB Wi-Fi AP chip on Linux,
+    # bar none - chosen as a known-good baseline when other USB
+    # chipsets misbehave on the Pi's USB controller. ``ht_capab``
+    # deliberately omits ``[LDPC]`` (driver does NOT claim it -
+    # tested against ath9k_htc May 2026, hostapd hard-fails with
+    # ``Driver does not support configured HT capability [LDPC]``)
+    # and ``[MAX-AMSDU-7935]`` (AR9271 max AMSDU is 3839 not 7935;
+    # asking for 7935 also triggers the same hostapd unsupported-
+    # capability hard fail). ``[DSSS_CCK-40]`` is kept because the
+    # chip does claim DSSS/CCK in HT40 and it's a real throughput
+    # win in mixed-rate environments.
+    HotspotRadio(
+        label="Atheros AR9271",
+        vendor_id="0cf3",
+        product_id="9271",
+        kernel_module="ath9k_htc",
+        needs_out_of_tree_driver=False,
+        is_mt76_family=False,
+        ht_capab="[HT40+][SHORT-GI-20][SHORT-GI-40][RX-STBC1][DSSS_CCK-40]",
+        extra_create_ap_argv_tokens=(),
+    ),
+)
+
+
+# Conservative HT20 set used when ``lsusb`` detection fails or returns
+# an unrecognised chip. Both capabilities are advertised by every
+# 802.11n driver we've checked (Realtek, MediaTek, Atheros, Broadcom),
+# so this lets the AP at least come up with HT20 + SGI-20 instead of
+# falling back to plain ``hw_mode=g`` (~25 Mbps stock). Real-world
+# units shouldn't hit this path - it's a belt-and-suspenders fallback
+# for "we know the rest of the patch wants to apply, we just can't
+# tell *which* chip".
+_FALLBACK_HT_CAPAB = "[SHORT-GI-20][RX-STBC1]"
+
+
+# Back-compat aliases for the Realtek IDs - some older call sites and
+# tests import ``USB_VENDOR_ID`` / ``USB_PRODUCT_ID`` by name. New code
+# should iterate over :data:`SUPPORTED_HOTSPOT_RADIOS` instead.
+USB_VENDOR_ID = SUPPORTED_HOTSPOT_RADIOS[0].vendor_id
+USB_PRODUCT_ID = SUPPORTED_HOTSPOT_RADIOS[0].product_id
 
 UDEV_RULE_PATH = "/etc/udev/rules.d/72-blueos-hotspot.rules"
 NM_CONF_PATH = "/etc/NetworkManager/conf.d/99-blueos-hotspot-uap0.conf"
+MT76_MODPROBE_PATH = "/etc/modprobe.d/blueos-mt76.conf"
 
 # Path used as the *source* of the bind mount on the host, plus the
 # corresponding path inside the blueos-core container.
@@ -227,95 +475,173 @@ _CREATE_AP_ANCHOR_RE = re.compile(
     re.MULTILINE,
 )
 
-# Maxed-out 2.4 GHz HT20 configuration. ``{channel}`` is filled at
-# install time by :func:`_pick_24ghz_channel` so the AP lands on
-# whichever of channels 1/6 is least crowded.  Channel 11 is left
-# out because the DORIS potted external antenna's SWR sweet spot is
-# the lower half of the 2.4 GHz band; see :func:`_pick_24ghz_channel`.
+# How we build the create_ap argv flags we splice in after the
+# ``--redirect-to-localhost`` anchor. Flag order in the generated
+# block, from top to bottom:
+#
+#   "-c", "<auto-picked: 1 or 6>",   # always present
+#   "--no-virt",                     # always present (universal-safe)
+#   "--ieee80211n",                  # always present
+#   "--ieee80211ax",                 # only for HE-capable chips (MT7921U)
+#   "--ht_capab", "<per-chip>",      # always present, value per-chip
+#   "--country", "<live regdomain>", # always present
+#
+# Why ``--no-virt`` is universal-safe (and required on some chips):
+#
+#   * **MediaTek MT7921U** rejects ``create_ap``'s default two-iface
+#     dance outright. Its interface combination matrix only allows
+#     ``#{ AP, P2P-GO } <= 1`` per phy, so when ``create_ap`` tries
+#     to add a virtual ``__ap0`` on top of the existing managed
+#     ``uap0`` the firmware refuses with ``Maybe your WiFi adapter
+#     does not fully support virtual interfaces`` and the AP never
+#     starts.
+#   * **MediaTek MT7612U** is in the same family; its driver also
+#     refuses concurrent managed+AP on one phy.
+#   * **Realtek RTL88x2BU** ``rtl88x2bu`` famously does not implement
+#     ``iw dev <X> interface add testap type __ap`` at all (returns
+#     ``-ENODEV``). We rename ``wlan1 -> uap0`` via udev so the
+#     first-iface-already-exists fast path is taken in ``wifi-manager``,
+#     but ``--no-virt`` is an additional safety net.
+#   * **Atheros AR9271** ``ath9k_htc`` does support virtual ifaces,
+#     so ``--no-virt`` here is a no-op rather than a fix - included
+#     for uniformity.
+#
+# Why ``--ieee80211n`` AND ``--ieee80211ax`` for HE chips:
+# upstream ``create_ap`` only emits ``ieee80211n=1`` + ``ht_capab=...``
+# into ``hostapd.conf`` when ``IEEE80211N=1``. Without
+# ``--ieee80211n`` hostapd silently falls back to ``hw_mode=g`` and
+# ignores the ``--ht_capab`` line entirely, so we always emit n.
+#
+# Why ``--country`` is sourced live (not hardcoded ``US``): hostapd
+# clamps TX power to 20 dBm and refuses 40 MHz channel widths on
+# 2.4 GHz when no country code is set, both of which silently undo
+# other parts of this patch. See :func:`_get_country_code`.
+#
 # ``{indent}`` is filled with the whitespace captured by
-# :data:`_CREATE_AP_ANCHOR_RE` so the inserted lines line up with the
-# surrounding argv entries regardless of upstream indentation choice.
-#
-# Why HT20 explicitly and not HT40?  The ``morrownr/88x2bu-20210702``
-# driver advertises HT40 capability but its AP-mode firmware path
-# cannot keep an HT40 BSS up.  May 2026 lab testing on a deliberately
-# cleaned RF environment (test owner moved all 2.4 GHz neighbours out
-# of ch 11 HT40-'s affected 2442-2482 MHz band, then hot-deployed
-# ``-c 11 --ht_capab [HT40-]`` into the live wifi-manager) showed
-# hostapd reach ``state=ENABLED`` but report ``secondary_channel=0``
-# and ``iw dev uap0 info`` come back with ``width: 20 MHz`` - i.e.
-# when things "worked" the driver was silently dropping us to HT20
-# below hostapd's state machine, inside the driver/firmware seam.
-#
-# An earlier revision of this patch asked for ``[HT40+]`` anyway,
-# betting on (a) "the driver downgrades for us" and (b) "hostapd's
-# OBSS coex scan downgrades to HT20 if any 2.4 GHz neighbour overlaps
-# the secondary 40 MHz band, so HT40+ falls back gracefully for free."
-# A field report in May 2026 broke that bet: a unit with no 2.4 GHz
-# neighbours on the auto-picked channel saw hostapd actually issue
-# the HT40 BSS request (no OBSS neighbours to coex-downgrade off of),
-# the driver rejected it inside the firmware path, and the BSS
-# entered an ``INTERFACE-ENABLED`` -> ``INTERFACE-DISABLED`` cycle
-# on every client association attempt.  The user-visible signature
-# is "AP appears, you connect, it disappears, you lose connection"
-# and ``iw dev uap0 info`` shows ``txpower -100.00 dBm`` (the
-# firmware-unset sentinel) with no ``channel/width/center`` line -
-# distinct from the "stable HT20" signature where the same command
-# reports ``channel <N>, width: 20 MHz, txpower 20.00 dBm`` cleanly.
-#
-# Same class of AP-mode firmware-path issue as the 5 GHz failure
-# noted in the module docstring ("Why no 5 GHz mode" section): the
-# driver advertises a capability it cannot actually sustain.
-#
-# We therefore advertise HT20 only.  This costs nothing: every unit
-# that "worked" with the previous patch was running HT20 internally
-# already (per the lab measurement above).  The ht_capab caps we
-# keep - SHORT-GI-20, LDPC, RX-STBC1, MAX-AMSDU-7935 - are all
-# HT20-valid and lift real TCP throughput from ~25 Mbps stock to
-# ~80 Mbps.  The HT40-specific caps ([HT40+], SHORT-GI-40,
-# DSSS_CCK-40) are removed both because they would be ignored at
-# HT20 and to make sure hostapd has no path back to attempting an
-# HT40 BSS.
-_CREATE_AP_24GHZ_FLAGS_TEMPLATE = (
-    '{indent}"-c", "{channel}",\n'
-    '{indent}"--ieee80211n",\n'
-    '{indent}"--ht_capab", "[SHORT-GI-20][LDPC][RX-STBC1][MAX-AMSDU-7935]",\n'
-    '{indent}"--country", "US",\n'
-)
+# :data:`_CREATE_AP_ANCHOR_RE` so the inserted lines line up with
+# the surrounding argv entries regardless of upstream indentation
+# choice (BlueOS reformat passes have changed it in the past).
+def _build_create_ap_flags(
+    *,
+    indent: str,
+    channel: int,
+    country: str,
+    radio: HotspotRadio | None,
+) -> str:
+    """Return the indented create_ap argv-flag block for *radio*.
+
+    Pass *radio*\\ =\\ ``None`` when :func:`_detect_hotspot_radio` could
+    not match the bus contents to any entry in
+    :data:`SUPPORTED_HOTSPOT_RADIOS`. In that case we emit the
+    conservative HT20 fallback - the AP still comes up, just at lower
+    throughput than a chip-tuned profile would deliver. See
+    :data:`_FALLBACK_HT_CAPAB` for the rationale.
+    """
+    ht_capab = radio.ht_capab if radio is not None else _FALLBACK_HT_CAPAB
+    extra_tokens: tuple[str, ...] = (
+        radio.extra_create_ap_argv_tokens if radio is not None else ()
+    )
+    lines = [
+        f'{indent}"-c", "{channel}",\n',
+        f'{indent}"--no-virt",\n',
+        f'{indent}"--ieee80211n",\n',
+    ]
+    for token in extra_tokens:
+        lines.append(f'{indent}"{token}",\n')
+    lines.append(f'{indent}"--ht_capab", "{ht_capab}",\n')
+    lines.append(f'{indent}"--country", "{country}",\n')
+    return "".join(lines)
+
 
 # Matches *any* DORIS create_ap insertion that may already follow
-# the anchor matched by :data:`_CREATE_AP_ANCHOR_RE` - either the
-# legacy 5 GHz attempt (with ``--freq-band 5`` and ``--vht_capab``)
-# or the current 2.4 GHz patch with any auto-picked channel. Used at
-# install time so re-running the patch on an upgraded install
-# converges to the current canonical block instead of stacking flags.
-# Anchored via ``re.match`` from the position right after the
+# the anchor matched by :data:`_CREATE_AP_ANCHOR_RE`. The regex is
+# anchored via ``re.match`` from the position right after the
 # anchor match, never used as a free search, so false positives
 # outside our managed region are impossible.
+#
+# Recognised historical block shapes (every supported lineage must
+# match here or re-running the patch on an upgrade stacks flags
+# instead of replacing the prior block):
+#
+#   1. **Legacy 5 GHz attempt** (pre bh-0.4.x):
+#      ``--freq-band 5 / -c / --ieee80211n / --ieee80211ac /
+#      --ht_capab / --vht_capab / --country``
+#   2. **Realtek HT20-only** (bh-0.4.x shipping):
+#      ``-c / --ieee80211n / --ht_capab / --country``
+#   3. **Current multi-chip** (this branch):
+#      ``-c / --no-virt / --ieee80211n / [--ieee80211ax] /
+#      --ht_capab / --country``
+#
+# Each line that's only in some lineages is wrapped in ``(?:...)?``;
+# lines required across every lineage stay required.
 _DORIS_PATCH_BLOCK_RE = re.compile(
     r'(?:[ \t]*"--freq-band", "[0-9]+",\n)?'        # legacy 5 GHz only
     r'[ \t]*"-c", "[0-9]+",\n'                      # always present
+    r'(?:[ \t]*"--no-virt",\n)?'                    # current multi-chip only
     r'[ \t]*"--ieee80211n",\n'                      # always present
-    r'(?:[ \t]*"--ieee80211ac",\n)?'                # legacy only
+    r'(?:[ \t]*"--ieee80211ac",\n)?'                # legacy 5 GHz only
+    r'(?:[ \t]*"--ieee80211ax",\n)?'                # MT7921U only
     r'[ \t]*"--ht_capab", "[^"]+",\n'               # always present
-    r'(?:[ \t]*"--vht_capab", "[^"]+",\n)?'         # legacy only
+    r'(?:[ \t]*"--vht_capab", "[^"]+",\n)?'         # legacy 5 GHz only
     r'[ \t]*"--country", "[A-Z]+",\n'               # always present
 )
 
-UDEV_RULE_CONTENT = (
-    "# Managed by DORIS extension (services/hotspot_radio.py).\n"
-    "# Rename the Realtek RTL88x2BU USB Wi-Fi adapter's net device to uap0\n"
-    "# so BlueOS uses it as the hotspot AP without trying to create a virtual\n"
-    "# __ap interface (rtl88x2bu does not support virtual interfaces).\n"
-    f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{USB_VENDOR_ID}",'
-    f' ATTRS{{idProduct}}=="{USB_PRODUCT_ID}", NAME="uap0"\n'
-)
+def _build_udev_rule_content() -> str:
+    """Build the udev-rule file content from :data:`SUPPORTED_HOTSPOT_RADIOS`.
+
+    Emits one ``SUBSYSTEM=="net" ... NAME="uap0"`` line per supported
+    chipset, so plugging in any of the recognised USB Wi-Fi adapters
+    causes the kernel to name its netdev ``uap0`` straight from the
+    add event - before NetworkManager or BlueOS sees it. ``wifi-
+    manager``'s ``_create_virtual_interface()`` short-circuits when
+    ``uap0`` already exists, which is exactly what we want: no
+    virtual-iface dance on top of a different radio, no chance of
+    parenting the AP on the onboard Broadcom.
+
+    Generated content is deterministic for a given table so re-runs
+    of :func:`setup_hotspot_radio` short-circuit cleanly in
+    :func:`_write_host_file`'s content-match check.
+    """
+    header = (
+        "# Managed by DORIS extension (services/hotspot_radio.py).\n"
+        "# Rename any supported USB Wi-Fi adapter's net device to uap0 so\n"
+        "# BlueOS uses it as the hotspot AP without trying to create a virtual\n"
+        "# __ap interface (several supported chipset drivers do not allow\n"
+        "# more than one AP-capable iface per phy).\n"
+    )
+    rules = "".join(
+        f"# {radio.label}\n"
+        f'SUBSYSTEM=="net", ACTION=="add", ATTRS{{idVendor}}=="{radio.vendor_id}",'
+        f' ATTRS{{idProduct}}=="{radio.product_id}", NAME="uap0"\n'
+        for radio in SUPPORTED_HOTSPOT_RADIOS
+    )
+    return header + rules
+
+
+UDEV_RULE_CONTENT = _build_udev_rule_content()
 
 NM_CONF_CONTENT = (
     "# Managed by DORIS extension (services/hotspot_radio.py).\n"
     "# Keep NetworkManager from grabbing uap0; hostapd / create_ap drives it.\n"
     "[keyfile]\n"
     "unmanaged-devices=interface-name:uap0\n"
+)
+
+# Install for every boot regardless of which chip is currently plugged
+# in: harmless on Realtek/Atheros (no mt76_usb module loads, so the
+# option is just ignored) and saves a reboot dance when swapping in an
+# MT chip later. The option mitigates ``mt76x02u_mcu_wait_resp failed
+# with -110`` MCU timeouts the morrownr/USB-WiFi project has documented
+# under sustained USB load on certain xhci controllers (VIA VL805 on
+# Pi 4, harmless on Pi 5's RP1 DWC3). See
+# https://github.com/morrownr/USB-WiFi for the upstream tracking.
+MT76_MODPROBE_CONTENT = (
+    "# Managed by DORIS extension (services/hotspot_radio.py).\n"
+    "# Disable scatter-gather USB transfers in the mt76_usb bus driver.\n"
+    "# Mitigates `mt76x02u_mcu_wait_resp failed with -110` MCU timeouts on\n"
+    "# MT7612U/MT7921U under sustained USB load. Harmless when no MT76\n"
+    "# chip is on the bus (option is parsed only when the module loads).\n"
+    "options mt76_usb disable_usb_sg=1\n"
 )
 
 
@@ -525,6 +851,122 @@ async def _read_container_file(container: str, path: str) -> str | None:
     """Return the contents of *path* from inside *container*, or None on error."""
     ok, out = await _run_host_command(f"docker exec {container} cat {path}")
     return out if ok else None
+
+
+# ``lsusb`` lines look like:
+#   Bus 003 Device 002: ID 0bda:b812 Realtek Semiconductor Corp. RTL88x2bu ...
+# We just need the ``id <V>:<P>`` token (lowercased) so we can match
+# against the table. Don't try to parse the descriptive tail - vendor
+# strings vary across firmware/EEPROM revisions of the same chip.
+_LSUSB_ID_RE = re.compile(r"\bID\s+([0-9a-f]{4}):([0-9a-f]{4})\b", re.IGNORECASE)
+
+
+async def _detect_hotspot_radio() -> HotspotRadio | None:
+    """Return the :class:`HotspotRadio` matching what ``lsusb`` reports.
+
+    Reads ``lsusb`` once on the host and walks
+    :data:`SUPPORTED_HOTSPOT_RADIOS` in iteration order, returning the
+    first matching entry (or ``None`` if no supported USB Wi-Fi
+    adapter is on the bus, or ``lsusb`` itself failed).
+
+    Read-only and idempotent. Callers can invoke this on every patch
+    install without side effects on the live system.
+
+    Returning ``None`` is *not* an error - it means "use the
+    conservative fallback profile" in
+    :func:`_build_create_ap_flags`. We deliberately do not crash or
+    refuse to install the patch in that case; the worst-case shape
+    of an unknown-chip patch is still better than stock
+    ``wifi-manager`` defaults (``hw_mode=g`` no-HT).
+    """
+    ok, out = await _run_host_command("lsusb")
+    if not ok or not out.strip():
+        logger.warning(
+            "Could not read lsusb to detect hotspot radio; "
+            "falling back to conservative HT20 profile"
+        )
+        return None
+
+    # Build a set of (vendor, product) pairs visible on the bus,
+    # lowercased. Matching against the supported table by both
+    # vendor *and* product avoids the false positive where a
+    # MediaTek-vendor non-Wi-Fi device (e.g. a webcam) shares the
+    # vendor ID 0x0e8d with the MT7921U entry below.
+    bus_ids: set[tuple[str, str]] = set()
+    for match in _LSUSB_ID_RE.finditer(out):
+        bus_ids.add((match.group(1).lower(), match.group(2).lower()))
+
+    for radio in SUPPORTED_HOTSPOT_RADIOS:
+        if (radio.vendor_id, radio.product_id) in bus_ids:
+            logger.info(
+                "Detected hotspot radio: %s (USB %s:%s, driver %s)",
+                radio.label,
+                radio.vendor_id,
+                radio.product_id,
+                radio.kernel_module,
+            )
+            return radio
+
+    logger.warning(
+        "No supported USB Wi-Fi chip on the bus (lsusb showed %d ID pairs); "
+        "falling back to conservative HT20 profile",
+        len(bus_ids),
+    )
+    return None
+
+
+# Reads the system regdomain so we can pass a real country code to
+# create_ap; without one hostapd uses world regulatory which caps
+# 2.4 GHz TX power to 20 dBm and refuses HT40 widths. ``iw reg get``
+# prints one or more ``country <CC>: ...`` lines; we want the
+# ``global`` block's value (first match in normal output).
+_IW_REG_COUNTRY_RE = re.compile(r"^country\s+([A-Z]{2}|00):", re.MULTILINE)
+_COUNTRY_CODE_FALLBACK = "US"
+
+
+async def _get_country_code() -> str:
+    """Return the active 2-letter country code, or ``US`` if unset.
+
+    Reads ``iw reg get`` on the host and parses the first
+    ``country <CC>:`` line. ``country 00`` is the kernel's
+    "world regulatory" sentinel meaning "no country has been set" -
+    we treat it the same as a failure and fall back to ``US`` because
+    a country-less hostapd config silently undoes other parts of this
+    patch (HT40 refused, 20 dBm TX power cap).
+
+    Falls back to ``US`` rather than refusing to install when ``iw``
+    fails or returns garbage: the speed patch is still useful with a
+    sane default country, just slightly less correct than reading the
+    live regdomain.
+    """
+    ok, out = await _run_host_command("iw reg get")
+    if not ok or not out.strip():
+        logger.info(
+            "Could not read system regdomain via `iw reg get`; "
+            "defaulting create_ap --country to %s",
+            _COUNTRY_CODE_FALLBACK,
+        )
+        return _COUNTRY_CODE_FALLBACK
+
+    match = _IW_REG_COUNTRY_RE.search(out)
+    if match is None:
+        logger.info(
+            "Could not parse country code from `iw reg get` output; "
+            "defaulting create_ap --country to %s",
+            _COUNTRY_CODE_FALLBACK,
+        )
+        return _COUNTRY_CODE_FALLBACK
+
+    code = match.group(1)
+    if code == "00":
+        logger.info(
+            "System regdomain is `country 00` (world default, unset); "
+            "defaulting create_ap --country to %s",
+            _COUNTRY_CODE_FALLBACK,
+        )
+        return _COUNTRY_CODE_FALLBACK
+
+    return code
 
 
 async def _pick_24ghz_channel() -> int:
@@ -755,6 +1197,8 @@ async def _install_create_ap_speed_patch() -> bool:
 
     stripped = _strip_doris_patch(source)
     channel = await _pick_24ghz_channel()
+    country = await _get_country_code()
+    radio = await _detect_hotspot_radio()
     anchor_match = _CREATE_AP_ANCHOR_RE.search(stripped)
     # We re-search post-strip because the strip can shift offsets, but
     # the anchor itself is never inside the stripped region; this match
@@ -766,8 +1210,8 @@ async def _install_create_ap_speed_patch() -> bool:
         "stripped span"
     )
     indent = anchor_match.group("indent")
-    flags = _CREATE_AP_24GHZ_FLAGS_TEMPLATE.format(
-        indent=indent, channel=channel
+    flags = _build_create_ap_flags(
+        indent=indent, channel=channel, country=country, radio=radio
     )
     insert_at = anchor_match.end()
     patched = stripped[:insert_at] + flags + stripped[insert_at:]
@@ -948,13 +1392,17 @@ async def setup_hotspot_radio() -> None:
     """
     rule_ok = await _write_host_file(UDEV_RULE_PATH, UDEV_RULE_CONTENT)
     nm_ok = await _write_host_file(NM_CONF_PATH, NM_CONF_CONTENT)
+    # Installed unconditionally - see :data:`MT76_MODPROBE_CONTENT` for
+    # why a non-MT chip is unaffected.
+    mt76_ok = await _write_host_file(MT76_MODPROBE_PATH, MT76_MODPROBE_CONTENT)
 
     if not (rule_ok and nm_ok):
         logger.warning(
-            "Hotspot-radio host config not fully written (udev=%s, NM=%s); "
-            "AP may stay parented on the onboard radio",
+            "Hotspot-radio host config not fully written (udev=%s, NM=%s, "
+            "mt76=%s); AP may stay parented on the onboard radio",
             rule_ok,
             nm_ok,
+            mt76_ok,
         )
         return
 

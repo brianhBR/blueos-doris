@@ -45,7 +45,8 @@ def _wrap(payload: str, *, anchor: str = CANONICAL_ANCHOR_LINE) -> str:
     )
 
 
-CURRENT_24GHZ_PATCH = (
+# The first DORIS shipping shape: Realtek HT20 with no --no-virt.
+LEGACY_REALTEK_NO_NOVIRT_PATCH = (
     '            "-c", "6",\n'
     '            "--ieee80211n",\n'
     '            "--ht_capab", "[SHORT-GI-20][LDPC][RX-STBC1][MAX-AMSDU-7935]",\n'
@@ -53,9 +54,42 @@ CURRENT_24GHZ_PATCH = (
 )
 
 
-# The previous shipped revision asked for HT40+. We keep it as test
-# data so the strip path can prove it still cleans up old overrides
-# on units that installed bh-0.4.x before the HT20-only change.
+# Current Realtek shape (this branch): HT20 caps + --no-virt + live country.
+CURRENT_REALTEK_PATCH = (
+    '            "-c", "6",\n'
+    '            "--no-virt",\n'
+    '            "--ieee80211n",\n'
+    '            "--ht_capab", "[SHORT-GI-20][LDPC][RX-STBC1][MAX-AMSDU-7935]",\n'
+    '            "--country", "US",\n'
+)
+
+
+# Current MT7921U shape: HT40 + HE + --no-virt + --ieee80211ax.
+CURRENT_MT7921U_PATCH = (
+    '            "-c", "6",\n'
+    '            "--no-virt",\n'
+    '            "--ieee80211n",\n'
+    '            "--ieee80211ax",\n'
+    '            "--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40][LDPC]'
+    '[TX-STBC][RX-STBC1][MAX-AMSDU-7935]",\n'
+    '            "--country", "US",\n'
+)
+
+
+# Current AR9271 shape: HT40 without LDPC/MAX-AMSDU-7935 and no HE.
+CURRENT_AR9271_PATCH = (
+    '            "-c", "6",\n'
+    '            "--no-virt",\n'
+    '            "--ieee80211n",\n'
+    '            "--ht_capab", "[HT40+][SHORT-GI-20][SHORT-GI-40][RX-STBC1][DSSS_CCK-40]",\n'
+    '            "--country", "US",\n'
+)
+
+
+# Legacy HT40 attempt (pre-PR21): single Realtek-tuned ht_capab with
+# HT40+. We keep this as test data so the strip path can prove it
+# still cleans up old overrides on units that installed bh-0.4.x or
+# earlier.
 LEGACY_24GHZ_HT40_PATCH = (
     '            "-c", "1",\n'
     '            "--ieee80211n",\n'
@@ -76,13 +110,51 @@ LEGACY_5GHZ_PATCH = (
 )
 
 
+# Older code referred to CURRENT_24GHZ_PATCH for the Realtek shape.
+# Keep an alias so any helper or fixture importing the old name from
+# outside this file keeps working. New tests should pick the
+# specific *_PATCH constant for the lineage being exercised.
+CURRENT_24GHZ_PATCH = LEGACY_REALTEK_NO_NOVIRT_PATCH
+
+
 def test_strip_doris_patch_noop_on_unpatched_source() -> None:
     src = _wrap("")
     assert hotspot_radio._strip_doris_patch(src) == src
 
 
-def test_strip_doris_patch_removes_current_24ghz_block() -> None:
-    src = _wrap(CURRENT_24GHZ_PATCH)
+def test_strip_doris_patch_removes_current_realtek_block() -> None:
+    src = _wrap(CURRENT_REALTEK_PATCH)
+    stripped = hotspot_radio._strip_doris_patch(src)
+    assert stripped == _wrap("")
+    assert "--ht_capab" not in stripped
+    assert "--no-virt" not in stripped
+
+
+def test_strip_doris_patch_removes_current_mt7921u_block() -> None:
+    """Re-running the patch on a unit that already had the MT7921U
+    block installed must strip the prior insertion cleanly, including
+    the --ieee80211ax line that's unique to that lineage."""
+    src = _wrap(CURRENT_MT7921U_PATCH)
+    stripped = hotspot_radio._strip_doris_patch(src)
+    assert stripped == _wrap("")
+    assert "--ht_capab" not in stripped
+    assert "--ieee80211ax" not in stripped
+    assert "--no-virt" not in stripped
+
+
+def test_strip_doris_patch_removes_current_ar9271_block() -> None:
+    src = _wrap(CURRENT_AR9271_PATCH)
+    stripped = hotspot_radio._strip_doris_patch(src)
+    assert stripped == _wrap("")
+    assert "--ht_capab" not in stripped
+    assert "--no-virt" not in stripped
+
+
+def test_strip_doris_patch_removes_legacy_realtek_no_novirt_block() -> None:
+    """The first shipping shape didn't include --no-virt. The strip
+    pass must still recognise that lineage so an upgrade from
+    bh-0.4.4 cleanly converges to the current shape."""
+    src = _wrap(LEGACY_REALTEK_NO_NOVIRT_PATCH)
     stripped = hotspot_radio._strip_doris_patch(src)
     assert stripped == _wrap("")
     assert "--ht_capab" not in stripped
@@ -109,11 +181,37 @@ def test_strip_doris_patch_removes_legacy_5ghz_block() -> None:
     assert "--vht_capab" not in stripped
 
 
-def test_strip_doris_patch_idempotent() -> None:
-    src = _wrap(CURRENT_24GHZ_PATCH)
+@pytest.mark.parametrize(
+    "patch_block",
+    [
+        CURRENT_REALTEK_PATCH,
+        CURRENT_MT7921U_PATCH,
+        CURRENT_AR9271_PATCH,
+        LEGACY_REALTEK_NO_NOVIRT_PATCH,
+        LEGACY_24GHZ_HT40_PATCH,
+        LEGACY_5GHZ_PATCH,
+    ],
+    ids=[
+        "current-realtek",
+        "current-mt7921u",
+        "current-ar9271",
+        "legacy-realtek-no-novirt",
+        "legacy-24ghz-ht40",
+        "legacy-5ghz",
+    ],
+)
+def test_strip_doris_patch_idempotent_across_lineages(patch_block: str) -> None:
+    """Strip must be idempotent for every supported lineage.
+
+    Anyone re-running ``setup_hotspot_radio`` on a vehicle picks the
+    chip's current canonical block; the strip step must converge in
+    one pass regardless of which prior lineage the existing override
+    came from."""
+    src = _wrap(patch_block)
     once = hotspot_radio._strip_doris_patch(src)
     twice = hotspot_radio._strip_doris_patch(once)
     assert once == twice
+    assert once == _wrap("")
 
 
 def test_strip_doris_patch_does_not_eat_unrelated_args() -> None:
@@ -335,7 +433,41 @@ async def test_install_patch_writes_when_source_is_clean(
     assert "--ht_capab" in content
 
 
-async def test_install_patch_emits_ht20_only_caps(
+def _realtek_radio() -> hotspot_radio.HotspotRadio:
+    """Return the Realtek RTL88x2BU entry from the supported-radio table.
+
+    Pulled by ``vendor_id`` so a future re-ordering of
+    :data:`SUPPORTED_HOTSPOT_RADIOS` doesn't silently change which
+    chip these tests exercise.
+    """
+    return next(
+        r for r in hotspot_radio.SUPPORTED_HOTSPOT_RADIOS
+        if r.vendor_id == "0bda" and r.product_id == "b812"
+    )
+
+
+def _mt7921u_radio() -> hotspot_radio.HotspotRadio:
+    return next(
+        r for r in hotspot_radio.SUPPORTED_HOTSPOT_RADIOS
+        if r.vendor_id == "0e8d" and r.product_id == "7961"
+    )
+
+
+def _ar9271_radio() -> hotspot_radio.HotspotRadio:
+    return next(
+        r for r in hotspot_radio.SUPPORTED_HOTSPOT_RADIOS
+        if r.vendor_id == "0cf3" and r.product_id == "9271"
+    )
+
+
+def _mt7612u_radio() -> hotspot_radio.HotspotRadio:
+    return next(
+        r for r in hotspot_radio.SUPPORTED_HOTSPOT_RADIOS
+        if r.vendor_id == "0e8d" and r.product_id == "7612"
+    )
+
+
+async def test_install_patch_emits_ht20_only_caps_on_realtek(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Regression for the May 2026 field report: an earlier revision
@@ -362,31 +494,40 @@ async def test_install_patch_emits_ht20_only_caps(
         # too, not just the docstring's example channel 6.
         return 1
 
+    async def fake_country() -> str:
+        return "US"
+
+    async def fake_detect() -> hotspot_radio.HotspotRadio:
+        return _realtek_radio()
+
     monkeypatch.setattr(hotspot_radio, "_read_container_file", fake_read)
     monkeypatch.setattr(hotspot_radio, "_write_host_file", fake_write)
     monkeypatch.setattr(hotspot_radio, "_pick_24ghz_channel", fake_pick)
+    monkeypatch.setattr(hotspot_radio, "_get_country_code", fake_country)
+    monkeypatch.setattr(hotspot_radio, "_detect_hotspot_radio", fake_detect)
 
     result = await hotspot_radio._install_create_ap_speed_patch()
     assert result is True
 
     content = captured["content"]
-    # HT20-valid caps we keep
+    # HT20-valid caps we keep on Realtek
     assert "[SHORT-GI-20]" in content
     assert "[LDPC]" in content
     assert "[RX-STBC1]" in content
     assert "[MAX-AMSDU-7935]" in content
-    # HT40-specific caps that broke Tony's unit. Each one is checked
-    # individually so a regression that brings back just one of them
-    # fails with a specific message.
+    # HT40-specific caps that broke a field unit's Realtek. Each
+    # one is checked individually so a regression that brings back
+    # just one of them fails with a specific message.
     assert "[HT40+]" not in content, (
-        "HT40+ must not be re-introduced - it caused INTERFACE-DISABLED "
-        "cycling on the morrownr 88x2bu AP-mode firmware path on units "
-        "with clean RF environments. See May 2026 field report."
+        "HT40+ must not be re-introduced on Realtek - it caused "
+        "INTERFACE-DISABLED cycling on the morrownr 88x2bu AP-mode "
+        "firmware path on units with clean RF environments. See May "
+        "2026 field report."
     )
     assert "[HT40-]" not in content, "HT40- has the same driver issue as HT40+"
     assert "SHORT-GI-40" not in content, (
         "SHORT-GI-40 only applies inside an HT40 BSS; emitting it "
-        "implies an HT40 path we explicitly removed."
+        "implies an HT40 path we explicitly removed from Realtek."
     )
     assert "DSSS_CCK-40" not in content, (
         "DSSS_CCK-40 only applies inside an HT40 BSS; same reason."
@@ -396,9 +537,14 @@ async def test_install_patch_emits_ht20_only_caps(
     assert '"-c", "1"' in content
     assert '"--country", "US"' in content
     assert '"--ieee80211n"' in content
-    # And nothing about ac/VHT should sneak in - that's the 5 GHz
-    # path we deliberately abandoned.
+    # --no-virt is universal-safe and now always emitted, including
+    # on Realtek (rtl88x2bu doesn't support virtual ifaces so the
+    # flag is a no-op for the chip but still belt-and-suspenders).
+    assert '"--no-virt"' in content
+    # And nothing about ac/ax/VHT should sneak in on Realtek -
+    # those are HE-chip / legacy-5GHz paths, not Realtek's.
     assert "--ieee80211ac" not in content
+    assert "--ieee80211ax" not in content
     assert "--vht_capab" not in content
     assert "--freq-band" not in content
 
@@ -492,9 +638,17 @@ async def test_install_patch_uses_captured_indent_in_output(
     async def fake_pick() -> int:
         return 1
 
+    async def fake_country() -> str:
+        return "US"
+
+    async def fake_detect() -> hotspot_radio.HotspotRadio:
+        return _realtek_radio()
+
     monkeypatch.setattr(hotspot_radio, "_read_container_file", fake_read)
     monkeypatch.setattr(hotspot_radio, "_write_host_file", fake_write)
     monkeypatch.setattr(hotspot_radio, "_pick_24ghz_channel", fake_pick)
+    monkeypatch.setattr(hotspot_radio, "_get_country_code", fake_country)
+    monkeypatch.setattr(hotspot_radio, "_detect_hotspot_radio", fake_detect)
 
     result = await hotspot_radio._install_create_ap_speed_patch()
     assert result is True
@@ -505,6 +659,7 @@ async def test_install_patch_uses_captured_indent_in_output(
     # as the shallow anchor.
     assert '        "-c", "1",\n' in content
     assert '        "--ieee80211n",\n' in content
+    assert '        "--no-virt",\n' in content
     # And must NOT have the canonical 12-space indent baked in.
     assert '            "-c", "1",\n' not in content
 
@@ -933,3 +1088,381 @@ async def test_write_host_file_skips_when_existing_matches(
     # No host commands should have been issued at all - the
     # short-circuit must fire before chunked writes start.
     assert rec.calls == [], rec.calls
+
+
+# =====================================================================
+# Multi-chipset support: per-chip create_ap flags, USB detection,
+# country-code parsing, multi-vendor udev rule, MT76 modprobe write.
+# These exercise the May 2026 expansion from Realtek-only to four
+# supported chipsets (Realtek RTL88x2BU, MediaTek MT7612U / MT7921U,
+# Atheros AR9271).
+# =====================================================================
+
+
+# ---------------------------------------------------------------------
+# _build_create_ap_flags: per-chip ht_capab and extra argv tokens.
+# Asserted as a *unit* test rather than going through
+# _install_create_ap_speed_patch so a regression points at the actual
+# offending function instead of the entire pipeline.
+# ---------------------------------------------------------------------
+
+
+def test_build_create_ap_flags_realtek() -> None:
+    flags = hotspot_radio._build_create_ap_flags(
+        indent="            ",
+        channel=6,
+        country="US",
+        radio=_realtek_radio(),
+    )
+    # Realtek = HT20-only on purpose; see module docstring's
+    # "Why HT20 on Realtek but HT40+ on every other supported chipset".
+    assert '"-c", "6",' in flags
+    assert '"--no-virt",' in flags
+    assert '"--ieee80211n",' in flags
+    assert "[LDPC]" in flags
+    assert "[MAX-AMSDU-7935]" in flags
+    assert "[SHORT-GI-20]" in flags
+    # No HT40, no HE, no AC on Realtek.
+    assert "[HT40+]" not in flags
+    assert "--ieee80211ax" not in flags
+    assert "--ieee80211ac" not in flags
+    assert "DSSS_CCK-40" not in flags
+    assert '"--country", "US",' in flags
+
+
+def test_build_create_ap_flags_mt7612u() -> None:
+    flags = hotspot_radio._build_create_ap_flags(
+        indent="            ",
+        channel=6,
+        country="US",
+        radio=_mt7612u_radio(),
+    )
+    # MT7612U handles HT40 cleanly in AP mode.
+    assert "[HT40+]" in flags
+    assert "[SHORT-GI-40]" in flags
+    assert "[LDPC]" in flags
+    assert "[DSSS_CCK-40]" in flags
+    # 802.11ac chip, but at 2.4 GHz we drive it as n only.
+    assert "--ieee80211ac" not in flags
+    assert "--ieee80211ax" not in flags
+    assert '"--no-virt",' in flags
+    assert '"--ieee80211n",' in flags
+
+
+def test_build_create_ap_flags_mt7921u_emits_ieee80211ax() -> None:
+    """MT7921U is the only currently-supported HE-capable chip; if
+    we ever stop emitting --ieee80211ax for it, ``ieee80211ax=1`` is
+    silently dropped from hostapd.conf and HE rates aren't unlocked."""
+    flags = hotspot_radio._build_create_ap_flags(
+        indent="            ",
+        channel=6,
+        country="US",
+        radio=_mt7921u_radio(),
+    )
+    assert '"--ieee80211ax",' in flags
+    assert "[HT40+]" in flags
+    assert "[LDPC]" in flags
+    assert "[TX-STBC]" in flags
+    assert "[MAX-AMSDU-7935]" in flags
+    # DSSS_CCK-40 must NOT appear: MT7921U's iw phy info reports
+    # "No DSSS/CCK HT40" and hostapd refuses to start with it.
+    assert "DSSS_CCK-40" not in flags
+
+
+def test_build_create_ap_flags_ar9271_omits_unsupported_caps() -> None:
+    """AR9271 + ath9k_htc doesn't advertise LDPC; hostapd refuses to
+    start with ``Driver does not support configured HT capability
+    [LDPC]``. Same goes for MAX-AMSDU-7935 (chip max is 3839)."""
+    flags = hotspot_radio._build_create_ap_flags(
+        indent="            ",
+        channel=6,
+        country="US",
+        radio=_ar9271_radio(),
+    )
+    # HT40 works on AR9271; SGI-20/40, RX-STBC1, DSSS_CCK-40 OK.
+    assert "[HT40+]" in flags
+    assert "[SHORT-GI-40]" in flags
+    assert "[RX-STBC1]" in flags
+    assert "[DSSS_CCK-40]" in flags
+    # The two capabilities that broke this chip in May 2026:
+    assert "[LDPC]" not in flags, (
+        "AR9271's ath9k_htc driver does NOT claim LDPC; emitting "
+        "[LDPC] makes hostapd hard-fail with 'Driver does not "
+        "support configured HT capability [LDPC]'"
+    )
+    assert "MAX-AMSDU-7935" not in flags, (
+        "AR9271 max A-MSDU is 3839, not 7935; emitting "
+        "[MAX-AMSDU-7935] also triggers the unsupported-cap fail."
+    )
+    # AR9271 is n-only.
+    assert "--ieee80211ax" not in flags
+    assert "--ieee80211ac" not in flags
+
+
+def test_build_create_ap_flags_fallback_when_radio_unknown() -> None:
+    """When the bus contains an unrecognised chip (or ``lsusb``
+    failed), we still emit a HT20 block with two caps that every
+    802.11n driver we've checked advertises. The AP comes up at
+    mid-throughput rather than not at all."""
+    flags = hotspot_radio._build_create_ap_flags(
+        indent="            ",
+        channel=6,
+        country="US",
+        radio=None,
+    )
+    assert '"-c", "6",' in flags
+    assert '"--no-virt",' in flags
+    assert '"--ieee80211n",' in flags
+    assert hotspot_radio._FALLBACK_HT_CAPAB in flags
+    # No HT40 / HE / AC / chip-specific high-end caps.
+    assert "[HT40+]" not in flags
+    assert "[LDPC]" not in flags
+    assert "MAX-AMSDU-7935" not in flags
+    assert "--ieee80211ax" not in flags
+
+
+def test_build_create_ap_flags_uses_indent_uniformly() -> None:
+    """Every emitted line must use the requested indent. Mixing
+    indents in the inserted block produces broken Python in the
+    patched ``networkmanager.py`` and wifi-manager crashes on
+    import."""
+    indent = "    "  # deliberately unusual: 4-space
+    flags = hotspot_radio._build_create_ap_flags(
+        indent=indent,
+        channel=1,
+        country="DE",
+        radio=_mt7921u_radio(),
+    )
+    for line in flags.splitlines():
+        assert line.startswith(indent), (
+            f"line does not use the requested indent: {line!r}"
+        )
+
+
+# ---------------------------------------------------------------------
+# _detect_hotspot_radio: parses ``lsusb`` output against the supported
+# table. Order matters: first match wins (matters in tests, never on a
+# real DORIS since there's only one USB Wi-Fi port).
+# ---------------------------------------------------------------------
+
+
+_LSUSB_REALTEK = (
+    "Bus 001 Device 002: ID 1d6b:0002 Linux Foundation 2.0 root hub\n"
+    "Bus 003 Device 003: ID 0bda:b812 Realtek Semiconductor Corp. "
+    "RTL88x2bu [AC1200 Techkey]\n"
+    "Bus 003 Device 004: ID 04b4:0033 Cypress Semiconductor Corp.\n"
+)
+
+_LSUSB_MT7612U = (
+    "Bus 001 Device 002: ID 1d6b:0002 Linux Foundation 2.0 root hub\n"
+    "Bus 003 Device 003: ID 0e8d:7612 MediaTek Inc. MT7612U "
+    "802.11ac WLAN Adapter\n"
+)
+
+_LSUSB_MT7921U = (
+    "Bus 003 Device 003: ID 0e8d:7961 MediaTek Inc. Wireless_Device\n"
+)
+
+_LSUSB_AR9271 = (
+    "Bus 001 Device 002: ID 1d6b:0002 Linux Foundation 2.0 root hub\n"
+    "Bus 003 Device 003: ID 0cf3:9271 Qualcomm Atheros Communications "
+    "AR9271 802.11n\n"
+)
+
+_LSUSB_NO_RADIO = (
+    "Bus 001 Device 002: ID 1d6b:0002 Linux Foundation 2.0 root hub\n"
+    "Bus 003 Device 002: ID 04b4:0033 Cypress Semiconductor Corp.\n"
+)
+
+# Same vendor as MediaTek MT7921U (0e8d) but a different product ID -
+# must NOT match the MT7921U row. Guards against an over-eager
+# vendor-only match that would map non-Wi-Fi MediaTek devices into the
+# Wi-Fi table.
+_LSUSB_MT_FOREIGN_PRODUCT = (
+    "Bus 003 Device 003: ID 0e8d:1234 MediaTek Inc. Generic Device\n"
+)
+
+
+@pytest.mark.parametrize(
+    "lsusb_out,expected_label",
+    [
+        (_LSUSB_REALTEK, "Realtek RTL88x2BU"),
+        (_LSUSB_MT7612U, "MediaTek MT7612U"),
+        (_LSUSB_MT7921U, "MediaTek MT7921AU"),
+        (_LSUSB_AR9271, "Atheros AR9271"),
+    ],
+    ids=["realtek", "mt7612u", "mt7921u", "ar9271"],
+)
+async def test_detect_hotspot_radio_returns_table_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    lsusb_out: str,
+    expected_label: str,
+) -> None:
+    async def fake_run(cmd: str, timeout: float = 30.0) -> tuple[bool, str]:
+        assert cmd == "lsusb"
+        return True, lsusb_out
+
+    monkeypatch.setattr(hotspot_radio, "_run_host_command", fake_run)
+    radio = await hotspot_radio._detect_hotspot_radio()
+    assert radio is not None
+    assert radio.label == expected_label
+
+
+async def test_detect_hotspot_radio_returns_none_when_no_match(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_run(cmd: str, timeout: float = 30.0) -> tuple[bool, str]:
+        return True, _LSUSB_NO_RADIO
+
+    monkeypatch.setattr(hotspot_radio, "_run_host_command", fake_run)
+    assert await hotspot_radio._detect_hotspot_radio() is None
+
+
+async def test_detect_hotspot_radio_rejects_foreign_product_with_known_vendor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Vendor-only matching would map a non-Wi-Fi MediaTek device into
+    the table. We match on (vendor, product) precisely."""
+    async def fake_run(cmd: str, timeout: float = 30.0) -> tuple[bool, str]:
+        return True, _LSUSB_MT_FOREIGN_PRODUCT
+
+    monkeypatch.setattr(hotspot_radio, "_run_host_command", fake_run)
+    assert await hotspot_radio._detect_hotspot_radio() is None
+
+
+async def test_detect_hotspot_radio_returns_none_when_lsusb_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_run(cmd: str, timeout: float = 30.0) -> tuple[bool, str]:
+        return False, ""
+
+    monkeypatch.setattr(hotspot_radio, "_run_host_command", fake_run)
+    assert await hotspot_radio._detect_hotspot_radio() is None
+
+
+# ---------------------------------------------------------------------
+# _get_country_code: parses ``iw reg get`` for the active regdomain.
+# Without a country code, hostapd uses world-regulatory which silently
+# undoes other parts of the create_ap speed patch.
+# ---------------------------------------------------------------------
+
+
+async def test_get_country_code_returns_active_regdomain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    iw_out = (
+        "global\n"
+        "country US: DFS-FCC\n"
+        "        (2402 - 2472 @ 40), (N/A, 36)\n"
+    )
+
+    async def fake_run(cmd: str, timeout: float = 30.0) -> tuple[bool, str]:
+        assert cmd == "iw reg get"
+        return True, iw_out
+
+    monkeypatch.setattr(hotspot_radio, "_run_host_command", fake_run)
+    assert await hotspot_radio._get_country_code() == "US"
+
+
+async def test_get_country_code_falls_back_on_world_default(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``country 00`` is the kernel's sentinel for "no country set"
+    (world regulatory). Treat it the same as a parse failure."""
+    iw_out = (
+        "global\n"
+        "country 00: DFS-UNSET\n"
+    )
+
+    async def fake_run(cmd: str, timeout: float = 30.0) -> tuple[bool, str]:
+        return True, iw_out
+
+    monkeypatch.setattr(hotspot_radio, "_run_host_command", fake_run)
+    assert (
+        await hotspot_radio._get_country_code()
+        == hotspot_radio._COUNTRY_CODE_FALLBACK
+    )
+
+
+async def test_get_country_code_falls_back_when_iw_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def fake_run(cmd: str, timeout: float = 30.0) -> tuple[bool, str]:
+        return False, ""
+
+    monkeypatch.setattr(hotspot_radio, "_run_host_command", fake_run)
+    assert (
+        await hotspot_radio._get_country_code()
+        == hotspot_radio._COUNTRY_CODE_FALLBACK
+    )
+
+
+# ---------------------------------------------------------------------
+# UDEV_RULE_CONTENT: generated from SUPPORTED_HOTSPOT_RADIOS. Every
+# supported chipset's USB IDs must appear so the kernel renames its
+# netdev to ``uap0`` regardless of which adapter the user plugged in.
+# ---------------------------------------------------------------------
+
+
+def test_udev_rule_content_includes_every_supported_chipset() -> None:
+    for radio in hotspot_radio.SUPPORTED_HOTSPOT_RADIOS:
+        assert f'ATTRS{{idVendor}}=="{radio.vendor_id}"' in hotspot_radio.UDEV_RULE_CONTENT, (
+            f"udev rule missing idVendor for {radio.label}"
+        )
+        assert f'ATTRS{{idProduct}}=="{radio.product_id}"' in hotspot_radio.UDEV_RULE_CONTENT, (
+            f"udev rule missing idProduct for {radio.label}"
+        )
+    assert hotspot_radio.UDEV_RULE_CONTENT.count('NAME="uap0"') == len(
+        hotspot_radio.SUPPORTED_HOTSPOT_RADIOS
+    ), "expected one NAME=\"uap0\" line per supported chipset"
+
+
+# ---------------------------------------------------------------------
+# setup_hotspot_radio: writes the MT76 modprobe.d file alongside the
+# udev rule and NetworkManager conf. Installed unconditionally because
+# it's harmless when no mt76_usb chip is on the bus.
+# ---------------------------------------------------------------------
+
+
+async def test_setup_hotspot_radio_writes_mt76_modprobe_conf(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writes: list[tuple[str, str]] = []
+
+    async def fake_write(path: str, content: str) -> bool:
+        writes.append((path, content))
+        return True
+
+    async def noop_reload() -> None:
+        return None
+
+    async def patch_succeeds() -> bool:
+        return True
+
+    async def fake_ensure_bind() -> None:
+        return None
+
+    rec = _RunHostCommandRecorder()
+
+    monkeypatch.setattr(hotspot_radio, "_write_host_file", fake_write)
+    monkeypatch.setattr(hotspot_radio, "_reload_udev", noop_reload)
+    monkeypatch.setattr(hotspot_radio, "_reload_network_manager", noop_reload)
+    monkeypatch.setattr(
+        hotspot_radio, "_install_create_ap_speed_patch", patch_succeeds
+    )
+    monkeypatch.setattr(hotspot_radio, "_ensure_startup_bind", fake_ensure_bind)
+    monkeypatch.setattr(hotspot_radio, "_run_host_command", rec)
+
+    await hotspot_radio.setup_hotspot_radio()
+
+    written_paths = {p for p, _ in writes}
+    assert hotspot_radio.UDEV_RULE_PATH in written_paths
+    assert hotspot_radio.NM_CONF_PATH in written_paths
+    assert hotspot_radio.MT76_MODPROBE_PATH in written_paths, (
+        "MT76 modprobe conf must be installed alongside udev rule and "
+        "NM conf so swapping in an MT chip doesn't need an extra reboot "
+        "to pick up disable_usb_sg=1"
+    )
+    mt76_content = dict(writes)[hotspot_radio.MT76_MODPROBE_PATH]
+    assert "disable_usb_sg=1" in mt76_content
+    assert "mt76_usb" in mt76_content

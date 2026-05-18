@@ -28,9 +28,17 @@ DMESG_KEYWORDS = (
     "usb",
     "wlan",
     "wifi",
+    # Realtek RTL88x2BU (out-of-tree morrownr/88x2bu + in-kernel rtw88).
     "rtw",
     "88x2bu",
     "rtl",
+    # MediaTek mt76 family (MT7612U, MT7921U).
+    "mt76",
+    "mt7612",
+    "mt7921",
+    # Atheros AR9271 (in-kernel ath9k_htc).
+    "ath9k",
+    "ar9271",
     "firmware",
     "error",
     "disconnect",
