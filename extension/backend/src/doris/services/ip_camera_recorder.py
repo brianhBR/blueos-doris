@@ -58,6 +58,7 @@ import logging
 import os
 import re
 import threading
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -279,6 +280,17 @@ class RecordingSession:
         # into a single MP4.
         self.cycle_seq = max(0, int(cycle_seq))
         self.restart_count = 0
+        # First-frame instrumentation.  ``session_started_at`` is the
+        # monotonic time the watchdog task was launched; ``first_frame_at``
+        # is the monotonic time splitmuxsink opened its first fragment
+        # (i.e. the first H.264 access unit actually hit disk).  The
+        # delta is the RTSP connect + jitter-buffer-fill latency that
+        # VIDEO_INTERVAL mode would otherwise silently charge against the
+        # operator's record window.  Set once (on the GStreamer streaming
+        # thread, GIL-safe) and read by recording_status() so the Lua
+        # dive script can gate its record clock on real frames.
+        self.session_started_at: float | None = None
+        self.first_frame_at: float | None = None
         self.last_pattern: str | None = None
         self.last_exit: dict | None = None
         self.rotation_count = 0
@@ -293,6 +305,17 @@ class RecordingSession:
     def is_alive(self) -> bool:
         return self._task is not None and not self._task.done()
 
+    @property
+    def frames_flowing(self) -> bool:
+        """True once the first .ts fragment has been opened (frames on disk)."""
+        return self.first_frame_at is not None
+
+    def first_frame_latency_s(self) -> float | None:
+        """Seconds from watchdog launch to the first frame, or None if pending."""
+        if self.first_frame_at is None or self.session_started_at is None:
+            return None
+        return round(self.first_frame_at - self.session_started_at, 3)
+
     def current_pid(self) -> int | None:
         # No subprocess any more; pipeline runs in the extension process.
         # Kept in the API shape for back-compat with /rec/status consumers.
@@ -305,6 +328,13 @@ class RecordingSession:
     # current_phase and fires split-now, the next callback (triggered
     # at the next keyframe) produces a file labelled with the new phase.
     def _on_format_location(self, _splitmux, fragment_id) -> str:
+        # The first fragment opened by this session marks the moment
+        # real video started landing on disk.  Latch it once; later
+        # fragments (segment rotations, watchdog rebuilds) leave it
+        # untouched so the recorded latency reflects the original
+        # connect, not subsequent splits.
+        if self.first_frame_at is None:
+            self.first_frame_at = time.monotonic()
         phase = self.current_phase
         path = str(
             self._out_dir
@@ -581,6 +611,7 @@ class RecordingSession:
         if self._task is not None:
             raise RuntimeError("session already started")
         _ensure_gst_init()
+        self.session_started_at = time.monotonic()
         self._task = asyncio.create_task(self._watchdog())
 
     async def stop(self, timeout_s: float = 12.0) -> None:
@@ -769,11 +800,12 @@ async def stop_recording() -> dict:
         # the next start_recording would re-use part00 and clobber the
         # files this session just produced.
         _session_part_offset = sess._current_part + 1
+        ff_latency = sess.first_frame_latency_s()
         logger.info(
-            "RECORD stop completed; restarts=%d rotations=%d last_exit=%s "
-            "next_part_offset=%d",
-            sess.restart_count, sess.rotation_count, sess.last_exit,
-            _session_part_offset,
+            "RECORD stop completed; restarts=%d rotations=%d "
+            "first_frame_latency_s=%s last_exit=%s next_part_offset=%d",
+            sess.restart_count, sess.rotation_count, ff_latency,
+            sess.last_exit, _session_part_offset,
         )
         return {
             "success": True,
@@ -781,6 +813,7 @@ async def stop_recording() -> dict:
             "base_stamp": sess.base_stamp,
             "restarts": sess.restart_count,
             "rotations": sess.rotation_count,
+            "first_frame_latency_s": ff_latency,
             "phases": list(sess._last_phases),
             "last_exit": sess.last_exit,
         }
@@ -958,8 +991,18 @@ async def recording_status() -> dict:
     last_exit = sess.last_exit if sess is not None else None
     phase = sess.current_phase if sess is not None else None
     rotations = sess.rotation_count if sess is not None else 0
+    # ``frames_flowing`` is the signal the Lua dive script gates its
+    # VIDEO_INTERVAL record clock on: only count the record window once
+    # real video is landing on disk, so a slow RTSP connect doesn't
+    # shorten the clip.  Reported even when not alive (False) so the
+    # poller gets a definite answer.  Kept near the top of the dict so
+    # it lands in the first TCP segment the Lua reader pulls.
+    frames_flowing = bool(sess.frames_flowing) if sess is not None else False
+    ff_latency = sess.first_frame_latency_s() if sess is not None else None
     return {
         "recording": alive,
+        "frames_flowing": frames_flowing,
+        "first_frame_latency_s": ff_latency,
         "base_stamp": base_stamp,
         "output_pattern": pattern,
         "phase": phase,
