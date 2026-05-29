@@ -57,12 +57,13 @@ import json
 import logging
 import os
 import re
+import shutil
 from datetime import datetime, timezone
 from pathlib import Path
 
 from ..config import settings
 from . import ip_camera_recorder as iprec
-from . import usb_storage
+from . import persistent_log, usb_storage
 
 logger = logging.getLogger(__name__)
 
@@ -122,6 +123,47 @@ async def _ffprobe_duration_s(path: Path) -> float | None:
     except Exception:
         logger.exception("ffprobe failed for %s", path)
         return None
+
+
+def _copy_diagnostic_logs(rec_dir: Path) -> dict:
+    """Copy the persistent doris/dmesg logs into ``<dive_dir>/logs/``.
+
+    The canonical logs live on *internal* storage
+    (``persistent_log.LOG_DIR``), but the recordings (and thus this dive
+    folder) frequently live on a USB stick the operator pulls -- so the
+    logs are otherwise easy to miss.  Copying ``doris.log*`` and
+    ``dmesg.log*`` here makes the whole diagnostic bundle travel with the
+    recordings.
+
+    Synchronous (runs in an executor); strictly best-effort -- a copy
+    failure is logged and summarised but never raises into finalize.
+    Returns a small summary dict for the manifest.
+    """
+    src_dir = persistent_log.LOG_DIR
+    out: dict = {"source": str(src_dir), "copied": [], "errors": []}
+    try:
+        if not src_dir.is_dir():
+            out["skipped"] = "log_dir_missing"
+            return out
+        logs_dir = rec_dir / "logs"
+        logs_dir.mkdir(parents=True, exist_ok=True)
+        for src in sorted(src_dir.iterdir()):
+            if not src.is_file():
+                continue
+            if not (src.name.startswith("doris.log")
+                    or src.name.startswith("dmesg.log")):
+                continue
+            try:
+                shutil.copy2(src, logs_dir / src.name)
+                out["copied"].append(src.name)
+            except OSError as e:
+                logger.warning("FINALIZE log copy failed for %s: %s", src.name, e)
+                out["errors"].append(f"{src.name}: {e}")
+        out["dest"] = str(logs_dir)
+    except Exception as e:
+        logger.exception("FINALIZE log copy step failed: %s", e)
+        out["errors"].append(str(e))
+    return out
 
 
 async def _concat_phase(
@@ -770,6 +812,14 @@ async def finalize_dive(
     # Reset the snapshot sequence counters so the next dive starts from seq=1.
     iprec.clear_snapshot_state()
 
+    # Copy the persistent doris/dmesg logs into <dive_dir>/logs/ so the
+    # diagnostic bundle rides along with the recordings (which usually
+    # live on the operator's USB stick, separate from the internal log
+    # dir).  Runs in an executor since it's blocking file I/O.
+    logs_summary = await asyncio.get_event_loop().run_in_executor(
+        None, _copy_diagnostic_logs, rec_dir,
+    )
+
     finished_at = datetime.now(tz=timezone.utc).isoformat()
     bottom_mode_label = {
         1: "continuous",
@@ -785,6 +835,7 @@ async def finalize_dive(
         "bottom_mode_id": bottom_mode,
         "phases": phase_results,
         "snapshots": snapshot_results,
+        "logs": logs_summary,
         "success": all(p["success"] for p in phase_results) if phase_results else True,
     }
 
