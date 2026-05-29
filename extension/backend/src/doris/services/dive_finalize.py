@@ -15,10 +15,9 @@ Bottom-phase output depends on the bottom camera mode
   ignore the raw layout entirely and run a two-pass lossless ffmpeg
   pipeline: concat every bottom ``.ts`` into a staging
   ``.bottom_full.ts``, then ``-f segment -segment_time 300
-  -reset_timestamps 1`` to slice it into clean 5-minute MP4 chunks
-  ``dive_<stamp>_on_bottom_chunkNN.mp4``.  Chunk count is therefore
-  proportional to dive duration (one chunk per ~5 minutes), not to
-  RTSP stability.
+  -reset_timestamps 1`` to slice it into clean 5-minute MP4 chunks.
+  Chunk count is therefore proportional to dive duration (one chunk
+  per ~5 minutes), not to RTSP stability.
 * INTERVAL (2): each ipcam start/stop cycle should yield one MP4,
   even if the cycle's recording was split across several ``.ts``
   files by mid-cycle RTSP rebuilds.  Cycles are identified
@@ -27,24 +26,27 @@ Bottom-phase output depends on the bottom camera mode
   ``ipcam_start`` and stays constant through every watchdog rebuild
   inside that cycle).  No timing heuristic is involved -- pause
   length, reconnect duration, restart count: irrelevant.  All ``.ts``
-  files sharing one ``<CC>`` are lossless-concatenated to one MP4
-  ``dive_<stamp>_on_bottom_videoNN.mp4`` where ``<NN>`` is the
-  chronological 1-based cycle index (so ``video01`` is the earliest
-  cycle that produced bottom .ts, regardless of the underlying
-  ``<CC>`` value).  Pre-upgrade dives whose ``.ts`` files lack the
-  ``<CC>`` tag fall back to the historical ``part<NN>`` grouping
-  with a ``legacy_`` prefix on the output filename so the operator
-  can spot the bridge case.
+  files sharing one ``<CC>`` are lossless-concatenated to one MP4.
+  Pre-upgrade dives whose ``.ts`` files lack the ``<CC>`` tag fall
+  back to the historical ``part<NN>`` grouping with a ``legacy_``
+  prefix on the output filename so the operator can spot the bridge
+  case.
 * TIMELAPSE (3): no .ts files exist; only JPEG snapshots, which are
   cataloged but never re-encoded into video.
 * OFF / unknown / legacy: falls through to the historical behavior
-  of concatenating every bottom .ts into a single
-  ``dive_<stamp>_on_bottom.mp4`` so older dives still finalize
-  cleanly.
+  of concatenating every bottom .ts into a single MP4 so older dives
+  still finalize cleanly.
 
-Descent and ascent always produce one MP4 per phase
-(``dive_<stamp>_descent.mp4`` / ``_ascent.mp4``) regardless of
-bottom mode.
+Output MP4s are named ``<recstart>_<phase>.mp4`` (e.g.
+``20260528t171502_on_bottom.mp4``), where ``recstart`` is the UTC
+``YYYYMMDDtHHMMSS`` the recording's footage started -- the earliest
+``.ts`` fragment open-stamp for that output (or, for continuous
+chunks, footage-start plus the cumulative duration of preceding
+chunks).  Files live inside the per-dive ``dive_<stamp>/`` folder, so
+dive grouping is preserved by directory.  Pre-upgrade ``.ts`` that
+lack an open-stamp fall back to the historical index-based names
+(``dive_<stamp>_on_bottom_videoNN.mp4`` / ``_chunkNN.mp4`` /
+``_<phase>.mp4``).
 
 Invoked at ``POST /api/v1/dive/finalize`` after the Lua dive state
 machine reaches RECOVERY.
@@ -58,7 +60,7 @@ import logging
 import os
 import re
 import shutil
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from ..config import settings
@@ -80,10 +82,17 @@ logger = logging.getLogger(__name__)
 # ``_cyc<CC>`` segment; the ``_part<NN>_<NNNNN>.ts`` suffix anchors
 # the trailing portion either way.  ``cyc`` is ``None`` for legacy
 # files and finalize routes those through the per-part fallback.
+#
+# Newest (post per-fragment open-stamp upgrade) adds a trailing
+# ``_t<YYYYMMDDtHHMMSS>`` carrying the fragment's open wall-clock (UTC):
+#   radcam_20260502_013722_on_bottom_cyc02_part10_00003_t20260502t013744.ts
+# The ``start`` group is optional so pre-upgrade .ts still match (those
+# fall back to index-based MP4 naming).
 _TS_RE = re.compile(
     r"^radcam_(?P<stamp>\d{8}_\d{6})_(?P<phase>[a-z0-9_]+?)"
     r"(?:_cyc(?P<cyc>\d{2}))?"
-    r"_part(?P<part>\d{2})_(?P<frag>\d{5})\.ts$"
+    r"_part(?P<part>\d{2})_(?P<frag>\d{5})"
+    r"(?:_t(?P<start>\d{8}t\d{6}))?\.ts$"
 )
 
 # TIMELAPSE snapshots:
@@ -92,6 +101,38 @@ _JPG_RE = re.compile(
     r"^radcam_(?P<stamp>\d{8}_\d{6})_(?P<phase>[a-z0-9_]+)"
     r"_(?P<seq>\d{5})\.jpg$"
 )
+
+
+# Output MP4 naming.  Operator-facing video files are named for *when
+# the recording actually started* rather than a synthetic index:
+#   <recstart>_<phase>.mp4   e.g. 20260528t171502_on_bottom.mp4
+# ``recstart`` is the UTC ``YYYYMMDDtHHMMSS`` of the earliest fragment in
+# the group (first frame on disk).  They live inside the per-dive
+# ``dive_<stamp>/`` folder, so the dive grouping is preserved by
+# directory and ``recstart`` is globally unique in time (no collisions
+# across cycles, chunks, or dives).  Pre-upgrade .ts that lack the
+# open-stamp fall back to the historical index-based names below.
+_START_FMT = "%Y%m%dt%H%M%S"
+
+
+def _group_start_stamp(files: list[Path]) -> str | None:
+    """Earliest fragment open-stamp (``YYYYMMDDtHHMMSS``) across a group.
+
+    The recorder tags every ``.ts`` with the wall-clock UTC time its
+    fragment opened (``_t<stamp>``); for the first fragment of a
+    recording that's the moment real frames started landing on disk.
+    The minimum across the group is therefore when that output's footage
+    began.  Fixed-width zero-padded stamps mean lexical ``min`` ==
+    chronological ``min``.  Returns ``None`` when no file carries the tag
+    (legacy .ts predating the stamp) so callers fall back to index-based
+    naming.
+    """
+    stamps = [
+        m.group("start")
+        for f in files
+        if (m := _TS_RE.match(f.name)) and m.group("start")
+    ]
+    return min(stamps) if stamps else None
 
 
 def _recordings_dir() -> Path:
@@ -403,39 +444,96 @@ async def _finalize_continuous_resegment(
     except OSError:
         pass
 
-    # ffmpeg writes chunk00.mp4, chunk01.mp4, ...  Rename chunkNN ->
-    # chunk(NN+1) so operator-facing numbering is 1-based.  Walk
-    # highest-first to avoid clobbering.
-    produced = sorted(
-        rec_dir.glob(f"dive_{dive_stamp}_on_bottom_chunk*.mp4"),
-        key=lambda p: p.name,
-    )
-    # Filter to ones that match the 0-based pattern we just produced,
-    # in case a previous run left chunk01+ on disk.
+    # Match the 0-based chunks ffmpeg just wrote (chunk00, chunk01, ...),
+    # filtering out any chunk01+ a previous run may have left on disk.
     zero_based_re = re.compile(
         r"^dive_" + re.escape(dive_stamp) + r"_on_bottom_chunk(\d{2})\.mp4$"
     )
-    matched: list[tuple[int, Path]] = []
-    for p in produced:
+    produced: list[tuple[int, Path]] = []
+    for p in rec_dir.glob(f"dive_{dive_stamp}_on_bottom_chunk*.mp4"):
         m = zero_based_re.match(p.name)
         if m:
-            matched.append((int(m.group(1)), p))
-    matched.sort(key=lambda t: t[0], reverse=True)
-    renamed: list[Path] = []
-    for idx0, p in matched:
-        new_idx = idx0 + 1
-        new_path = rec_dir / (
-            f"dive_{dive_stamp}_on_bottom_chunk{new_idx:02d}.mp4"
-        )
+            produced.append((int(m.group(1)), p))
+    produced.sort(key=lambda t: t[0])
+
+    # Re-segmented chunks don't align to .ts fragment boundaries, so
+    # derive each chunk's start by walking actual durations forward from
+    # when bottom footage began (the earliest fragment's open-stamp).
+    staging_start = _group_start_stamp(files)
+    start_dt: datetime | None = None
+    if staging_start:
         try:
-            p.rename(new_path)
-            renamed.append(new_path)
-        except OSError as e:
-            logger.warning(
-                "FINALIZE could not rename %s -> %s: %s", p, new_path, e,
+            start_dt = datetime.strptime(staging_start, _START_FMT).replace(
+                tzinfo=timezone.utc,
             )
-            renamed.append(p)
-    renamed.sort(key=lambda p: p.name)
+        except ValueError:
+            start_dt = None
+
+    chunk_entries: list[dict] = []
+    renamed: list[Path] = []
+    if start_dt is not None:
+        # Timestamped names: <chunkstart>_on_bottom.mp4, where chunkstart
+        # = footage start + cumulative duration of preceding chunks.
+        cumulative = 0.0
+        for idx, (_idx0, p) in enumerate(produced, start=1):
+            dur = await _ffprobe_duration_s(p)
+            stamp = (start_dt + timedelta(seconds=cumulative)).strftime(
+                _START_FMT,
+            )
+            new_path = rec_dir / f"{stamp}_on_bottom.mp4"
+            try:
+                p.rename(new_path)
+            except OSError as e:
+                logger.warning(
+                    "FINALIZE could not rename %s -> %s: %s", p, new_path, e,
+                )
+                new_path = p
+            renamed.append(new_path)
+            out_bytes = new_path.stat().st_size if new_path.exists() else 0
+            chunk_entries.append({
+                "phase": "on_bottom",
+                "kind": "chunk",
+                "index": idx,
+                "rec_start": stamp,
+                "output": str(new_path),
+                "output_bytes": out_bytes,
+                "output_duration_s": dur,
+                "success": True,
+                "message": "ok",
+            })
+            # Assume the configured segment length on a probe failure so
+            # the next chunk's start still advances (avoids a collision).
+            cumulative += dur if dur is not None else 300.0
+    else:
+        # Legacy fallback (pre open-stamp .ts): 1-based chunkNN names.
+        # Rename highest-first to avoid clobbering as chunkNN ->
+        # chunk(NN+1).
+        for idx0, p in sorted(produced, key=lambda t: t[0], reverse=True):
+            new_path = rec_dir / (
+                f"dive_{dive_stamp}_on_bottom_chunk{idx0 + 1:02d}.mp4"
+            )
+            try:
+                p.rename(new_path)
+                renamed.append(new_path)
+            except OSError as e:
+                logger.warning(
+                    "FINALIZE could not rename %s -> %s: %s", p, new_path, e,
+                )
+                renamed.append(p)
+        renamed.sort(key=lambda p: p.name)
+        for idx, out_path in enumerate(renamed, start=1):
+            out_bytes = out_path.stat().st_size if out_path.exists() else 0
+            dur = await _ffprobe_duration_s(out_path)
+            chunk_entries.append({
+                "phase": "on_bottom",
+                "kind": "chunk",
+                "index": idx,
+                "output": str(out_path),
+                "output_bytes": out_bytes,
+                "output_duration_s": dur,
+                "success": True,
+                "message": "ok",
+            })
 
     # All chunks landed; safe to drop the source .ts files.
     removed = 0
@@ -446,21 +544,6 @@ async def _finalize_continuous_resegment(
         except OSError:
             pass
     summary["inputs_deleted"] = removed
-
-    chunk_entries: list[dict] = []
-    for idx, out_path in enumerate(renamed, start=1):
-        out_bytes = out_path.stat().st_size if out_path.exists() else 0
-        dur = await _ffprobe_duration_s(out_path)
-        chunk_entries.append({
-            "phase": "on_bottom",
-            "kind": "chunk",
-            "index": idx,
-            "output": str(out_path),
-            "output_bytes": out_bytes,
-            "output_duration_s": dur,
-            "success": True,
-            "message": "ok",
-        })
 
     summary["outputs"] = [str(p) for p in renamed]
     summary["success"] = True
@@ -534,9 +617,13 @@ async def _finalize_interval_by_cyc(
     # counter is monotonic).
     for idx, cyc_key in enumerate(sorted(by_cyc.keys()), start=1):
         group = by_cyc[cyc_key]
-        out_path = rec_dir / (
-            f"dive_{dive_stamp}_on_bottom_video{idx:02d}.mp4"
-        )
+        # Name from when this cycle's footage actually started; fall back
+        # to the chronological 1-based index for legacy untagged .ts.
+        recstart = _group_start_stamp(group)
+        if recstart:
+            out_path = rec_dir / f"{recstart}_on_bottom.mp4"
+        else:
+            out_path = rec_dir / f"dive_{dive_stamp}_on_bottom_video{idx:02d}.mp4"
         src_bytes = sum((f.stat().st_size for f in group if f.exists()), 0)
         logger.info(
             "FINALIZE on_bottom video %02d (cyc=%s, inputs=%d, %d B) -> %s",
@@ -548,6 +635,7 @@ async def _finalize_interval_by_cyc(
             "kind": "cycle",
             "index": idx,
             "cyc": cyc_key,
+            "rec_start": recstart,
             "input_count": len(group),
             "input_bytes": src_bytes,
             "inputs_deleted": 0,
@@ -758,7 +846,13 @@ async def finalize_dive(
             )
             continue
 
-        out_path = rec_dir / f"dive_{dive_stamp}_{phase}.mp4"
+        # Name from when this phase's footage actually started; fall back
+        # to the dive-stamped name for legacy untagged .ts.
+        recstart = _group_start_stamp(files)
+        if recstart:
+            out_path = rec_dir / f"{recstart}_{phase}.mp4"
+        else:
+            out_path = rec_dir / f"dive_{dive_stamp}_{phase}.mp4"
         source_bytes = sum((f.stat().st_size for f in files if f.exists()), 0)
         logger.info(
             "FINALIZE phase=%s inputs=%d source_bytes=%d -> %s",
@@ -768,6 +862,7 @@ async def finalize_dive(
         entry: dict = {
             "phase": phase,
             "kind": "single",
+            "rec_start": recstart,
             "input_count": len(files),
             "input_bytes": source_bytes,
             "inputs_deleted": 0,
