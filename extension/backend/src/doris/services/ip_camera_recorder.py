@@ -54,6 +54,7 @@ session.  Two distinct counters are embedded in the filename:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import re
@@ -234,12 +235,83 @@ def _build_pipeline_description(rtsp_url: str, segment_s: int) -> str:
         f"rtspsrc location={rtsp_url} protocols=tcp is-live=true latency=2000 "
         f"retry=5 timeout=5000000 do-retransmission=false "
         f"! rtph264depay "
-        f"! h264parse config-interval=-1 "
+        f"! h264parse name=h264parse config-interval=-1 "
         f"! video/x-h264,stream-format=byte-stream,alignment=au "
         f"! splitmuxsink name=muxsink max-size-time={seg_ns} "
         f"muxer-factory=mpegtsmux send-keyframe-requests=true "
         f"async-finalize=true"
     )
+
+
+def _caps_to_dict(caps) -> dict | None:
+    """Flatten the negotiated H.264 caps into a small JSON-able dict.
+
+    Returns ``None`` if caps are absent/empty.  Best-effort: any GI
+    quirk just drops the offending field rather than raising into the
+    streaming thread.
+    """
+    try:
+        if caps is None or caps.get_size() == 0:
+            return None
+        s = caps.get_structure(0)
+        out: dict = {"name": s.get_name()}
+        ok, w = s.get_int("width")
+        if ok:
+            out["width"] = w
+        ok, h = s.get_int("height")
+        if ok:
+            out["height"] = h
+        ok, num, den = s.get_fraction("framerate")
+        if ok and den:
+            out["framerate"] = round(num / den, 3)
+        for key in ("profile", "level", "stream-format", "alignment"):
+            val = s.get_string(key)
+            if val:
+                out[key] = val
+        return out
+    except Exception:
+        return None
+
+
+class _StreamLog:
+    """Append-only JSONL log of recorder stream + cadence events for one
+    dive.
+
+    Written next to the recordings (``<dive_dir>/stream_log.jsonl``) so
+    it survives the 12 MB ``doris.log`` rotation window and is trivially
+    parseable for interval-spacing analysis: ``session_start`` /
+    ``first_frame`` / ``fragment_open`` / ``pipeline_exit`` /
+    ``session_stop`` events each carry wall-clock + monotonic stamps, so
+    the true gap between clips (pause vs. reconnect latency) can be
+    reconstructed offline.
+
+    Thread-safe: events arrive from both the asyncio event loop and the
+    GStreamer streaming threads.  Strictly best-effort -- a write failure
+    is swallowed so logging can never disrupt recording.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._lock = threading.Lock()
+
+    def emit(self, event: str, **fields) -> None:
+        rec: dict = {
+            "ts": datetime.now(tz=timezone.utc).isoformat(),
+            "mono": round(time.monotonic(), 3),
+            "event": event,
+        }
+        rec.update(fields)
+        try:
+            line = json.dumps(rec, default=str)
+        except Exception:
+            return
+        try:
+            with self._lock, open(self._path, "a", encoding="utf-8") as fh:
+                fh.write(line + "\n")
+        except Exception:
+            logger.debug("STREAM log write failed (%s)", self._path, exc_info=True)
+        # Mirror to doris.log so a live tail shows the same timeline.
+        logger.info("STREAM %s %s", event, fields)
 
 
 class RecordingSession:
@@ -251,7 +323,8 @@ class RecordingSession:
                  storage_label: str, base_stamp: str,
                  phase: str = PHASE_DEFAULT,
                  initial_part: int = 0,
-                 cycle_seq: int = 0) -> None:
+                 cycle_seq: int = 0,
+                 stream_log: "_StreamLog | None" = None) -> None:
         self._rtsp_url = rtsp_url
         self._segment_s = segment_s
         self._out_dir = out_dir
@@ -291,6 +364,13 @@ class RecordingSession:
         # dive script can gate its record clock on real frames.
         self.session_started_at: float | None = None
         self.first_frame_at: float | None = None
+        # Per-dive structured stream/cadence log (best-effort, may be
+        # None).  ``frame_count`` accumulates across watchdog rebuilds
+        # within this cycle; ``stream_caps`` is the negotiated
+        # resolution/framerate/profile captured on the first buffer.
+        self._stream_log = stream_log
+        self.frame_count = 0
+        self.stream_caps: dict | None = None
         self.last_pattern: str | None = None
         self.last_exit: dict | None = None
         self.rotation_count = 0
@@ -321,6 +401,35 @@ class RecordingSession:
         # Kept in the API shape for back-compat with /rec/status consumers.
         return None
 
+    def _emit(self, event: str, **fields) -> None:
+        """Emit a stream-log event tagged with this session's part/cyc."""
+        sl = self._stream_log
+        if sl is not None:
+            sl.emit(event, part=self._current_part, cyc=self.cycle_seq, **fields)
+
+    def _on_h264_buffer(self, _pad, _info):
+        """Buffer probe on h264parse src; runs on the streaming thread.
+
+        Cheap on the steady-state path (just a counter bump).  On the
+        very first buffer it latches the precise first-frame time and the
+        negotiated caps (resolution / framerate / H.264 profile+level)
+        which are otherwise never recorded, and emits a ``first_frame``
+        event carrying the connect latency.
+        """
+        self.frame_count += 1
+        if self.first_frame_at is None:
+            self.first_frame_at = time.monotonic()
+            try:
+                self.stream_caps = _caps_to_dict(_pad.get_current_caps())
+            except Exception:
+                self.stream_caps = None
+            self._emit(
+                "first_frame",
+                latency_s=self.first_frame_latency_s(),
+                caps=self.stream_caps,
+            )
+        return Gst.PadProbeReturn.OK
+
     # Invoked by GStreamer on a streaming thread whenever splitmuxsink
     # opens a new fragment.  Must be fast and avoid blocking on anything
     # that needs the asyncio loop.  Reads ``current_phase`` at the
@@ -342,6 +451,10 @@ class RecordingSession:
             f"_part{self._current_part:02d}_{int(fragment_id):05d}.ts"
         )
         self.last_pattern = path
+        self._emit(
+            "fragment_open", fragment_id=int(fragment_id), phase=phase,
+            path=path,
+        )
         return path
 
     async def rotate_to_phase(
@@ -458,6 +571,16 @@ class RecordingSession:
             raise RuntimeError("splitmuxsink 'muxsink' not found in pipeline")
         muxsink.connect("format-location", self._on_format_location)
         self._muxsink = muxsink
+        # Buffer probe on h264parse's src pad: counts frames and captures
+        # first-frame timing + negotiated caps for the stream log.  Best-
+        # effort -- a missing element or pad must never fail the build.
+        try:
+            h264 = pipeline.get_by_name("h264parse")
+            srcpad = h264.get_static_pad("src") if h264 is not None else None
+            if srcpad is not None:
+                srcpad.add_probe(Gst.PadProbeType.BUFFER, self._on_h264_buffer)
+        except Exception:
+            logger.debug("RECORD failed to attach h264 buffer probe", exc_info=True)
         return pipeline
 
     async def _run_one(self) -> tuple[str, float]:
@@ -499,6 +622,8 @@ class RecordingSession:
             self._pipeline = None
             self._muxsink = None
             return "set_state_failure", asyncio.get_event_loop().time() - t0
+
+        self._emit("pipeline_playing")
 
         exit_reason = "unknown"
         try:
@@ -583,6 +708,11 @@ class RecordingSession:
                 "runtime_s": round(runtime_s, 2),
                 "pattern": self.last_pattern,
             }
+            self._emit(
+                "pipeline_exit", reason=exit_reason,
+                runtime_s=round(runtime_s, 2), frames=self.frame_count,
+                user_stop=self._user_stop.is_set(),
+            )
             if self._user_stop.is_set():
                 logger.info(
                     "RECORD pipeline part=%d exited reason=%s runtime=%.1fs (user stop)",
@@ -597,6 +727,7 @@ class RecordingSession:
                 backoff = _RESTART_BACKOFF_S
             else:
                 backoff = min(_MAX_BACKOFF_S, backoff * 1.5)
+            self._emit("pipeline_restart", backoff_s=round(backoff, 2))
             try:
                 await asyncio.wait_for(self._user_stop.wait(), timeout=backoff)
                 break
@@ -727,6 +858,10 @@ async def start_recording(
         # into one MP4 per cycle without any timing heuristic.
         _dive_cycle_seq += 1
         cycle_seq = _dive_cycle_seq
+        # One stream log per dive, colocated with the recordings and
+        # appended across every cycle so the whole interval cadence
+        # lands in a single parseable file.
+        stream_log = _StreamLog(out_dir / "stream_log.jsonl")
         sess = RecordingSession(
             rtsp_url=rtsp_url,
             segment_s=seg,
@@ -736,10 +871,16 @@ async def start_recording(
             phase=phase_label,
             initial_part=initial_part,
             cycle_seq=cycle_seq,
+            stream_log=stream_log,
         )
         sess.start()
         _session = sess
         _last_base_stamp = stamp
+        stream_log.emit(
+            "session_start", cyc=cycle_seq, phase=phase_label,
+            part0=initial_part, seg_s=seg, storage=storage,
+            rtsp_source=source_label, base_stamp=stamp,
+        )
         logger.info(
             "RECORD session started base=%s phase=%s cyc=%02d storage=%s "
             "rtsp=%s seg=%ds",
@@ -801,11 +942,18 @@ async def stop_recording() -> dict:
         # files this session just produced.
         _session_part_offset = sess._current_part + 1
         ff_latency = sess.first_frame_latency_s()
+        if sess._stream_log is not None:
+            sess._stream_log.emit(
+                "session_stop", cyc=sess.cycle_seq,
+                restarts=sess.restart_count, rotations=sess.rotation_count,
+                first_frame_latency_s=ff_latency, frames=sess.frame_count,
+                caps=sess.stream_caps, last_exit=sess.last_exit,
+            )
         logger.info(
             "RECORD stop completed; restarts=%d rotations=%d "
-            "first_frame_latency_s=%s last_exit=%s next_part_offset=%d",
+            "first_frame_latency_s=%s frames=%d last_exit=%s next_part_offset=%d",
             sess.restart_count, sess.rotation_count, ff_latency,
-            sess.last_exit, _session_part_offset,
+            sess.frame_count, sess.last_exit, _session_part_offset,
         )
         return {
             "success": True,
@@ -999,10 +1147,14 @@ async def recording_status() -> dict:
     # it lands in the first TCP segment the Lua reader pulls.
     frames_flowing = bool(sess.frames_flowing) if sess is not None else False
     ff_latency = sess.first_frame_latency_s() if sess is not None else None
+    frame_count = sess.frame_count if sess is not None else 0
+    stream_caps = sess.stream_caps if sess is not None else None
     return {
         "recording": alive,
         "frames_flowing": frames_flowing,
         "first_frame_latency_s": ff_latency,
+        "frame_count": frame_count,
+        "stream_caps": stream_caps,
         "base_stamp": base_stamp,
         "output_pattern": pattern,
         "phase": phase,
