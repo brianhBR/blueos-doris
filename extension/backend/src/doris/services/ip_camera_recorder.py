@@ -36,8 +36,11 @@ SPS+PPS+IDR into a single buffer so splitmuxsink can never split
 between the parameter sets and their keyframe.
 
 ``splitmuxsink`` produces multiple
-``radcam_<stamp>_<phase>_cyc<CC>_part<NN>_%05d.ts`` segments per
-session.  Two distinct counters are embedded in the filename:
+``radcam_<stamp>_<phase>_cyc<CC>_part<NN>_%05d_t<open>.ts`` segments
+per session.  ``<open>`` is the fragment's open wall-clock
+(UTC ``YYYYMMDDtHHMMSS``); finalize names each output MP4 from the
+earliest fragment's stamp in the group.  Two distinct counters are
+also embedded in the filename:
 
 * ``cyc<CC>`` increments **once per ``start_recording`` call** within
   one dive.  Every ``.ts`` file written by a single ipcam_start /
@@ -445,10 +448,18 @@ class RecordingSession:
         if self.first_frame_at is None:
             self.first_frame_at = time.monotonic()
         phase = self.current_phase
+        # Tag the fragment with its open wall-clock (UTC, YYYYMMDDtHHMMSS).
+        # For the first fragment of a recording this is the moment real
+        # frames started landing on disk (post-connect), so finalize can
+        # name the output MP4 from the earliest fragment's stamp instead
+        # of a synthetic index.  ``.ts`` is transient (deleted at
+        # finalize); only the MP4 carries this forward.
+        opened = datetime.now(tz=timezone.utc).strftime("%Y%m%dt%H%M%S")
         path = str(
             self._out_dir
             / f"radcam_{self.base_stamp}_{phase}_cyc{self.cycle_seq:02d}"
-            f"_part{self._current_part:02d}_{int(fragment_id):05d}.ts"
+            f"_part{self._current_part:02d}_{int(fragment_id):05d}"
+            f"_t{opened}.ts"
         )
         self.last_pattern = path
         self._emit(
