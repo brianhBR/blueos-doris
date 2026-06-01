@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import {
   Database, Calendar, Clock, MapPin, Camera, Image, FileText, Play,
-  Download, Trash2, AlertTriangle, Archive, Search, X
+  Download, Trash2, AlertTriangle, Archive, Search, X, Loader2
 } from 'lucide-vue-next'
 import { useDiveHistory } from '../composables/useApi'
 import { parseBackendDateTime } from '../parseBackendTime'
@@ -107,6 +107,44 @@ const selectedMission = ref<string | null>(null)
 const nameFilter = ref('')
 const dateSort = ref<'recent' | 'oldest'>('recent')
 const isDeleting = ref(false)
+
+// Per-dive CSV export state. The export parses the dive's .mcap, which can
+// take tens of seconds on the vehicle when no pre-generated copy exists, so
+// we fetch it explicitly and show a spinner instead of using a bare link.
+const exportingIds = ref<Set<string>>(new Set())
+const exportErrors = ref<Record<string, string>>({})
+
+async function handleExportCsv(mission: DisplayMission) {
+  if (exportingIds.value.has(mission.id)) return
+  exportingIds.value = new Set(exportingIds.value).add(mission.id)
+  if (exportErrors.value[mission.id]) {
+    const next = { ...exportErrors.value }
+    delete next[mission.id]
+    exportErrors.value = next
+  }
+  try {
+    const res = await fetch(scientificCsvHref(mission.id))
+    if (!res.ok) throw new Error(`HTTP ${res.status}`)
+    const blob = await res.blob()
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    a.href = url
+    a.download = `${mission.id}_dive_data.csv`
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+    URL.revokeObjectURL(url)
+  } catch (e) {
+    exportErrors.value = {
+      ...exportErrors.value,
+      [mission.id]: 'Export failed. Please try again.',
+    }
+  } finally {
+    const next = new Set(exportingIds.value)
+    next.delete(mission.id)
+    exportingIds.value = next
+  }
+}
 
 const filteredMissions = computed(() => {
   return previousMissions.value
@@ -326,15 +364,25 @@ const handleDeleteMission = async () => {
                 <Archive class="w-4 h-4 flex-shrink-0" />
                 No MCAP linked
               </span>
-              <a
-                :href="scientificCsvHref(mission.id)"
-                class="px-4 py-2 rounded-lg flex items-center justify-center gap-2 text-sm whitespace-nowrap transition-all hover:opacity-90 no-underline"
+              <button
+                type="button"
+                @click="handleExportCsv(mission)"
+                :disabled="exportingIds.has(mission.id)"
+                class="px-4 py-2 rounded-lg flex items-center justify-center gap-2 text-sm whitespace-nowrap transition-all hover:opacity-90 disabled:opacity-70 disabled:cursor-wait"
                 style="background-color: rgba(0, 212, 170, 0.2); border: 1px solid rgba(0, 212, 170, 0.5); color: #00D4AA"
-                :title="mission.mcapRelativePath ? 'Depth, temperature, GPS columns from recorder log where available' : 'Dive metadata and any samples we could read from the linked log'"
+                :title="exportingIds.has(mission.id) ? 'Reading the recorder log — long dives can take a minute' : (mission.mcapRelativePath ? 'Dive-data header plus per-timestamp system + science telemetry (depth, temperature, state, battery, relay, GPS) from the recorder log' : 'Dive metadata and any telemetry we could read from the linked log')"
               >
-                <Download class="w-4 h-4 flex-shrink-0" />
-                Export scientific CSV
-              </a>
+                <Loader2 v-if="exportingIds.has(mission.id)" class="w-4 h-4 flex-shrink-0 animate-spin" />
+                <Download v-else class="w-4 h-4 flex-shrink-0" />
+                {{ exportingIds.has(mission.id) ? 'Generating CSV…' : 'Export dive data (CSV)' }}
+              </button>
+              <span
+                v-if="exportErrors[mission.id]"
+                class="text-xs text-center"
+                style="color: #FF4757"
+              >
+                {{ exportErrors[mission.id] }}
+              </span>
               <button
                 type="button"
                 disabled

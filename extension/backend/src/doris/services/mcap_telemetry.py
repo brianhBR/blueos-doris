@@ -1,9 +1,15 @@
-"""Best-effort telemetry extraction from recorder .mcap files.
+"""Telemetry extraction from recorder .mcap files for the dive CSV export.
 
-DORIS Lua publishes mavlink NAMED_VALUE_FLOAT-style names such as MAX_DPTH, DEPTH,
-and MIN_TEMP. Messages may be wrapped in ROS/JSON/other encodings; we scan each
-record payload for those name patterns and little-endian floats that precede the
-10-byte MAVLink name field (uint32 time + float value + char[10] name).
+The BlueOS recorder stores each MAVLink message as a JSON record on its own
+topic, e.g. ``mavlink/1/1/NAMED_VALUE_FLOAT`` or ``mavlink/1/1/SCALED_PRESSURE``
+with a ``{"header": {...}, "message": {...}}`` payload.  We decode the subset
+of autopilot (system 1, component 1) messages that carry relevant system and
+science data and merge those asynchronous streams into fixed UTC time buckets
+so the export has one row per timestamp and one column per signal.
+
+DORIS-specific telemetry arrives as NAMED_VALUE_FLOAT bursts published by
+``backend/scripts/doris.lua`` (STATE, DEPTH, MAX_DPTH, MIN_TEMP, ...); standard
+ArduSub messages provide position, attitude, pressure and power.
 """
 
 from __future__ import annotations
@@ -12,7 +18,7 @@ import csv
 import io
 import json
 import math
-import struct
+import re
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -63,247 +69,589 @@ def map_dive_stem_to_largest_mcap(root: Path, windows: list[Any]) -> dict[str, P
     return {stem: p for stem, (_, p) in best.items()}
 
 
-def _pad_name_10(name: str) -> bytes:
-    b = name.encode("ascii", errors="ignore")[:10]
-    return b + b"\x00" * (10 - len(b))
+# ── column model ─────────────────────────────────────────────────────────────
+
+# DORIS NAMED_VALUE_FLOAT name -> CSV column (see update_telemetry in doris.lua).
+# The descent/ascent rate floats are intentionally omitted: vertical motion is
+# represented by the single signed vertical_velocity_mps column (VFR_HUD.climb).
+NAMED_FLOAT_COLUMNS: dict[str, str] = {
+    "STATE": "mission_state",
+    "MSN_TIME": "mission_time_s",
+    "BTM_TIME": "bottom_time_s",
+    "DEPTH": "depth_m",
+    "RELAY": "relay_active",
+    "BATT_V": "battery_voltage_v",
+}
+
+# NAMED_VALUE_FLOATs that are deliberately excluded from the export:
+#   * ArduSub manual-control pilot inputs (not relevant to a passive lander)
+#   * DORIS floats superseded by other columns -- MAX_DPTH (max depth is in the
+#     header only), DSC_RATE/ASC_RATE/ASC_VEL (replaced by vertical_velocity_mps)
+#     and BATT_PCT (dropped).
+# Everything else is captured dynamically (see _sensor_column).
+NAMED_FLOAT_DENYLIST: frozenset[str] = frozenset(
+    {
+        # ArduSub pilot inputs
+        "CamTilt",
+        "CamPan",
+        "TetherTrn",
+        "Lights1",
+        "Lights2",
+        "PilotGain",
+        "InputHold",
+        "RollPitch",
+        "RFTarget",
+        # DORIS floats intentionally not exported as time-series columns
+        "MAX_DPTH",
+        "DSC_RATE",
+        "ASC_RATE",
+        "ASC_VEL",
+        "BATT_PCT",
+        # MIN_TEMP is the internal baro min; environmental temperature comes
+        # from the external probe instead (see min_external_temperature_c).
+        "MIN_TEMP",
+    }
+)
+
+# Friendly column names for recognized sensor NAMED_VALUE_FLOATs (keyed by the
+# uppercased mavlink name).  Any other non-denylisted named float is still
+# captured dynamically under its own sanitized name, so new sensors added to
+# the MAVLink stream (e.g. a CO2/oxygen probe) appear in the CSV automatically
+# without a code change -- see _sensor_column().
+SENSOR_FLOAT_ALIASES: dict[str, str] = {
+    "COND": "conductivity",
+    "CONDUCT": "conductivity",
+    "SALINITY": "salinity",
+    "CO2": "co2",
+    "O2": "oxygen",
+    "OXY": "oxygen",
+    "OXYGEN": "oxygen",
+    "DOXY": "oxygen",
+}
 
 
-def _values_before_name(blob: bytes, name: str) -> list[float]:
-    """Extract float values immediately before a 10-byte MAVLink-style name field."""
-    needle = _pad_name_10(name)
-    if len(needle) != 10:
-        return []
-    vals: list[float] = []
-    start = 0
-    while True:
-        i = blob.find(needle, start)
-        if i < 0:
-            break
-        if i >= 4:
-            (v,) = struct.unpack_from("<f", blob, i - 4)
-            if math.isfinite(v):
-                vals.append(v)
-        start = i + 1
-    return vals
+def _sensor_column(name: str) -> str | None:
+    """Map an unknown NAMED_VALUE_FLOAT name to a CSV column.
+
+    Recognized sensors get a friendly alias; anything else is sanitized to a
+    lowercase snake-ish identifier so future named floats are captured as-is.
+    """
+    alias = SENSOR_FLOAT_ALIASES.get(name.upper())
+    if alias:
+        return alias
+    safe = re.sub(r"[^0-9a-z]+", "_", name.lower()).strip("_")
+    return safe or None
+
+# Inclusive sanity bounds; out-of-range samples are dropped so a corrupt or
+# sentinel value (e.g. 65535) never reaches the CSV.  Columns without an entry
+# (string columns) are passed through untouched.
+COLUMN_BOUNDS: dict[str, tuple[float, float]] = {
+    "mission_state": (-1.0, 4.0),
+    "mission_time_s": (0.0, 1.0e7),
+    "bottom_time_s": (0.0, 1.0e7),
+    "depth_m": (-10.0, 15_000.0),
+    "vertical_velocity_mps": (-50.0, 50.0),
+    "internal_pressure_hpa": (0.0, 20_000.0),
+    "internal_temperature_c": (-100.0, 150.0),
+    "external_pressure_hpa": (0.0, 20_000.0),
+    "external_temperature_c": (-100.0, 150.0),
+    "latitude": (-90.0, 90.0),
+    "longitude": (-180.0, 180.0),
+    "heading_trueN_degrees": (0.0, 360.0),
+    "ground_speed_mps": (-50.0, 50.0),
+    "gps_satellites": (0.0, 255.0),
+    "roll_deg": (-360.0, 360.0),
+    "pitch_deg": (-360.0, 360.0),
+    "yaw_deg": (-360.0, 360.0),
+    "relay_active": (0.0, 1.0),
+    "light_level_percent": (0.0, 100.0),
+    "battery_voltage_v": (0.0, 100.0),
+    "battery_current_a": (-1_000.0, 1_000.0),
+}
+
+# Ordered numeric/string signal columns stored per time bucket.
+SIGNAL_COLUMNS: list[str] = [
+    "mission_state",
+    "mission_time_s",
+    "bottom_time_s",
+    "depth_m",
+    "vertical_velocity_mps",
+    "internal_pressure_hpa",
+    "internal_temperature_c",
+    "external_pressure_hpa",
+    "external_temperature_c",
+    "latitude",
+    "longitude",
+    "heading_trueN_degrees",
+    "ground_speed_mps",
+    "gps_fix_type",
+    "gps_satellites",
+    "roll_deg",
+    "pitch_deg",
+    "yaw_deg",
+    "relay_active",
+    "light_level_percent",
+    "battery_voltage_v",
+    "battery_current_a",
+]
+
+# Columns produced by the fixed extractors; anything else a message yields is a
+# dynamically-discovered sensor column (appended after these in the CSV).
+_KNOWN_COLUMNS: frozenset[str] = frozenset(SIGNAL_COLUMNS)
+
+# CSV header labels with units fully spelled out.  Internal logic keeps the
+# short keys above; this map is applied only when writing the time-series
+# header row.  Columns not listed (e.g. dynamically-discovered sensors) fall
+# back to their raw name.
+COLUMN_DISPLAY_NAMES: dict[str, str] = {
+    "mission_time_s": "mission_time_seconds",
+    "bottom_time_s": "bottom_time_seconds",
+    "depth_m": "depth_meters",
+    "vertical_velocity_mps": "vertical_velocity_meters_per_second",
+    "internal_pressure_hpa": "internal_pressure_hectopascals",
+    "internal_temperature_c": "internal_temperature_celsius",
+    "external_pressure_hpa": "external_pressure_hectopascals",
+    "external_temperature_c": "external_temperature_celsius",
+    "latitude": "latitude_degrees",
+    "longitude": "longitude_degrees",
+    "ground_speed_mps": "ground_speed_meters_per_second",
+    "roll_deg": "roll_degrees",
+    "pitch_deg": "pitch_degrees",
+    "yaw_deg": "yaw_degrees",
+    "battery_voltage_v": "battery_voltage_volts",
+    "battery_current_a": "battery_current_amperes",
+}
+
+# DORIS_STATE numeric -> human label (mirrors STATE_* constants in doris.lua).
+STATE_LABELS: dict[int, str] = {
+    -1: "CONFIG",
+    0: "MISSION_START",
+    1: "DESCENT",
+    2: "ON_BOTTOM",
+    3: "ASCENT",
+    4: "RECOVERY",
+}
+
+_RAD_TO_DEG = 180.0 / math.pi
+# Bucket asynchronous streams into 1-second rows keyed by recorder UTC time.
+BUCKET_NS = 1_000_000_000
 
 
-def _scan_named_floats(blob: bytes) -> dict[str, list[float]]:
-    out: dict[str, list[float]] = {}
-    for name in ("MAX_DPTH", "DEPTH", "MIN_TEMP", "TEMP"):
-        vs = _values_before_name(blob, name)
-        if vs:
-            out[name] = vs
+def _f(value: Any) -> float | None:
+    try:
+        out = float(value)
+    except (TypeError, ValueError):
+        return None
+    return out if math.isfinite(out) else None
+
+
+# Lights are commanded over the ArduSub default lights PWM range (1100-1900 us,
+# off..full); express the level as 0-100% of that span (values are clamped).
+_LIGHT_PWM_MIN = 1100.0
+_LIGHT_PWM_MAX = 1900.0
+
+
+def _pwm_to_percent(us: float) -> float:
+    pct = (us - _LIGHT_PWM_MIN) / (_LIGHT_PWM_MAX - _LIGHT_PWM_MIN) * 100.0
+    return round(max(0.0, min(100.0, pct)), 1)
+
+
+def _extract_message(msg_type: str, m: dict[str, Any]) -> dict[str, float | str]:
+    """Map one decoded MAVLink message to {column: value} signal pairs."""
+    out: dict[str, float | str] = {}
+    if msg_type == "NAMED_VALUE_FLOAT":
+        name = str(m.get("name", "")).replace("\x00", "").strip()
+        v = _f(m.get("value"))
+        if name and v is not None:
+            if name in NAMED_FLOAT_COLUMNS:
+                out[NAMED_FLOAT_COLUMNS[name]] = v
+            elif name not in NAMED_FLOAT_DENYLIST:
+                col = _sensor_column(name)
+                if col is not None:
+                    out[col] = v
+    elif msg_type == "SCALED_PRESSURE":
+        # Pressure 1: internal barometer inside the sealed housing.
+        pa = _f(m.get("press_abs"))
+        if pa is not None:
+            out["internal_pressure_hpa"] = pa
+        t = _f(m.get("temperature"))
+        if t is not None:
+            out["internal_temperature_c"] = t / 100.0
+    elif msg_type == "SCALED_PRESSURE2":
+        # Pressure 2: external pressure sensor.  Its on-board temperature
+        # duplicates the dedicated external probe below, so only pressure is
+        # kept here.
+        pa = _f(m.get("press_abs"))
+        if pa is not None:
+            out["external_pressure_hpa"] = pa
+    elif msg_type == "SCALED_PRESSURE3":
+        # Pressure 3: dedicated external temperature probe (press_abs unused).
+        t = _f(m.get("temperature"))
+        if t is not None:
+            out["external_temperature_c"] = t / 100.0
+    elif msg_type == "GLOBAL_POSITION_INT":
+        lat = _f(m.get("lat"))
+        lon = _f(m.get("lon"))
+        if lat is not None:
+            out["latitude"] = lat / 1.0e7
+        if lon is not None:
+            out["longitude"] = lon / 1.0e7
+        hdg = _f(m.get("hdg"))
+        if hdg is not None and hdg != 65535:
+            # EKF yaw (GLOBAL_POSITION_INT.hdg).  ArduPilot applies the
+            # magnetic declination (COMPASS_DEC, auto-set via COMPASS_AUTODEC)
+            # so this is referenced to TRUE north, not magnetic.
+            out["heading_trueN_degrees"] = hdg / 100.0
+    elif msg_type == "GPS_RAW_INT":
+        sats = _f(m.get("satellites_visible"))
+        if sats is not None and sats != 255:
+            out["gps_satellites"] = sats
+        # GPS course-over-ground (cog) is intentionally not exported: it is
+        # only meaningful for horizontal surface travel and reads 0 for a
+        # vertical profiler.  Heading comes from the compass-aided
+        # GLOBAL_POSITION_INT.hdg -> mag_heading_deg instead.
+        fix = m.get("fix_type")
+        if isinstance(fix, dict):
+            fix = fix.get("type")
+        if isinstance(fix, str):
+            out["gps_fix_type"] = fix.replace("GPS_FIX_TYPE_", "")
+    elif msg_type == "VFR_HUD":
+        climb = _f(m.get("climb"))
+        if climb is not None:
+            # Single signed vertical-velocity signal: positive = up (ascending),
+            # negative = down (descending).
+            out["vertical_velocity_mps"] = climb
+        gs = _f(m.get("groundspeed"))
+        if gs is not None:
+            out["ground_speed_mps"] = gs
+    elif msg_type == "ATTITUDE":
+        for key, col in (("roll", "roll_deg"), ("pitch", "pitch_deg"), ("yaw", "yaw_deg")):
+            rad = _f(m.get(key))
+            if rad is not None:
+                out[col] = rad * _RAD_TO_DEG
+    elif msg_type == "BATTERY_STATUS":
+        volts = m.get("voltages")
+        if isinstance(volts, list) and volts:
+            mv = _f(volts[0])
+            if mv is not None and mv != 65535:
+                out["battery_voltage_v"] = mv / 1000.0
+        cur = _f(m.get("current_battery"))
+        if cur is not None and cur >= 0:
+            out["battery_current_a"] = cur / 100.0
+    elif msg_type == "RC_CHANNELS":
+        # ArduSub Lights 1 is on RC input channel 9.  Map the PWM (us) to a
+        # 0-100% light level.  0 / 65535 mean "channel not available".
+        raw = _f(m.get("chan9_raw"))
+        if raw is not None and raw > 0 and raw != 65535:
+            out["light_level_percent"] = _pwm_to_percent(raw)
     return out
 
 
-def _try_json_coords(blob: bytes) -> tuple[float | None, float | None]:
-    """If payload is JSON, try to read latitude/longitude-like keys."""
-    try:
-        t = blob.decode("utf-8", errors="strict")
-    except UnicodeDecodeError:
-        return None, None
-    t = t.strip()
-    if not t or t[0] not in "{[":
-        return None, None
-    try:
-        obj = json.loads(t)
-    except json.JSONDecodeError:
-        return None, None
-
-    def walk(o: Any) -> tuple[float | None, float | None]:
-        if isinstance(o, dict):
-            lat = o.get("latitude", o.get("lat"))
-            lon = o.get("longitude", o.get("lon", o.get("lng")))
-            try:
-                if lat is not None and lon is not None:
-                    return float(lat), float(lon)
-            except (TypeError, ValueError):
-                pass
-            for v in o.values():
-                la, lo = walk(v)
-                if la is not None and lo is not None:
-                    return la, lo
-        elif isinstance(o, list):
-            for it in o:
-                la, lo = walk(it)
-                if la is not None and lo is not None:
-                    return la, lo
-        return None, None
-
-    return walk(obj)
+# Message types we decode (component 1, the autopilot).  NAMED_VALUE_FLOAT is
+# matched specially since DORIS publishes its science/system signals there.
+_DECODED_TYPES = frozenset(
+    {
+        "NAMED_VALUE_FLOAT",
+        "SCALED_PRESSURE",
+        "SCALED_PRESSURE2",
+        "SCALED_PRESSURE3",
+        "GLOBAL_POSITION_INT",
+        "GPS_RAW_INT",
+        "VFR_HUD",
+        "ATTITUDE",
+        "BATTERY_STATUS",
+        "RC_CHANNELS",
+    }
+)
 
 
 @dataclass
-class TelemetrySample:
+class TelemetryFrame:
+    """One reassembled time bucket: a UTC timestamp + the latest signals in it."""
+
     log_time_ns: int
-    depth_m: float | None = None
-    temperature_c: float | None = None
-    lat: float | None = None
-    lon: float | None = None
+    values: dict[str, float | str] = field(default_factory=dict)
 
 
 @dataclass
 class McapSummary:
-    """Aggregates used for dive history and CSV export."""
+    """Aggregates + per-bucket frames used for dive history and CSV export."""
 
     max_depth_m: float | None = None
-    log_max_depth_m: float | None = None
-    min_temperature_c: float | None = None
-    samples: list[TelemetrySample] = field(default_factory=list)
+    min_external_temperature_c: float | None = None
+    min_battery_voltage_v: float | None = None
+    max_satellites: int | None = None
+    frames: list[TelemetryFrame] = field(default_factory=list)
     last_lat: float | None = None
     last_lon: float | None = None
     messages_seen: int = 0
+    # Magnetic declination the autopilot applied to derive true heading
+    # (COMPASS_DEC, converted to degrees) and whether it was auto-set
+    # (COMPASS_AUTODEC).  Read from the PARAM_VALUE stream.
+    compass_declination_deg: float | None = None
+    compass_autodec: int | None = None
+    # Dynamically-discovered sensor columns (e.g. conductivity, co2, oxygen)
+    # that aren't part of the fixed column set, sorted for stable output.
+    extra_columns: list[str] = field(default_factory=list)
 
 
-_MAX_MESSAGES = 400_000
+# Cap parsed (decoded) messages so a pathologically long recording can't stall
+# the request path; 2M decoded messages already covers a multi-hour dive.
+_MAX_DECODED = 2_000_000
 
 
 def summarize_mcap(path: Path) -> McapSummary:
-    """Parse one .mcap file; tolerates missing or non-mavlink data."""
+    """Parse one .mcap file into time-bucketed telemetry frames.
+
+    Tolerant of missing or unexpected data: anything that fails to decode is
+    skipped and an empty summary is returned on a hard read error.
+    """
     summary = McapSummary()
-    max_depth = 0.0
-    max_d_max = 0.0
-    has_depth = False
-    has_max_d = False
-    min_temp: float | None = None
-    lat: float | None = None
-    lon: float | None = None
+    # bucket_ns -> {column: (value, log_time_ns)} keeping the latest sample.
+    buckets: dict[int, dict[str, tuple[float | str, int]]] = {}
+    dynamic_cols: set[str] = set()
+    decoded = 0
 
     try:
         with path.open("rb") as f:
             reader = make_reader(f)
-            for _schema, _channel, message in reader.iter_messages():
+            for _schema, channel, message in reader.iter_messages():
                 summary.messages_seen += 1
-                if summary.messages_seen > _MAX_MESSAGES:
-                    break
-                blob = message.data
-                if not blob:
+                topic = channel.topic
+                # Autopilot messages only (system 1, component 1).
+                if not topic.startswith("mavlink/1/1/"):
                     continue
+                msg_type = topic.rsplit("/", 1)[-1]
+                if msg_type == "PARAM_VALUE":
+                    try:
+                        pm = json.loads(message.data)
+                    except (json.JSONDecodeError, UnicodeDecodeError):
+                        continue
+                    pmsg = pm.get("message") if isinstance(pm, dict) else None
+                    if isinstance(pmsg, dict):
+                        _extract_param(summary, pmsg)
+                    continue
+                if msg_type not in _DECODED_TYPES:
+                    continue
+                decoded += 1
+                if decoded > _MAX_DECODED:
+                    break
+                try:
+                    payload = json.loads(message.data)
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                m = payload.get("message") if isinstance(payload, dict) else None
+                if not isinstance(m, dict):
+                    continue
+                signals = _extract_message(msg_type, m)
+                if not signals:
+                    continue
+
                 lt = int(message.log_time)
-                nf = _scan_named_floats(blob)
-                row = TelemetrySample(log_time_ns=lt)
-                if "DEPTH" in nf:
-                    v = nf["DEPTH"][-1]
-                    if math.isfinite(v) and 0 <= v < 15_000:
-                        row.depth_m = v
-                        max_depth = max(max_depth, v)
-                        has_depth = True
-                if "MAX_DPTH" in nf:
-                    v = nf["MAX_DPTH"][-1]
-                    if math.isfinite(v) and 0 <= v < 15_000:
-                        row.depth_m = row.depth_m or v
-                        max_d_max = max(max_d_max, v)
-                        has_max_d = True
-                if "MIN_TEMP" in nf:
-                    v = nf["MIN_TEMP"][-1]
-                    if math.isfinite(v) and -100 < v < 60:
-                        row.temperature_c = v
-                        min_temp = v if min_temp is None else min(min_temp, v)
-                elif "TEMP" in nf:
-                    v = nf["TEMP"][-1]
-                    if math.isfinite(v) and -100 < v < 60:
-                        row.temperature_c = v
-                        min_temp = v if min_temp is None else min(min_temp, v)
-
-                jlat, jlon = _try_json_coords(blob)
-                if jlat is not None and jlon is not None:
-                    row.lat, row.lon = jlat, jlon
-                    lat, lon = jlat, jlon
-
-                if (
-                    row.depth_m is not None
-                    or row.temperature_c is not None
-                    or (row.lat is not None and row.lon is not None)
-                ):
-                    summary.samples.append(row)
-
+                bkey = lt // BUCKET_NS
+                slot = buckets.setdefault(bkey, {})
+                for col, val in signals.items():
+                    bounds = COLUMN_BOUNDS.get(col)
+                    if bounds is not None and (
+                        not isinstance(val, (int, float)) or not (bounds[0] <= val <= bounds[1])
+                    ):
+                        continue
+                    prev = slot.get(col)
+                    if prev is None or lt >= prev[1]:
+                        slot[col] = (val, lt)
+                    if col not in _KNOWN_COLUMNS:
+                        dynamic_cols.add(col)
+                    _update_aggregates(summary, col, val)
     except Exception:
         return McapSummary()
 
-    if has_max_d:
-        summary.log_max_depth_m = max_d_max
-    if has_depth:
-        summary.max_depth_m = max_depth
-    if has_max_d and has_depth:
-        summary.max_depth_m = max(max_depth, max_d_max)
-    elif has_max_d and not has_depth:
-        summary.max_depth_m = max_d_max
-    summary.min_temperature_c = min_temp
-    summary.last_lat = lat
-    summary.last_lon = lon
+    summary.extra_columns = sorted(dynamic_cols)
+    for bkey in sorted(buckets):
+        slot = buckets[bkey]
+        frame = TelemetryFrame(log_time_ns=bkey * BUCKET_NS)
+        for col, (val, _ts) in slot.items():
+            frame.values[col] = val
+        summary.frames.append(frame)
     return summary
 
 
+def _update_aggregates(summary: McapSummary, col: str, val: float | str) -> None:
+    if not isinstance(val, (int, float)):
+        return
+    if col == "depth_m":
+        summary.max_depth_m = val if summary.max_depth_m is None else max(summary.max_depth_m, val)
+    elif col == "external_temperature_c":
+        summary.min_external_temperature_c = (
+            val
+            if summary.min_external_temperature_c is None
+            else min(summary.min_external_temperature_c, val)
+        )
+    elif col == "battery_voltage_v" and val > 1.0:
+        summary.min_battery_voltage_v = (
+            val if summary.min_battery_voltage_v is None else min(summary.min_battery_voltage_v, val)
+        )
+    elif col == "gps_satellites":
+        iv = int(val)
+        summary.max_satellites = iv if summary.max_satellites is None else max(summary.max_satellites, iv)
+    elif col == "latitude":
+        summary.last_lat = val
+    elif col == "longitude":
+        summary.last_lon = val
+
+
+def _extract_param(summary: McapSummary, m: dict[str, Any]) -> None:
+    """Capture compass declination params from a PARAM_VALUE message.
+
+    ArduPilot derives ``heading_trueN_degrees`` (GLOBAL_POSITION_INT.hdg, the
+    EKF yaw) referenced to true north by applying ``COMPASS_DEC``.  We surface
+    the declination it used (and whether it was auto-set) in the CSV header.
+    """
+    pid = str(m.get("param_id", "")).replace("\x00", "").strip()
+    if pid == "COMPASS_DEC":
+        rad = _f(m.get("param_value"))
+        if rad is not None:
+            summary.compass_declination_deg = round(math.degrees(rad), 3)
+    elif pid == "COMPASS_AUTODEC":
+        v = _f(m.get("param_value"))
+        if v is not None:
+            summary.compass_autodec = int(v)
+
+
+# ── CSV export ─────────────────────────────────────────────────────────────
+
+
 def _ns_to_utc_iso(ns: int) -> str:
-    sec = ns / 1e9
-    dt = datetime.fromtimestamp(sec, tz=timezone.utc)
-    return dt.isoformat()
+    # No timezone offset: every timestamp in this file is UTC (the column is
+    # named timestamp_utc), so a trailing "+00:00" is just noise.
+    return datetime.fromtimestamp(ns / 1e9, tz=timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
 
 
-def build_scientific_csv(
+def _strip_utc_offset(value: Any) -> str:
+    """Drop a trailing UTC offset / 'Z' from an ISO timestamp for display.
+
+    Header timestamps are already labeled ``*_utc``; the offset is redundant.
+    """
+    s = str(value or "")
+    if s.endswith("+00:00"):
+        return s[:-6]
+    if s.endswith("Z"):
+        return s[:-1]
+    return s
+
+
+def _to_float(value: Any) -> float | None:
+    return _f(value)
+
+
+def _cell(value: float | str | None) -> str:
+    if value is None or value == "":
+        return ""
+    if isinstance(value, str):
+        return value
+    return f"{value:g}"
+
+
+# gps_fix_type values (GPS_FIX_TYPE_* prefix already stripped) that mean the
+# receiver has no horizontal position lock, so any latitude/longitude in that
+# bucket is stale and must not be reported as a real coordinate.
+_NO_FIX_LABELS: frozenset[str] = frozenset({"NO_GPS", "NO_FIX"})
+
+
+def _has_no_gps_fix(frame_values: dict[str, float | str]) -> bool:
+    fix = frame_values.get("gps_fix_type")
+    return isinstance(fix, str) and fix in _NO_FIX_LABELS
+
+
+def _duration_label(started: str | None, ended: str | None) -> str:
+    """H:MM:SS between two ISO-8601 timestamps, or '' if unavailable."""
+    if not started or not ended:
+        return ""
+    try:
+        a = datetime.fromisoformat(str(started))
+        b = datetime.fromisoformat(str(ended))
+    except ValueError:
+        return ""
+    secs = int((b - a).total_seconds())
+    if secs < 0:
+        return ""
+    h, rem = divmod(secs, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}"
+
+
+def build_dive_csv(
     dive_record: dict[str, Any],
     summary: McapSummary,
     mcap_rel: str | None,
 ) -> str:
-    """Build CSV text: metadata rows then time series."""
-    start_lat = dive_record.get("latitude")
-    start_lon = dive_record.get("longitude")
-    try:
-        s_lat = float(start_lat) if start_lat is not None else None
-    except (TypeError, ValueError):
-        s_lat = None
-    try:
-        s_lon = float(start_lon) if start_lon is not None else None
-    except (TypeError, ValueError):
-        s_lon = None
+    """Build the dive CSV: a dive-data header section then per-second telemetry.
 
-    # Ending GPS: last position seen in the log (not duplicated from start if unknown).
+    Section 1 (DIVE DATA): key/value metadata from the dive record plus
+    aggregates computed from the linked .mcap.  Section 2 (TIME SERIES): one row
+    per 1-second UTC bucket covering system data (state, relay, battery,
+    attitude, rates) and science data (depth, temperature, pressure, GPS).
+    """
+    s_lat = _to_float(dive_record.get("latitude"))
+    s_lon = _to_float(dive_record.get("longitude"))
     end_lat = summary.last_lat
     end_lon = summary.last_lon
-
     started = dive_record.get("started_at")
     ended = dive_record.get("ended_at")
     dive_name = str(dive_record.get("dive_name") or "").strip()
 
     buf = io.StringIO()
-    w = csv.writer(buf)
-    w.writerow(["doris_scientific_export", "v1"])
+    # Pin the row terminator to a single "\n"; csv's default "\r\n" turns into
+    # "\r\r\n" once written/served in text mode, which shows up as a blank row
+    # between every line in Excel.
+    w = csv.writer(buf, lineterminator="\n")
+
+    # ── Section 1: dive data ──
+    w.writerow(["# DIVE DATA"])
+    w.writerow(["doris_dive_export", "v2"])
     w.writerow(["dive_name", dive_name])
+    w.writerow(["user_name", str(dive_record.get("username") or "")])
+    w.writerow(["configuration", str(dive_record.get("configuration") or "")])
+    w.writerow(["status", str(dive_record.get("status") or "")])
+    w.writerow(["profile_id", str(dive_record.get("profile_id") or "")])
+    w.writerow(["started_at_utc", _strip_utc_offset(started)])
+    w.writerow(["ended_at_utc", _strip_utc_offset(ended)])
+    w.writerow(["duration", _duration_label(started, ended)])
+    w.writerow(["start_latitude", _cell(s_lat)])
+    w.writerow(["start_longitude", _cell(s_lon)])
+    w.writerow(["end_latitude", _cell(end_lat)])
+    w.writerow(["end_longitude", _cell(end_lon)])
+    w.writerow(["max_depth_from_log_meters", _cell(summary.max_depth_m)])
+    w.writerow(["min_external_temperature_celsius", _cell(summary.min_external_temperature_c)])
+    w.writerow(["min_battery_voltage_volts", _cell(summary.min_battery_voltage_v)])
+    w.writerow(["max_gps_satellites", _cell(summary.max_satellites)])
+    w.writerow(["compass_declination_degrees", _cell(summary.compass_declination_deg)])
+    w.writerow(["compass_autodec", _cell(summary.compass_autodec)])
     w.writerow(["mcap_file", mcap_rel or ""])
-    w.writerow(["started_at_utc", str(started or "")])
-    w.writerow(["ended_at_utc", str(ended or "")])
-    w.writerow(["max_depth_from_log_m", summary.max_depth_m if summary.max_depth_m is not None else ""])
-    w.writerow(["min_temperature_from_log_c", summary.min_temperature_c if summary.min_temperature_c is not None else ""])
-    w.writerow(["start_latitude", s_lat if s_lat is not None else ""])
-    w.writerow(["start_longitude", s_lon if s_lon is not None else ""])
-    w.writerow(["end_latitude", end_lat if end_lat is not None else ""])
-    w.writerow(["end_longitude", end_lon if end_lon is not None else ""])
+    w.writerow(["telemetry_rows", str(len(summary.frames))])
     w.writerow([])
-    w.writerow(
-        [
-            "timestamp_utc",
-            "depth_m",
-            "temperature_c",
-            "latitude",
-            "longitude",
-            "dive_start_latitude",
-            "dive_start_longitude",
-            "dive_end_latitude",
-            "dive_end_longitude",
-        ]
-    )
-    for s in sorted(summary.samples, key=lambda x: x.log_time_ns):
-        w.writerow(
-            [
-                _ns_to_utc_iso(s.log_time_ns),
-                s.depth_m if s.depth_m is not None else "",
-                s.temperature_c if s.temperature_c is not None else "",
-                s.lat if s.lat is not None else "",
-                s.lon if s.lon is not None else "",
-                s_lat if s_lat is not None else "",
-                s_lon if s_lon is not None else "",
-                (end_lat if end_lat is not None else ""),
-                (end_lon if end_lon is not None else ""),
-            ]
-        )
+
+    # ── Section 2: per-second telemetry ──
+    # Fixed columns first, then any dynamically-discovered sensor columns
+    # (conductivity, co2, oxygen, ...) appended in stable sorted order.
+    data_columns = [c for c in SIGNAL_COLUMNS if c != "mission_state"]
+    data_columns += list(summary.extra_columns)
+    display_columns = [COLUMN_DISPLAY_NAMES.get(c, c) for c in data_columns]
+    w.writerow(["# TIME SERIES"])
+    w.writerow(["timestamp_utc", "mission_state_label", *display_columns])
+
+    for fr in summary.frames:
+        state_val = fr.values.get("mission_state")
+        label = ""
+        if isinstance(state_val, (int, float)):
+            label = STATE_LABELS.get(int(round(state_val)), "")
+        row: list[str] = [_ns_to_utc_iso(fr.log_time_ns), label]
+        # When the GPS has no fix, position is stale -> report "na" rather
+        # than a misleading last-known coordinate.
+        no_fix = _has_no_gps_fix(fr.values)
+        for col in data_columns:
+            if no_fix and col in ("latitude", "longitude"):
+                row.append("na")
+            else:
+                row.append(_cell(fr.values.get(col)))
+        w.writerow(row)
     return buf.getvalue()
