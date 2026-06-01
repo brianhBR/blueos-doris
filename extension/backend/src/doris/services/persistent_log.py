@@ -23,6 +23,45 @@ BACKUP_COUNT = 5  # keep 5 rotated files (10 MB total max)
 LOG_FORMAT = "%(asctime)s  %(levelname)-8s  %(name)s  %(message)s"
 LOG_DATEFMT = "%Y-%m-%d %H:%M:%S"
 
+# Third-party / framework loggers that emit high-volume DEBUG/INFO
+# records.  Most damagingly, robyn logs full HTTP response *bodies* at
+# DEBUG -- so downloading a log file dumps that file's own bytes straight
+# back into the log as a multi-MB single-line entry, which blows through
+# rotation and evicts the real dive/recorder history we actually need.
+# These are pinned to WARNING (and enforced by a handler filter below) so
+# DORIS's own ``doris.*`` loggers stay fully verbose while the framework
+# chatter is kept out of the persistent log.
+NOISY_LOGGER_PREFIXES = (
+    "robyn",
+    "httpcore",
+    "httpx",
+    "websockets",
+    "actix_files",
+)
+
+
+class _NoisyLoggerFilter(logging.Filter):
+    """Drop sub-WARNING records from known high-volume framework loggers.
+
+    Attached to the persistent file handler so verbose request/response
+    DEBUG (including robyn's full response-body dumps) never reaches the
+    rotating log regardless of how those loggers' levels are configured
+    elsewhere -- robyn reconfigures its own logging after startup, so a
+    plain ``setLevel`` is not enough on its own.  ``doris.*`` records and
+    anything at WARNING or above always pass through.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if record.levelno >= logging.WARNING:
+            return True
+        return not record.name.startswith(NOISY_LOGGER_PREFIXES)
+
+
+def _quiet_noisy_loggers() -> None:
+    """Pin the noisy framework loggers to WARNING (idempotent)."""
+    for name in NOISY_LOGGER_PREFIXES:
+        logging.getLogger(name).setLevel(logging.WARNING)
+
 DMESG_INTERVAL_S = 300  # capture dmesg every 5 minutes
 DMESG_KEYWORDS = (
     "usb",
@@ -51,6 +90,10 @@ def setup_persistent_logging(level: int = logging.DEBUG) -> Path:
     """
     LOG_DIR.mkdir(parents=True, exist_ok=True)
 
+    # Re-assert on every call so it survives the framework reconfiguring
+    # its loggers after startup.
+    _quiet_noisy_loggers()
+
     root = logging.getLogger()
 
     log_file = LOG_DIR / "doris.log"
@@ -66,6 +109,7 @@ def setup_persistent_logging(level: int = logging.DEBUG) -> Path:
     )
     file_handler.setLevel(level)
     file_handler.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+    file_handler.addFilter(_NoisyLoggerFilter())
     root.addHandler(file_handler)
 
     if root.level > level:
@@ -77,6 +121,7 @@ def setup_persistent_logging(level: int = logging.DEBUG) -> Path:
         console = logging.StreamHandler()
         console.setLevel(logging.INFO)
         console.setFormatter(logging.Formatter(LOG_FORMAT, datefmt=LOG_DATEFMT))
+        console.addFilter(_NoisyLoggerFilter())
         root.addHandler(console)
 
     logger.info("Persistent logging initialized -> %s", log_file)
