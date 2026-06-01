@@ -110,8 +110,8 @@ def test_export_writes_csv_to_usb(tmp_path: Path, monkeypatch) -> None:
     result = asyncio.run(dce.export_dive_csv_to_usb(dive_file))
 
     assert result["status"] == "ok"
-    # Named by dive start time then dive name (matches video file stamp format).
-    out = usb / "20260528_165058_reef_survey_dive_data.csv"
+    # Named by dive start time (YYYYMMDDtHHMMSS) then dive name.
+    out = usb / "20260528t165058_reef_survey_dive_data.csv"
     assert out.is_file()
     assert result["file"] == str(out)
     assert result["rows"] == 2
@@ -164,7 +164,7 @@ def test_export_without_mcap_still_writes_header(tmp_path: Path, monkeypatch) ->
 
     assert result["status"] == "ok"
     assert result["rows"] == 0
-    out = usb / "20260528_165058_reef_survey_dive_data.csv"
+    out = usb / "20260528t165058_reef_survey_dive_data.csv"
     assert out.is_file()
     assert "# DIVE DATA" in out.read_text(encoding="utf-8")
 
