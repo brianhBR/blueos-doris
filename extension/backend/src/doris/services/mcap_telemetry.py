@@ -629,11 +629,13 @@ def _filename_slug(value: str) -> str:
 
 
 def dive_csv_filename(dive_record: dict[str, Any], dive_id: str) -> str:
-    """Download/USB name: ``<YYYYMMDD_HHMMSS>_<dive_name>_dive_data.csv``.
+    """Download/USB name: ``<YYYYMMDDtHHMMSS>_<dive_name>_dive_data.csv``.
 
     Leads with the dive's start timestamp (UTC) so exports sort
-    chronologically, followed by the slugified dive name.  The timestamp
-    falls back to the dive id stem when the start time is missing/unparseable,
+    chronologically, followed by the slugified dive name.  The timestamp uses
+    the same ``YYYYMMDDtHHMMSS`` form as the finalized MP4 names
+    (``dive_finalize._START_FMT``) so video and CSV exports stay consistent.
+    Falls back to the dive id stem when the start time is missing/unparseable,
     and the dive-name segment is omitted when there is no name.
     """
     started = dive_record.get("started_at")
@@ -646,7 +648,7 @@ def dive_csv_filename(dive_record: dict[str, Any], dive_id: str) -> str:
         if dt is not None:
             if dt.tzinfo is None:
                 dt = dt.replace(tzinfo=timezone.utc)
-            stamp = dt.astimezone(timezone.utc).strftime("%Y%m%d_%H%M%S")
+            stamp = dt.astimezone(timezone.utc).strftime("%Y%m%dt%H%M%S")
     parts = [stamp or dive_id]
     name = _filename_slug(str(dive_record.get("dive_name") or ""))
     if name:

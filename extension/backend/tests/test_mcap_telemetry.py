@@ -375,18 +375,18 @@ def test_value_precision_rounding() -> None:
 def test_dive_csv_filename() -> None:
     from doris.services.mcap_telemetry import dive_csv_filename
 
-    # Start time (UTC, YYYYMMDD_HHMMSS to match the video files) then dive name.
+    # Start time (UTC, YYYYMMDDtHHMMSS to match finalized MP4 names) then name.
     assert (
         dive_csv_filename(
             {"started_at": "2026-05-28T16:50:58+00:00", "dive_name": "Reef Survey #2"},
             "dive_0007",
         )
-        == "20260528_165058_reef_survey_2_dive_data.csv"
+        == "20260528t165058_reef_survey_2_dive_data.csv"
     )
     # Non-UTC offset is converted to UTC.
     assert (
         dive_csv_filename({"started_at": "2026-05-28T09:50:58-07:00", "dive_name": ""}, "dive_0007")
-        == "20260528_165058_dive_data.csv"
+        == "20260528t165058_dive_data.csv"
     )
     # Missing/!parseable start time falls back to the dive id.
     assert dive_csv_filename({"dive_name": "Test"}, "dive_0007") == "dive_0007_test_dive_data.csv"

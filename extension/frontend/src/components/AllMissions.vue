@@ -135,7 +135,7 @@ async function handleExportCsv(mission: DisplayMission) {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    // Backend names the file <YYYYMMDD_HHMMSS>_<dive_name>_dive_data.csv via
+    // Backend names the file <YYYYMMDDtHHMMSS>_<dive_name>_dive_data.csv via
     // Content-Disposition; honor it, falling back to the dive id.
     a.download = filenameFromContentDisposition(
       res.headers.get('Content-Disposition'),
