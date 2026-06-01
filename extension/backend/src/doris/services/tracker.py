@@ -22,6 +22,7 @@ missed even if the AGT emits dozens of messages between polls.
 import asyncio
 import json
 import logging
+import time
 from collections import deque
 from datetime import datetime, timezone
 
@@ -57,6 +58,15 @@ STATUSTEXT_BUFFER_SIZE = 100
 WS_RECONNECT_DELAY_S = 2.0
 WS_FIRST_CONNECT_TIMEOUT_S = 5.0  # max wait before sending first MAV_CMD_USER_4
 TRIGGER_POST_TIMEOUT_S = 15.0  # mavlink2rest POST commonly takes 4-5s
+
+# Keep reporting the tracker (and therefore the Iridium button) for this
+# long after the last good HEARTBEAT.  mavlink2rest's per-message
+# frequency estimate is noisy and regularly dips below the detection
+# threshold for a poll or two even while the AGT is heartbeating at 1 Hz,
+# which made the tracker tile randomly vanish from the sensors page
+# (issue #29).  A grace window rides out those dips without keeping a
+# truly disconnected tracker visible forever.
+TRACKER_STICKY_GRACE_S = 60.0
 
 
 def _m2r_base() -> str:
@@ -125,6 +135,9 @@ class ArtemisTrackerService:
         # AGT's "IRIDIUM: Test starting" reply (and possibly PASSED/FAILED
         # if the test resolves quickly) gets dropped on the floor.
         self._ws_connected: asyncio.Event = asyncio.Event()
+        # Monotonic timestamp of the most recent good HEARTBEAT, used to
+        # keep the tracker tile sticky across mavlink2rest frequency dips.
+        self._last_heartbeat_monotonic: float | None = None
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -133,10 +146,22 @@ class ArtemisTrackerService:
         return self._client
 
     async def get_modules(self) -> list[ModuleInfo]:
-        """Return a ModuleInfo for the tracker if a recent heartbeat exists."""
+        """Return a ModuleInfo for the tracker if it's present or was seen recently.
+
+        Detection is sticky: a single missed/low-frequency HEARTBEAT poll
+        no longer drops the tile.  We only stop reporting the tracker once
+        no heartbeat has been seen for ``TRACKER_STICKY_GRACE_S`` (issue #29).
+        """
         hb = await self._get_heartbeat()
-        if hb is None:
-            return []
+        now = time.monotonic()
+        if hb is not None:
+            self._last_heartbeat_monotonic = now
+        else:
+            last = self._last_heartbeat_monotonic
+            if last is None or (now - last) > TRACKER_STICKY_GRACE_S:
+                return []
+            # Within the grace window — ride out a transient frequency dip
+            # and keep the tile (with whatever GPS data is still available).
 
         gps = await self.get_gps_data()
 
