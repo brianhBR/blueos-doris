@@ -332,6 +332,46 @@ def test_light_level_percent_mapping(tmp_path: Path) -> None:
     assert [data[0][li], data[1][li], data[2][li], data[3][li], data[4][li]] == ["0", "50", "100", "100", ""]
 
 
+def test_value_precision_rounding() -> None:
+    """Each column is rounded to its useful resolution; position keeps 6 dp."""
+    from doris.services.mcap_telemetry import McapSummary, TelemetryFrame
+
+    s = McapSummary()
+    s.frames.append(
+        TelemetryFrame(
+            log_time_ns=BASE_NS,
+            values={
+                "depth_m": 12.34567,
+                "vertical_velocity_mps": -0.540541,
+                "internal_pressure_hpa": 989.4719,
+                "internal_temperature_c": 26.7434,
+                "roll_deg": 86.6259,
+                "heading_trueN_degrees": 300.541,
+                "latitude": 33.7261148,
+                "longitude": -118.2754123,
+                "battery_voltage_v": 16.4843,
+                "gps_satellites": 14.0,
+            },
+        )
+    )
+    text = build_dive_csv({"dive_name": "Precision"}, s, None)
+    rows = list(csv.reader(io.StringIO(text)))
+    hi = next(i for i, r in enumerate(rows) if r and r[0] == "timestamp_utc")
+    row = dict(zip(rows[hi], rows[hi + 1], strict=False))
+
+    assert row["depth_meters"] == "12.35"
+    assert row["vertical_velocity_meters_per_second"] == "-0.54"
+    assert row["internal_pressure_hectopascals"] == "989.5"
+    assert row["internal_temperature_celsius"] == "26.74"
+    assert row["roll_degrees"] == "86.6"
+    assert row["heading_trueN_degrees"] == "300.5"
+    assert row["battery_voltage_volts"] == "16.48"
+    assert row["gps_satellites"] == "14"
+    # Position retains sub-meter precision (6 decimal places).
+    assert row["latitude_degrees"] == "33.726115"
+    assert row["longitude_degrees"] == "-118.275412"
+
+
 def test_empty_summary_still_emits_header() -> None:
     from doris.services.mcap_telemetry import McapSummary
 

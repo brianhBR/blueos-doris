@@ -222,6 +222,34 @@ COLUMN_DISPLAY_NAMES: dict[str, str] = {
     "battery_current_a": "battery_current_amperes",
 }
 
+# Decimal places per column for CSV output (trailing zeros are stripped).
+# Chosen to match each sensor's useful resolution rather than dumping the raw
+# float's 6 significant figures.  Position keeps 6 dp (~0.1 m); columns not
+# listed (e.g. dynamically-discovered sensors) use _DEFAULT_DECIMALS.
+_DEFAULT_DECIMALS = 3
+COLUMN_DECIMALS: dict[str, int] = {
+    "mission_time_s": 0,
+    "bottom_time_s": 0,
+    "depth_m": 2,
+    "vertical_velocity_mps": 2,
+    "internal_pressure_hpa": 1,
+    "internal_temperature_c": 2,
+    "external_pressure_hpa": 1,
+    "external_temperature_c": 2,
+    "latitude": 6,
+    "longitude": 6,
+    "heading_trueN_degrees": 1,
+    "ground_speed_mps": 2,
+    "gps_satellites": 0,
+    "roll_deg": 1,
+    "pitch_deg": 1,
+    "yaw_deg": 1,
+    "relay_active": 0,
+    "light_level_percent": 1,
+    "battery_voltage_v": 2,
+    "battery_current_a": 2,
+}
+
 # DORIS_STATE numeric -> human label (mirrors STATE_* constants in doris.lua).
 STATE_LABELS: dict[int, str] = {
     -1: "CONFIG",
@@ -543,12 +571,22 @@ def _to_float(value: Any) -> float | None:
     return _f(value)
 
 
-def _cell(value: float | str | None) -> str:
+def _cell(value: float | str | None, decimals: int | None = None) -> str:
     if value is None or value == "":
         return ""
     if isinstance(value, str):
         return value
-    return f"{value:g}"
+    if decimals is None:
+        return f"{value:g}"
+    r = round(value, decimals)
+    if r == 0:  # collapse -0.0 -> 0
+        r = 0.0
+    # Fixed-point (so we don't hit %g's 6-significant-figure cap, which would
+    # truncate latitude/longitude), then drop trailing zeros for a clean cell.
+    s = f"{r:.{decimals}f}"
+    if "." in s:
+        s = s.rstrip("0").rstrip(".")
+    return s
 
 
 # gps_fix_type values (GPS_FIX_TYPE_* prefix already stripped) that mean the
@@ -616,15 +654,15 @@ def build_dive_csv(
     w.writerow(["started_at_utc", _strip_utc_offset(started)])
     w.writerow(["ended_at_utc", _strip_utc_offset(ended)])
     w.writerow(["duration", _duration_label(started, ended)])
-    w.writerow(["start_latitude", _cell(s_lat)])
-    w.writerow(["start_longitude", _cell(s_lon)])
-    w.writerow(["end_latitude", _cell(end_lat)])
-    w.writerow(["end_longitude", _cell(end_lon)])
-    w.writerow(["max_depth_from_log_meters", _cell(summary.max_depth_m)])
-    w.writerow(["min_external_temperature_celsius", _cell(summary.min_external_temperature_c)])
-    w.writerow(["min_battery_voltage_volts", _cell(summary.min_battery_voltage_v)])
-    w.writerow(["max_gps_satellites", _cell(summary.max_satellites)])
-    w.writerow(["compass_declination_degrees", _cell(summary.compass_declination_deg)])
+    w.writerow(["start_latitude", _cell(s_lat, 6)])
+    w.writerow(["start_longitude", _cell(s_lon, 6)])
+    w.writerow(["end_latitude", _cell(end_lat, 6)])
+    w.writerow(["end_longitude", _cell(end_lon, 6)])
+    w.writerow(["max_depth_from_log_meters", _cell(summary.max_depth_m, 2)])
+    w.writerow(["min_external_temperature_celsius", _cell(summary.min_external_temperature_c, 2)])
+    w.writerow(["min_battery_voltage_volts", _cell(summary.min_battery_voltage_v, 2)])
+    w.writerow(["max_gps_satellites", _cell(summary.max_satellites, 0)])
+    w.writerow(["compass_declination_degrees", _cell(summary.compass_declination_deg, 3)])
     w.writerow(["compass_autodec", _cell(summary.compass_autodec)])
     w.writerow(["mcap_file", mcap_rel or ""])
     w.writerow(["telemetry_rows", str(len(summary.frames))])
@@ -652,6 +690,6 @@ def build_dive_csv(
             if no_fix and col in ("latitude", "longitude"):
                 row.append("na")
             else:
-                row.append(_cell(fr.values.get(col)))
+                row.append(_cell(fr.values.get(col), COLUMN_DECIMALS.get(col, _DEFAULT_DECIMALS)))
         w.writerow(row)
     return buf.getvalue()
