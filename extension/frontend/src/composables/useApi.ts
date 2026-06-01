@@ -75,6 +75,32 @@ export interface SensorReading {
   quality: number
 }
 
+export interface ConductivityReading {
+  raw_conductance_ms: number
+  magnitude: number
+  real: number
+  imag: number
+  conductivity_uscm: number | null
+  valid: boolean
+  timestamp: string
+}
+
+export interface ConductivityStatus {
+  enabled: boolean
+  last_error: string | null
+  reading: ConductivityReading | null
+}
+
+export interface ConductivityCalibration {
+  serial_number: number
+  gain: number
+  cal_cb: number
+  cal_cc: number
+  suggested_gain: number
+  suggested_frequency_hz: number
+  suggested_range: number
+}
+
 export interface WifiNetwork {
   ssid: string
   signal_strength: number
@@ -470,6 +496,28 @@ export function useSensors() {
   }
 
   return { modules: readonly(modules), loading: readonly(loading), error: readonly(error), fetchModules, fetchReadings, updateConfig, calibrateBarometer }
+}
+
+export function useConductivity() {
+  const status = ref<ConductivityStatus | null>(null)
+
+  async function fetchConductivity() {
+    try {
+      status.value = await fetchApi<ConductivityStatus>('/sensors/conductivity')
+    } catch {
+      /* best effort — leave previous value in place */
+    }
+  }
+
+  async function readOnce(): Promise<ConductivityReading> {
+    return await postApi<ConductivityReading>('/sensors/conductivity/read')
+  }
+
+  async function readCalibration(): Promise<ConductivityCalibration> {
+    return await postApi<ConductivityCalibration>('/sensors/conductivity/calibration/read')
+  }
+
+  return { status: readonly(status), fetchConductivity, readOnce, readCalibration }
 }
 
 // ── Network composables ─────────────────────────────────────────────

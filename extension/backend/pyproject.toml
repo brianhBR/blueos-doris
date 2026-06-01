@@ -18,6 +18,9 @@ dependencies = [
     "uvloop>=0.19.0",
     "websockets>=15.0",
     "pyserial>=3.5",
+    # Raw I2C access (/dev/i2c-N) for the external conductivity probe
+    # (AD5933) on the Navigator's i2c6 bus.  Pure-Python, no compiler.
+    "smbus2>=0.4.3",
     # NOTE: PyGObject is intentionally NOT a pip dependency.  It's
     # provided by Debian's apt python3-gi in the Dockerfile (and made
     # importable via PYTHONPATH=/usr/lib/python3/dist-packages).  We

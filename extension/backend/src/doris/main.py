@@ -201,6 +201,12 @@ def create_app() -> Robyn:
         timesync_service.start_background_sync()
         start_dmesg_capture()
 
+        try:
+            from .services.conductivity import conductivity_service
+            conductivity_service.start()
+        except Exception as e:
+            logger.warning("Conductivity service start skipped: %s", e)
+
         logger.info("DORIS backend startup complete")
         asyncio.get_event_loop().create_task(_restart_autopilot(logger))
 

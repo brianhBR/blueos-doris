@@ -48,6 +48,43 @@ class Settings(BaseSettings):
     ipcam_usb_min_free_mb: float = 256.0
     usb_probe_interval_s: int = 30
 
+    # ── External conductivity probe (AD5933 on i2c6) ────────────────
+    # Opt-in: leave disabled until the probe is physically wired to the
+    # Navigator's i2c6 bus (shared with the Bar100 @ 0x40 and Celsius
+    # @ 0x77; the AD5933 lives at 0x0D so there is no address clash).
+    # The DORIS container already has /dev/i2c access (Privileged +
+    # /dev:/dev bind), so the probe is read directly and the result is
+    # published as a NAMED_VALUE_FLOAT into the MAVLink stream — no
+    # ArduSub firmware change required.
+    conductivity_enabled: bool = False
+    conductivity_i2c_bus: int = 6
+    conductivity_ad5933_addr: int = 0x0D
+    # Probe cal EEPROM (24-series) address; used only by the bench-only
+    # /calibration/read helper, never by the live measurement loop.
+    conductivity_eeprom_addr: int = 0x50
+    # Excitation sweep: 70 kHz / range 3 are the modern CProbe defaults;
+    # legacy units (serNo 4/7) used 47500 Hz / range 2.
+    conductivity_frequency_hz: float = 70000.0
+    conductivity_range: int = 3
+    conductivity_settling_cycles: int = 128
+    # ``gain`` is the per-probe AD5933 gain factor read once on the bench
+    # from the probe's EEPROM (GetCoeffs()).  Stored here so the live bus
+    # never has to touch the cal EEPROM @ 0x50.  Must be > 0 to publish a
+    # physically meaningful conductance.
+    conductivity_gain: float = 0.0
+    # Optional linear calibration: conductivity_uScm = 1000*(CB*raw + CC).
+    conductivity_apply_linear_cal: bool = False
+    conductivity_cal_cb: float = 0.0
+    conductivity_cal_cc: float = 0.0
+    # Polling cadence and the NAMED_VALUE_FLOAT name (<=10 chars).
+    conductivity_publish_interval_s: float = 1.0
+    conductivity_named_float: str = "COND"
+    # Source ids the injected NAMED_VALUE_FLOAT carries.  Defaults mirror
+    # the autopilot's Lua named floats (sys 1 / comp 1) so the value lands
+    # in the same telemetry namespace as DEPTH, BATT_V, etc.
+    conductivity_src_system: int = 1
+    conductivity_src_component: int = 1
+
     class Config:
         env_prefix = "DORIS_"
         env_file = ".env"

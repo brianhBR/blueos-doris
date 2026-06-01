@@ -57,3 +57,39 @@ class SensorConfig(BaseModel):
     enabled: bool = True
     calibration_file: str | None = None
 
+
+class ConductivityReading(BaseModel):
+    """A single AD5933 conductivity-probe measurement.
+
+    ``raw_conductance_ms`` mirrors the CProbe sketch's ``RawConductance``
+    (gain * |Z⁻¹| magnitude * 1000, in millimhos / mS).  ``conductivity_uscm``
+    is the optional linear-calibrated value (µS/cm) when CB/CC are set.
+    """
+
+    raw_conductance_ms: float
+    magnitude: float
+    real: int
+    imag: int
+    conductivity_uscm: float | None = None
+    valid: bool = True
+    timestamp: datetime
+
+
+class ConductivityCalibration(BaseModel):
+    """Per-probe calibration read from the cell's EEPROM (GetCoeffs()).
+
+    ``gain`` / ``cal_cb`` / ``cal_cc`` are the raw little-endian floats
+    stored at EEPROM offsets 12 / 4 / 8.  The ``suggested_*`` fields apply
+    the sketch's serial-number special cases (serNo 9 -> gain*4.69, range 4;
+    serNo 4/7 -> 47500 Hz, range 2) so the operator can copy them straight
+    into the DORIS_CONDUCTIVITY_* env vars.
+    """
+
+    serial_number: int
+    gain: float
+    cal_cb: float
+    cal_cc: float
+    suggested_gain: float
+    suggested_frequency_hz: float
+    suggested_range: int
+

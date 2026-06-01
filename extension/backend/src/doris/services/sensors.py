@@ -53,7 +53,49 @@ class SensorService:
         tracker_modules = await self.tracker_service.get_modules()
         modules.extend(tracker_modules)
 
+        # Get external conductivity probe (AD5933 on i2c6) if enabled
+        modules.extend(self._get_conductivity_modules())
+
         return modules
+
+    def _get_conductivity_modules(self) -> list[ModuleInfo]:
+        """Get a ModuleInfo for the AD5933 conductivity probe if enabled."""
+        from .conductivity import conductivity_service
+
+        if not conductivity_service.enabled:
+            return []
+
+        latest = conductivity_service.latest
+        if latest is not None and conductivity_service.last_error is None:
+            value = (
+                latest.conductivity_uscm
+                if latest.conductivity_uscm is not None
+                else latest.raw_conductance_ms
+            )
+            unit = "\u00b5S/cm" if latest.conductivity_uscm is not None else "mS"
+            return [
+                ModuleInfo(
+                    id="conductivity",
+                    name="Conductivity Probe",
+                    type="sensor",
+                    status="connected",
+                    module_status=f"Ready: {value:.3f} {unit}",
+                    last_reading=latest.timestamp.isoformat(),
+                )
+            ]
+
+        status_msg = "Error: no reading"
+        if conductivity_service.last_error:
+            status_msg = f"Error: {conductivity_service.last_error}"
+        return [
+            ModuleInfo(
+                id="conductivity",
+                name="Conductivity Probe",
+                type="sensor",
+                status="error",
+                module_status=status_msg,
+            )
+        ]
 
     async def get_sensor_readings(self, sensor_id: str) -> list[SensorReading]:
         """Get recent readings from a sensor.

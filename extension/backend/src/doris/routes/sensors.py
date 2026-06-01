@@ -7,6 +7,7 @@ from robyn import Response, Robyn
 from ..models.sensors import SensorConfig
 from ..services.barometer import BarometerService
 from ..services.camera import CameraService
+from ..services.conductivity import conductivity_service
 from ..services.sensors import SensorService
 from ..services.tracker import ArtemisTrackerService
 
@@ -132,6 +133,60 @@ def register_sensor_routes(app: Robyn) -> None:
         except Exception as e:
             return Response(
                 status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+
+    @app.get("/api/v1/sensors/conductivity")
+    async def get_conductivity(request):
+        """Latest conductivity reading + service status.
+
+        Returns the most recent AD5933 measurement (published as a
+        NAMED_VALUE_FLOAT into MAVLink) along with whether the service
+        is enabled and any last error.
+        """
+        try:
+            latest = conductivity_service.latest
+            payload = {
+                "enabled": conductivity_service.enabled,
+                "last_error": conductivity_service.last_error,
+                "reading": latest.model_dump(mode="json") if latest else None,
+            }
+            return json.dumps(payload)
+        except Exception as e:
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+
+    @app.post("/api/v1/sensors/conductivity/read")
+    async def read_conductivity(request):
+        """Force a single AD5933 measurement (bench/debug helper)."""
+        try:
+            reading = await conductivity_service.read_once()
+            return json.dumps(reading.model_dump(mode="json"))
+        except Exception as e:
+            return Response(
+                status_code=502,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+
+    @app.post("/api/v1/sensors/conductivity/calibration/read")
+    async def read_conductivity_calibration(request):
+        """Read the probe's gain/CB/CC from its EEPROM (bench-only).
+
+        Touches the cal EEPROM @ 0x50; intended to be run once so the
+        operator can copy the returned ``suggested_*`` values into the
+        DORIS_CONDUCTIVITY_* env vars.
+        """
+        try:
+            cal = await conductivity_service.read_calibration()
+            return json.dumps(cal.model_dump(mode="json"))
+        except Exception as e:
+            return Response(
+                status_code=502,
                 description=json.dumps({"error": str(e)}),
                 headers={"Content-Type": "application/json"},
             )

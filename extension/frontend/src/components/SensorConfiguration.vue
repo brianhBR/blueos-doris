@@ -18,8 +18,11 @@ import {
   mdiCogOutline,
   mdiChip,
 } from '@mdi/js'
-import { useSensors } from '../composables/useApi'
-import type { SensorModule as ApiSensorModule } from '../composables/useApi'
+import { useSensors, useConductivity } from '../composables/useApi'
+import type {
+  SensorModule as ApiSensorModule,
+  ConductivityCalibration,
+} from '../composables/useApi'
 import type { Screen } from '../types'
 
 interface DisplayModule {
@@ -615,6 +618,73 @@ async function triggerBaroCalibration() {
   }, 5000)
 }
 
+// ── Conductivity probe (AD5933 on i2c6) ──────────────────────────────
+const { status: conductivityStatus, fetchConductivity, readOnce: readConductivityOnce, readCalibration } = useConductivity()
+let conductivityInterval: number | undefined
+
+const hasConductivity = computed(() =>
+  modules.value.some(m => m.id === 'conductivity')
+)
+
+/** Live tile values, derived from the polled status. */
+const conductivityDisplay = computed(() => {
+  const reading = conductivityStatus.value?.reading
+  if (!reading) return null
+  const hasCal = reading.conductivity_uscm != null
+  return {
+    value: hasCal ? reading.conductivity_uscm! : reading.raw_conductance_ms,
+    unit: hasCal ? 'µS/cm' : 'mS',
+    raw: reading.raw_conductance_ms,
+    magnitude: reading.magnitude,
+    timestamp: reading.timestamp,
+  }
+})
+
+function startConductivityPolling() {
+  if (conductivityInterval) { clearInterval(conductivityInterval); conductivityInterval = undefined }
+  if (hasConductivity.value) {
+    void fetchConductivity()
+    conductivityInterval = setInterval(fetchConductivity, 2000) as unknown as number
+  }
+}
+
+watch(hasConductivity, startConductivityPolling)
+
+// One-shot manual reading (bench/debug button).
+const condReadBusy = ref(false)
+const condReadError = ref('')
+async function takeConductivityReading() {
+  if (condReadBusy.value) return
+  condReadBusy.value = true
+  condReadError.value = ''
+  try {
+    await readConductivityOnce()
+    await fetchConductivity()
+  } catch (e) {
+    condReadError.value = e instanceof Error ? e.message : 'Read failed'
+  } finally {
+    condReadBusy.value = false
+  }
+}
+
+// EEPROM calibration read (bench-only helper).
+type CondCalState = 'idle' | 'reading' | 'done' | 'error'
+const condCalState = ref<CondCalState>('idle')
+const condCalError = ref('')
+const condCal = ref<ConductivityCalibration | null>(null)
+async function readConductivityCalibration() {
+  if (condCalState.value === 'reading') return
+  condCalState.value = 'reading'
+  condCalError.value = ''
+  try {
+    condCal.value = await readCalibration()
+    condCalState.value = 'done'
+  } catch (e) {
+    condCalState.value = 'error'
+    condCalError.value = e instanceof Error ? e.message : 'Calibration read failed'
+  }
+}
+
 // ── Module list sync ────────────────────────────────────────────────
 watch(apiModules, (newModules) => {
   if (newModules.length > 0) {
@@ -663,6 +733,7 @@ onUnmounted(() => {
   if (snapshotInterval) clearInterval(snapshotInterval)
   if (ipcamStatusInterval) clearInterval(ipcamStatusInterval)
   if (trackerInterval) clearInterval(trackerInterval)
+  if (conductivityInterval) clearInterval(conductivityInterval)
   if (lightKeepAlive) clearInterval(lightKeepAlive)
   stopIridiumPolling()
   if (snapshotUrl.value) URL.revokeObjectURL(snapshotUrl.value)
@@ -1055,6 +1126,32 @@ const getStatusColor = (moduleStatus: string) => {
               </p>
             </div>
 
+            <!-- Inline conductivity live readout -->
+            <div v-if="mod.id === 'conductivity'" class="mt-3 rounded-lg overflow-hidden" style="border: 1px solid rgba(65, 185, 195, 0.2)">
+              <div v-if="conductivityDisplay" class="grid grid-cols-3 gap-px" style="background-color: rgba(65, 185, 195, 0.1)">
+                <div class="px-3 py-2" style="background-color: rgba(14, 36, 70, 0.7)">
+                  <div class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Conductivity</div>
+                  <div class="text-sm font-medium" style="color: #96EEF2">
+                    {{ conductivityDisplay.value.toFixed(3) }} {{ conductivityDisplay.unit }}
+                  </div>
+                </div>
+                <div class="px-3 py-2" style="background-color: rgba(14, 36, 70, 0.7)">
+                  <div class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Raw conductance</div>
+                  <div class="text-sm font-medium" style="color: #96EEF2">{{ conductivityDisplay.raw.toFixed(3) }} mS</div>
+                </div>
+                <div class="px-3 py-2" style="background-color: rgba(14, 36, 70, 0.7)">
+                  <div class="text-xs" style="color: rgba(150, 238, 242, 0.5)">|Z| magnitude</div>
+                  <div class="text-sm font-medium" style="color: #96EEF2">{{ conductivityDisplay.magnitude.toFixed(0) }}</div>
+                </div>
+              </div>
+              <div v-else class="px-3 py-3 text-center text-xs" style="background-color: rgba(14, 36, 70, 0.7); color: rgba(150, 238, 242, 0.5)">
+                {{ conductivityStatus?.last_error ? `Error: ${conductivityStatus.last_error}` : 'Waiting for first reading…' }}
+              </div>
+              <div class="flex items-center justify-between px-2 py-1" style="background-color: rgba(14, 36, 70, 0.8)">
+                <span class="text-xs" style="color: rgba(150, 238, 242, 0.4)">Published as NAMED_VALUE_FLOAT • updates every 2s</span>
+              </div>
+            </div>
+
             <!-- Inline tracker GPS data -->
             <div v-if="mod.type === 'tracker' && mod.connected && trackerGps" class="mt-3 rounded-lg overflow-hidden" style="border: 1px solid rgba(65, 185, 195, 0.2)">
               <div class="grid grid-cols-2 gap-px" style="background-color: rgba(65, 185, 195, 0.1)">
@@ -1221,6 +1318,88 @@ const getStatusColor = (moduleStatus: string) => {
               <p class="text-sm" style="color: rgba(150, 238, 242, 0.6)">
                 No calibration options available for this sensor.
               </p>
+            </div>
+
+            <!-- Conductivity probe: live reading + EEPROM calibration helper -->
+            <div v-else-if="selectedModule.id === 'conductivity'" class="space-y-4">
+              <p class="text-sm" style="color: rgba(150, 238, 242, 0.6)">
+                The AD5933 probe is read over i2c6 and published as a NAMED_VALUE_FLOAT.
+                Take a one-shot reading to verify wiring, or read the probe's stored
+                calibration coefficients and copy the suggested values into the
+                DORIS_CONDUCTIVITY_* extension settings.
+              </p>
+
+              <button
+                :disabled="condReadBusy"
+                class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm transition-all"
+                :style="{
+                  backgroundColor: 'rgba(14, 36, 70, 0.5)',
+                  border: '1px solid rgba(65, 185, 195, 0.2)',
+                  color: '#96EEF2',
+                  opacity: condReadBusy ? '0.7' : '1',
+                  cursor: condReadBusy ? 'not-allowed' : 'pointer',
+                }"
+                @click="takeConductivityReading"
+              >
+                <Loader2 v-if="condReadBusy" class="w-4 h-4 animate-spin" />
+                <svg v-else class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor"><path :d="mdiSineWave" /></svg>
+                Take Reading
+              </button>
+              <p v-if="condReadError" class="text-xs text-center" style="color: #f87171">{{ condReadError }}</p>
+
+              <button
+                :disabled="condCalState === 'reading'"
+                class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm transition-all"
+                :style="{
+                  backgroundColor: condCalState === 'done' ? 'rgba(34, 197, 94, 0.2)'
+                    : condCalState === 'error' ? 'rgba(239, 68, 68, 0.2)'
+                    : condCalState === 'reading' ? 'rgba(252, 216, 105, 0.15)'
+                    : 'rgba(14, 36, 70, 0.5)',
+                  border: condCalState === 'done' ? '1px solid rgba(34, 197, 94, 0.5)'
+                    : condCalState === 'error' ? '1px solid rgba(239, 68, 68, 0.5)'
+                    : condCalState === 'reading' ? '1px solid rgba(252, 216, 105, 0.4)'
+                    : '1px solid rgba(65, 185, 195, 0.2)',
+                  color: condCalState === 'done' ? '#22c55e'
+                    : condCalState === 'error' ? '#ef4444'
+                    : condCalState === 'reading' ? '#FCD869'
+                    : '#96EEF2',
+                  cursor: condCalState === 'reading' ? 'not-allowed' : 'pointer',
+                }"
+                @click="readConductivityCalibration"
+              >
+                <Loader2 v-if="condCalState === 'reading'" class="w-4 h-4 animate-spin" />
+                <svg v-else class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor"><path :d="mdiChip" /></svg>
+                <span v-if="condCalState === 'reading'">Reading EEPROM…</span>
+                <span v-else>Read Calibration from Probe</span>
+              </button>
+              <p v-if="condCalError" class="text-xs text-center" style="color: #f87171">{{ condCalError }}</p>
+
+              <div v-if="condCal" class="rounded-lg overflow-hidden" style="border: 1px solid rgba(65, 185, 195, 0.2)">
+                <div class="grid grid-cols-2 gap-px" style="background-color: rgba(65, 185, 195, 0.1)">
+                  <div class="px-3 py-2" style="background-color: rgba(14, 36, 70, 0.7)">
+                    <div class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Serial #</div>
+                    <div class="text-sm font-medium" style="color: #96EEF2">{{ condCal.serial_number }}</div>
+                  </div>
+                  <div class="px-3 py-2" style="background-color: rgba(14, 36, 70, 0.7)">
+                    <div class="text-xs" style="color: rgba(150, 238, 242, 0.5)">Gain (raw)</div>
+                    <div class="text-sm font-medium" style="color: #96EEF2">{{ condCal.gain.toExponential(4) }}</div>
+                  </div>
+                  <div class="px-3 py-2" style="background-color: rgba(14, 36, 70, 0.7)">
+                    <div class="text-xs" style="color: rgba(150, 238, 242, 0.5)">CB</div>
+                    <div class="text-sm font-medium" style="color: #96EEF2">{{ condCal.cal_cb.toExponential(4) }}</div>
+                  </div>
+                  <div class="px-3 py-2" style="background-color: rgba(14, 36, 70, 0.7)">
+                    <div class="text-xs" style="color: rgba(150, 238, 242, 0.5)">CC</div>
+                    <div class="text-sm font-medium" style="color: #96EEF2">{{ condCal.cal_cc.toExponential(4) }}</div>
+                  </div>
+                </div>
+                <div class="px-3 py-2 text-xs font-mono leading-relaxed" style="background-color: rgba(0, 0, 0, 0.25); color: rgba(150, 238, 242, 0.8)">
+                  <div style="color: rgba(150, 238, 242, 0.5)">Suggested extension settings:</div>
+                  <div>DORIS_CONDUCTIVITY_GAIN={{ condCal.suggested_gain }}</div>
+                  <div>DORIS_CONDUCTIVITY_FREQUENCY_HZ={{ condCal.suggested_frequency_hz }}</div>
+                  <div>DORIS_CONDUCTIVITY_RANGE={{ condCal.suggested_range }}</div>
+                </div>
+              </div>
             </div>
 
             <!-- Other sensor types: calibration file upload -->
