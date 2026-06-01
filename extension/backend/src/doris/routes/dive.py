@@ -541,6 +541,10 @@ def register_dive_routes(app: Robyn) -> None:
                 headers={"Content-Type": "application/json"},
             )
 
+        from ..services.mcap_telemetry import dive_csv_filename
+
+        download_name = dive_csv_filename(dive_data, dive_id)
+
         # Prefer a CSV already generated to USB at dive end -- serving it
         # is instant, whereas a fresh parse of a large .mcap can take tens
         # of seconds on the vehicle's Raspberry Pi.
@@ -556,7 +560,7 @@ def register_dive_routes(app: Robyn) -> None:
                     description=raw,
                     headers={
                         "Content-Type": "text/csv; charset=utf-8",
-                        "Content-Disposition": f'attachment; filename="{dive_id}_dive_data.csv"',
+                        "Content-Disposition": f'attachment; filename="{download_name}"',
                         "Content-Length": str(len(raw)),
                     },
                 )
@@ -588,7 +592,7 @@ def register_dive_routes(app: Robyn) -> None:
             description=raw,
             headers={
                 "Content-Type": "text/csv; charset=utf-8",
-                "Content-Disposition": f'attachment; filename="{dive_id}_dive_data.csv"',
+                "Content-Disposition": f'attachment; filename="{download_name}"',
                 "Content-Length": str(len(raw)),
             },
         )

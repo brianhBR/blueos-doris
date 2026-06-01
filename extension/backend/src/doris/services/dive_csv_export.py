@@ -29,7 +29,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import usb_storage
-from .binlog import slug_for_dive, wait_until_quiescent
+from .binlog import wait_until_quiescent
 
 logger = logging.getLogger(__name__)
 
@@ -96,6 +96,7 @@ async def export_dive_csv_to_usb(dive_file: Path) -> dict:
     from .mcap_telemetry import (
         McapSummary,
         build_dive_csv,
+        dive_csv_filename,
         map_dive_stem_to_largest_mcap,
         summarize_mcap,
     )
@@ -159,8 +160,7 @@ async def export_dive_csv_to_usb(dive_file: Path) -> dict:
         _write_record(dive_file, record)
         return {"status": "skipped_no_usb"}
 
-    slug = slug_for_dive(record, dive_file)
-    dest = Path(usb_dir) / f"{slug}_dive_data.csv"
+    dest = Path(usb_dir) / dive_csv_filename(record, dive_file.stem)
     try:
         await asyncio.to_thread(_write_text_atomic, dest, csv_text)
     except Exception as e:

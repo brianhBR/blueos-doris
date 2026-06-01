@@ -114,6 +114,12 @@ const isDeleting = ref(false)
 const exportingIds = ref<Set<string>>(new Set())
 const exportErrors = ref<Record<string, string>>({})
 
+function filenameFromContentDisposition(header: string | null, fallback: string): string {
+  if (!header) return fallback
+  const match = /filename\*?=(?:UTF-8'')?"?([^"';]+)"?/i.exec(header)
+  return match ? decodeURIComponent(match[1].trim()) : fallback
+}
+
 async function handleExportCsv(mission: DisplayMission) {
   if (exportingIds.value.has(mission.id)) return
   exportingIds.value = new Set(exportingIds.value).add(mission.id)
@@ -129,7 +135,12 @@ async function handleExportCsv(mission: DisplayMission) {
     const url = URL.createObjectURL(blob)
     const a = document.createElement('a')
     a.href = url
-    a.download = `${mission.id}_dive_data.csv`
+    // Backend names the file <YYYYMMDD_HHMMSS>_<dive_name>_dive_data.csv via
+    // Content-Disposition; honor it, falling back to the dive id.
+    a.download = filenameFromContentDisposition(
+      res.headers.get('Content-Disposition'),
+      `${mission.id}_dive_data.csv`,
+    )
     document.body.appendChild(a)
     a.click()
     a.remove()

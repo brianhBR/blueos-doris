@@ -617,6 +617,43 @@ def _duration_label(started: str | None, ended: str | None) -> str:
     return f"{h}:{m:02d}:{s:02d}"
 
 
+_FNAME_BAD = re.compile(r"[^\w\s-]")
+_FNAME_SPACE = re.compile(r"[\s-]+")
+
+
+def _filename_slug(value: str) -> str:
+    """Filename-safe lowercase slug of a dive name (empty if nothing usable)."""
+    s = _FNAME_BAD.sub("", value.strip().lower())
+    s = _FNAME_SPACE.sub("_", s)
+    return s.strip("_")
+
+
+def dive_csv_filename(dive_record: dict[str, Any], dive_id: str) -> str:
+    """Download/USB name: ``<YYYYMMDD_HHMMSS>_<dive_name>_dive_data.csv``.
+
+    Leads with the dive's start timestamp (UTC) so exports sort
+    chronologically, followed by the slugified dive name.  The timestamp
+    falls back to the dive id stem when the start time is missing/unparseable,
+    and the dive-name segment is omitted when there is no name.
+    """
+    started = dive_record.get("started_at")
+    stamp = ""
+    if started:
+        try:
+            dt = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+        except ValueError:
+            dt = None
+        if dt is not None:
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            stamp = dt.astimezone(timezone.utc).strftime("%Y%m%d_%H%M%S")
+    parts = [stamp or dive_id]
+    name = _filename_slug(str(dive_record.get("dive_name") or ""))
+    if name:
+        parts.append(name)
+    return "_".join(parts) + "_dive_data.csv"
+
+
 def build_dive_csv(
     dive_record: dict[str, Any],
     summary: McapSummary,
