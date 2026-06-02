@@ -4,9 +4,10 @@ import {
   Database, Calendar, Clock, MapPin, Camera, Image, FileText, Play,
   Download, Trash2, AlertTriangle, Archive, Search, X, Loader2
 } from 'lucide-vue-next'
-import { useDiveHistory } from '../composables/useApi'
+import { useDiveHistory, useMedia } from '../composables/useApi'
+import { enqueueBulkDownload } from '../composables/useDownloads'
 import { parseBackendDateTime } from '../parseBackendTime'
-import type { DiveHistorySummary } from '../composables/useApi'
+import type { DiveHistorySummary, MediaFile } from '../composables/useApi'
 import type { Screen, DiveData } from '../types'
 
 const emit = defineEmits<{
@@ -14,6 +15,7 @@ const emit = defineEmits<{
 }>()
 
 const { dives: apiDives, loading, error, fetchDives, deleteDiveRecord } = useDiveHistory()
+const { files: mediaFiles, fetchFiles } = useMedia()
 
 function mcapDownloadHref(relativePath: string): string {
   return `/api/v1/media/download?path=${encodeURIComponent(relativePath)}`
@@ -154,6 +156,87 @@ async function handleExportCsv(mission: DisplayMission) {
     const next = new Set(exportingIds.value)
     next.delete(mission.id)
     exportingIds.value = next
+  }
+}
+
+// Per-dive bulk download state. "Download Media" grabs images + videos;
+// "Download All Files" adds data files. Both join media to the dive by
+// dive_name (the same key the media browser uses) and stream through the
+// shared download queue so the global <DownloadToast /> shows progress.
+const downloadingMediaIds = ref<Set<string>>(new Set())
+const downloadingAllIds = ref<Set<string>>(new Set())
+const downloadErrors = ref<Record<string, string>>({})
+
+function setDownloadError(missionId: string, message: string) {
+  downloadErrors.value = { ...downloadErrors.value, [missionId]: message }
+}
+
+function clearDownloadError(missionId: string) {
+  if (downloadErrors.value[missionId]) {
+    const next = { ...downloadErrors.value }
+    delete next[missionId]
+    downloadErrors.value = next
+  }
+}
+
+function withId(set: Set<string>, id: string, present: boolean): Set<string> {
+  const next = new Set(set)
+  if (present) next.add(id)
+  else next.delete(id)
+  return next
+}
+
+async function diveMediaFiles(mission: DisplayMission): Promise<MediaFile[]> {
+  // Fetch generously: the endpoint has no dive_name filter, so we pull the
+  // flat file list and join client-side. A high limit avoids truncating a
+  // dive's files in a "download all" action when many dives are on disk.
+  await fetchFiles({ limit: 5000 })
+  const want = mission.name.trim().toLowerCase()
+  if (!want) return []
+  return mediaFiles.value.filter(f => (f.dive_name ?? '').trim().toLowerCase() === want)
+}
+
+function toDownloadItems(rows: MediaFile[]) {
+  return rows.map(f => ({ filePath: f.id, fileName: f.filename, sizeBytes: f.size_bytes }))
+}
+
+async function handleDownloadMedia(mission: DisplayMission) {
+  if (downloadingMediaIds.value.has(mission.id)) return
+  downloadingMediaIds.value = withId(downloadingMediaIds.value, mission.id, true)
+  clearDownloadError(mission.id)
+  try {
+    const rows = (await diveMediaFiles(mission)).filter(
+      f => f.media_type === 'image' || f.media_type === 'video',
+    )
+    const items = toDownloadItems(rows)
+    if (items.length === 0) {
+      setDownloadError(mission.id, 'No media files found for this dive.')
+      return
+    }
+    await enqueueBulkDownload(items)
+  } catch {
+    setDownloadError(mission.id, 'Download failed. Please try again.')
+  } finally {
+    downloadingMediaIds.value = withId(downloadingMediaIds.value, mission.id, false)
+  }
+}
+
+async function handleDownloadAllFiles(mission: DisplayMission) {
+  if (downloadingAllIds.value.has(mission.id)) return
+  downloadingAllIds.value = withId(downloadingAllIds.value, mission.id, true)
+  clearDownloadError(mission.id)
+  try {
+    const rows = await diveMediaFiles(mission)
+    const items = toDownloadItems(rows)
+    if (items.length === 0) {
+      setDownloadError(mission.id, 'No files found for this dive.')
+      return
+    }
+    await enqueueBulkDownload(items)
+  } catch {
+    setDownloadError(mission.id, 'Download failed. Please try again.')
+  } finally {
+    downloadingAllIds.value = withId(downloadingAllIds.value, mission.id, false)
   }
 }
 
@@ -423,24 +506,35 @@ const handleDeleteMission = async () => {
               </button>
               <button
                 type="button"
-                disabled
-                title="Use the Data page to download files"
-                class="px-4 py-2 rounded-lg flex items-center gap-2 text-sm whitespace-nowrap opacity-45 cursor-not-allowed"
+                @click="handleDownloadMedia(mission)"
+                :disabled="downloadingMediaIds.has(mission.id)"
+                title="Download all images and videos from this dive"
+                class="px-4 py-2 rounded-lg flex items-center gap-2 text-sm whitespace-nowrap transition-all hover:opacity-90 disabled:opacity-70 disabled:cursor-wait"
                 style="background-color: rgba(65, 185, 195, 0.3); border: 1px solid #41B9C3; color: #96EEF2"
               >
-                <Download class="w-4 h-4" />
-                Download Media
+                <Loader2 v-if="downloadingMediaIds.has(mission.id)" class="w-4 h-4 animate-spin" />
+                <Download v-else class="w-4 h-4" />
+                {{ downloadingMediaIds.has(mission.id) ? 'Starting…' : 'Download Media' }}
               </button>
               <button
                 type="button"
-                disabled
-                title="Not available yet"
-                class="px-4 py-2 rounded-lg flex items-center gap-2 text-sm whitespace-nowrap opacity-45 cursor-not-allowed"
+                @click="handleDownloadAllFiles(mission)"
+                :disabled="downloadingAllIds.has(mission.id)"
+                title="Download all images, videos and data files from this dive"
+                class="px-4 py-2 rounded-lg flex items-center gap-2 text-sm whitespace-nowrap transition-all hover:opacity-90 disabled:opacity-70 disabled:cursor-wait"
                 style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid #41B9C3; color: #41B9C3"
               >
-                <Archive class="w-4 h-4" />
-                Download All Files
+                <Loader2 v-if="downloadingAllIds.has(mission.id)" class="w-4 h-4 animate-spin" />
+                <Archive v-else class="w-4 h-4" />
+                {{ downloadingAllIds.has(mission.id) ? 'Starting…' : 'Download All Files' }}
               </button>
+              <span
+                v-if="downloadErrors[mission.id]"
+                class="text-xs text-center"
+                style="color: #FF4757"
+              >
+                {{ downloadErrors[mission.id] }}
+              </span>
               <button
                 class="px-4 py-2 rounded-lg transition-all hover:opacity-90 flex items-center gap-2 text-sm whitespace-nowrap"
                 style="background-color: rgba(221, 44, 29, 0.2); border: 1px solid #DD2C1D; color: #DD2C1D"

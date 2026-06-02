@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { ref, watch, nextTick, onMounted, onUnmounted, computed } from 'vue'
-import { Settings, Save, Copy, AlertTriangle, ChevronDown, ChevronUp, Camera as CameraIcon, Lightbulb, Database as DatabaseIcon, Battery, ArrowDown, Anchor, ArrowUp, Radio, X } from 'lucide-vue-next'
+import { Settings, Save, Copy, AlertTriangle, ChevronDown, ChevronUp, Camera as CameraIcon, Lightbulb, Database as DatabaseIcon, Battery, ArrowDown, Anchor, ArrowUp, Radio, X, Trash2 } from 'lucide-vue-next'
 import type { Screen } from '../types'
 import { useConfigurations } from '../composables/useApi'
 import type { DeploymentConfiguration } from '../composables/useApi'
@@ -24,6 +24,9 @@ const warnings = ref<string[]>([])
 const showBatteryPlanning = ref(false)
 const showSaveModal = ref(false)
 const configurationName = ref('')
+const showDeleteModal = ref(false)
+const deleting = ref(false)
+const deleteError = ref('')
 const hasUnsavedChanges = ref(false)
 let suppressUnsavedTracking = false
 const showNavigationWarning = ref(false)
@@ -33,6 +36,7 @@ const {
   fetchConfigurations,
   loadConfiguration,
   saveConfiguration,
+  deleteConfiguration,
   error: configurationSaveError,
   clearError: clearConfigurationSaveError,
 } = useConfigurations()
@@ -71,7 +75,7 @@ const descentLightOnNumber = ref('10')
 const descentLightOnUnit = ref('seconds')
 const descentLightOffNumber = ref('5')
 const descentLightOffUnit = ref('seconds')
-const descentLightBrightness = ref(75)
+const descentLightBrightness = ref(60)
 const descentMatchCameraInterval = ref(false)
 
 // On Bottom settings
@@ -109,7 +113,7 @@ const bottomLightOnNumber = ref('10')
 const bottomLightOnUnit = ref('seconds')
 const bottomLightOffNumber = ref('5')
 const bottomLightOffUnit = ref('seconds')
-const bottomLightBrightness = ref(75)
+const bottomLightBrightness = ref(60)
 const bottomMatchCameraInterval = ref(false)
 
 // Ascent settings
@@ -146,7 +150,7 @@ const ascentLightOnNumber = ref('10')
 const ascentLightOnUnit = ref('seconds')
 const ascentLightOffNumber = ref('5')
 const ascentLightOffUnit = ref('seconds')
-const ascentLightBrightness = ref(75)
+const ascentLightBrightness = ref(60)
 const ascentMatchCameraInterval = ref(false)
 
 // Recovery settings
@@ -296,7 +300,7 @@ function resetToDefaults() {
   descentLightOnUnit.value = 'seconds'
   descentLightOffNumber.value = '5'
   descentLightOffUnit.value = 'seconds'
-  descentLightBrightness.value = 75
+  descentLightBrightness.value = 60
   descentMatchCameraInterval.value = false
   bottomCameraOn.value = true
   bottomCameraDelayNumber.value = '30'
@@ -332,7 +336,7 @@ function resetToDefaults() {
   bottomLightOnUnit.value = 'seconds'
   bottomLightOffNumber.value = '5'
   bottomLightOffUnit.value = 'seconds'
-  bottomLightBrightness.value = 75
+  bottomLightBrightness.value = 60
   bottomMatchCameraInterval.value = false
   ascentSameAsDescent.value = false
   emit('update:releaseWeightBy', 'elapsed')
@@ -368,7 +372,7 @@ function resetToDefaults() {
   ascentLightOnUnit.value = 'seconds'
   ascentLightOffNumber.value = '5'
   ascentLightOffUnit.value = 'seconds'
-  ascentLightBrightness.value = 75
+  ascentLightBrightness.value = 60
   ascentMatchCameraInterval.value = false
   activateMastLight.value = false
   updateFrequency.value = '5min'
@@ -712,11 +716,42 @@ async function handleConfigurationChange(value: string) {
   }
 }
 
+function requestDeleteConfiguration() {
+  if (!selectedConfiguration.value || selectedConfiguration.value === 'New Configuration') return
+  deleteError.value = ''
+  showDeleteModal.value = true
+}
+
+async function confirmDeleteConfiguration() {
+  const target = selectedConfiguration.value
+  if (!target || target === 'New Configuration') {
+    showDeleteModal.value = false
+    return
+  }
+  deleting.value = true
+  deleteError.value = ''
+  const ok = await deleteConfiguration(target)
+  deleting.value = false
+  if (!ok) {
+    deleteError.value = configurationSaveError.value || 'Failed to delete configuration.'
+    return
+  }
+  showDeleteModal.value = false
+  selectedConfiguration.value = ''
+  hasUnsavedChanges.value = false
+  resetToDefaults()
+}
+
+function cancelDeleteConfiguration() {
+  showDeleteModal.value = false
+  deleteError.value = ''
+}
+
 function handleBrightnessChange(value: number, phase: 'descent' | 'bottom' | 'ascent') {
   const currentBrightness = phase === 'descent' ? descentLightBrightness.value
     : phase === 'bottom' ? bottomLightBrightness.value
     : ascentLightBrightness.value
-  if (value < 75 && currentBrightness >= 75) {
+  if (value < 60 && currentBrightness >= 60) {
     pendingBrightness.value = { value, phase }
     showBrightnessWarning.value = true
   } else {
@@ -827,11 +862,24 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
       <!-- Configuration Profile -->
       <div class="mb-6">
         <label class="block mb-2" style="color: #96EEF2">Load Configuration</label>
-        <select :value="selectedConfiguration" @change="handleConfigurationChange(($event.target as HTMLSelectElement).value)" class="w-full px-4 py-3 text-white rounded-lg focus:outline-none mb-3" :style="inputStyle">
-          <option value="">-- Select Configuration --</option>
-          <option value="New Configuration">New Configuration</option>
-          <option v-for="(config, index) in savedConfigurations" :key="index" :value="config">{{ config }}</option>
-        </select>
+        <div class="flex items-stretch gap-2 mb-3">
+          <select :value="selectedConfiguration" @change="handleConfigurationChange(($event.target as HTMLSelectElement).value)" class="flex-1 px-4 py-3 text-white rounded-lg focus:outline-none" :style="inputStyle">
+            <option value="">-- Select Configuration --</option>
+            <option value="New Configuration">New Configuration</option>
+            <option v-for="(config, index) in savedConfigurations" :key="index" :value="config">{{ config }}</option>
+          </select>
+          <button
+            v-if="selectedConfiguration && selectedConfiguration !== 'New Configuration'"
+            type="button"
+            @click="requestDeleteConfiguration"
+            :title="`Delete configuration ${selectedConfiguration}`"
+            aria-label="Delete configuration"
+            class="px-4 rounded-lg text-white transition-all hover:opacity-90 flex items-center justify-center"
+            style="background-color: rgba(221, 44, 29, 0.2); border: 1px solid rgba(221, 44, 29, 0.5)"
+          >
+            <Trash2 class="w-5 h-5" style="color: #FF6B5E" />
+          </button>
+        </div>
       </div>
 
       <!-- ==================== DESCENT SECTION ==================== -->
@@ -1842,6 +1890,33 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
       </div>
     </Teleport>
 
+    <!-- Delete Configuration Modal -->
+    <Teleport to="body">
+      <div v-if="showDeleteModal" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
+        <div class="w-full max-w-md rounded-xl p-6" style="background-color: #0E2446; border: 2px solid #DD2C1D">
+          <div class="flex items-center justify-between mb-4">
+            <h2 class="text-white text-xl flex items-center gap-2">
+              <Trash2 class="w-5 h-5" style="color: #FF6B5E" />
+              Delete Configuration
+            </h2>
+            <button @click="cancelDeleteConfiguration" class="text-white hover:opacity-80 transition-opacity">
+              <X class="w-5 h-5" />
+            </button>
+          </div>
+          <p class="text-white mb-4">
+            Permanently delete <span class="font-semibold" style="color: #96EEF2">{{ selectedConfiguration }}</span>? This cannot be undone.
+          </p>
+          <p v-if="deleteError" class="text-sm mb-4 rounded-lg p-3" style="color: #FF9937; background-color: rgba(221, 44, 29, 0.15); border: 1px solid rgba(221, 44, 29, 0.4)">{{ deleteError }}</p>
+          <div class="flex gap-3">
+            <button @click="cancelDeleteConfiguration" :disabled="deleting" class="flex-1 px-4 py-3 rounded-lg transition-all disabled:opacity-50" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.3); color: #96EEF2">Cancel</button>
+            <button @click="confirmDeleteConfiguration" :disabled="deleting" class="flex-1 px-4 py-3 text-white rounded-lg transition-all hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed" style="background-color: #DD2C1D">
+              <Trash2 class="w-4 h-4 inline mr-2" />{{ deleting ? 'Deleting…' : 'Delete' }}
+            </button>
+          </div>
+        </div>
+      </div>
+    </Teleport>
+
     <!-- Navigation Warning Modal -->
     <Teleport to="body">
       <div v-if="showNavigationWarning" class="fixed inset-0 bg-black bg-opacity-50 flex items-center justify-center z-50 p-4">
@@ -1870,7 +1945,7 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
             <AlertTriangle class="w-5 h-5 flex-shrink-0 mt-0.5" style="color: #DD2C1D" />
             <div class="flex-1">
               <h3 class="text-white font-semibold mb-1">Low Brightness Warning</h3>
-              <p class="text-white text-sm opacity-90">Setting the light brightness below 75% may result in poor image quality and reduced visibility.</p>
+              <p class="text-white text-sm opacity-90">Setting the light brightness below 60% may result in poor image quality and reduced visibility.</p>
             </div>
             <div class="flex gap-2 ml-2">
               <button @click="cancelBrightnessChange" class="px-3 py-1.5 text-sm text-white rounded transition-all hover:opacity-80" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4)">Cancel</button>
