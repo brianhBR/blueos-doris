@@ -2,10 +2,11 @@
 import { ref, computed, onMounted } from 'vue'
 import {
   ArrowLeft, Calendar, Clock, Gauge, MapPin, User, Download,
-  Trash2, ZoomIn, Image, Video, Play, FileText, Loader2, AlertCircle
+  Trash2, ZoomIn, Image, Video, Play, Loader2, AlertCircle
 } from 'lucide-vue-next'
 import type { Screen, DiveData } from '../types'
 import { useMedia, type MediaFile } from '../composables/useApi'
+import { enqueueBulkDownload } from '../composables/useDownloads'
 import { parseBackendDateTime } from '../parseBackendTime'
 
 const API_V1 = '/api/v1'
@@ -37,6 +38,7 @@ const { files, loading, error, fetchFiles } = useMedia()
 
 const lightboxIndex = ref<number | null>(null)
 const showDeleteModal = ref(false)
+const downloadingAll = ref(false)
 
 const currentDive = computed<DiveData>(() => props.diveData ?? {
   name: 'Media',
@@ -153,6 +155,26 @@ const goBack = () => {
   emit('navigate', props.previousScreen)
 }
 
+const handleDownloadAll = async () => {
+  if (downloadingAll.value) return
+  const want = diveNameNorm.value
+  const items = files.value
+    .filter((f) => {
+      if (f.media_type !== 'image' && f.media_type !== 'video') return false
+      if (!want) return true
+      const dn = (f.dive_name ?? '').trim().toLowerCase()
+      return dn === want
+    })
+    .map((f) => ({ filePath: f.id, fileName: f.filename, sizeBytes: f.size_bytes }))
+  if (items.length === 0) return
+  downloadingAll.value = true
+  try {
+    await enqueueBulkDownload(items)
+  } finally {
+    downloadingAll.value = false
+  }
+}
+
 const imageCount = computed(() => mediaItems.value.filter(m => m.type === 'image').length)
 const videoCount = computed(() => mediaItems.value.filter(m => m.type === 'video').length)
 
@@ -194,18 +216,15 @@ onMounted(() => {
         </div>
         <div class="flex flex-wrap gap-2">
           <button
-            class="px-3 py-1.5 text-sm rounded-lg transition-all hover:opacity-90 flex items-center gap-1.5"
+            @click="handleDownloadAll"
+            :disabled="downloadingAll || mediaItems.length === 0"
+            :title="mediaItems.length === 0 ? 'No media to download' : `Download all ${mediaItems.length} media files`"
+            class="px-3 py-1.5 text-sm rounded-lg transition-all hover:opacity-90 flex items-center gap-1.5 disabled:opacity-50 disabled:cursor-not-allowed"
             style="background: linear-gradient(135deg, #FF9937 0%, #FF621D 100%); color: white"
           >
-            <Download class="w-3.5 h-3.5" />
-            Download All
-          </button>
-          <button
-            class="px-3 py-1.5 text-sm rounded-lg transition-all hover:opacity-90 flex items-center gap-1.5"
-            style="background: linear-gradient(135deg, #41B9C3 0%, #187D8B 100%); color: white"
-          >
-            <FileText class="w-3.5 h-3.5" />
-            Open Log
+            <Loader2 v-if="downloadingAll" class="w-3.5 h-3.5 animate-spin" />
+            <Download v-else class="w-3.5 h-3.5" />
+            {{ downloadingAll ? 'Starting…' : 'Download All' }}
           </button>
           <button
             @click="confirmDelete"
