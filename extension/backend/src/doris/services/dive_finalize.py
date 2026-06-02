@@ -797,6 +797,11 @@ async def finalize_dive(
     scan_dirs: list[Path] = []
     if dive_dir.is_dir():
         scan_dirs.append(dive_dir)
+        # TIMELAPSE/snapshot JPEGs now live in <dive_dir>/photos/ (issue
+        # #37); include it so the snapshot manifest still catalogs them.
+        photos_dir = dive_dir / iprec.SNAPSHOT_SUBDIR
+        if photos_dir.is_dir():
+            scan_dirs.append(photos_dir)
     scan_dirs.append(rec_root)
 
     # Bucket files by phase.  Snapshots and segments both embed the

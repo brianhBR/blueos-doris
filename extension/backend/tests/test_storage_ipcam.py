@@ -46,6 +46,15 @@ def _make_recorder_file(svc: StorageService, mission: str) -> Path:
     return f
 
 
+def _make_ipcam_snapshot(svc: StorageService, dive: str) -> Path:
+    """Timelapse JPEG in the dive's photos/ subfolder (issue #37)."""
+    d = svc.ipcam_root / dive / "photos"
+    d.mkdir(parents=True, exist_ok=True)
+    f = d / f"radcam_{dive.replace('dive_', '')}_on_bottom_00001.jpg"
+    f.write_bytes(b"\xff\xd8\xff\xe0" + b"\x00" * 512)
+    return f
+
+
 async def test_flat_scan_includes_internal_ipcam(svc):
     _make_ipcam_recording(svc, "dive_20260601_120000")
 
@@ -106,3 +115,37 @@ async def test_empty_ipcam_tree_is_noop(svc):
 
     assert len(files) == 1
     assert all(m.mission_id == "mission_x" for m in missions)
+
+
+async def test_snapshot_in_photos_subfolder_is_discovered(svc):
+    """Issue #37: stills moved into <dive>/photos/ still appear as media,
+    grouped under their dive folder (recursive scan)."""
+    _make_ipcam_snapshot(svc, "dive_20260601_120000")
+
+    files = await svc.get_media_files()
+
+    assert len(files) == 1
+    mf = files[0]
+    assert mf.media_type == MediaType.IMAGE
+    assert mf.mission_id == "dive_20260601_120000"
+    assert mf.dive_name == "dive_20260601_120000"
+
+
+async def test_snapshot_in_photos_counts_toward_mission(svc):
+    """The per-dive image count includes stills nested in photos/."""
+    _make_ipcam_snapshot(svc, "dive_20260601_120000")
+
+    missions = await svc.get_missions_with_media()
+    by_id = {m.mission_id: m for m in missions}
+
+    assert by_id["dive_20260601_120000"].image_count == 1
+
+
+async def test_mission_filter_finds_snapshot_in_photos(svc):
+    """Filtering by the dive folder returns the nested still."""
+    _make_ipcam_snapshot(svc, "dive_20260601_120000")
+
+    files = await svc.get_media_files(mission_id="dive_20260601_120000")
+
+    assert len(files) == 1
+    assert files[0].filename.endswith(".jpg")
