@@ -76,7 +76,7 @@ class CameraSettings(BaseModel):
 class LightSettings(BaseModel):
     enabled: bool = False
     mode: LightMode = LightMode.CONTINUOUS
-    brightness: int = 75
+    brightness: int = 60
     match_camera_interval: bool = False
 
     on_time: TimeValue = Field(default_factory=lambda: TimeValue(number="10", unit="seconds"))

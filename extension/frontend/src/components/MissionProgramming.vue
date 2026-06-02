@@ -71,7 +71,7 @@ const descentLightOnNumber = ref('10')
 const descentLightOnUnit = ref('seconds')
 const descentLightOffNumber = ref('5')
 const descentLightOffUnit = ref('seconds')
-const descentLightBrightness = ref(75)
+const descentLightBrightness = ref(60)
 const descentMatchCameraInterval = ref(false)
 
 // On Bottom settings
@@ -109,7 +109,7 @@ const bottomLightOnNumber = ref('10')
 const bottomLightOnUnit = ref('seconds')
 const bottomLightOffNumber = ref('5')
 const bottomLightOffUnit = ref('seconds')
-const bottomLightBrightness = ref(75)
+const bottomLightBrightness = ref(60)
 const bottomMatchCameraInterval = ref(false)
 
 // Ascent settings
@@ -146,7 +146,7 @@ const ascentLightOnNumber = ref('10')
 const ascentLightOnUnit = ref('seconds')
 const ascentLightOffNumber = ref('5')
 const ascentLightOffUnit = ref('seconds')
-const ascentLightBrightness = ref(75)
+const ascentLightBrightness = ref(60)
 const ascentMatchCameraInterval = ref(false)
 
 // Recovery settings
@@ -296,7 +296,7 @@ function resetToDefaults() {
   descentLightOnUnit.value = 'seconds'
   descentLightOffNumber.value = '5'
   descentLightOffUnit.value = 'seconds'
-  descentLightBrightness.value = 75
+  descentLightBrightness.value = 60
   descentMatchCameraInterval.value = false
   bottomCameraOn.value = true
   bottomCameraDelayNumber.value = '30'
@@ -332,7 +332,7 @@ function resetToDefaults() {
   bottomLightOnUnit.value = 'seconds'
   bottomLightOffNumber.value = '5'
   bottomLightOffUnit.value = 'seconds'
-  bottomLightBrightness.value = 75
+  bottomLightBrightness.value = 60
   bottomMatchCameraInterval.value = false
   ascentSameAsDescent.value = false
   emit('update:releaseWeightBy', 'elapsed')
@@ -368,7 +368,7 @@ function resetToDefaults() {
   ascentLightOnUnit.value = 'seconds'
   ascentLightOffNumber.value = '5'
   ascentLightOffUnit.value = 'seconds'
-  ascentLightBrightness.value = 75
+  ascentLightBrightness.value = 60
   ascentMatchCameraInterval.value = false
   activateMastLight.value = false
   updateFrequency.value = '5min'
@@ -716,7 +716,7 @@ function handleBrightnessChange(value: number, phase: 'descent' | 'bottom' | 'as
   const currentBrightness = phase === 'descent' ? descentLightBrightness.value
     : phase === 'bottom' ? bottomLightBrightness.value
     : ascentLightBrightness.value
-  if (value < 75 && currentBrightness >= 75) {
+  if (value < 60 && currentBrightness >= 60) {
     pendingBrightness.value = { value, phase }
     showBrightnessWarning.value = true
   } else {
@@ -1870,7 +1870,7 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
             <AlertTriangle class="w-5 h-5 flex-shrink-0 mt-0.5" style="color: #DD2C1D" />
             <div class="flex-1">
               <h3 class="text-white font-semibold mb-1">Low Brightness Warning</h3>
-              <p class="text-white text-sm opacity-90">Setting the light brightness below 75% may result in poor image quality and reduced visibility.</p>
+              <p class="text-white text-sm opacity-90">Setting the light brightness below 60% may result in poor image quality and reduced visibility.</p>
             </div>
             <div class="flex gap-2 ml-2">
               <button @click="cancelBrightnessChange" class="px-3 py-1.5 text-sm text-white rounded transition-all hover:opacity-80" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4)">Cancel</button>
