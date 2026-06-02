@@ -70,6 +70,14 @@ local MAV_SEVERITY = {
 local UPDATE_INTERVAL_MS = 500
 local ARM_RETRY_MS       = 2000
 
+-- VIDEO_INTERVAL first-frame gating: after ipcam_start the record clock
+-- does not begin counting until the extension reports frames are
+-- actually landing on disk (RTSP connect + jitter-buffer fill can take
+-- anywhere from <1 s to ~15 s on this camera).  If the readiness signal
+-- can't be confirmed within this many ms we start the clock anyway so a
+-- status-endpoint outage can never hang a record cycle.
+local IPCAM_FIRST_FRAME_TIMEOUT_MS = 30000
+
 local surface_pressure = baro:get_pressure() or 101325
 
 -- ArduSub SITL exposes SIM_BUOYANCY; used for depth fallback and relay tests.
@@ -348,6 +356,17 @@ local ipcam_btm_started      = false
 local ipcam_state = {
     cycle_start_ms  = 0,
     cycle_is_record = false,
+    -- VIDEO_INTERVAL first-frame gating.  ``cycle_started`` flips true
+    -- once the duty cycle has begun for the current bottom visit (so the
+    -- inaugural record window is only kicked off once).
+    -- ``cycle_awaiting_frames`` is true between issuing ipcam_start and
+    -- confirming frames are on disk; while true the record clock
+    -- (``cycle_start_ms``) is held at 0 and not counted.
+    -- ``cycle_wait_start_ms`` stamps when the wait began so the safety
+    -- timeout can fire.
+    cycle_started        = false,
+    cycle_awaiting_frames = false,
+    cycle_wait_start_ms  = 0,
     last_snap_ms    = 0,
     -- Timelapse: ``next_snap_ms`` is the absolute millis when the
     -- next snapshot should fire; the dispatcher sets it to ``now +
@@ -726,6 +745,44 @@ local function ipcam_http_send(first_line, host, port)
     sock:send(req, string.len(req))
     sock:close()
     return true
+end
+
+-- Bounded HTTP GET that DOES read the response (unlike the fire-and-
+-- forget ipcam_http_send above).  Returns the raw response text
+-- (headers + body) or nil on any failure.  Kept deliberately small and
+-- non-blocking-friendly: a single ``pollin`` with a short timeout so it
+-- never stalls the dive update loop (which also services failsafes).
+-- Only used to poll /rec/status during the brief first-frame wait.
+local function ipcam_http_get(path, host, port)
+    local sock = Socket(0)
+    if not sock then return nil end
+    if not sock:bind("0.0.0.0", 0) then sock:close(); return nil end
+    if not sock:connect(host, port) then sock:close(); return nil end
+    local req = string.format(
+        "GET %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host)
+    sock:send(req, string.len(req))
+    local body = nil
+    -- Localhost replies in <few ms; cap the wait at 100 ms.  The status
+    -- payload is small and ``frames_flowing`` sits near the front of the
+    -- JSON, so a single recv of the first chunk is sufficient.
+    if sock:pollin(100) then
+        local data = sock:recv(4096)
+        if data and #data > 0 then body = data end
+    end
+    sock:close()
+    return body
+end
+
+-- Query the recorder's readiness.  Returns true if frames are confirmed
+-- on disk, false if the recorder explicitly reports not-yet, and nil if
+-- the status couldn't be read / parsed (caller treats nil as "keep
+-- waiting" up to the safety timeout).
+local function ipcam_frames_flowing()
+    local body = ipcam_http_get("/rec/status", "127.0.0.1", 8095)
+    if not body then return nil end
+    if body:find('"frames_flowing"%s*:%s*true') then return true end
+    if body:find('"frames_flowing"%s*:%s*false') then return false end
+    return nil
 end
 
 local function ipcam_http_start(host, port, seg_s, phase)
@@ -1133,10 +1190,13 @@ function update()
                 ipcam_btm_started = false
                 -- Reset interval/timelapse timers so the on_bottom
                 -- loop below can establish its own cadence.
-                ipcam_state.cycle_start_ms  = 0
-                ipcam_state.cycle_is_record = false
-                ipcam_state.last_snap_ms    = 0
-                ipcam_state.next_snap_ms    = 0
+                ipcam_state.cycle_start_ms       = 0
+                ipcam_state.cycle_is_record      = false
+                ipcam_state.cycle_started        = false
+                ipcam_state.cycle_awaiting_frames = false
+                ipcam_state.cycle_wait_start_ms  = 0
+                ipcam_state.last_snap_ms         = 0
+                ipcam_state.next_snap_ms         = 0
                 -- For CONTINUOUS bottom mode with no camera delay we do
                 -- a zero-gap rotate-or-start right now so the moment
                 -- the vehicle settles, the first "on_bottom" .ts starts.
@@ -1191,12 +1251,15 @@ function update()
         local bottom_lgt_eff = cfg.btm_lgt
         if ipcam_cfg.btm_cmod == 2 then
             -- INTERVAL: the camera starts each cycle, the light comes on
-            -- cfg.btm_dly_ms (light delay) after recording starts, and
-            -- both turn off together when the record window ends.  The
-            -- "record for" duration is measured from when the camera
-            -- started, so the light is lit for (btm_rec_ms - btm_dly_ms).
+            -- cfg.btm_dly_ms (light delay) after the record clock starts,
+            -- and both turn off together when the record window ends.  The
+            -- record clock is first-frame gated (held at 0 while awaiting
+            -- frames), so the light stays off until recording truly begins;
+            -- it is then lit for (btm_rec_ms - btm_dly_ms).
             bottom_lgt_eff = cfg.btm_lgt
                 and ipcam_state.cycle_is_record
+                and not ipcam_state.cycle_awaiting_frames
+                and ipcam_state.cycle_start_ms > 0
                 and (now_ms - ipcam_state.cycle_start_ms) >= cfg.btm_dly_ms
         elseif ipcam_cfg.btm_cmod == 3 then
             local pre_active = ipcam_state.next_snap_ms > 0
@@ -1237,21 +1300,59 @@ function update()
                 ipcam_btm_started = ipcam_recording
             end
         elseif ipcam_cfg.btm_cmod == 2 then
-            -- VIDEO_INTERVAL: record for btm_rec_ms (measured from camera
-            -- start), pause btm_pau_ms.  The light comes on btm_dly_ms
-            -- into the record window (handled in the light block above)
-            -- and goes off with the camera at the end of the window.
+            -- VIDEO_INTERVAL: duty-cycle record for btm_rec_ms, pause
+            -- btm_pau_ms.  The record clock is gated on first-frame: the
+            -- window only starts counting once the extension confirms
+            -- frames are on disk, so a slow RTSP connect (observed up to
+            -- ~15 s) no longer eats into the recorded clip length.  The
+            -- light comes on btm_dly_ms into the record window (handled in
+            -- the light block above) and goes off with the camera at the
+            -- end of the window.
             if cam_delay_done and ipcam_cfg.btm_rec_ms > 0
                and ipcam_cfg.btm_pau_ms > 0 then
-                if ipcam_state.cycle_start_ms == 0 then
-                    ipcam_state.cycle_start_ms  = now_ms
-                    ipcam_state.cycle_is_record = true
+                if not ipcam_state.cycle_started then
+                    -- Inaugural record window for this bottom visit: kick
+                    -- off the recorder, then wait for frames before the
+                    -- clock starts.
+                    ipcam_state.cycle_started         = true
+                    ipcam_state.cycle_is_record       = true
+                    ipcam_state.cycle_awaiting_frames = true
+                    ipcam_state.cycle_wait_start_ms   = now_ms
+                    ipcam_state.cycle_start_ms        = 0
                     ipcam_begin_phase(true, "on_bottom")
                     ipcam_btm_started = ipcam_recording
                     gcs:send_text(MAV_SEVERITY.INFO,
                         string.format("DIVE: IPcam interval start (rec %ds, light +%ds)",
                             math.floor(ipcam_cfg.btm_rec_ms / 1000),
                             math.floor(cfg.btm_dly_ms / 1000)))
+                elseif ipcam_state.cycle_awaiting_frames then
+                    -- Hold the record clock until frames are confirmed on
+                    -- disk (or the safety timeout fires).  The light delay
+                    -- is measured from this point, so the light stays off
+                    -- during the wait.
+                    local ff = ipcam_frames_flowing()
+                    local waited = now_ms - ipcam_state.cycle_wait_start_ms
+                    if ff == true then
+                        ipcam_state.cycle_awaiting_frames = false
+                        ipcam_state.cycle_start_ms        = now_ms
+                        gcs:send_text(MAV_SEVERITY.INFO,
+                            string.format(
+                                "DIVE: IPcam frames flowing after %.1fs, "
+                                .. "recording %ds (light +%ds)",
+                                waited / 1000.0,
+                                math.floor(ipcam_cfg.btm_rec_ms / 1000),
+                                math.floor(cfg.btm_dly_ms / 1000)))
+                    elseif waited >= IPCAM_FIRST_FRAME_TIMEOUT_MS then
+                        -- Fail-safe: never hang a cycle on a missing
+                        -- readiness signal -- start the clock anyway.
+                        ipcam_state.cycle_awaiting_frames = false
+                        ipcam_state.cycle_start_ms        = now_ms
+                        gcs:send_text(MAV_SEVERITY.WARNING,
+                            string.format(
+                                "DIVE: IPcam first-frame wait timed out "
+                                .. "(%.0fs), starting clock anyway",
+                                waited / 1000.0))
+                    end
                 else
                     local cycle_elapsed = now_ms - ipcam_state.cycle_start_ms
                     if ipcam_state.cycle_is_record
@@ -1264,8 +1365,13 @@ function update()
                                 math.floor(ipcam_cfg.btm_pau_ms / 1000)))
                     elseif (not ipcam_state.cycle_is_record)
                        and cycle_elapsed >= ipcam_cfg.btm_pau_ms then
-                        ipcam_state.cycle_is_record = true
-                        ipcam_state.cycle_start_ms  = now_ms
+                        -- Begin the next record window: start the
+                        -- recorder, then re-enter the first-frame wait so
+                        -- this window's clock is gated too.
+                        ipcam_state.cycle_is_record       = true
+                        ipcam_state.cycle_awaiting_frames = true
+                        ipcam_state.cycle_wait_start_ms   = now_ms
+                        ipcam_state.cycle_start_ms        = 0
                         if not ipcam_recording then
                             ipcam_start("on_bottom")
                         end

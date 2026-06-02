@@ -19,7 +19,7 @@ from pathlib import Path
 
 from robyn import Response, Robyn
 
-from ..services import binlog
+from ..services import binlog, dive_csv_export
 from ..services import ip_camera_recorder as iprec
 from ..services.camera import CameraService
 from ..services.dive import DiveService
@@ -81,6 +81,7 @@ def _sync_mission_state_from_vehicle(status_dict: dict) -> None:
             updated = None
         if updated is not None:
             _schedule_binlog_archive(updated)
+            _schedule_csv_export(updated)
     if changed:
         try:
             MISSION_STATE_PATH.write_text(json.dumps(ms, indent=2, default=str))
@@ -173,6 +174,32 @@ def _schedule_binlog_archive(dive_file: Path) -> None:
             logger.info("BIN archive (%s): %s", dive_file.name, result)
         except Exception:
             logger.exception("BIN archive failed for %s", dive_file)
+
+    loop.create_task(_runner())
+
+
+def _schedule_csv_export(dive_file: Path) -> None:
+    """Fire-and-forget background dive-data CSV export to USB.
+
+    Parses the dive's ``.mcap`` once at dive end and writes the CSV to
+    USB so the "Export dive data" button can serve it instantly instead
+    of re-parsing on the request path.  Like the BIN archive this runs on
+    the request path's event loop and must never bubble failures up: a
+    missing USB drive or unreadable log just leaves the on-demand export
+    as the fallback.
+    """
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        logger.debug("No running loop; skipping CSV export for %s", dive_file)
+        return
+
+    async def _runner() -> None:
+        try:
+            result = await dive_csv_export.export_dive_csv_to_usb(dive_file)
+            logger.info("CSV export (%s): %s", dive_file.name, result)
+        except Exception:
+            logger.exception("CSV export failed for %s", dive_file)
 
     loop.create_task(_runner())
 
@@ -376,6 +403,7 @@ def register_dive_routes(app: Robyn) -> None:
 
         if updated_dive_file is not None:
             _schedule_binlog_archive(updated_dive_file)
+            _schedule_csv_export(updated_dive_file)
 
         try:
             _set_mission_terminal_status("cancelled")
@@ -487,7 +515,8 @@ def register_dive_routes(app: Robyn) -> None:
 
     @app.get("/api/v1/dive/history/:dive_id/export/scientific.csv")
     async def dive_history_scientific_csv(request):
-        """CSV with dive metadata and time-series samples from the dive's primary .mcap."""
+        """CSV with a dive-data header plus per-cycle system + science telemetry
+        reassembled from the dive's primary .mcap."""
         dive_id = request.path_params.get("dive_id", "").strip()
         if not re.fullmatch(r"dive_\d{4}", dive_id):
             return Response(
@@ -512,9 +541,33 @@ def register_dive_routes(app: Robyn) -> None:
                 headers={"Content-Type": "application/json"},
             )
 
+        from ..services.mcap_telemetry import dive_csv_filename
+
+        download_name = dive_csv_filename(dive_data, dive_id)
+
+        # Prefer a CSV already generated to USB at dive end -- serving it
+        # is instant, whereas a fresh parse of a large .mcap can take tens
+        # of seconds on the vehicle's Raspberry Pi.
+        cached = dive_csv_export.find_cached_csv(dive_data)
+        if cached is not None:
+            try:
+                raw = cached.read_bytes()
+            except OSError as e:
+                logger.warning("Cached CSV unreadable (%s); regenerating: %s", cached, e)
+            else:
+                return Response(
+                    status_code=200,
+                    description=raw,
+                    headers={
+                        "Content-Type": "text/csv; charset=utf-8",
+                        "Content-Disposition": f'attachment; filename="{download_name}"',
+                        "Content-Length": str(len(raw)),
+                    },
+                )
+
         from ..services.mcap_telemetry import (
             McapSummary,
-            build_scientific_csv,
+            build_dive_csv,
             map_dive_stem_to_largest_mcap,
             summarize_mcap,
         )
@@ -532,14 +585,14 @@ def register_dive_routes(app: Robyn) -> None:
             except Exception as e:
                 logger.warning("MCAP summarize failed for %s: %s", mcap_path, e)
 
-        csv_text = build_scientific_csv(dive_data, summary, rel)
+        csv_text = build_dive_csv(dive_data, summary, rel)
         raw = csv_text.encode("utf-8")
         return Response(
             status_code=200,
             description=raw,
             headers={
                 "Content-Type": "text/csv; charset=utf-8",
-                "Content-Disposition": f'attachment; filename="{dive_id}_scientific.csv"',
+                "Content-Disposition": f'attachment; filename="{download_name}"',
                 "Content-Length": str(len(raw)),
             },
         )
@@ -591,6 +644,43 @@ def register_dive_routes(app: Robyn) -> None:
             result = await binlog.archive_dive_bin_logs(path)
         except Exception as e:
             logger.exception("Manual BIN archive failed for %s", dive_id)
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+        return Response(
+            status_code=200,
+            description=json.dumps(result, default=str),
+            headers={"Content-Type": "application/json"},
+        )
+
+    @app.post("/api/v1/dive/history/:dive_id/export_csv_to_usb")
+    async def dive_history_export_csv_to_usb(request):
+        """Re-run the dive-data CSV export to USB for a past dive.
+
+        Useful when the USB drive was missing at dive end, or when the
+        operator wants to refresh the cached CSV.  Returns the same status
+        dict the background exporter writes into the dive record.
+        """
+        dive_id = request.path_params.get("dive_id", "").strip()
+        if not re.fullmatch(r"dive_\d{4}", dive_id):
+            return Response(
+                status_code=400,
+                description=json.dumps({"error": "Invalid dive id"}),
+                headers={"Content-Type": "application/json"},
+            )
+        path = DIVES_DIR / f"{dive_id}.json"
+        if not path.is_file():
+            return Response(
+                status_code=404,
+                description=json.dumps({"error": "Dive record not found"}),
+                headers={"Content-Type": "application/json"},
+            )
+        try:
+            result = await dive_csv_export.export_dive_csv_to_usb(path)
+        except Exception as e:
+            logger.exception("Manual CSV export failed for %s", dive_id)
             return Response(
                 status_code=500,
                 description=json.dumps({"error": str(e)}),

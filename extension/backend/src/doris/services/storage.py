@@ -487,8 +487,12 @@ def _parse_datetime_from_filename(filename: str) -> datetime | None:
             )
         except ValueError:
             pass
-    # Loose YYYYMMDD_HHMMSS anywhere in stem
-    m2 = re.search(r"(20\d{2})(\d{2})(\d{2})[_-](\d{2})(\d{2})(\d{2})", filename)
+    # Loose YYYYMMDD<sep>HHMMSS anywhere in stem.  ``t``/``T`` covers the
+    # recorder's MP4 names (e.g. 20260528t171502_on_bottom.mp4); ``_``/``-``
+    # cover dive-stamp prefixes and other DORIS exports.
+    m2 = re.search(
+        r"(20\d{2})(\d{2})(\d{2})[_\-tT](\d{2})(\d{2})(\d{2})", filename
+    )
     if m2:
         try:
             return datetime(
