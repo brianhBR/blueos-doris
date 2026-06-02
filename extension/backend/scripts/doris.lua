@@ -1250,7 +1250,17 @@ function update()
         --                  (driven by tl_strobe_active below)
         local bottom_lgt_eff = cfg.btm_lgt
         if ipcam_cfg.btm_cmod == 2 then
-            bottom_lgt_eff = cfg.btm_lgt and ipcam_recording
+            -- INTERVAL: the camera starts each cycle, the light comes on
+            -- cfg.btm_dly_ms (light delay) after the record clock starts,
+            -- and both turn off together when the record window ends.  The
+            -- record clock is first-frame gated (held at 0 while awaiting
+            -- frames), so the light stays off until recording truly begins;
+            -- it is then lit for (btm_rec_ms - btm_dly_ms).
+            bottom_lgt_eff = cfg.btm_lgt
+                and ipcam_state.cycle_is_record
+                and not ipcam_state.cycle_awaiting_frames
+                and ipcam_state.cycle_start_ms > 0
+                and (now_ms - ipcam_state.cycle_start_ms) >= cfg.btm_dly_ms
         elseif ipcam_cfg.btm_cmod == 3 then
             local pre_active = ipcam_state.next_snap_ms > 0
                 and (ipcam_state.next_snap_ms - now_ms) <= ipcam_cfg.tl_pre_ms
@@ -1259,7 +1269,12 @@ function update()
             bottom_lgt_eff = cfg.btm_lgt and (pre_active or post_active)
         end
 
-        if not bottom_delay_done then
+        if ipcam_cfg.btm_cmod == 2 then
+            -- INTERVAL owns its light timing per-cycle (above).  The
+            -- one-time bottom settling delay is replaced by the camera
+            -- settle (cam_delay_done), which gates the first cycle.
+            update_lights(bottom_lgt_eff, now_ms)
+        elseif not bottom_delay_done then
             update_lights(false, now_ms)
             if bottom_elapsed >= cfg.btm_dly_ms then
                 bottom_delay_done = true
@@ -1289,7 +1304,10 @@ function update()
             -- btm_pau_ms.  The record clock is gated on first-frame: the
             -- window only starts counting once the extension confirms
             -- frames are on disk, so a slow RTSP connect (observed up to
-            -- ~15 s) no longer eats into the recorded clip length.
+            -- ~15 s) no longer eats into the recorded clip length.  The
+            -- light comes on btm_dly_ms into the record window (handled in
+            -- the light block above) and goes off with the camera at the
+            -- end of the window.
             if cam_delay_done and ipcam_cfg.btm_rec_ms > 0
                and ipcam_cfg.btm_pau_ms > 0 then
                 if not ipcam_state.cycle_started then
@@ -1304,11 +1322,14 @@ function update()
                     ipcam_begin_phase(true, "on_bottom")
                     ipcam_btm_started = ipcam_recording
                     gcs:send_text(MAV_SEVERITY.INFO,
-                        string.format("DIVE: IPcam interval start (rec %ds)",
-                            math.floor(ipcam_cfg.btm_rec_ms / 1000)))
+                        string.format("DIVE: IPcam interval start (rec %ds, light +%ds)",
+                            math.floor(ipcam_cfg.btm_rec_ms / 1000),
+                            math.floor(cfg.btm_dly_ms / 1000)))
                 elseif ipcam_state.cycle_awaiting_frames then
                     -- Hold the record clock until frames are confirmed on
-                    -- disk (or the safety timeout fires).
+                    -- disk (or the safety timeout fires).  The light delay
+                    -- is measured from this point, so the light stays off
+                    -- during the wait.
                     local ff = ipcam_frames_flowing()
                     local waited = now_ms - ipcam_state.cycle_wait_start_ms
                     if ff == true then
@@ -1317,9 +1338,10 @@ function update()
                         gcs:send_text(MAV_SEVERITY.INFO,
                             string.format(
                                 "DIVE: IPcam frames flowing after %.1fs, "
-                                .. "recording %ds",
+                                .. "recording %ds (light +%ds)",
                                 waited / 1000.0,
-                                math.floor(ipcam_cfg.btm_rec_ms / 1000)))
+                                math.floor(ipcam_cfg.btm_rec_ms / 1000),
+                                math.floor(cfg.btm_dly_ms / 1000)))
                     elseif waited >= IPCAM_FIRST_FRAME_TIMEOUT_MS then
                         -- Fail-safe: never hang a cycle on a missing
                         -- readiness signal -- start the clock anyway.
@@ -1354,8 +1376,9 @@ function update()
                             ipcam_start("on_bottom")
                         end
                         gcs:send_text(MAV_SEVERITY.INFO,
-                            string.format("DIVE: IPcam interval record (%ds)",
-                                math.floor(ipcam_cfg.btm_rec_ms / 1000)))
+                            string.format("DIVE: IPcam interval record (%ds, light +%ds)",
+                                math.floor(ipcam_cfg.btm_rec_ms / 1000),
+                                math.floor(cfg.btm_dly_ms / 1000)))
                     end
                 end
             end

@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.parse import quote
 
+from ..config import settings
 from ..models.configuration import (
     ConfigurationSummary,
     DeploymentConfiguration,
@@ -35,6 +36,15 @@ ALL_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | DATA_EXTENSIONS
 
 DATA_ROOT = Path(os.environ.get("DORIS_DATA_ROOT", "/tmp/storage"))
 RECORDER_ROOT = Path(os.environ.get("DORIS_RECORDER_ROOT", "/tmp/storage/userdata/recorder"))
+# Internal fallback for IP-camera recordings when no USB stick is mounted.
+# The recorder writes here (see services/ip_camera_recorder._output_dir);
+# without scanning it, test/dive recordings made without a USB drive never
+# appeared on the data page (issue #32).
+IPCAM_ROOT = DATA_ROOT / settings.ipcam_recordings_subdir.strip("/")
+# Path parts of the ipcam subdir relative to DATA_ROOT, e.g.
+# ("userdata", "ipcam_recordings"). Used to label internal recordings by
+# their per-dive folder instead of the generic "userdata" top-level dir.
+IPCAM_SUBDIR_PARTS = tuple(Path(settings.ipcam_recordings_subdir.strip("/")).parts)
 
 # BlueOS bind-mount folders under DATA_ROOT — not user dive names.
 SYSTEM_TOP_LEVEL = frozenset(
@@ -598,6 +608,25 @@ def _file_to_media(
     dive_name: str | None = None
     media_type = content_kind
 
+    # Internal IP-camera recordings live under
+    # ``userdata/ipcam_recordings/dive_<stamp>/`` — group them by that
+    # per-dive folder rather than the generic "userdata" top-level dir.
+    n = len(IPCAM_SUBDIR_PARTS)
+    if IPCAM_SUBDIR_PARTS and len(parts) > n and parts[:n] == IPCAM_SUBDIR_PARTS:
+        dive_folder = parts[n]
+        wn = _match_dive_window(dive_windows, eff_utc)
+        dive_name = wn.display_name if wn else dive_folder
+        return MediaFile(
+            id=str(rel),
+            filename=path.name,
+            media_type=media_type,
+            size_bytes=stat.st_size,
+            created_at=eff,
+            mission_id=dive_folder,
+            dive_name=dive_name,
+            download_url=f"/api/v1/media/download/{rel}",
+        )
+
     if top == RECORDER_DIR:
         wn = _match_dive_window(dive_windows, eff_utc)
         dive_name = wn.display_name if wn else None
@@ -622,6 +651,37 @@ def _file_to_media(
     )
 
 
+def _summarize_media_dir(
+    entry: Path,
+) -> tuple[int, int, int, int, datetime | None]:
+    """Count images/videos/data files, total bytes, and the latest mtime."""
+    images = videos = data_files = 0
+    total_size = 0
+    latest_date: datetime | None = None
+    for path in entry.rglob("*"):
+        try:
+            if not path.is_file():
+                continue
+            ext = path.suffix.lstrip(".").lower()
+            if ext not in ALL_EXTENSIONS:
+                continue
+            stat = path.stat()
+            total_size += stat.st_size
+            eff = _effective_created_at(path, stat.st_mtime)
+            if latest_date is None or eff > latest_date:
+                latest_date = eff
+            mt = _detect_media_type(path.name)
+            if mt == MediaType.IMAGE:
+                images += 1
+            elif mt == MediaType.VIDEO:
+                videos += 1
+            else:
+                data_files += 1
+        except (FileNotFoundError, PermissionError):
+            continue
+    return images, videos, data_files, total_size, latest_date
+
+
 class StorageService:
     """Service for managing stored media files on the local filesystem.
 
@@ -631,9 +691,16 @@ class StorageService:
     for configurations and other extension data.
     """
 
-    def __init__(self, root: Path | None = None, media_root: Path | None = None):
+    def __init__(
+        self,
+        root: Path | None = None,
+        media_root: Path | None = None,
+        ipcam_root: Path | None = None,
+    ):
         self.root = root or DATA_ROOT
         self.media_root = media_root or RECORDER_ROOT
+        # Internal IP-camera recordings tree (used when no USB is mounted).
+        self.ipcam_root = ipcam_root or IPCAM_ROOT
         if not self.root.exists():
             self.root.mkdir(parents=True, exist_ok=True)
         if not self.media_root.exists() and not self.media_root.is_symlink():
@@ -697,7 +764,13 @@ class StorageService:
             if mission_id:
                 search_root = self.media_root / mission_id
                 if not search_root.exists():
-                    return []
+                    # Fall back to the internal IP-camera tree so a dive
+                    # recorded without a USB stick is still browsable.
+                    alt = self.ipcam_root / mission_id
+                    if alt.exists():
+                        search_root = alt
+                    else:
+                        return []
                 for path in search_root.rglob("*"):
                     try:
                         if not path.is_file():
@@ -710,8 +783,13 @@ class StorageService:
                     except (FileNotFoundError, PermissionError):
                         continue
             else:
-                if self.media_root.exists():
-                    for path in self.media_root.rglob("*"):
+                # ``media_root`` and ``ipcam_root`` are sibling trees under
+                # DATA_ROOT; the latter only holds files when recording
+                # without a USB stick, so scanning both never double-counts.
+                for scan_root in (self.media_root, self.ipcam_root):
+                    if not scan_root.exists():
+                        continue
+                    for path in scan_root.rglob("*"):
                         try:
                             if not path.is_file():
                                 continue
@@ -764,31 +842,9 @@ class StorageService:
                     if entry.name.lower() in SYSTEM_TOP_LEVEL:
                         continue
 
-                    images = videos = data_files = 0
-                    total_size = 0
-                    latest_date: datetime | None = None
-
-                    for path in entry.rglob("*"):
-                        try:
-                            if not path.is_file():
-                                continue
-                            ext = path.suffix.lstrip(".").lower()
-                            if ext not in ALL_EXTENSIONS:
-                                continue
-                            stat = path.stat()
-                            total_size += stat.st_size
-                            eff = _effective_created_at(path, stat.st_mtime)
-                            if latest_date is None or eff > latest_date:
-                                latest_date = eff
-                            mt = _detect_media_type(path.name)
-                            if mt == MediaType.IMAGE:
-                                images += 1
-                            elif mt == MediaType.VIDEO:
-                                videos += 1
-                            else:
-                                data_files += 1
-                        except (FileNotFoundError, PermissionError):
-                            continue
+                    images, videos, data_files, total_size, latest_date = (
+                        _summarize_media_dir(entry)
+                    )
 
                     if images + videos + data_files == 0:
                         continue
@@ -802,6 +858,28 @@ class StorageService:
                         MediaMission(
                             mission_id=entry.name,
                             mission_name=display_name,
+                            date=latest_date or datetime.now(tz=timezone.utc),
+                            image_count=images,
+                            video_count=videos,
+                            data_file_count=data_files,
+                            total_size_bytes=total_size,
+                        )
+                    )
+
+            # Internal IP-camera dives (recorded without a USB stick).
+            if self.ipcam_root.exists() and self.ipcam_root != self.media_root:
+                for entry in sorted(self.ipcam_root.iterdir(), reverse=True):
+                    if not entry.is_dir():
+                        continue
+                    images, videos, data_files, total_size, latest_date = (
+                        _summarize_media_dir(entry)
+                    )
+                    if images + videos + data_files == 0:
+                        continue
+                    missions.append(
+                        MediaMission(
+                            mission_id=entry.name,
+                            mission_name=entry.name,
                             date=latest_date or datetime.now(tz=timezone.utc),
                             image_count=images,
                             video_count=videos,

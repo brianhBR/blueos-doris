@@ -229,13 +229,15 @@ const descentCaptureFrequencyTooLow = computed(() => {
 })
 
 const releaseWeightWarning = computed(() => {
+  // This value is the bottom time before weight release (counted from when
+  // DORIS reaches the seafloor), not total dive duration. A short bottom
+  // time is a valid choice, so we only flag implausibly long values.
   const totalMinutes = releaseWeightElapsedUnit.value === 'hours'
     ? Number(releaseWeightElapsedNumber.value) * 60
     : releaseWeightElapsedUnit.value === 'minutes'
     ? Number(releaseWeightElapsedNumber.value)
     : Number(releaseWeightElapsedNumber.value) / 60
-  if (totalMinutes < 20) return { show: true, severity: 'warning' as const, title: 'Release Time May Be Short', message: 'Release time is under 20 minutes. This may not allow enough dive duration, but will be used as configured.' }
-  if (totalMinutes > 1200) return { show: true, severity: 'error' as const, title: 'Release Time Too Long', message: 'Release time exceeds 20 hours. Consider if this extended duration is necessary for mission objectives.' }
+  if (totalMinutes > 1200) return { show: true, severity: 'error' as const, title: 'Bottom Time Too Long', message: 'Bottom time before release exceeds 20 hours. Consider if this extended duration is necessary for mission objectives.' }
   return { show: false, severity: 'warning' as const, title: '', message: '' }
 })
 
@@ -1464,7 +1466,7 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
             <div class="space-y-3">
               <label class="flex items-center gap-2 cursor-pointer">
                 <input type="radio" value="elapsed" :checked="releaseWeightBy === 'elapsed'" @change="emit('update:releaseWeightBy', 'elapsed')" class="w-4 h-4" />
-                <span style="color: #96EEF2">By Elapsed Time from Dive Start</span>
+                <span style="color: #96EEF2">By Elapsed Time on Bottom</span>
               </label>
               <div v-if="releaseWeightBy === 'elapsed'" class="pl-6 space-y-3">
                 <div class="flex gap-2">
@@ -1473,6 +1475,9 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                     <option value="seconds">seconds</option><option value="minutes">minutes</option><option value="hours">hours</option>
                   </select>
                 </div>
+                <p class="text-xs italic" style="color: rgba(150, 238, 242, 0.5)">
+                  Time spent on the bottom before the weight is released. Counted from when DORIS reaches the seafloor, not from launch.
+                </p>
                 <div v-if="releaseWeightWarning.show" class="mt-3 rounded-lg p-4" :style="releaseWeightWarning.severity === 'warning' ? 'background-color: rgba(255, 184, 0, 0.1); border: 1px solid rgba(255, 184, 0, 0.5)' : 'background-color: #0E2446; border: 2px solid #DD2C1D'">
                   <div class="flex items-start gap-3">
                     <AlertTriangle class="w-5 h-5 flex-shrink-0 mt-0.5" :style="releaseWeightWarning.severity === 'warning' ? 'color: #FFB800' : 'color: #DD2C1D'" />
