@@ -909,9 +909,10 @@ end
 -- right thing whether we're not-yet-recording (start), already recording
 -- in a different phase (rotate), or the phase is disabled (stop).
 -- ``seg_s`` (optional) clamps splitmuxsink's max-size-time at this
--- transition: pass 300 to switch on_bottom continuous to 5-min chunks,
--- pass 1800 to restore the default for descent/ascent so those phases
--- finalize as a single MP4.  Omit / pass nil to keep the prior policy.
+-- transition.  All continuous-video phases (descent, on_bottom in
+-- CONTINUOUS mode, ascent) pass 300 so splitmuxsink rotates every
+-- 5 minutes and finalize chunks each phase into 5-min MP4s (#33).
+-- Omit / pass nil to keep the prior policy.
 local function ipcam_begin_phase(phase_enabled, phase_name, seg_s)
     if not ipcam_cfg.rec_en then return end
     if phase_enabled then
@@ -1092,9 +1093,8 @@ function update()
             ascent_start_ms = now_ms
             init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
-            -- Restore default segment so ascent finalizes as one MP4
-            -- (no chunking) regardless of bottom mode.
-            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent", 1800)
+            -- 5-min (300s) chunking for ascent too (#33).
+            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent", 300)
             state = STATE_ASCENT
             return update, UPDATE_INTERVAL_MS
         end
@@ -1137,10 +1137,10 @@ function update()
                     dive_start_ms = now_ms
                     init_ring(dr, DORIS_BTM_AVG:get())
                     reset_light_cycle(now_ms)
-                    -- Descent uses the default 1800s segment so the
-                    -- whole descent is one .ts -> one MP4 after
-                    -- finalize, regardless of bottom mode.
-                    ipcam_begin_phase(ipcam_cfg.dsc_rec, "descent", 1800)
+                    -- Descent rotates at 5-min (300s) boundaries so
+                    -- finalize chunks it into 5-min MP4s like the
+                    -- bottom phase, instead of one long file (#33).
+                    ipcam_begin_phase(ipcam_cfg.dsc_rec, "descent", 300)
                     state = STATE_DESCENT
                 end
             end
@@ -1152,7 +1152,8 @@ function update()
             ascent_start_ms = now_ms
             init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
-            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent", 1800)
+            -- 5-min (300s) chunking for ascent too (#33).
+            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent", 300)
             state = STATE_ASCENT
             return update, UPDATE_INTERVAL_MS
         end
@@ -1224,9 +1225,9 @@ function update()
             ascent_start_ms = now_ms
             init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
-            -- Restore default segment so ascent is one MP4 even after
-            -- continuous bottom (which set splitmuxsink to 300s).
-            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent", 1800)
+            -- Keep 5-min (300s) chunking for ascent (#33); the bottom
+            -- continuous path already set splitmuxsink to 300s.
+            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent", 300)
             state = STATE_ASCENT
             return update, UPDATE_INTERVAL_MS
         end
@@ -1439,9 +1440,9 @@ function update()
             ascent_start_ms = now_ms
             init_ring(ar, DORIS_ASC_AVG:get() or 120)
             reset_light_cycle(now_ms)
-            -- Restore default segment so ascent is one MP4 even after
-            -- continuous bottom (which set splitmuxsink to 300s).
-            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent", 1800)
+            -- Keep 5-min (300s) chunking for ascent (#33); the bottom
+            -- continuous path already set splitmuxsink to 300s.
+            ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent", 300)
             state = STATE_ASCENT
         end
 
