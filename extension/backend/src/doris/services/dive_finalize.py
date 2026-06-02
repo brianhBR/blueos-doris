@@ -37,6 +37,11 @@ Bottom-phase output depends on the bottom camera mode
   of concatenating every bottom .ts into a single MP4 so older dives
   still finalize cleanly.
 
+The descent and ascent phases are recorded as a single continuous
+stream; they are re-segmented into 5-minute MP4 chunks via the same
+two-pass pipeline as continuous bottom (issue #33) so file sizes stay
+consistent and manageable regardless of phase duration.
+
 Output MP4s are named ``<recstart>_<phase>.mp4`` (e.g.
 ``20260528t171502_on_bottom.mp4``), where ``recstart`` is the UTC
 ``YYYYMMDDtHHMMSS`` the recording's footage started -- the earliest
@@ -373,18 +378,24 @@ async def _ffmpeg_segment_ts_to_mp4(
 
 async def _finalize_continuous_resegment(
     files: list[Path], rec_dir: Path, dive_stamp: str,
+    phase: str = "on_bottom",
 ) -> list[dict]:
-    """CONTINUOUS bottom: concat all .ts then slice into 5-min MP4s.
+    """Concat all of one phase's ``.ts`` then slice into 5-min MP4s.
+
+    Used for every continuously-recorded phase: CONTINUOUS bottom
+    (``DORIS_BTM_CMOD=1``) and the descent/ascent phases (issue #33),
+    which are recorded as a single continuous stream and should be
+    chunked into 5-minute segments for consistency and data management.
 
     Two-pass lossless ffmpeg pipeline:
 
-    1. Concat every bottom ``.ts`` into a staging
-       ``<rec_dir>/.bottom_full.ts`` (``-c copy -f mpegts``).
+    1. Concat every ``.ts`` for ``phase`` into a staging
+       ``<rec_dir>/.<phase>_full.ts`` (``-c copy -f mpegts``).
     2. Re-segment the staging file at 5-minute boundaries with
        ``-f segment -segment_time 300 -reset_timestamps 1`` directly
-       to ``dive_<stamp>_on_bottom_chunkNN.mp4``.
+       to ``dive_<stamp>_<phase>_chunkNN.mp4``.
 
-    The output count is therefore proportional to dive duration, not
+    The output count is therefore proportional to phase duration, not
     to how many times the camera-side RTSP server tore down the
     pipeline.  ffmpeg's segment muxer numbers outputs from 00; we
     rename ``chunk00`` -> ``chunk01`` etc. so the operator-visible
@@ -397,15 +408,17 @@ async def _finalize_continuous_resegment(
     if not files:
         return []
 
-    staging = rec_dir / ".bottom_full.ts"
+    # Per-phase staging name so descent/on_bottom/ascent re-segmentation
+    # in the same dive never collide on one shared staging file.
+    staging = rec_dir / f".{phase}_full.ts"
     src_bytes = sum((f.stat().st_size for f in files if f.exists()), 0)
     logger.info(
-        "FINALIZE on_bottom continuous: concat %d .ts (%d B) -> %s",
-        len(files), src_bytes, staging,
+        "FINALIZE %s continuous: concat %d .ts (%d B) -> %s",
+        phase, len(files), src_bytes, staging,
     )
 
     summary: dict = {
-        "phase": "on_bottom",
+        "phase": phase,
         "kind": "continuous_resegment",
         "input_count": len(files),
         "input_bytes": src_bytes,
@@ -428,7 +441,7 @@ async def _finalize_continuous_resegment(
         return [summary]
 
     out_pattern = str(
-        rec_dir / f"dive_{dive_stamp}_on_bottom_chunk%02d.mp4"
+        rec_dir / f"dive_{dive_stamp}_{phase}_chunk%02d.mp4"
     )
     ok, msg = await _ffmpeg_segment_ts_to_mp4(
         staging, out_pattern, 300, _FFMPEG_BIG_TIMEOUT_S,
@@ -447,10 +460,11 @@ async def _finalize_continuous_resegment(
     # Match the 0-based chunks ffmpeg just wrote (chunk00, chunk01, ...),
     # filtering out any chunk01+ a previous run may have left on disk.
     zero_based_re = re.compile(
-        r"^dive_" + re.escape(dive_stamp) + r"_on_bottom_chunk(\d{2})\.mp4$"
+        r"^dive_" + re.escape(dive_stamp)
+        + r"_" + re.escape(phase) + r"_chunk(\d{2})\.mp4$"
     )
     produced: list[tuple[int, Path]] = []
-    for p in rec_dir.glob(f"dive_{dive_stamp}_on_bottom_chunk*.mp4"):
+    for p in rec_dir.glob(f"dive_{dive_stamp}_{phase}_chunk*.mp4"):
         m = zero_based_re.match(p.name)
         if m:
             produced.append((int(m.group(1)), p))
@@ -458,7 +472,7 @@ async def _finalize_continuous_resegment(
 
     # Re-segmented chunks don't align to .ts fragment boundaries, so
     # derive each chunk's start by walking actual durations forward from
-    # when bottom footage began (the earliest fragment's open-stamp).
+    # when this phase's footage began (the earliest fragment's open-stamp).
     staging_start = _group_start_stamp(files)
     start_dt: datetime | None = None
     if staging_start:
@@ -472,7 +486,7 @@ async def _finalize_continuous_resegment(
     chunk_entries: list[dict] = []
     renamed: list[Path] = []
     if start_dt is not None:
-        # Timestamped names: <chunkstart>_on_bottom.mp4, where chunkstart
+        # Timestamped names: <chunkstart>_<phase>.mp4, where chunkstart
         # = footage start + cumulative duration of preceding chunks.
         cumulative = 0.0
         for idx, (_idx0, p) in enumerate(produced, start=1):
@@ -480,7 +494,7 @@ async def _finalize_continuous_resegment(
             stamp = (start_dt + timedelta(seconds=cumulative)).strftime(
                 _START_FMT,
             )
-            new_path = rec_dir / f"{stamp}_on_bottom.mp4"
+            new_path = rec_dir / f"{stamp}_{phase}.mp4"
             try:
                 p.rename(new_path)
             except OSError as e:
@@ -491,7 +505,7 @@ async def _finalize_continuous_resegment(
             renamed.append(new_path)
             out_bytes = new_path.stat().st_size if new_path.exists() else 0
             chunk_entries.append({
-                "phase": "on_bottom",
+                "phase": phase,
                 "kind": "chunk",
                 "index": idx,
                 "rec_start": stamp,
@@ -510,7 +524,7 @@ async def _finalize_continuous_resegment(
         # chunk(NN+1).
         for idx0, p in sorted(produced, key=lambda t: t[0], reverse=True):
             new_path = rec_dir / (
-                f"dive_{dive_stamp}_on_bottom_chunk{idx0 + 1:02d}.mp4"
+                f"dive_{dive_stamp}_{phase}_chunk{idx0 + 1:02d}.mp4"
             )
             try:
                 p.rename(new_path)
@@ -525,7 +539,7 @@ async def _finalize_continuous_resegment(
             out_bytes = out_path.stat().st_size if out_path.exists() else 0
             dur = await _ffprobe_duration_s(out_path)
             chunk_entries.append({
-                "phase": "on_bottom",
+                "phase": phase,
                 "kind": "chunk",
                 "index": idx,
                 "output": str(out_path),
@@ -783,6 +797,11 @@ async def finalize_dive(
     scan_dirs: list[Path] = []
     if dive_dir.is_dir():
         scan_dirs.append(dive_dir)
+        # TIMELAPSE/snapshot JPEGs now live in <dive_dir>/photos/ (issue
+        # #37); include it so the snapshot manifest still catalogs them.
+        photos_dir = dive_dir / iprec.SNAPSHOT_SUBDIR
+        if photos_dir.is_dir():
+            scan_dirs.append(photos_dir)
     scan_dirs.append(rec_root)
 
     # Bucket files by phase.  Snapshots and segments both embed the
@@ -842,6 +861,16 @@ async def finalize_dive(
             phase_results.extend(
                 await _finalize_interval_by_cyc(
                     files, rec_dir, dive_stamp,
+                )
+            )
+            continue
+        # Descent/ascent are recorded as a single continuous stream;
+        # chunk them into 5-min MP4s like continuous bottom (issue #33)
+        # so the operator gets consistent, manageable file sizes.
+        if phase in ("descent", "ascent"):
+            phase_results.extend(
+                await _finalize_continuous_resegment(
+                    files, rec_dir, dive_stamp, phase=phase,
                 )
             )
             continue

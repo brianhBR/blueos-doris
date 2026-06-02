@@ -91,6 +91,11 @@ _STOP_EOS_TIMEOUT_S = 5.0
 _PHASE_RE = re.compile(r"^[a-z0-9_]{1,32}$")
 PHASE_DEFAULT = "manual"
 
+# TIMELAPSE/snapshot JPEGs go in this subfolder of the per-dive directory
+# (rather than alongside the MP4s, manifest, and telemetry logs) so the
+# data files are easy to find when a dive captures many stills (issue #37).
+SNAPSHOT_SUBDIR = "photos"
+
 
 def sanitize_phase(raw: str | None) -> str:
     """Return ``raw`` if it's a valid phase label, else ``PHASE_DEFAULT``.
@@ -1074,7 +1079,7 @@ _fetch_camera_jpeg = fetch_camera_jpeg
 
 async def take_phase_snapshot(phase: str | None) -> dict:
     """Capture a single JPEG from the RTSP camera and save it under
-    ``<recordings>/radcam_<stamp>_<phase>_<seq>.jpg``.
+    ``<recordings>/dive_<stamp>/photos/radcam_<stamp>_<phase>_<seq>.jpg``.
 
     This is the TIMELAPSE primitive driven by the Lua dive script.
     Returns ``success=False, reason="recorder_active"`` (with an HTTP
@@ -1099,7 +1104,9 @@ async def take_phase_snapshot(phase: str | None) -> dict:
 
     out_root, storage = _output_dir()
     stamp = _ensure_dive_stamp()
-    out_dir = _dive_dir(out_root, stamp)
+    # Stills live in <dive_dir>/photos/ so they don't bury the dive's
+    # data files (manifest, MP4s, telemetry logs) -- issue #37.
+    out_dir = _dive_dir(out_root, stamp) / SNAPSHOT_SUBDIR
     seq = _next_snapshot_seq(stamp, phase_label)
     filename = f"radcam_{stamp}_{phase_label}_{seq:05d}.jpg"
     path = out_dir / filename
