@@ -24,6 +24,7 @@ from ..services import ip_camera_recorder as iprec
 from ..services.camera import CameraService
 from ..services.dive import DiveService
 from ..services.dive_finalize import finalize_dive
+from ..services.dive_records import find_latest_active_dive_record
 from ..services.storage import DATA_ROOT, StorageService, media_download_id_from_abs_path
 
 logger = logging.getLogger(__name__)
@@ -152,6 +153,12 @@ def _update_active_dive_record(new_status: str) -> Path | None:
         except Exception as e:
             logger.warning(f"Error reading {dive_file.name}: {e}")
     return None
+
+
+def _find_latest_active_dive_record() -> dict | None:
+    """Most recent 'active' dive record, used to reconstruct the banner
+    configuration name after a restart/reconnect (issue #38)."""
+    return find_latest_active_dive_record(DIVES_DIR)
 
 
 def _schedule_binlog_archive(dive_file: Path) -> None:
@@ -485,13 +492,44 @@ def register_dive_routes(app: Robyn) -> None:
     async def dive_mission():
         status = await dive_service.get_status()
         _sync_mission_state_from_vehicle(status)
-        if not MISSION_STATE_PATH.exists():
+        mission: dict | None = None
+        if MISSION_STATE_PATH.exists():
+            try:
+                mission = json.loads(MISSION_STATE_PATH.read_text())
+            except Exception:
+                mission = None
+
+        # Issue #38: after a vehicle restart or device reconnect the
+        # mission state can be missing or lose its configuration name while
+        # the dive is still active, so the banner falls back to a bare
+        # "Active Dive".  Reconstruct the configuration name from the
+        # persisted active dive record (which survives restarts) and heal
+        # mission_state.json so subsequent reads are consistent.
+        needs_config = mission is None or not str(
+            mission.get("configuration_name") or ""
+        ).strip()
+        if needs_config:
+            record = _find_latest_active_dive_record()
+            if record is not None:
+                config_name = str(record.get("configuration") or "").strip()
+                if config_name:
+                    if mission is None:
+                        mission = {
+                            "status": "active",
+                            "configuration_name": config_name,
+                            "loaded_at": record.get("started_at", ""),
+                            "profile_id": record.get("profile_id", 0),
+                            "dive_file": record.get("_dive_file", ""),
+                        }
+                    else:
+                        mission["configuration_name"] = config_name
+                    _write_mission_state(
+                        {k: v for k, v in mission.items() if not k.startswith("_")}
+                    )
+
+        if mission is None:
             return json.dumps({"mission": None})
-        try:
-            mission = json.loads(MISSION_STATE_PATH.read_text())
-            return json.dumps({"mission": mission})
-        except Exception:
-            return json.dumps({"mission": None})
+        return json.dumps({"mission": mission})
 
     @app.get("/api/v1/dive/status")
     async def dive_status():

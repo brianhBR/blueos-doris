@@ -1058,6 +1058,41 @@ export function useDiveControl() {
   }
 }
 
+// ── Vehicle arming status ────────────────────────────────────────────
+
+export interface ArmingReason {
+  text: string
+  severity: number
+  timestamp: string
+}
+
+export interface ArmingStatus {
+  armed: boolean
+  armed_known: boolean
+  waiting_to_arm: boolean
+  reasons: ArmingReason[]
+  checked_at: string
+}
+
+export function useArmingStatus() {
+  const status = ref<ArmingStatus | null>(null)
+  const error = ref<string | null>(null)
+
+  async function fetchArmingStatus() {
+    try {
+      status.value = await fetchApi<ArmingStatus>('/vehicle/arming')
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to fetch arming status'
+    }
+  }
+
+  return {
+    status: readonly(status),
+    error: readonly(error),
+    fetchArmingStatus,
+  }
+}
+
 // ── Artemis composables ─────────────────────────────────────────────
 
 export interface SerialPortInfo {

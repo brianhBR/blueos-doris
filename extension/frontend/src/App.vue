@@ -2,7 +2,7 @@
 import { ref, computed, onMounted, onUnmounted } from 'vue'
 import { HardDrive, Loader2, AlertTriangle, Clock } from 'lucide-vue-next'
 import type { Screen, DiveData } from './types'
-import { useDiveControl, useNotifications, useStorageMigration } from './composables/useApi'
+import { useDiveControl, useNotifications, useStorageMigration, useArmingStatus } from './composables/useApi'
 import Navigation from './components/Navigation.vue'
 import Footer from './components/Footer.vue'
 import HomeScreen from './components/HomeScreen.vue'
@@ -29,6 +29,14 @@ const activeConfigName = computed(() => diveMission.value?.configuration_name?.t
 
 const { unreadCount: notificationCount, fetchUnreadCount } = useNotifications()
 const { status: migrationStatus, isActive: migrationActive, isError: migrationError, fetchMigrationStatus } = useStorageMigration()
+
+const { status: armingStatus, fetchArmingStatus } = useArmingStatus()
+const showArmingBanner = computed(() => armingStatus.value?.waiting_to_arm === true)
+// Strip the redundant "PreArm:"/"Arm:" prefix since the banner heading
+// already says pre-arm checks are failing.
+const armingReasons = computed(() =>
+  (armingStatus.value?.reasons ?? []).map(r => r.text.replace(/^(PreArm:|Arm:)\s*/i, '').trim())
+)
 
 const clockSyncFailed = ref(false)
 const clockSyncMessage = ref('')
@@ -95,7 +103,8 @@ onMounted(() => {
   fetchDiveMission()
   fetchUnreadCount()
   fetchMigrationStatus()
-  divePolling = setInterval(() => { fetchDiveStatus(); fetchDiveMission() }, 5000) as unknown as number
+  fetchArmingStatus()
+  divePolling = setInterval(() => { fetchDiveStatus(); fetchDiveMission(); fetchArmingStatus() }, 5000) as unknown as number
   notifPolling = setInterval(fetchUnreadCount, 15000) as unknown as number
   migrationPolling = setInterval(fetchMigrationStatus, 3000) as unknown as number
   clockPolling = setInterval(syncVehicleClock, 60000) as unknown as number
@@ -160,6 +169,20 @@ const setConnected = (connected: boolean) => {
       style="background-color: #DD2C1D; font-family: Montserrat, sans-serif"
     >
       Active Dive<span v-if="activeConfigName"> — {{ activeConfigName }}</span>
+    </div>
+
+    <div
+      v-if="showArmingBanner"
+      class="w-full py-2.5 px-4 flex flex-col items-center gap-1"
+      style="background-color: rgba(255, 153, 55, 0.18); border-bottom: 1px solid rgba(255, 153, 55, 0.55); font-family: Montserrat, sans-serif"
+    >
+      <div class="flex items-center gap-2">
+        <AlertTriangle class="w-4 h-4 flex-shrink-0" style="color: #FF9937" />
+        <span class="text-sm font-semibold" style="color: #FFD180">Waiting to arm — pre-arm checks failing</span>
+      </div>
+      <ul class="text-xs text-center" style="color: #FFD180; opacity: 0.95">
+        <li v-for="(reason, idx) in armingReasons" :key="idx">{{ reason }}</li>
+      </ul>
     </div>
 
     <div

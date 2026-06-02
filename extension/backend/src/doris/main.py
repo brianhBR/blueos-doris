@@ -11,6 +11,7 @@ from .config import settings
 from .services.network import NetworkService
 from .services.persistent_log import setup_persistent_logging, start_dmesg_capture
 from .routes import (
+    register_arming_routes,
     register_artemis_routes,
     register_attitude_routes,
     register_blueos_routes,
@@ -127,6 +128,7 @@ def create_app() -> Robyn:
     register_configuration_routes(app)
     register_dive_routes(app)
     register_frame_routes(app)
+    register_arming_routes(app)
     register_notification_routes(app)
 
     register_log_routes(app)
