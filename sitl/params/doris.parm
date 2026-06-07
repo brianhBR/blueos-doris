@@ -1,93 +1,45 @@
-# DORIS Drop Camera - ArduSub Parameter File
-# For use with standard ArduSub binary on Blue Robotics Navigator
-# Load via: sim_vehicle.py --add-param-file doris.parm
-# Or upload via: python tools/configure_doris.py --upload
+# ─────────────────────────────────────────────────────────────────────────────
+# DORIS autopilot configuration for SITL.
+#
+# Layered ON TOP of ArduSub's Tools/autotest/default_params/sub.parm
+# (see launch_sitl.sh / entrypoint_ardusub.sh --defaults ordering).
+#
+# This file only carries:
+#   1. What must be true BEFORE doris.lua runs (e.g. scripting enabled).
+#   2. Hardware wiring the script depends on (relay + light servo).
+#
+# It deliberately does NOT duplicate the many params doris.lua re-asserts
+# itself at boot via set_and_save() — ARMING_CHECK, FS_*, EK3_SRC1_*,
+# SERVO13_FUNCTION, BARO_SPEC_GRAV, BATT_FS_*, DISARM_DELAY — so there is
+# a single source of truth for those (the Lua).  The one exception is
+# SERVO13_FUNCTION below, pre-seeded so the light mapping is correct on
+# the very first cycle.
+#
+# ⚠ CONFIRM the lines marked "CONFIRM" against a real-vehicle parameter
+#   dump before trusting SITL results for relay / battery behavior.
+# ─────────────────────────────────────────────────────────────────────────────
 
-# === Frame Configuration ===
-# Custom frame - no motors (passive drop camera)
-FRAME_CONFIG     7
-
-# Disable all motor servo outputs
-SERVO1_FUNCTION  0
-SERVO2_FUNCTION  0
-SERVO3_FUNCTION  0
-SERVO4_FUNCTION  0
-SERVO5_FUNCTION  0
-SERVO6_FUNCTION  0
-SERVO7_FUNCTION  0
-SERVO8_FUNCTION  0
-
-# === Depth Sensor (Keller 6HPLD) ===
-# Natively supported via AP_Baro_KellerLD driver
-# Auto-probes I2C address 0x40, reads calibration from ROM
-BARO_SPEC_GRAV   1.025
-BARO_EXT_BUS     1
-BARO_PROBE_EXT   256
-
-# === Battery Monitoring ===
-# 4S LiPo, ~300 Wh (~20 Ah at 14.8V nominal)
-# Typical system draw: 30W (~2A at nominal voltage)
-# Mission endurance: ~10 hours
-BATT_MONITOR     4
-BATT_CAPACITY    20000
-BATT_LOW_VOLT    14.0
-BATT_CRT_VOLT    13.0
-BATT_FS_LOW_ACT  0
-BATT_FS_CRT_ACT  0
-
-# === Failsafes ===
-# Lua script handles failsafe actions directly
-FS_LEAK_ENABLE   1
-FS_PRESS_ENABLE  1
-FS_PRESS_MAX     100000
-FS_TEMP_ENABLE   1
-FS_TEMP_MAX      60
-FS_PILOT_INPUT   0
-FS_GCS_ENABLE    0
-
-# === Relay (Weight Release) ===
-RELAY1_PIN       -1
-RELAY1_DEFAULT   0
-
-# === Scripting (Lua) ===
+# --- Lua scripting -----------------------------------------------------------
+# Must be enabled before the autopilot will load scripts/doris.lua.
 SCR_ENABLE       1
+# doris.lua is large (38-entry param table, ring buffers, lots of string
+# formatting). Give the Lua VM generous heap so allocation never fails.
 SCR_HEAP_SIZE    200000
-SCR_VM_I_COUNT   50000
 
-# === GPS (via AGT MAVLink) ===
-# GPS_INPUT messages from SparkFun Artemis Global Tracker
-GPS1_TYPE        14
+# --- Drop-weight relay -------------------------------------------------------
+# doris.lua drives relay instance DORIS_RELAY_CH (default 0 -> RELAY1) via
+# relay:on()/relay:off(). The relay must be assigned to a GPIO pin and have
+# a Relay function for the binding to actuate hardware.
+# Per "Doris Setup instructions": Relay function 1, Relay 1 pin 14.
+RELAY1_FUNCTION  1     # CONFIRM: 1 = Relay
+RELAY1_PIN       14    # CONFIRM: BCM/AUX pin driving the burn-wire relay
 
-# === Serial Port for AGT MAVLink ===
-SERIAL1_PROTOCOL 2
-SERIAL1_BAUD     115
+# --- Lights ------------------------------------------------------------------
+# SERVO13 -> RCIN9 (59). doris.lua also sets this at boot; pre-seeding keeps
+# the mapping correct on the first update cycle before the Lua runs.
+SERVO13_FUNCTION 59
 
-# === Logging ===
-LOG_BITMASK      65535
-LOG_DISARMED     1
-
-# === Surface Detection ===
-SURFACE_DEPTH    -10
-
-# === Compass ===
-COMPASS_OFS_X    5
-COMPASS_OFS_Y    13
-COMPASS_OFS_Z    -18
-
-# === INS Calibration ===
-INS_ACCOFFS_X    0.001
-INS_ACCOFFS_Y    0.001
-INS_ACCOFFS_Z    0.001
-INS_ACCSCAL_X    1.001
-INS_ACCSCAL_Y    1.001
-INS_ACCSCAL_Z    1.001
-
-# === RC (not used - autonomous) ===
-RC3_TRIM         1500
-RC_OPTIONS       0
-RC_PROTOCOLS     1
-
-# === Position Controller (not actively used) ===
-PILOT_SPEED_UP   200
-PILOT_SPEED_DN   200
-PILOT_ACCEL_Z    200
+# --- Battery monitor ---------------------------------------------------------
+# Analog voltage+current so battery:voltage(0) / capacity_remaining_pct(0)
+# return real values for the pre-arm and low-battery failsafe checks.
+BATT_MONITOR     4     # CONFIRM: monitor type / analog pin mapping

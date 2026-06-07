@@ -1,0 +1,42 @@
+{
+  "name": "sitl-interval",
+  "dive_name": "SITL interval test",
+  "estimated_depth": "50",
+  "descent": {
+    "camera": {
+      "enabled": true,
+      "camera_type": "continuous-video"
+    },
+    "light": {
+      "enabled": true,
+      "brightness": 75
+    }
+  },
+  "bottom": {
+    "camera": {
+      "enabled": true,
+      "camera_type": "video-interval",
+      "video_record": { "number": "30", "unit": "seconds" },
+      "video_pause": { "number": "15", "unit": "seconds" }
+    },
+    "camera_delay": { "number": "0", "unit": "seconds" },
+    "light": {
+      "enabled": true,
+      "brightness": 75
+    },
+    "light_delay": { "number": "0", "unit": "seconds" }
+  },
+  "ascent": {
+    "same_as_descent": true,
+    "release_weight": {
+      "method": "elapsed",
+      "elapsed": { "number": "2", "unit": "minutes" }
+    }
+  },
+  "recovery": {
+    "activate_mast_light": false,
+    "update_frequency": "5min",
+    "use_iridium": false,
+    "use_lora": false
+  }
+}

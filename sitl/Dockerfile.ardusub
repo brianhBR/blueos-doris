@@ -1,0 +1,57 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# ArduSub SITL for DORIS dive testing.
+#
+# Builds the ardusub SITL binary from source (pinned to the Sub-4.7 family
+# to match the production firmware) and ships an entrypoint that:
+#   * symlinks the mounted doris.lua into ArduPilot's scripts/ dir,
+#   * boots ardusub with sub.parm + doris.parm + doris_sitl.parm,
+#   * fans MAVLink out to mavlink2rest (TCP 5772) and the host-side
+#     sitl_monitor.py (UDP 14551) via MAVProxy.
+#
+# ⚠ The first build COMPILES ArduPilot (~15-20 min). It is heavily cached:
+#   change only the entrypoint / params and rebuilds are seconds. In CI,
+#   cache the resulting image layer (or the whole image) by ARDUPILOT_TAG.
+#
+# Build:   docker build -f sitl/Dockerfile.ardusub -t doris-ardusub sitl
+# (normally invoked for you by docker-compose; see docker-compose.yml)
+# ─────────────────────────────────────────────────────────────────────────────
+FROM python:3.11-slim-bookworm
+
+ARG ARDUPILOT_TAG=Sub-4.7
+ENV DEBIAN_FRONTEND=noninteractive
+
+# Build toolchain + ArduPilot waf build deps. bash/procps/iproute2 are used
+# by the entrypoint for the port-ready wait and process supervision.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        git build-essential ccache g++ gawk make wget rsync pkg-config \
+        libtool libxml2-dev libxslt1-dev \
+        python3-dev python3-setuptools python3-wheel \
+        bash procps iproute2 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ArduPilot's waf build + MAVProxy fan-out need these Python packages.
+# empy is pinned: ArduPilot's mavgen is incompatible with empy 4.x.
+RUN python3 -m pip install --no-cache-dir \
+        future "empy==3.3.4" pexpect dronecan \
+        MAVProxy pymavlink
+
+# Shallow-clone just the pinned branch and its submodules to keep the
+# image small and the clone fast.
+WORKDIR /
+RUN git clone --depth 1 --branch ${ARDUPILOT_TAG} \
+        https://github.com/ArduPilot/ardupilot.git
+WORKDIR /ardupilot
+RUN git submodule update --init --recursive --depth 1
+
+# Configure + build only the SITL sub target.
+RUN ./waf configure --board sitl \
+    && ./waf sub \
+    && ./waf clean   # keep the binary, drop intermediate objects
+
+COPY entrypoint_ardusub.sh /usr/local/bin/entrypoint_ardusub.sh
+RUN chmod +x /usr/local/bin/entrypoint_ardusub.sh
+
+# 5760 = raw SITL MAVLink (TCP), 5772 = MAVProxy fan-out for mavlink2rest.
+EXPOSE 5760/tcp 5772/tcp
+
+ENTRYPOINT ["/usr/local/bin/entrypoint_ardusub.sh"]

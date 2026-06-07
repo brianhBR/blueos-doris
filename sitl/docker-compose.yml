@@ -1,59 +1,85 @@
 services:
 
+  # ── DORIS extension ───────────────────────────────────────────────────────
+  # Full BlueOS extension backend + Vue frontend.  Started first because it
+  # OWNS the network namespace that ardusub joins (network_mode below).  This
+  # mirrors production, where the autopilot and the extension share a netns so
+  # the Lua dive script can POST to 127.0.0.1:8095.
+  doris:
+    build:
+      context: ../extension
+      dockerfile: Dockerfile
+    ports:
+      - "8095:8095"   # DORIS UI / REST API
+      - "6040:6040"   # mavlink2rest (published here; m2r joins via depends_on)
+    environment:
+      - DORIS_BLUEOS_ADDRESS=http://127.0.0.1:6040
+      # Override the hardcoded RadCam URL so the in-process Gst recorder talks
+      # to the sidecar test server instead.  The Lua dive script's POST
+      # /rec/start still works unchanged.
+      - DORIS_IPCAM_RTSP_URL=rtsp://rtsp-server:8554/test
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ./configurations:/tmp/storage/configurations
+      - ./data/dives:/tmp/storage/dives
+      - ./data/userdata:/tmp/storage/userdata
+      # Surface the recordings dir on the host so the operator / test harness
+      # can inspect the per-phase .mp4 output of /api/v1/dive/finalize without
+      # exec'ing into the container.
+      - ./data/recordings:/tmp/storage/recordings
+    restart: unless-stopped
+
+  # ── ArduSub SITL ──────────────────────────────────────────────────────────
+  # Runs the real ardusub binary executing the bind-mounted doris.lua.  Shares
+  # the doris container's network namespace so:
+  #   * the Lua's POST 127.0.0.1:8095 reaches the extension (production-faithful)
+  #   * mavlink2rest reaches the MAVProxy fan-out at doris:5772
+  # Editing doris.lua + `docker compose restart ardusub` is the fast inner loop
+  # (no ArduPilot rebuild).
+  ardusub:
+    build:
+      context: .
+      dockerfile: Dockerfile.ardusub
+    network_mode: "service:doris"
+    environment:
+      - M2R_OUT=tcpin:0.0.0.0:5772
+      - MONITOR_OUT=udpout:host.docker.internal:14551
+      - SITL_SPEEDUP=1
+      # Set WIPE=1 to force fresh param defaults on the next boot.
+      - WIPE=0
+    volumes:
+      - ../extension/backend/scripts/doris.lua:/sitl/doris.lua:ro
+      - ./params:/sitl/params:ro
+    depends_on:
+      - doris
+    restart: unless-stopped
+
   # ── mavlink2rest ──────────────────────────────────────────────────────────
   # Bridges the DORIS backend REST API to the ArduSub SITL MAVLink stream.
-  # Connects to MAVProxy's TCP listener on the host at :5772.
+  # Connects (as a TCP client) to the MAVProxy fan-out hosted inside the
+  # ardusub container.  All three share the doris netns, so the fan-out is
+  # reachable on loopback at 127.0.0.1:5772.
   mavlink2rest:
     build:
       context: .
       dockerfile: Dockerfile.mavlink2rest
     command: >
-      --connect=tcpout:host.docker.internal:5772
+      --connect=${M2R_CONNECT:-tcpout:127.0.0.1:5772}
       --server 0.0.0.0:6040
-    ports:
-      - "6040:6040"
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
+    network_mode: "service:doris"
+    depends_on:
+      - ardusub
     restart: unless-stopped
 
-  # ── RTSP test server ──────────────────────────────────────────────────────
-  # Serves a videotestsrc-backed H.264 stream so the extension's
-  # in-process ip_camera_recorder pipeline (splitmuxsink, split-now
-  # rotation) can be validated end-to-end without a real RadCam.
-  # Point the extension at it via DORIS_IPCAM_RTSP_URL below.
+  # ── RTSP test server ────────────────────────────────────────────────────--
+  # Serves a videotestsrc-backed H.264 stream so the extension's in-process
+  # ip_camera_recorder pipeline (splitmuxsink, split-now rotation) can be
+  # validated end-to-end without a real RadCam.
   rtsp-server:
     build:
       context: ./rtsp-server
       dockerfile: Dockerfile
     ports:
       - "8554:8554"
-    restart: unless-stopped
-
-  # ── DORIS extension ───────────────────────────────────────────────────────
-  # Full BlueOS extension backend + Vue frontend.
-  doris:
-    build:
-      context: ../extension
-      dockerfile: Dockerfile
-    ports:
-      - "8095:8095"
-    environment:
-      - DORIS_BLUEOS_ADDRESS=http://mavlink2rest
-      # Override the hardcoded RadCam URL so the in-process Gst
-      # recorder talks to the sidecar test server instead.  The Lua
-      # dive script's POST /rec/start still works unchanged.
-      - DORIS_IPCAM_RTSP_URL=rtsp://rtsp-server:8554/test
-    extra_hosts:
-      - "host.docker.internal:host-gateway"
-    volumes:
-      - ./data/configurations:/tmp/storage/configurations
-      - ./data/dives:/tmp/storage/dives
-      - ./data/userdata:/tmp/storage/userdata
-      # Surface the recordings dir on the host so the operator /
-      # test harness can inspect the per-phase .mp4 output of
-      # /api/v1/dive/finalize without exec'ing into the container.
-      - ./data/recordings:/tmp/storage/recordings
-    depends_on:
-      - mavlink2rest
-      - rtsp-server
     restart: unless-stopped
