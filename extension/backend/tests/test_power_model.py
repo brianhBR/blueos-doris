@@ -81,9 +81,9 @@ def test_camera_duty_modes():
 
 
 # ── Phase + dive estimation ──────────────────────────────────────────
-def test_phase_power_hotel_only():
+def test_phase_power_base_only():
     cfg = pm.PhaseConfig()  # everything off
-    assert pm.phase_power(cfg) == pytest.approx(pm.HOTEL_W)
+    assert pm.phase_power(cfg) == pytest.approx(pm.BASE_W)
 
 
 def test_phase_power_full_light_and_camera():
@@ -93,7 +93,7 @@ def test_phase_power_full_light_and_camera():
         camera_on=True,
         camera_type="continuous-video",
     )
-    expected = pm.HOTEL_W + pm.led_power_w(100) + pm.CAMERA_RECORDING_W
+    expected = pm.BASE_W + pm.led_power_w(100) + pm.CAMERA_RECORDING_W
     assert pm.phase_power(cfg) == pytest.approx(expected)
 
 
@@ -112,7 +112,7 @@ def test_estimate_dive_durations():
     assert est["total_hours"] == pytest.approx(4.75)
 
 
-def test_estimate_dive_hotel_only_energy():
+def test_estimate_dive_base_only_energy():
     est = pm.estimate_dive(
         depth_m=0,
         bottom_time_hours=10.0,
@@ -121,9 +121,9 @@ def test_estimate_dive_hotel_only_energy():
         ascent=pm.PhaseConfig(),
     )
     # depth 0 -> descent 0 h, ascent = 0.75 h burn, bottom 10 h
-    expected_wh = pm.HOTEL_W * (10.0 + 0.75)
+    expected_wh = pm.BASE_W * (10.0 + 0.75)
     assert est["energy_wh"] == pytest.approx(expected_wh)
-    assert est["average_power_w"] == pytest.approx(pm.HOTEL_W)
+    assert est["average_power_w"] == pytest.approx(pm.BASE_W)
 
 
 def test_estimate_dive_brightness_affects_usage():
@@ -193,11 +193,11 @@ def test_phase_breakdown_components_sum():
         light_on=True, brightness_pct=100, camera_on=True, camera_type="continuous-video"
     )
     b = pm.phase_breakdown("Bottom", cfg, hours=2.0)
-    assert b["hotel_wh"] == pytest.approx(pm.HOTEL_W * 2.0)
+    assert b["base_wh"] == pytest.approx(pm.BASE_W * 2.0)
     assert b["light_wh"] == pytest.approx(pm.led_power_w(100) * 2.0)
     assert b["camera_wh"] == pytest.approx(pm.CAMERA_RECORDING_W * 2.0)
     assert b["total_wh"] == pytest.approx(
-        b["hotel_wh"] + b["light_wh"] + b["camera_wh"]
+        b["base_wh"] + b["light_wh"] + b["camera_wh"]
     )
 
 
@@ -212,7 +212,7 @@ def test_estimate_dive_breakdown_totals_match():
     assert len(est["phases"]) == 3
     assert [p["name"] for p in est["phases"]] == ["Descent", "On Bottom", "Ascent"]
     # Component totals reconcile with overall energy.
-    assert est["hotel_wh"] + est["light_wh"] + est["camera_wh"] == pytest.approx(
+    assert est["base_wh"] + est["light_wh"] + est["camera_wh"] == pytest.approx(
         est["energy_wh"]
     )
     assert sum(p["total_wh"] for p in est["phases"]) == pytest.approx(est["energy_wh"])
@@ -308,8 +308,8 @@ def test_recovery_hours_from_remaining_energy():
         bottom=pm.PhaseConfig(),
         ascent=pm.PhaseConfig(),
     )
-    assert est["recovery_hotel_w"] == pytest.approx(pm.RECOVERY_HOTEL_W)
-    expected = est["remaining_after_dive_wh"] / pm.RECOVERY_HOTEL_W
+    assert est["recovery_base_w"] == pytest.approx(pm.RECOVERY_BASE_W)
+    expected = est["remaining_after_dive_wh"] / pm.RECOVERY_BASE_W
     assert est["recovery_hours"] == pytest.approx(expected)
     # More energy consumed => less surface recovery time.
     heavy = pm.estimate_dive(

@@ -6,7 +6,7 @@ import { useConfigurations } from '../composables/useApi'
 import type { DeploymentConfiguration } from '../composables/useApi'
 import {
   estimateDive,
-  HOTEL_W,
+  BASE_W,
   CAMERA_RECORDING_W,
   BATTERY_CAPACITY_WH,
   ASCENT_BURN_MINUTES,
@@ -15,7 +15,7 @@ import {
   type LightMode,
 } from '../lib/powerModel'
 
-const POWER = { HOTEL_W, CAMERA_RECORDING_W, BATTERY_CAPACITY_WH, ASCENT_BURN_MINUTES }
+const POWER = { BASE_W, CAMERA_RECORDING_W, BATTERY_CAPACITY_WH, ASCENT_BURN_MINUTES }
 
 const props = withDefaults(defineProps<{
   releaseWeightBy: 'datetime' | 'elapsed'
@@ -1869,7 +1869,7 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
               <span style="color: #96EEF2">Surface recovery time</span>
               <span class="text-white">
                 {{ batteryData.estimate.recoveryHours.toFixed(1) }} h
-                <span style="color: rgba(150, 238, 242, 0.6)">({{ batteryData.estimate.remainingAfterDiveWh.toFixed(0) }} Wh left ÷ {{ batteryData.estimate.recoveryHotelW.toFixed(1) }} W hotel)</span>
+                <span style="color: rgba(150, 238, 242, 0.6)">({{ batteryData.estimate.remainingAfterDiveWh.toFixed(0) }} Wh left ÷ {{ batteryData.estimate.recoveryBaseW.toFixed(1) }} W base)</span>
               </span>
             </div>
 
@@ -1887,7 +1887,7 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
 
             <div v-if="showBatteryBreakdown" class="mt-3 text-xs" style="color: #96EEF2">
               <p class="mb-2" style="color: rgba(150, 238, 242, 0.75)">
-                Energy per phase = (Hotel {{ POWER.HOTEL_W }} W + LED×brightness×duty + Camera {{ POWER.CAMERA_RECORDING_W }} W×duty) × phase&nbsp;hours.
+                Energy per phase = (Base {{ POWER.BASE_W }} W + LED×brightness×duty + Camera {{ POWER.CAMERA_RECORDING_W }} W×duty) × phase&nbsp;hours.
                 Usage % = total energy ÷ {{ POWER.BATTERY_CAPACITY_WH.toFixed(0) }} Wh pack.
                 Durations: descent = depth ÷ 1 m/s, bottom = release-weight time, ascent = {{ POWER.ASCENT_BURN_MINUTES }} min burn + depth ÷ 1 m/s.
               </p>
@@ -1897,7 +1897,7 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                     <tr style="color: rgba(150, 238, 242, 0.9)">
                       <th class="py-1 pr-3">Phase</th>
                       <th class="py-1 pr-3">Dur (h)</th>
-                      <th class="py-1 pr-3">Hotel</th>
+                      <th class="py-1 pr-3">Base</th>
                       <th class="py-1 pr-3">Lights</th>
                       <th class="py-1 pr-3">Camera</th>
                       <th class="py-1">Total (Wh)</th>
@@ -1916,7 +1916,7 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                         </span>
                       </td>
                       <td class="py-1 pr-3">{{ phase.hours.toFixed(2) }}</td>
-                      <td class="py-1 pr-3">{{ phase.hotelWh.toFixed(1) }}</td>
+                      <td class="py-1 pr-3">{{ phase.baseWh.toFixed(1) }}</td>
                       <td class="py-1 pr-3">{{ phase.lightWh.toFixed(1) }}</td>
                       <td class="py-1 pr-3">{{ phase.cameraWh.toFixed(1) }}</td>
                       <td class="py-1 text-white">{{ phase.totalWh.toFixed(1) }}</td>
@@ -1924,7 +1924,7 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                     <tr style="border-top: 1px solid rgba(65, 185, 195, 0.4)">
                       <td class="py-1 pr-3 text-white">Total</td>
                       <td class="py-1 pr-3 text-white">{{ batteryData.estimate.totalHours.toFixed(2) }}</td>
-                      <td class="py-1 pr-3 text-white">{{ batteryData.estimate.hotelWh.toFixed(1) }}</td>
+                      <td class="py-1 pr-3 text-white">{{ batteryData.estimate.baseWh.toFixed(1) }}</td>
                       <td class="py-1 pr-3 text-white">{{ batteryData.estimate.lightWh.toFixed(1) }}</td>
                       <td class="py-1 pr-3 text-white">{{ batteryData.estimate.cameraWh.toFixed(1) }}</td>
                       <td class="py-1 text-white">{{ batteryData.estimate.energyWh.toFixed(1) }}</td>
