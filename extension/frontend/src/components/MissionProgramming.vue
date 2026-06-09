@@ -4,6 +4,7 @@ import { Settings, Save, Copy, AlertTriangle, ChevronDown, ChevronUp, Camera as 
 import type { Screen } from '../types'
 import { useConfigurations } from '../composables/useApi'
 import type { DeploymentConfiguration } from '../composables/useApi'
+import { estimateDive, type PhaseConfig, type CameraType, type LightMode } from '../lib/powerModel'
 
 const props = withDefaults(defineProps<{
   releaseWeightBy: 'datetime' | 'elapsed'
@@ -155,43 +156,81 @@ const updateFrequency = ref('5min')
 const useIridium = ref(false)
 const useLoRA = ref(false)
 
-const batteryData = computed(() => {
-  // -- Descent / ascent parameters --
-  const descentRate_m_per_s = 1          // descent speed in meters per second
-  const descentRate_m_per_min = descentRate_m_per_s * 60
+// Convert a {number, unit} pair from the planner UI into seconds.
+function toSeconds(value: string | number, unit: string): number {
+  const n = Number(value) || 0
+  if (unit === 'hours') return n * 3600
+  if (unit === 'minutes') return n * 60
+  return n
+}
 
-  // -- Power consumption (watts) --
-  const powerRPi5_W = 15                // Raspberry Pi 5 single-board computer
-  const powerRadCAM_W = 5               // RadCAM camera module
-  const powerPerLumen_W = 15            // each lumen light module
-  const lumenCount = 2                  // number of lumen lights installed
-
-  // -- Battery --
-  // 2× Blue Robotics 10 Ah 4S Li-ion packs in parallel @ 14.8 V nominal.
-  // Keep in sync with HomeScreen.vue and backend system.py.
-  const batteryCapacity_Wh = 2 * 10 * 14.8   // 296 Wh total
-
-  // -- Dive duration from depth + release weight settings --
-  const depth = parseFloat(estimatedDepth.value) || 0
-  const descentTimeHours = depth / descentRate_m_per_min / 60
-  const ascentTimeHours = depth / descentRate_m_per_min / 60
-
-  let diveDuration = 0
+// Bottom time (hours) from the operator's release-weight setting.
+const bottomTimeHours = computed(() => {
   if (props.releaseWeightBy === 'elapsed') {
-    const num = Number(releaseWeightElapsedNumber.value) || 0
-    const unit = releaseWeightElapsedUnit.value
-    diveDuration = unit === 'hours' ? num : unit === 'minutes' ? num / 60 : num / 3600
-  } else {
-    diveDuration = descentTimeHours + ascentTimeHours
+    return toSeconds(releaseWeightElapsedNumber.value, releaseWeightElapsedUnit.value) / 3600
   }
+  if (releaseWeightDate.value && releaseWeightTime.value) {
+    const release = new Date(`${releaseWeightDate.value}T${releaseWeightTime.value}:00Z`)
+    const hrs = (release.getTime() - Date.now()) / 3_600_000
+    return Math.max(0, hrs)
+  }
+  return 0
+})
 
-  // -- Derived values --
-  const totalPower = powerRPi5_W + powerRadCAM_W + (powerPerLumen_W * lumenCount)
-  const batteryLife = totalPower > 0 ? batteryCapacity_Wh / totalPower : 0
-  const batteryUsagePercent = batteryLife > 0
-    ? Math.min((diveDuration / batteryLife) * 100, 100)
-    : 0
-  return { totalPower, batteryLife, batteryUsagePercent, diveDuration }
+const descentPhase = computed<PhaseConfig>(() => ({
+  lightOn: descentLightOn.value,
+  brightnessPct: descentLightBrightness.value,
+  lightMode: descentLightMode.value as LightMode,
+  lightOnS: toSeconds(descentLightOnNumber.value, descentLightOnUnit.value),
+  lightOffS: toSeconds(descentLightOffNumber.value, descentLightOffUnit.value),
+  cameraOn: descentCameraOn.value,
+  cameraType: descentCameraType.value as CameraType,
+  recordS: toSeconds(descentVideoRecordNumber.value, descentVideoRecordUnit.value),
+  pauseS: toSeconds(descentVideoPauseNumber.value, descentVideoPauseUnit.value),
+  capturePeriodS: toSeconds(descentCaptureFrequency.value, descentCaptureFrequencyUnit.value),
+}))
+
+const bottomPhase = computed<PhaseConfig>(() => ({
+  lightOn: bottomLightOn.value,
+  brightnessPct: bottomLightBrightness.value,
+  lightMode: bottomLightMode.value as LightMode,
+  lightOnS: toSeconds(bottomLightOnNumber.value, bottomLightOnUnit.value),
+  lightOffS: toSeconds(bottomLightOffNumber.value, bottomLightOffUnit.value),
+  cameraOn: bottomCameraOn.value,
+  cameraType: bottomCameraType.value as CameraType,
+  recordS: toSeconds(bottomVideoRecordNumber.value, bottomVideoRecordUnit.value),
+  pauseS: toSeconds(bottomVideoPauseNumber.value, bottomVideoPauseUnit.value),
+  capturePeriodS: toSeconds(bottomCaptureFrequency.value, bottomCaptureFrequencyUnit.value),
+}))
+
+const ascentPhase = computed<PhaseConfig>(() => ({
+  lightOn: ascentLightOn.value,
+  brightnessPct: ascentLightBrightness.value,
+  lightMode: ascentLightMode.value as LightMode,
+  lightOnS: toSeconds(ascentLightOnNumber.value, ascentLightOnUnit.value),
+  lightOffS: toSeconds(ascentLightOffNumber.value, ascentLightOffUnit.value),
+  cameraOn: ascentCameraOn.value,
+  cameraType: ascentCameraType.value as CameraType,
+  recordS: toSeconds(ascentVideoRecordNumber.value, ascentVideoRecordUnit.value),
+  pauseS: toSeconds(ascentVideoPauseNumber.value, ascentVideoPauseUnit.value),
+  capturePeriodS: toSeconds(ascentCaptureFrequency.value, ascentCaptureFrequencyUnit.value),
+}))
+
+const batteryData = computed(() => {
+  const estimate = estimateDive({
+    depthM: parseFloat(estimatedDepth.value) || 0,
+    bottomTimeHours: bottomTimeHours.value,
+    descent: descentPhase.value,
+    bottom: bottomPhase.value,
+    ascent: ascentPhase.value,
+  })
+  return {
+    totalPower: estimate.averagePowerW,
+    batteryLife: estimate.batteryLifeHours,
+    batteryUsagePercent: estimate.usagePercent,
+    diveDuration: estimate.totalHours,
+    estimate,
+  }
 })
 
 // Bottom timelapse strobe helpers.  Both pre/post are stored in

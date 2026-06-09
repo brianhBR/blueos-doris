@@ -8,6 +8,7 @@ import httpx
 
 from ..config import blueos_services
 from ..models.system import BatteryInfo, LocationInfo, StorageInfo, SystemStatus
+from . import power_model
 from .base import BlueOSClient
 from .external_storage import get_migration_status
 from .storage import DATA_ROOT
@@ -32,25 +33,6 @@ _SOC_CURVE_4S: list[tuple[float, float]] = [
     (14.44, 5.0),
     (13.20, 0.0),
 ]
-
-# Battery pack: 2× Blue Robotics 10 Ah 4S Li-ion packs wired in parallel.
-# Update these together with the matching constants in the frontend
-# (HomeScreen.vue / MissionProgramming.vue) if the hardware ever changes.
-_BATTERY_PACK_COUNT = 2
-_BATTERY_PACK_AH = 10.0
-_BATTERY_NOMINAL_V = 14.8  # 4S Li-ion nominal
-_BATTERY_TOTAL_AH = _BATTERY_PACK_COUNT * _BATTERY_PACK_AH      # 20 Ah
-_BATTERY_CAPACITY_WH = _BATTERY_TOTAL_AH * _BATTERY_NOMINAL_V   # 296 Wh
-
-# Reserve held back from the time-remaining estimate so the vehicle has
-# margin for surfacing, recovery, and unexpected loads. SOC% below this
-# value is reported as zero hours remaining.
-_BATTERY_RESERVE_PCT = 15.0
-
-# Standard platform load (W) used when no live current measurement is
-# available. Pi5 (15) + RadCAM (5) + 2× lumen lights (15 each) = 50 W.
-_STANDARD_LOAD_W = 50.0
-
 
 def _voltage_to_soc_4s(voltage: float) -> float:
     """Map a measured 4S pack voltage to State-of-Charge (0–100 %).
@@ -323,17 +305,18 @@ class SystemService:
     ) -> float | None:
         """Estimate remaining battery hours before hitting the safety reserve.
 
-        Assumes 2× Blue Robotics 10 Ah 4S Li-ion packs in parallel (20 Ah
-        total) with `_BATTERY_RESERVE_PCT` of capacity held back as
-        margin. With a measured current draw the remaining usable
-        ampere-hours are divided by the instantaneous current; otherwise
-        we fall back to the standard DORIS platform load (~50 W).
+        Uses the shared :mod:`power_model` (2× 10 Ah 4S packs, 15% reserve).
+        With a measured current draw the remaining usable ampere-hours are
+        divided by the instantaneous current; otherwise we fall back to the
+        empirically-measured typical dive load (~11 W whole-dive average).
         """
-        usable_pct = max(0.0, percent - _BATTERY_RESERVE_PCT)
-        usable_ah = (usable_pct / 100.0) * _BATTERY_TOTAL_AH
+        usable_pct = max(0.0, percent - power_model.BATTERY_RESERVE_PCT)
+        usable_ah = (usable_pct / 100.0) * power_model.BATTERY_TOTAL_AH
         if current is None or current <= 0:
-            standard_current_a = _STANDARD_LOAD_W / _BATTERY_NOMINAL_V
-            return usable_ah / standard_current_a
+            fallback_current_a = (
+                power_model.TYPICAL_DIVE_LOAD_W / power_model.BATTERY_NOMINAL_V
+            )
+            return usable_ah / fallback_current_a
         return usable_ah / current
 
     def _format_time_remaining(self, hours: float | None) -> str:
