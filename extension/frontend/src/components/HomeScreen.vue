@@ -16,8 +16,18 @@ import {
 import { mdiCompassOutline } from '@mdi/js'
 import { useSystemStatus, useBattery, useStorage, useLocation, useSensors, useConfigurations, useDiveControl } from '../composables/useApi'
 import AttitudeVisualization from './AttitudeVisualization.vue'
-import type { SensorModule } from '../composables/useApi'
+import type { SensorModule, DeploymentConfiguration } from '../composables/useApi'
 import type { Screen } from '../types'
+import {
+  estimateDive,
+  phaseConfigFromSettings,
+  hoursRemainingFromSoc,
+  BATTERY_CAPACITY_WH,
+  BATTERY_RESERVE_PCT as PM_RESERVE_PCT,
+  BATTERY_PACK_COUNT,
+  BATTERY_PACK_AH,
+  TYPICAL_DIVE_LOAD_W,
+} from '../lib/powerModel'
 
 const props = defineProps<{
   isConnected: boolean
@@ -64,31 +74,19 @@ const storageUsed = computed(() => storage.value?.used_percent ?? systemStatus.v
 const storageTotal = computed(() => storage.value?.total_gb ?? systemStatus.value?.storage_total_gb ?? 100)
 const storageAvailableGb = computed(() => storage.value?.available_gb ?? (storageTotal.value - (storage.value?.used_gb ?? systemStatus.value?.storage_used_gb ?? 0)))
 const storageType = computed(() => storage.value?.storage_type ?? 'SD Card')
-// Pack: 2× Blue Robotics 10 Ah 4S Li-ion packs in parallel (20 Ah / 296 Wh).
-// Keep these in sync with the backend (system.py) and the dive planner
-// (MissionProgramming.vue).
-const BATTERY_PACK_COUNT = 2
-const BATTERY_PACK_AH = 10
-const BATTERY_NOMINAL_V = 14.8
-const BATTERY_TOTAL_WH = BATTERY_PACK_COUNT * BATTERY_PACK_AH * BATTERY_NOMINAL_V
-const BATTERY_RESERVE_PCT = 15
-
+// Live time-remaining: prefer the backend estimate (uses measured pack
+// current); fall back to the shared power model's typical-load estimate.
+// All pack/power constants come from ../lib/powerModel (single source).
 const batteryTimeRemaining = computed(() => {
-  const powerRPi5_W = 15
-  const powerRadCAM_W = 5
-  const powerPerLumen_W = 15
-  const lumenCount = 2
-
-  const totalPower_W = powerRPi5_W + powerRadCAM_W + (powerPerLumen_W * lumenCount)
-  const usablePct = Math.max(0, batteryLevel.value - BATTERY_RESERVE_PCT)
-  const usableCapacity_Wh = BATTERY_TOTAL_WH * (usablePct / 100)
-  const hoursRemaining = totalPower_W > 0 ? usableCapacity_Wh / totalPower_W : 0
-  const h = Math.floor(hoursRemaining)
-  const m = Math.round((hoursRemaining - h) * 60)
+  const backend = battery.value?.time_remaining
+  if (backend && backend !== 'Unknown' && backend !== 'Unavailable') return backend
+  const hours = hoursRemainingFromSoc(batteryLevel.value, TYPICAL_DIVE_LOAD_W)
+  const h = Math.floor(hours)
+  const m = Math.round((hours - h) * 60)
   return `${h}h ${m}m`
 })
 
-const batteryEstimateAssumption = `Assumes ${BATTERY_PACK_COUNT}× ${BATTERY_PACK_AH} Ah Blue Robotics 4S packs (${BATTERY_TOTAL_WH.toFixed(0)} Wh) at ~50 W draw, ${BATTERY_RESERVE_PCT}% reserve held back`
+const batteryEstimateAssumption = `Assumes ${BATTERY_PACK_COUNT}× ${BATTERY_PACK_AH} Ah Blue Robotics 4S packs (${BATTERY_CAPACITY_WH.toFixed(0)} Wh), ${PM_RESERVE_PCT}% reserve held back; live estimate uses measured pack current`
 
 const gpsStatus = computed<'active' | 'searching' | 'inactive'>(() => {
   if (!location.value) return 'inactive'
@@ -195,6 +193,7 @@ const { configurations: savedConfigSummaries, fetchConfigurations, loadConfigura
 const savedConfigurations = computed(() => savedConfigSummaries.value.map(c => c.name))
 
 const loadedElapsedTimeHours = ref(0)
+const loadedConfig = ref<DeploymentConfiguration | null>(null)
 
 const depthWarningLevel = computed(() => {
   const depth = parseFloat(estimatedDepth.value)
@@ -210,46 +209,35 @@ const diveFeasibility = computed(() => {
   const depth = parseFloat(estimatedDepth.value)
   if (isNaN(depth) || depth <= 0) return null
 
-  // -- Descent / ascent parameters --
-  const descentRate_m_per_s = 1          // descent speed in meters per second
-  const descentRate_m_per_min = descentRate_m_per_s * 60  // converted to m/min for time calc
-
-  const descentTimeMinutes = depth / descentRate_m_per_min
-  const ascentTimeMinutes = depth / descentRate_m_per_min
-  const descentTimeHours = descentTimeMinutes / 60
-  const ascentTimeHours = ascentTimeMinutes / 60
-
+  // Bottom time comes from the operator's release-weight setting.
   let bottomTimeHours = 0
-  let totalDiveTimeHours = 0
-
   if (props.releaseWeightBy === 'datetime') {
-    if (estimatedBottomTime.value) {
-      bottomTimeHours = parseFloat(estimatedBottomTime.value)
-      if (isNaN(bottomTimeHours)) bottomTimeHours = 0
+    if (releaseWeightDate.value && releaseWeightTime.value) {
+      const release = new Date(`${releaseWeightDate.value}T${releaseWeightTime.value}:00Z`)
+      bottomTimeHours = Math.max(0, (release.getTime() - Date.now()) / 3_600_000)
+    } else if (estimatedBottomTime.value) {
+      bottomTimeHours = parseFloat(estimatedBottomTime.value) || 0
     }
-    totalDiveTimeHours = descentTimeHours + bottomTimeHours + ascentTimeHours
   } else {
-    totalDiveTimeHours = loadedElapsedTimeHours.value
-    bottomTimeHours = Math.max(0, totalDiveTimeHours - descentTimeHours - ascentTimeHours)
+    bottomTimeHours = loadedElapsedTimeHours.value
   }
 
-  // -- Power consumption (watts) --
-  const powerRPi5_W = 15                // Raspberry Pi 5 single-board computer
-  const powerRadCAM_W = 5               // RadCAM camera module
-  const powerPerLumen_W = 15            // each lumen light module
-  const lumenCount = 2                  // number of lumen lights installed
+  // Per-phase light/camera draw from the selected configuration's real
+  // settings, via the shared power model (single LED, brightness-scaled,
+  // duty-cycled by camera/light mode). descent = depth/1 m/s, ascent =
+  // 45 min burn + depth/1 m/s.
+  const cfg = loadedConfig.value
+  const estimate = estimateDive({
+    depthM: depth,
+    bottomTimeHours,
+    descent: phaseConfigFromSettings(cfg?.descent?.light, cfg?.descent?.camera),
+    bottom: phaseConfigFromSettings(cfg?.bottom?.light, cfg?.bottom?.camera),
+    ascent: phaseConfigFromSettings(cfg?.ascent?.light, cfg?.ascent?.camera),
+  })
 
-  // -- Battery --
-  const batteryCapacity_Wh = 266        // onboard battery capacity in watt-hours
-
-  // -- Derived values --
-  const totalPowerDraw = powerRPi5_W + powerRadCAM_W + (powerPerLumen_W * lumenCount)
-  const batteryLifeHours = totalPowerDraw > 0 ? batteryCapacity_Wh / totalPowerDraw : 0
-  const batteryUsagePercent = Math.min(
-    batteryLifeHours > 0 ? (totalDiveTimeHours / batteryLifeHours) * 100 : 100,
-    100
-  )
-  const batteryRemainingPercent = Math.max(0, 100 - batteryUsagePercent)
+  const totalDiveTimeHours = estimate.totalHours
+  const batteryUsagePercent = estimate.usagePercent
+  const batteryRemainingPercent = estimate.remainingPercent
   const batteryOk = batteryRemainingPercent >= 20
 
   const storagePerHour = 8
@@ -274,13 +262,13 @@ const diveFeasibility = computed(() => {
     batteryRemainingPercent: Math.round(batteryRemainingPercent),
     storageRemaining: Math.round(storageRemaining),
     totalDiveTimeHours: totalDiveTimeHours.toFixed(1),
-    descentTimeHours: descentTimeHours.toFixed(1),
-    bottomTimeHours: bottomTimeHours.toFixed(1),
-    ascentTimeHours: ascentTimeHours.toFixed(1),
+    descentTimeHours: estimate.descentHours.toFixed(1),
+    bottomTimeHours: estimate.bottomHours.toFixed(1),
+    ascentTimeHours: estimate.ascentHours.toFixed(1),
     batteryUsagePercent: Math.round(batteryUsagePercent),
     estimatedStorageNeeded: Math.round(estimatedStorageNeeded),
-    totalPowerDraw: totalPowerDraw.toFixed(1),
-    batteryLifeHours: batteryLifeHours.toFixed(1),
+    totalPowerConsumedWh: estimate.energyWh.toFixed(1),
+    batteryLifeHours: estimate.batteryLifeHours.toFixed(1),
     surfaceTimeUTC,
     timeUntilRelease: timeUntilRelease !== null ? timeUntilRelease.toFixed(1) : null
   }
@@ -390,12 +378,14 @@ const handleConfigurationChange = async () => {
     releaseWeightDate.value = ''
     releaseWeightTime.value = ''
     loadedElapsedTimeHours.value = 0
+    loadedConfig.value = null
     emit('configurationSelect', '')
     return
   }
   if (selectedConfiguration.value) {
     const cfg = await loadConfiguration(selectedConfiguration.value)
     if (cfg) {
+      loadedConfig.value = cfg
       const rw = cfg.ascent.release_weight
       emit('update:releaseWeightBy', rw.method)
       if (rw.method === 'elapsed') {
@@ -695,8 +685,8 @@ const formatReleaseTime = (date: Date) => {
       <!-- Power & Battery Metrics -->
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
         <div class="rounded-lg p-4" style="background-color: rgba(14, 36, 70, 0.5)">
-          <p class="text-xs mb-1" style="color: #96EEF2">Power Draw</p>
-          <p class="text-xl font-bold text-white">{{ diveFeasibility.totalPowerDraw }} W</p>
+          <p class="text-xs mb-1" style="color: #96EEF2">Total Power Consumed</p>
+          <p class="text-xl font-bold text-white">{{ diveFeasibility.totalPowerConsumedWh }} Wh</p>
         </div>
         <div class="rounded-lg p-4" style="background-color: rgba(14, 36, 70, 0.5)">
           <p class="text-xs mb-1" style="color: #96EEF2">Battery Life</p>
@@ -849,7 +839,7 @@ const formatReleaseTime = (date: Date) => {
           Estimated: {{ batteryTimeRemaining }} remaining
         </p>
         <p class="text-xs mt-1 opacity-75" style="color: #96EEF2">
-          2× 10 Ah 4S packs · 50 W draw · 15% reserve
+          2× 10 Ah 4S packs · live current · 15% reserve
         </p>
       </div>
 

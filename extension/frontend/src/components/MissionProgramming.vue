@@ -4,6 +4,18 @@ import { Settings, Save, Copy, AlertTriangle, ChevronDown, ChevronUp, Camera as 
 import type { Screen } from '../types'
 import { useConfigurations } from '../composables/useApi'
 import type { DeploymentConfiguration } from '../composables/useApi'
+import {
+  estimateDive,
+  HOTEL_W,
+  CAMERA_RECORDING_W,
+  BATTERY_CAPACITY_WH,
+  ASCENT_BURN_MINUTES,
+  type PhaseConfig,
+  type CameraType,
+  type LightMode,
+} from '../lib/powerModel'
+
+const POWER = { HOTEL_W, CAMERA_RECORDING_W, BATTERY_CAPACITY_WH, ASCENT_BURN_MINUTES }
 
 const props = withDefaults(defineProps<{
   releaseWeightBy: 'datetime' | 'elapsed'
@@ -22,6 +34,7 @@ const selectedConfiguration = ref(props.initialConfiguration || '')
 const estimatedDepth = ref('')
 const warnings = ref<string[]>([])
 const showBatteryPlanning = ref(false)
+const showBatteryBreakdown = ref(false)
 const showSaveModal = ref(false)
 const configurationName = ref('')
 const showDeleteModal = ref(false)
@@ -159,43 +172,84 @@ const updateFrequency = ref('5min')
 const useIridium = ref(false)
 const useLoRA = ref(false)
 
-const batteryData = computed(() => {
-  // -- Descent / ascent parameters --
-  const descentRate_m_per_s = 1          // descent speed in meters per second
-  const descentRate_m_per_min = descentRate_m_per_s * 60
+// Convert a {number, unit} pair from the planner UI into seconds.
+function toSeconds(value: string | number, unit: string): number {
+  const n = Number(value) || 0
+  if (unit === 'hours') return n * 3600
+  if (unit === 'minutes') return n * 60
+  return n
+}
 
-  // -- Power consumption (watts) --
-  const powerRPi5_W = 15                // Raspberry Pi 5 single-board computer
-  const powerRadCAM_W = 5               // RadCAM camera module
-  const powerPerLumen_W = 15            // each lumen light module
-  const lumenCount = 2                  // number of lumen lights installed
-
-  // -- Battery --
-  // 2× Blue Robotics 10 Ah 4S Li-ion packs in parallel @ 14.8 V nominal.
-  // Keep in sync with HomeScreen.vue and backend system.py.
-  const batteryCapacity_Wh = 2 * 10 * 14.8   // 296 Wh total
-
-  // -- Dive duration from depth + release weight settings --
-  const depth = parseFloat(estimatedDepth.value) || 0
-  const descentTimeHours = depth / descentRate_m_per_min / 60
-  const ascentTimeHours = depth / descentRate_m_per_min / 60
-
-  let diveDuration = 0
+// Bottom time (hours) from the operator's release-weight setting.
+const bottomTimeHours = computed(() => {
   if (props.releaseWeightBy === 'elapsed') {
-    const num = Number(releaseWeightElapsedNumber.value) || 0
-    const unit = releaseWeightElapsedUnit.value
-    diveDuration = unit === 'hours' ? num : unit === 'minutes' ? num / 60 : num / 3600
-  } else {
-    diveDuration = descentTimeHours + ascentTimeHours
+    return toSeconds(releaseWeightElapsedNumber.value, releaseWeightElapsedUnit.value) / 3600
   }
+  if (releaseWeightDate.value && releaseWeightTime.value) {
+    const release = new Date(`${releaseWeightDate.value}T${releaseWeightTime.value}:00Z`)
+    const hrs = (release.getTime() - Date.now()) / 3_600_000
+    return Math.max(0, hrs)
+  }
+  return 0
+})
 
-  // -- Derived values --
-  const totalPower = powerRPi5_W + powerRadCAM_W + (powerPerLumen_W * lumenCount)
-  const batteryLife = totalPower > 0 ? batteryCapacity_Wh / totalPower : 0
-  const batteryUsagePercent = batteryLife > 0
-    ? Math.min((diveDuration / batteryLife) * 100, 100)
-    : 0
-  return { totalPower, batteryLife, batteryUsagePercent, diveDuration }
+const descentPhase = computed<PhaseConfig>(() => ({
+  lightOn: descentLightOn.value,
+  brightnessPct: descentLightBrightness.value,
+  lightMode: descentLightMode.value as LightMode,
+  lightOnS: toSeconds(descentLightOnNumber.value, descentLightOnUnit.value),
+  lightOffS: toSeconds(descentLightOffNumber.value, descentLightOffUnit.value),
+  cameraOn: descentCameraOn.value,
+  cameraType: descentCameraType.value as CameraType,
+  recordS: toSeconds(descentVideoRecordNumber.value, descentVideoRecordUnit.value),
+  pauseS: toSeconds(descentVideoPauseNumber.value, descentVideoPauseUnit.value),
+  capturePeriodS: toSeconds(descentCaptureFrequency.value, descentCaptureFrequencyUnit.value),
+}))
+
+const bottomPhase = computed<PhaseConfig>(() => ({
+  lightOn: bottomLightOn.value,
+  brightnessPct: bottomLightBrightness.value,
+  lightMode: bottomLightMode.value as LightMode,
+  lightOnS: toSeconds(bottomLightOnNumber.value, bottomLightOnUnit.value),
+  lightOffS: toSeconds(bottomLightOffNumber.value, bottomLightOffUnit.value),
+  cameraOn: bottomCameraOn.value,
+  cameraType: bottomCameraType.value as CameraType,
+  recordS: toSeconds(bottomVideoRecordNumber.value, bottomVideoRecordUnit.value),
+  pauseS: toSeconds(bottomVideoPauseNumber.value, bottomVideoPauseUnit.value),
+  capturePeriodS: toSeconds(bottomCaptureFrequency.value, bottomCaptureFrequencyUnit.value),
+  timelapsePreS: toSeconds(bottomTimelapseLightPreNumber.value, 'seconds'),
+  timelapsePostS: toSeconds(bottomTimelapseLightPostNumber.value, 'seconds'),
+}))
+
+const ascentPhase = computed<PhaseConfig>(() => ({
+  lightOn: ascentLightOn.value,
+  brightnessPct: ascentLightBrightness.value,
+  lightMode: ascentLightMode.value as LightMode,
+  lightOnS: toSeconds(ascentLightOnNumber.value, ascentLightOnUnit.value),
+  lightOffS: toSeconds(ascentLightOffNumber.value, ascentLightOffUnit.value),
+  cameraOn: ascentCameraOn.value,
+  cameraType: ascentCameraType.value as CameraType,
+  recordS: toSeconds(ascentVideoRecordNumber.value, ascentVideoRecordUnit.value),
+  pauseS: toSeconds(ascentVideoPauseNumber.value, ascentVideoPauseUnit.value),
+  capturePeriodS: toSeconds(ascentCaptureFrequency.value, ascentCaptureFrequencyUnit.value),
+}))
+
+const batteryData = computed(() => {
+  const estimate = estimateDive({
+    depthM: parseFloat(estimatedDepth.value) || 0,
+    bottomTimeHours: bottomTimeHours.value,
+    descent: descentPhase.value,
+    bottom: bottomPhase.value,
+    ascent: ascentPhase.value,
+  })
+  return {
+    totalPower: estimate.averagePowerW,
+    energyWh: estimate.energyWh,
+    batteryLife: estimate.batteryLifeHours,
+    batteryUsagePercent: estimate.usagePercent,
+    diveDuration: estimate.totalHours,
+    estimate,
+  }
 })
 
 // Bottom timelapse strobe helpers.  Both pre/post are stored in
@@ -1783,14 +1837,14 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
           <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
             <div class="p-4 rounded-lg" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
               <div class="flex items-center justify-between mb-2">
-                <span style="color: #96EEF2">Estimated Dive Depth</span>
-                <span class="text-white text-xl">{{ estimatedDepth || '--' }}m</span>
+                <span style="color: #96EEF2">Average Power Draw</span>
+                <span class="text-white text-xl">{{ batteryData.totalPower.toFixed(1) }} W</span>
               </div>
             </div>
             <div class="p-4 rounded-lg" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
               <div class="flex items-center justify-between mb-2">
-                <span style="color: #96EEF2">Total Power Draw</span>
-                <span class="text-white text-xl">{{ batteryData.totalPower.toFixed(1) }}W</span>
+                <span style="color: #96EEF2">Total Power Consumed</span>
+                <span class="text-white text-xl">{{ batteryData.energyWh.toFixed(1) }} Wh</span>
               </div>
             </div>
             <div class="p-4 rounded-lg" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
@@ -1808,6 +1862,76 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
             </div>
             <div class="w-full bg-gray-700 rounded-full h-4 overflow-hidden">
               <div class="h-full rounded-full transition-all" :style="{ width: `${batteryData.batteryUsagePercent}%`, background: batteryData.batteryUsagePercent > 80 ? 'linear-gradient(90deg, #DD2C1D 0%, #FF9937 100%)' : batteryData.batteryUsagePercent > 50 ? 'linear-gradient(90deg, #FF9937 0%, #FCD869 100%)' : 'linear-gradient(90deg, #41B9C3 0%, #96EEF2 100%)' }"></div>
+            </div>
+
+            <!-- Surface recovery time on remaining energy -->
+            <div class="flex items-center justify-between mt-3 pt-3 text-sm" style="border-top: 1px solid rgba(65, 185, 195, 0.2)">
+              <span style="color: #96EEF2">Surface recovery time</span>
+              <span class="text-white">
+                {{ batteryData.estimate.recoveryHours.toFixed(1) }} h
+                <span style="color: rgba(150, 238, 242, 0.6)">({{ batteryData.estimate.remainingAfterDiveWh.toFixed(0) }} Wh left ÷ {{ batteryData.estimate.recoveryHotelW.toFixed(1) }} W hotel)</span>
+              </span>
+            </div>
+
+            <!-- Breakdown dropdown -->
+            <button
+              type="button"
+              @click="showBatteryBreakdown = !showBatteryBreakdown"
+              class="mt-3 flex items-center gap-1 text-xs"
+              style="color: #96EEF2"
+            >
+              <ChevronDown v-if="!showBatteryBreakdown" class="w-4 h-4" />
+              <ChevronUp v-else class="w-4 h-4" />
+              {{ showBatteryBreakdown ? 'Hide' : 'Show' }} calculation &amp; component breakdown
+            </button>
+
+            <div v-if="showBatteryBreakdown" class="mt-3 text-xs" style="color: #96EEF2">
+              <p class="mb-2" style="color: rgba(150, 238, 242, 0.75)">
+                Energy per phase = (Hotel {{ POWER.HOTEL_W }} W + LED×brightness×duty + Camera {{ POWER.CAMERA_RECORDING_W }} W×duty) × phase&nbsp;hours.
+                Usage % = total energy ÷ {{ POWER.BATTERY_CAPACITY_WH.toFixed(0) }} Wh pack.
+                Durations: descent = depth ÷ 1 m/s, bottom = release-weight time, ascent = {{ POWER.ASCENT_BURN_MINUTES }} min burn + depth ÷ 1 m/s.
+              </p>
+              <div class="overflow-x-auto">
+                <table class="w-full text-left" style="border-collapse: collapse">
+                  <thead>
+                    <tr style="color: rgba(150, 238, 242, 0.9)">
+                      <th class="py-1 pr-3">Phase</th>
+                      <th class="py-1 pr-3">Dur (h)</th>
+                      <th class="py-1 pr-3">Hotel</th>
+                      <th class="py-1 pr-3">Lights</th>
+                      <th class="py-1 pr-3">Camera</th>
+                      <th class="py-1">Total (Wh)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr
+                      v-for="phase in batteryData.estimate.phases"
+                      :key="phase.name"
+                      style="border-top: 1px solid rgba(65, 185, 195, 0.2)"
+                    >
+                      <td class="py-1 pr-3 text-white">
+                        {{ phase.name }}
+                        <span v-if="phase.lightWh > 0" style="color: rgba(150, 238, 242, 0.6)">
+                          ({{ phase.brightnessPct }}% · {{ Math.round(phase.lightDuty * 100) }}% on)
+                        </span>
+                      </td>
+                      <td class="py-1 pr-3">{{ phase.hours.toFixed(2) }}</td>
+                      <td class="py-1 pr-3">{{ phase.hotelWh.toFixed(1) }}</td>
+                      <td class="py-1 pr-3">{{ phase.lightWh.toFixed(1) }}</td>
+                      <td class="py-1 pr-3">{{ phase.cameraWh.toFixed(1) }}</td>
+                      <td class="py-1 text-white">{{ phase.totalWh.toFixed(1) }}</td>
+                    </tr>
+                    <tr style="border-top: 1px solid rgba(65, 185, 195, 0.4)">
+                      <td class="py-1 pr-3 text-white">Total</td>
+                      <td class="py-1 pr-3 text-white">{{ batteryData.estimate.totalHours.toFixed(2) }}</td>
+                      <td class="py-1 pr-3 text-white">{{ batteryData.estimate.hotelWh.toFixed(1) }}</td>
+                      <td class="py-1 pr-3 text-white">{{ batteryData.estimate.lightWh.toFixed(1) }}</td>
+                      <td class="py-1 pr-3 text-white">{{ batteryData.estimate.cameraWh.toFixed(1) }}</td>
+                      <td class="py-1 text-white">{{ batteryData.estimate.energyWh.toFixed(1) }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
 
