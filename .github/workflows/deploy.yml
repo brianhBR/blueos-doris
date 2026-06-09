@@ -3,7 +3,7 @@ name: Deploy BlueOS Extension Image
 on:
   push:
     branches:
-      - master
+      - main
     tags:
       - 'bh-*'
   pull_request:

@@ -157,7 +157,8 @@ Body: {
 ## Git & CI Workflow
 
 - **Fork remote**: `fork` (points to `github.com/brianhBR/blueos-doris`)
-- **Push to master**: `git push fork {branch}:master`
+- **Default branch**: `main` (renamed from `master`)
+- **Push to main**: `git push fork {branch}:main`
 - **Tagged releases**: `git tag -a bh-X.Y.Z -m "description" && git push fork bh-X.Y.Z`
 - CI builds trigger on `bh-*` tags and produce Docker images at `ghcr.io/brianhbr/blueos-doris`
 - **PowerShell note**: Use `-m` flags for commit messages, not heredocs. Use `;` not `&&` to chain commands.
