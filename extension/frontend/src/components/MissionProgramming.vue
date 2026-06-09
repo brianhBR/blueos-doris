@@ -807,7 +807,7 @@ function handleBrightnessChange(value: number, phase: 'descent' | 'bottom' | 'as
   const currentBrightness = phase === 'descent' ? descentLightBrightness.value
     : phase === 'bottom' ? bottomLightBrightness.value
     : ascentLightBrightness.value
-  if (value < 60 && currentBrightness >= 60) {
+  if (value < 50 && currentBrightness >= 50) {
     pendingBrightness.value = { value, phase }
     showBrightnessWarning.value = true
   } else {
@@ -2074,7 +2074,7 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
             <AlertTriangle class="w-5 h-5 flex-shrink-0 mt-0.5" style="color: #DD2C1D" />
             <div class="flex-1">
               <h3 class="text-white font-semibold mb-1">Low Brightness Warning</h3>
-              <p class="text-white text-sm opacity-90">Setting the light brightness below 60% may result in poor image quality and reduced visibility.</p>
+              <p class="text-white text-sm opacity-90">Setting the light brightness below 50% may result in poor image quality and reduced visibility.</p>
             </div>
             <div class="flex gap-2 ml-2">
               <button @click="cancelBrightnessChange" class="px-3 py-1.5 text-sm text-white rounded transition-all hover:opacity-80" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4)">Cancel</button>
