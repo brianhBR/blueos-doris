@@ -53,6 +53,9 @@ HOTEL_W = 8.0
 CAMERA_RECORDING_W = 1.5
 # Burn-wire / drop-weight release: no measurable draw in the logs.
 RELEASE_W = 0.0
+# Surface recovery draw (terminal RECOVERY state, disarmed on the surface):
+# measured ~9.2 W in-log = hotel electronics + recovery beacon/strobe.
+RECOVERY_HOTEL_W = 9.2
 # Whole-dive average draw measured in-log (~26 Wh over 140 min). Used as
 # the live time-remaining fallback when no instantaneous current is read.
 TYPICAL_DIVE_LOAD_W = 11.0
@@ -199,29 +202,97 @@ class PhaseConfig:
     record_s: float = 0.0
     pause_s: float = 0.0
     capture_period_s: float = 0.0
+    timelapse_pre_s: float = 0.0
+    timelapse_post_s: float = 0.0
 
 
-def phase_power(cfg: PhaseConfig, voltage: float = BATTERY_NOMINAL_V) -> float:
-    """Average power (W) for a phase given its light/camera configuration."""
-    ld = light_duty(
-        enabled=cfg.light_on,
-        mode=cfg.light_mode,
-        on_seconds=cfg.light_on_s,
-        off_seconds=cfg.light_off_s,
-    )
-    cd = camera_duty(
+# Default light strobe window (s) for a timelapse snapshot when no explicit
+# pre/post roll is configured (matches doris.lua's ~2 s pre + 1 s post).
+_TIMELAPSE_DEFAULT_STROBE_S = 3.0
+
+
+def effective_light_duty(cfg: PhaseConfig) -> float:
+    """Average-on fraction for the LED, accounting for camera coupling.
+
+    The firmware drives the light off during the camera pause in interval
+    mode and strobes it only around each snapshot in timelapse mode (see
+    doris.lua ``bottom_lgt_eff``). So when the camera is duty-cycled the
+    LED follows the *camera*, not its own on/off schedule. Increasing the
+    camera pause therefore reduces the (dominant) LED energy, not just the
+    small camera term.
+    """
+    if not cfg.light_on:
+        return 0.0
+    if cfg.camera_on and cfg.camera_type == "video-interval":
+        return interval_duty(cfg.record_s, cfg.pause_s)
+    if cfg.camera_on and cfg.camera_type == "timelapse":
+        if cfg.capture_period_s <= 0:
+            return 0.0
+        window = cfg.timelapse_pre_s + cfg.timelapse_post_s
+        if window <= 0:
+            window = _TIMELAPSE_DEFAULT_STROBE_S
+        return _clamp(window / cfg.capture_period_s, 0.0, 1.0)
+    if cfg.light_mode == "interval":
+        return interval_duty(cfg.light_on_s, cfg.light_off_s)
+    return 1.0
+
+
+def effective_camera_duty(cfg: PhaseConfig) -> float:
+    """Average video-pipeline-active fraction for the camera in a phase."""
+    return camera_duty(
         enabled=cfg.camera_on,
         mode=cfg.camera_type,
         record_seconds=cfg.record_s,
         pause_seconds=cfg.pause_s,
         capture_period_seconds=cfg.capture_period_s,
     )
+
+
+def phase_power(cfg: PhaseConfig, voltage: float = BATTERY_NOMINAL_V) -> float:
+    """Average power (W) for a phase given its light/camera configuration."""
     return phase_average_power_w(
         light_brightness_pct=cfg.brightness_pct,
-        light_duty_fraction=ld,
-        camera_duty_fraction=cd,
+        light_duty_fraction=effective_light_duty(cfg),
+        camera_duty_fraction=effective_camera_duty(cfg),
         voltage=voltage,
     )
+
+
+def phase_breakdown(
+    name: str, cfg: PhaseConfig, hours: float, voltage: float = BATTERY_NOMINAL_V
+) -> dict:
+    """Per-component energy (Wh) for one phase of a given duration."""
+    ld = effective_light_duty(cfg)
+    cd = effective_camera_duty(cfg)
+    hotel_wh = HOTEL_W * hours
+    light_wh = led_power_w(cfg.brightness_pct, voltage) * ld * hours
+    camera_wh = CAMERA_RECORDING_W * cd * hours
+    total_wh = hotel_wh + light_wh + camera_wh
+    return {
+        "name": name,
+        "hours": hours,
+        "brightness_pct": cfg.brightness_pct,
+        "light_duty": ld,
+        "camera_duty": cd,
+        "hotel_wh": hotel_wh,
+        "light_wh": light_wh,
+        "camera_wh": camera_wh,
+        "total_wh": total_wh,
+        "average_w": total_wh / hours if hours > 0 else 0.0,
+    }
+
+
+def reserve_energy_wh(
+    reserve_wh: float | None = None, reserve_pct: float = BATTERY_RESERVE_PCT
+) -> float:
+    """Energy (Wh) held back for recovery mode.
+
+    An explicit ``reserve_wh`` wins; otherwise it falls back to
+    ``reserve_pct`` of the pack capacity.
+    """
+    if reserve_wh is not None:
+        return max(0.0, reserve_wh)
+    return BATTERY_CAPACITY_WH * _clamp(reserve_pct, 0.0, 100.0) / 100.0
 
 
 def estimate_dive(
@@ -233,6 +304,7 @@ def estimate_dive(
     ascent: PhaseConfig,
     voltage: float = BATTERY_NOMINAL_V,
     reserve_pct: float = BATTERY_RESERVE_PCT,
+    reserve_wh: float | None = None,
 ) -> dict:
     """Estimate energy/time/battery usage for a planned dive.
 
@@ -247,17 +319,34 @@ def estimate_dive(
     ascent_h = ASCENT_BURN_MINUTES / 60.0 + rise_h
     bottom_h = max(0.0, bottom_time_hours)
 
-    p_desc = phase_power(descent, voltage)
-    p_btm = phase_power(bottom, voltage)
-    p_asc = phase_power(ascent, voltage)
+    phases = [
+        phase_breakdown("Descent", descent, descent_h, voltage),
+        phase_breakdown("On Bottom", bottom, bottom_h, voltage),
+        phase_breakdown("Ascent", ascent, ascent_h, voltage),
+    ]
+    p_desc = phases[0]["average_w"]
+    p_btm = phases[1]["average_w"]
+    p_asc = phases[2]["average_w"]
 
-    energy_wh = p_desc * descent_h + p_btm * bottom_h + p_asc * ascent_h
+    energy_wh = sum(p["total_wh"] for p in phases)
+    hotel_wh = sum(p["hotel_wh"] for p in phases)
+    light_wh = sum(p["light_wh"] for p in phases)
+    camera_wh = sum(p["camera_wh"] for p in phases)
     total_h = descent_h + bottom_h + ascent_h
     avg_w = energy_wh / total_h if total_h > 0 else 0.0
 
     usage_pct = (energy_wh / BATTERY_CAPACITY_WH) * 100.0 if BATTERY_CAPACITY_WH else 0.0
-    usable_wh = usable_capacity_wh(reserve_pct)
+    reserve_wh_val = reserve_energy_wh(reserve_wh, reserve_pct)
+    usable_wh = max(0.0, BATTERY_CAPACITY_WH - reserve_wh_val)
+    remaining_after_dive_wh = BATTERY_CAPACITY_WH - energy_wh
     battery_life_h = BATTERY_CAPACITY_WH / avg_w if avg_w > 0 else 0.0
+    # Time the vehicle can loiter on the surface in RECOVERY on whatever
+    # energy is left after the dive, running only the recovery hotel load.
+    recovery_hours = (
+        max(0.0, remaining_after_dive_wh) / RECOVERY_HOTEL_W
+        if RECOVERY_HOTEL_W > 0
+        else 0.0
+    )
 
     return {
         "descent_hours": descent_h,
@@ -272,5 +361,14 @@ def estimate_dive(
         "usage_percent": min(usage_pct, 100.0),
         "remaining_percent": max(0.0, 100.0 - usage_pct),
         "battery_life_hours": battery_life_h,
-        "fits_within_reserve": energy_wh <= usable_wh,
+        "reserve_wh": reserve_wh_val,
+        "usable_wh": usable_wh,
+        "remaining_after_dive_wh": remaining_after_dive_wh,
+        "fits_within_reserve": remaining_after_dive_wh >= reserve_wh_val,
+        "recovery_hotel_w": RECOVERY_HOTEL_W,
+        "recovery_hours": recovery_hours,
+        "phases": phases,
+        "hotel_wh": hotel_wh,
+        "light_wh": light_wh,
+        "camera_wh": camera_wh,
     }

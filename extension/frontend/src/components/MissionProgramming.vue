@@ -4,7 +4,18 @@ import { Settings, Save, Copy, AlertTriangle, ChevronDown, ChevronUp, Camera as 
 import type { Screen } from '../types'
 import { useConfigurations } from '../composables/useApi'
 import type { DeploymentConfiguration } from '../composables/useApi'
-import { estimateDive, type PhaseConfig, type CameraType, type LightMode } from '../lib/powerModel'
+import {
+  estimateDive,
+  HOTEL_W,
+  CAMERA_RECORDING_W,
+  BATTERY_CAPACITY_WH,
+  ASCENT_BURN_MINUTES,
+  type PhaseConfig,
+  type CameraType,
+  type LightMode,
+} from '../lib/powerModel'
+
+const POWER = { HOTEL_W, CAMERA_RECORDING_W, BATTERY_CAPACITY_WH, ASCENT_BURN_MINUTES }
 
 const props = withDefaults(defineProps<{
   releaseWeightBy: 'datetime' | 'elapsed'
@@ -23,6 +34,7 @@ const selectedConfiguration = ref(props.initialConfiguration || '')
 const estimatedDepth = ref('')
 const warnings = ref<string[]>([])
 const showBatteryPlanning = ref(false)
+const showBatteryBreakdown = ref(false)
 const showSaveModal = ref(false)
 const configurationName = ref('')
 const hasUnsavedChanges = ref(false)
@@ -201,6 +213,8 @@ const bottomPhase = computed<PhaseConfig>(() => ({
   recordS: toSeconds(bottomVideoRecordNumber.value, bottomVideoRecordUnit.value),
   pauseS: toSeconds(bottomVideoPauseNumber.value, bottomVideoPauseUnit.value),
   capturePeriodS: toSeconds(bottomCaptureFrequency.value, bottomCaptureFrequencyUnit.value),
+  timelapsePreS: toSeconds(bottomTimelapseLightPreNumber.value, 'seconds'),
+  timelapsePostS: toSeconds(bottomTimelapseLightPostNumber.value, 'seconds'),
 }))
 
 const ascentPhase = computed<PhaseConfig>(() => ({
@@ -226,6 +240,7 @@ const batteryData = computed(() => {
   })
   return {
     totalPower: estimate.averagePowerW,
+    energyWh: estimate.energyWh,
     batteryLife: estimate.batteryLifeHours,
     batteryUsagePercent: estimate.usagePercent,
     diveDuration: estimate.totalHours,
@@ -1769,14 +1784,14 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
           <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
             <div class="p-4 rounded-lg" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
               <div class="flex items-center justify-between mb-2">
-                <span style="color: #96EEF2">Estimated Dive Depth</span>
-                <span class="text-white text-xl">{{ estimatedDepth || '--' }}m</span>
+                <span style="color: #96EEF2">Average Power Draw</span>
+                <span class="text-white text-xl">{{ batteryData.totalPower.toFixed(1) }} W</span>
               </div>
             </div>
             <div class="p-4 rounded-lg" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
               <div class="flex items-center justify-between mb-2">
-                <span style="color: #96EEF2">Total Power Draw</span>
-                <span class="text-white text-xl">{{ batteryData.totalPower.toFixed(1) }}W</span>
+                <span style="color: #96EEF2">Total Power Consumed</span>
+                <span class="text-white text-xl">{{ batteryData.energyWh.toFixed(1) }} Wh</span>
               </div>
             </div>
             <div class="p-4 rounded-lg" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
@@ -1794,6 +1809,76 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
             </div>
             <div class="w-full bg-gray-700 rounded-full h-4 overflow-hidden">
               <div class="h-full rounded-full transition-all" :style="{ width: `${batteryData.batteryUsagePercent}%`, background: batteryData.batteryUsagePercent > 80 ? 'linear-gradient(90deg, #DD2C1D 0%, #FF9937 100%)' : batteryData.batteryUsagePercent > 50 ? 'linear-gradient(90deg, #FF9937 0%, #FCD869 100%)' : 'linear-gradient(90deg, #41B9C3 0%, #96EEF2 100%)' }"></div>
+            </div>
+
+            <!-- Surface recovery time on remaining energy -->
+            <div class="flex items-center justify-between mt-3 pt-3 text-sm" style="border-top: 1px solid rgba(65, 185, 195, 0.2)">
+              <span style="color: #96EEF2">Surface recovery time</span>
+              <span class="text-white">
+                {{ batteryData.estimate.recoveryHours.toFixed(1) }} h
+                <span style="color: rgba(150, 238, 242, 0.6)">({{ batteryData.estimate.remainingAfterDiveWh.toFixed(0) }} Wh left ÷ {{ batteryData.estimate.recoveryHotelW.toFixed(1) }} W hotel)</span>
+              </span>
+            </div>
+
+            <!-- Breakdown dropdown -->
+            <button
+              type="button"
+              @click="showBatteryBreakdown = !showBatteryBreakdown"
+              class="mt-3 flex items-center gap-1 text-xs"
+              style="color: #96EEF2"
+            >
+              <ChevronDown v-if="!showBatteryBreakdown" class="w-4 h-4" />
+              <ChevronUp v-else class="w-4 h-4" />
+              {{ showBatteryBreakdown ? 'Hide' : 'Show' }} calculation &amp; component breakdown
+            </button>
+
+            <div v-if="showBatteryBreakdown" class="mt-3 text-xs" style="color: #96EEF2">
+              <p class="mb-2" style="color: rgba(150, 238, 242, 0.75)">
+                Energy per phase = (Hotel {{ POWER.HOTEL_W }} W + LED×brightness×duty + Camera {{ POWER.CAMERA_RECORDING_W }} W×duty) × phase&nbsp;hours.
+                Usage % = total energy ÷ {{ POWER.BATTERY_CAPACITY_WH.toFixed(0) }} Wh pack.
+                Durations: descent = depth ÷ 1 m/s, bottom = release-weight time, ascent = {{ POWER.ASCENT_BURN_MINUTES }} min burn + depth ÷ 1 m/s.
+              </p>
+              <div class="overflow-x-auto">
+                <table class="w-full text-left" style="border-collapse: collapse">
+                  <thead>
+                    <tr style="color: rgba(150, 238, 242, 0.9)">
+                      <th class="py-1 pr-3">Phase</th>
+                      <th class="py-1 pr-3">Dur (h)</th>
+                      <th class="py-1 pr-3">Hotel</th>
+                      <th class="py-1 pr-3">Lights</th>
+                      <th class="py-1 pr-3">Camera</th>
+                      <th class="py-1">Total (Wh)</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <tr
+                      v-for="phase in batteryData.estimate.phases"
+                      :key="phase.name"
+                      style="border-top: 1px solid rgba(65, 185, 195, 0.2)"
+                    >
+                      <td class="py-1 pr-3 text-white">
+                        {{ phase.name }}
+                        <span v-if="phase.lightWh > 0" style="color: rgba(150, 238, 242, 0.6)">
+                          ({{ phase.brightnessPct }}% · {{ Math.round(phase.lightDuty * 100) }}% on)
+                        </span>
+                      </td>
+                      <td class="py-1 pr-3">{{ phase.hours.toFixed(2) }}</td>
+                      <td class="py-1 pr-3">{{ phase.hotelWh.toFixed(1) }}</td>
+                      <td class="py-1 pr-3">{{ phase.lightWh.toFixed(1) }}</td>
+                      <td class="py-1 pr-3">{{ phase.cameraWh.toFixed(1) }}</td>
+                      <td class="py-1 text-white">{{ phase.totalWh.toFixed(1) }}</td>
+                    </tr>
+                    <tr style="border-top: 1px solid rgba(65, 185, 195, 0.4)">
+                      <td class="py-1 pr-3 text-white">Total</td>
+                      <td class="py-1 pr-3 text-white">{{ batteryData.estimate.totalHours.toFixed(2) }}</td>
+                      <td class="py-1 pr-3 text-white">{{ batteryData.estimate.hotelWh.toFixed(1) }}</td>
+                      <td class="py-1 pr-3 text-white">{{ batteryData.estimate.lightWh.toFixed(1) }}</td>
+                      <td class="py-1 pr-3 text-white">{{ batteryData.estimate.cameraWh.toFixed(1) }}</td>
+                      <td class="py-1 text-white">{{ batteryData.estimate.energyWh.toFixed(1) }}</td>
+                    </tr>
+                  </tbody>
+                </table>
+              </div>
             </div>
           </div>
 

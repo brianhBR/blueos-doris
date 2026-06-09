@@ -267,7 +267,7 @@ const diveFeasibility = computed(() => {
     ascentTimeHours: estimate.ascentHours.toFixed(1),
     batteryUsagePercent: Math.round(batteryUsagePercent),
     estimatedStorageNeeded: Math.round(estimatedStorageNeeded),
-    totalPowerDraw: estimate.averagePowerW.toFixed(1),
+    totalPowerConsumedWh: estimate.energyWh.toFixed(1),
     batteryLifeHours: estimate.batteryLifeHours.toFixed(1),
     surfaceTimeUTC,
     timeUntilRelease: timeUntilRelease !== null ? timeUntilRelease.toFixed(1) : null
@@ -685,8 +685,8 @@ const formatReleaseTime = (date: Date) => {
       <!-- Power & Battery Metrics -->
       <div class="grid grid-cols-1 md:grid-cols-3 gap-4 mb-6">
         <div class="rounded-lg p-4" style="background-color: rgba(14, 36, 70, 0.5)">
-          <p class="text-xs mb-1" style="color: #96EEF2">Power Draw</p>
-          <p class="text-xl font-bold text-white">{{ diveFeasibility.totalPowerDraw }} W</p>
+          <p class="text-xs mb-1" style="color: #96EEF2">Total Power Consumed</p>
+          <p class="text-xl font-bold text-white">{{ diveFeasibility.totalPowerConsumedWh }} Wh</p>
         </div>
         <div class="rounded-lg p-4" style="background-color: rgba(14, 36, 70, 0.5)">
           <p class="text-xs mb-1" style="color: #96EEF2">Battery Life</p>

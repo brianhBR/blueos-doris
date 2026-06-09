@@ -28,6 +28,9 @@ export const BATTERY_RESERVE_PCT = 15.0
 export const HOTEL_W = 8.0
 export const CAMERA_RECORDING_W = 1.5
 export const RELEASE_W = 0.0
+// Surface recovery draw (terminal RECOVERY state, disarmed): measured
+// ~9.2 W in-log = hotel electronics + recovery beacon/strobe.
+export const RECOVERY_HOTEL_W = 9.2
 export const TYPICAL_DIVE_LOAD_W = 11.0
 
 // ── LED (single) ─────────────────────────────────────────────────────
@@ -121,6 +124,46 @@ export interface PhaseConfig {
   recordS?: number
   pauseS?: number
   capturePeriodS?: number
+  timelapsePreS?: number
+  timelapsePostS?: number
+}
+
+// Default light strobe window (s) for a timelapse snapshot with no
+// explicit pre/post roll (matches doris.lua ~2 s pre + 1 s post).
+const TIMELAPSE_DEFAULT_STROBE_S = 3.0
+
+/**
+ * Average-on fraction for the LED, accounting for camera coupling.
+ * In interval/timelapse the firmware gates the LED to the recorder
+ * (doris.lua bottom_lgt_eff), so the LED follows the camera duty — not
+ * its own on/off. Increasing the camera pause cuts the dominant LED term.
+ */
+export function effectiveLightDuty(cfg: PhaseConfig): number {
+  if (!cfg.lightOn) return 0
+  if (cfg.cameraOn && cfg.cameraType === 'video-interval') {
+    return intervalDuty(cfg.recordS ?? 0, cfg.pauseS ?? 0)
+  }
+  if (cfg.cameraOn && cfg.cameraType === 'timelapse') {
+    const period = cfg.capturePeriodS ?? 0
+    if (period <= 0) return 0
+    let window = (cfg.timelapsePreS ?? 0) + (cfg.timelapsePostS ?? 0)
+    if (window <= 0) window = TIMELAPSE_DEFAULT_STROBE_S
+    return clamp(window / period, 0, 1)
+  }
+  if (cfg.lightMode === 'interval') {
+    return intervalDuty(cfg.lightOnS ?? 0, cfg.lightOffS ?? 0)
+  }
+  return 1
+}
+
+export function effectiveCameraDuty(cfg: PhaseConfig): number {
+  return cameraDuty({
+    enabled: !!cfg.cameraOn,
+    mode: cfg.cameraType,
+    recordSeconds: cfg.recordS,
+    pauseSeconds: cfg.pauseS,
+    capturePeriodSeconds: cfg.capturePeriodS,
+  })
 }
 
 export function phaseAveragePowerW(opts: {
@@ -136,23 +179,10 @@ export function phaseAveragePowerW(opts: {
 }
 
 export function phasePower(cfg: PhaseConfig, voltage = BATTERY_NOMINAL_V): number {
-  const ld = lightDuty({
-    enabled: !!cfg.lightOn,
-    mode: cfg.lightMode,
-    onSeconds: cfg.lightOnS,
-    offSeconds: cfg.lightOffS,
-  })
-  const cd = cameraDuty({
-    enabled: !!cfg.cameraOn,
-    mode: cfg.cameraType,
-    recordSeconds: cfg.recordS,
-    pauseSeconds: cfg.pauseS,
-    capturePeriodSeconds: cfg.capturePeriodS,
-  })
   return phaseAveragePowerW({
     brightnessPct: cfg.brightnessPct,
-    lightDutyFraction: ld,
-    cameraDutyFraction: cd,
+    lightDutyFraction: effectiveLightDuty(cfg),
+    cameraDutyFraction: effectiveCameraDuty(cfg),
     voltage,
   })
 }
@@ -188,6 +218,8 @@ interface CameraSettingsLike {
   capture_frequency_unit: string
   video_record?: TimeValueLike
   video_pause?: TimeValueLike
+  timelapse_light_pre?: TimeValueLike
+  timelapse_light_post?: TimeValueLike
 }
 
 export function timeValueToSeconds(tv?: TimeValueLike | null): number {
@@ -219,6 +251,48 @@ export function phaseConfigFromSettings(
           unit: camera.capture_frequency_unit,
         })
       : 0,
+    timelapsePreS: timeValueToSeconds(camera?.timelapse_light_pre),
+    timelapsePostS: timeValueToSeconds(camera?.timelapse_light_post),
+  }
+}
+
+export interface PhaseBreakdown {
+  name: string
+  hours: number
+  brightnessPct: number
+  lightDuty: number
+  cameraDuty: number
+  hotelWh: number
+  lightWh: number
+  cameraWh: number
+  totalWh: number
+  averageW: number
+}
+
+/** Per-component energy (Wh) for a single phase of a given duration. */
+export function phaseBreakdown(
+  name: string,
+  cfg: PhaseConfig,
+  hours: number,
+  voltage = BATTERY_NOMINAL_V,
+): PhaseBreakdown {
+  const ld = effectiveLightDuty(cfg)
+  const cd = effectiveCameraDuty(cfg)
+  const hotelWh = HOTEL_W * hours
+  const lightWh = ledPowerW(cfg.brightnessPct ?? 0, voltage) * ld * hours
+  const cameraWh = CAMERA_RECORDING_W * cd * hours
+  const totalWh = hotelWh + lightWh + cameraWh
+  return {
+    name,
+    hours,
+    brightnessPct: cfg.brightnessPct ?? 0,
+    lightDuty: ld,
+    cameraDuty: cd,
+    hotelWh,
+    lightWh,
+    cameraWh,
+    totalWh,
+    averageW: hours > 0 ? totalWh / hours : 0,
   }
 }
 
@@ -235,7 +309,22 @@ export interface DiveEstimate {
   usagePercent: number
   remainingPercent: number
   batteryLifeHours: number
+  reserveWh: number
+  usableWh: number
+  remainingAfterDiveWh: number
   fitsWithinReserve: boolean
+  recoveryHotelW: number
+  recoveryHours: number
+  phases: PhaseBreakdown[]
+  hotelWh: number
+  lightWh: number
+  cameraWh: number
+}
+
+/** Energy (Wh) held back for recovery mode (explicit Wh wins over %). */
+export function reserveEnergyWh(reserveWh?: number, reservePct = BATTERY_RESERVE_PCT): number {
+  if (reserveWh !== undefined && reserveWh !== null) return Math.max(0, reserveWh)
+  return (BATTERY_CAPACITY_WH * clamp(reservePct, 0, 100)) / 100
 }
 
 /**
@@ -251,6 +340,7 @@ export function estimateDive(opts: {
   ascent: PhaseConfig
   voltage?: number
   reservePct?: number
+  reserveWh?: number
 }): DiveEstimate {
   const v = opts.voltage ?? BATTERY_NOMINAL_V
   const riseH = Math.max(0, opts.depthM) / DESCENT_RATE_M_S / 3600
@@ -258,16 +348,28 @@ export function estimateDive(opts: {
   const ascentHours = ASCENT_BURN_MINUTES / 60 + riseH
   const bottomHours = Math.max(0, opts.bottomTimeHours)
 
-  const descentPowerW = phasePower(opts.descent, v)
-  const bottomPowerW = phasePower(opts.bottom, v)
-  const ascentPowerW = phasePower(opts.ascent, v)
+  const phases = [
+    phaseBreakdown('Descent', opts.descent, descentHours, v),
+    phaseBreakdown('On Bottom', opts.bottom, bottomHours, v),
+    phaseBreakdown('Ascent', opts.ascent, ascentHours, v),
+  ]
+  const descentPowerW = phases[0].averageW
+  const bottomPowerW = phases[1].averageW
+  const ascentPowerW = phases[2].averageW
 
-  const energyWh =
-    descentPowerW * descentHours + bottomPowerW * bottomHours + ascentPowerW * ascentHours
+  const energyWh = phases.reduce((s, p) => s + p.totalWh, 0)
+  const hotelWh = phases.reduce((s, p) => s + p.hotelWh, 0)
+  const lightWh = phases.reduce((s, p) => s + p.lightWh, 0)
+  const cameraWh = phases.reduce((s, p) => s + p.cameraWh, 0)
   const totalHours = descentHours + bottomHours + ascentHours
   const averagePowerW = totalHours > 0 ? energyWh / totalHours : 0
   const usagePercent = BATTERY_CAPACITY_WH ? (energyWh / BATTERY_CAPACITY_WH) * 100 : 0
   const batteryLifeHours = averagePowerW > 0 ? BATTERY_CAPACITY_WH / averagePowerW : 0
+  const reserveWh = reserveEnergyWh(opts.reserveWh, opts.reservePct)
+  const usableWh = Math.max(0, BATTERY_CAPACITY_WH - reserveWh)
+  const remainingAfterDiveWh = BATTERY_CAPACITY_WH - energyWh
+  const recoveryHours =
+    RECOVERY_HOTEL_W > 0 ? Math.max(0, remainingAfterDiveWh) / RECOVERY_HOTEL_W : 0
 
   return {
     descentHours,
@@ -282,6 +384,15 @@ export function estimateDive(opts: {
     usagePercent: Math.min(usagePercent, 100),
     remainingPercent: Math.max(0, 100 - usagePercent),
     batteryLifeHours,
-    fitsWithinReserve: energyWh <= usableCapacityWh(opts.reservePct),
+    reserveWh,
+    usableWh,
+    remainingAfterDiveWh,
+    fitsWithinReserve: remainingAfterDiveWh >= reserveWh,
+    recoveryHotelW: RECOVERY_HOTEL_W,
+    recoveryHours,
+    phases,
+    hotelWh,
+    lightWh,
+    cameraWh,
   }
 }

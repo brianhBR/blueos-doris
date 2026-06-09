@@ -188,6 +188,140 @@ def test_reserve_flag():
     assert over["fits_within_reserve"] is False
 
 
+def test_phase_breakdown_components_sum():
+    cfg = pm.PhaseConfig(
+        light_on=True, brightness_pct=100, camera_on=True, camera_type="continuous-video"
+    )
+    b = pm.phase_breakdown("Bottom", cfg, hours=2.0)
+    assert b["hotel_wh"] == pytest.approx(pm.HOTEL_W * 2.0)
+    assert b["light_wh"] == pytest.approx(pm.led_power_w(100) * 2.0)
+    assert b["camera_wh"] == pytest.approx(pm.CAMERA_RECORDING_W * 2.0)
+    assert b["total_wh"] == pytest.approx(
+        b["hotel_wh"] + b["light_wh"] + b["camera_wh"]
+    )
+
+
+def test_estimate_dive_breakdown_totals_match():
+    est = pm.estimate_dive(
+        depth_m=500,
+        bottom_time_hours=4.0,
+        descent=pm.PhaseConfig(light_on=True, brightness_pct=50),
+        bottom=pm.PhaseConfig(light_on=True, brightness_pct=75, camera_on=True),
+        ascent=pm.PhaseConfig(),
+    )
+    assert len(est["phases"]) == 3
+    assert [p["name"] for p in est["phases"]] == ["Descent", "On Bottom", "Ascent"]
+    # Component totals reconcile with overall energy.
+    assert est["hotel_wh"] + est["light_wh"] + est["camera_wh"] == pytest.approx(
+        est["energy_wh"]
+    )
+    assert sum(p["total_wh"] for p in est["phases"]) == pytest.approx(est["energy_wh"])
+
+
+def test_interval_camera_gates_light():
+    # Light follows the camera record/pause duty in interval mode, so a
+    # longer pause cuts the (dominant) LED energy, not just the camera term.
+    short_pause = pm.PhaseConfig(
+        light_on=True,
+        brightness_pct=100,
+        camera_on=True,
+        camera_type="video-interval",
+        record_s=10,
+        pause_s=10,
+    )
+    long_pause = pm.PhaseConfig(
+        light_on=True,
+        brightness_pct=100,
+        camera_on=True,
+        camera_type="video-interval",
+        record_s=10,
+        pause_s=50,
+    )
+    assert pm.effective_light_duty(short_pause) == pytest.approx(0.5)
+    assert pm.effective_light_duty(long_pause) == pytest.approx(10 / 60)
+    # The light energy must drop substantially, not marginally.
+    b_short = pm.phase_breakdown("b", short_pause, hours=4.0)
+    b_long = pm.phase_breakdown("b", long_pause, hours=4.0)
+    assert b_long["light_wh"] < b_short["light_wh"] * 0.5
+
+
+def test_timelapse_light_uses_strobe_window():
+    cfg = pm.PhaseConfig(
+        light_on=True,
+        brightness_pct=100,
+        camera_on=True,
+        camera_type="timelapse",
+        capture_period_s=60,
+        timelapse_pre_s=2,
+        timelapse_post_s=1,
+    )
+    assert pm.effective_light_duty(cfg) == pytest.approx(3 / 60)
+
+
+def test_continuous_camera_keeps_light_own_mode():
+    cfg = pm.PhaseConfig(
+        light_on=True,
+        brightness_pct=100,
+        light_mode="interval",
+        light_on_s=10,
+        light_off_s=10,
+        camera_on=True,
+        camera_type="continuous-video",
+    )
+    assert pm.effective_light_duty(cfg) == pytest.approx(0.5)
+
+
+def test_reserve_wh_overrides_percent():
+    base = dict(
+        depth_m=100,
+        bottom_time_hours=2.0,
+        descent=pm.PhaseConfig(),
+        bottom=pm.PhaseConfig(),
+        ascent=pm.PhaseConfig(),
+    )
+    est = pm.estimate_dive(reserve_wh=50.0, **base)
+    assert est["reserve_wh"] == pytest.approx(50.0)
+    assert est["usable_wh"] == pytest.approx(pm.BATTERY_CAPACITY_WH - 50.0)
+    assert est["remaining_after_dive_wh"] == pytest.approx(
+        pm.BATTERY_CAPACITY_WH - est["energy_wh"]
+    )
+
+
+def test_reserve_wh_fit_flag():
+    # Huge reserve makes even a tiny dive fail the reserve check.
+    est = pm.estimate_dive(
+        depth_m=50,
+        bottom_time_hours=1.0,
+        descent=pm.PhaseConfig(),
+        bottom=pm.PhaseConfig(),
+        ascent=pm.PhaseConfig(),
+        reserve_wh=290.0,
+    )
+    assert est["fits_within_reserve"] is False
+
+
+def test_recovery_hours_from_remaining_energy():
+    est = pm.estimate_dive(
+        depth_m=100,
+        bottom_time_hours=2.0,
+        descent=pm.PhaseConfig(),
+        bottom=pm.PhaseConfig(),
+        ascent=pm.PhaseConfig(),
+    )
+    assert est["recovery_hotel_w"] == pytest.approx(pm.RECOVERY_HOTEL_W)
+    expected = est["remaining_after_dive_wh"] / pm.RECOVERY_HOTEL_W
+    assert est["recovery_hours"] == pytest.approx(expected)
+    # More energy consumed => less surface recovery time.
+    heavy = pm.estimate_dive(
+        depth_m=300,
+        bottom_time_hours=10.0,
+        descent=pm.PhaseConfig(),
+        bottom=pm.PhaseConfig(light_on=True, brightness_pct=100),
+        ascent=pm.PhaseConfig(),
+    )
+    assert heavy["recovery_hours"] < est["recovery_hours"]
+
+
 def test_pack_constants():
     assert pm.BATTERY_TOTAL_AH == pytest.approx(20.0)  # noqa: SIM300
     assert pm.BATTERY_CAPACITY_WH == pytest.approx(296.0)  # noqa: SIM300
