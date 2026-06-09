@@ -7,7 +7,7 @@
  * Constants were validated against a real 140 min / 791 m dive log
  * (recorder_20260528_165058.mcap):
  *  - LED: measured pack-current rise at 1700 us = 1.28 A vs bench 1.24 A.
- *  - Hotel (Pi5 + autopilot + sensors, lights off): ~8 W.
+ *  - Base (Pi5 + autopilot + sensors, lights off): ~8 W.
  *  - Camera recording adder: ~1.5 W.
  *  - Release/burn-wire relay: no measurable draw.
  */
@@ -25,12 +25,12 @@ export const BATTERY_CAPACITY_WH = BATTERY_TOTAL_AH * BATTERY_NOMINAL_V // 296 W
 export const BATTERY_RESERVE_PCT = 15.0
 
 // ── Component loads (empirical) ──────────────────────────────────────
-export const HOTEL_W = 8.0
+export const BASE_W = 8.0
 export const CAMERA_RECORDING_W = 1.5
 export const RELEASE_W = 0.0
 // Surface recovery draw (terminal RECOVERY state, disarmed): measured
-// ~9.2 W in-log = hotel electronics + recovery beacon/strobe.
-export const RECOVERY_HOTEL_W = 9.2
+// ~9.2 W in-log = base electronics + recovery beacon/strobe.
+export const RECOVERY_BASE_W = 9.2
 export const TYPICAL_DIVE_LOAD_W = 11.0
 
 // ── LED (single) ─────────────────────────────────────────────────────
@@ -175,7 +175,7 @@ export function phaseAveragePowerW(opts: {
   const v = opts.voltage ?? BATTERY_NOMINAL_V
   const led = ledPowerW(opts.brightnessPct ?? 0, v) * clamp(opts.lightDutyFraction ?? 0, 0, 1)
   const cam = CAMERA_RECORDING_W * clamp(opts.cameraDutyFraction ?? 0, 0, 1)
-  return HOTEL_W + led + cam
+  return BASE_W + led + cam
 }
 
 export function phasePower(cfg: PhaseConfig, voltage = BATTERY_NOMINAL_V): number {
@@ -262,7 +262,7 @@ export interface PhaseBreakdown {
   brightnessPct: number
   lightDuty: number
   cameraDuty: number
-  hotelWh: number
+  baseWh: number
   lightWh: number
   cameraWh: number
   totalWh: number
@@ -278,17 +278,17 @@ export function phaseBreakdown(
 ): PhaseBreakdown {
   const ld = effectiveLightDuty(cfg)
   const cd = effectiveCameraDuty(cfg)
-  const hotelWh = HOTEL_W * hours
+  const baseWh = BASE_W * hours
   const lightWh = ledPowerW(cfg.brightnessPct ?? 0, voltage) * ld * hours
   const cameraWh = CAMERA_RECORDING_W * cd * hours
-  const totalWh = hotelWh + lightWh + cameraWh
+  const totalWh = baseWh + lightWh + cameraWh
   return {
     name,
     hours,
     brightnessPct: cfg.brightnessPct ?? 0,
     lightDuty: ld,
     cameraDuty: cd,
-    hotelWh,
+    baseWh,
     lightWh,
     cameraWh,
     totalWh,
@@ -313,10 +313,10 @@ export interface DiveEstimate {
   usableWh: number
   remainingAfterDiveWh: number
   fitsWithinReserve: boolean
-  recoveryHotelW: number
+  recoveryBaseW: number
   recoveryHours: number
   phases: PhaseBreakdown[]
-  hotelWh: number
+  baseWh: number
   lightWh: number
   cameraWh: number
 }
@@ -358,7 +358,7 @@ export function estimateDive(opts: {
   const ascentPowerW = phases[2].averageW
 
   const energyWh = phases.reduce((s, p) => s + p.totalWh, 0)
-  const hotelWh = phases.reduce((s, p) => s + p.hotelWh, 0)
+  const baseWh = phases.reduce((s, p) => s + p.baseWh, 0)
   const lightWh = phases.reduce((s, p) => s + p.lightWh, 0)
   const cameraWh = phases.reduce((s, p) => s + p.cameraWh, 0)
   const totalHours = descentHours + bottomHours + ascentHours
@@ -369,7 +369,7 @@ export function estimateDive(opts: {
   const usableWh = Math.max(0, BATTERY_CAPACITY_WH - reserveWh)
   const remainingAfterDiveWh = BATTERY_CAPACITY_WH - energyWh
   const recoveryHours =
-    RECOVERY_HOTEL_W > 0 ? Math.max(0, remainingAfterDiveWh) / RECOVERY_HOTEL_W : 0
+    RECOVERY_BASE_W > 0 ? Math.max(0, remainingAfterDiveWh) / RECOVERY_BASE_W : 0
 
   return {
     descentHours,
@@ -388,10 +388,10 @@ export function estimateDive(opts: {
     usableWh,
     remainingAfterDiveWh,
     fitsWithinReserve: remainingAfterDiveWh >= reserveWh,
-    recoveryHotelW: RECOVERY_HOTEL_W,
+    recoveryBaseW: RECOVERY_BASE_W,
     recoveryHours,
     phases,
-    hotelWh,
+    baseWh,
     lightWh,
     cameraWh,
   }

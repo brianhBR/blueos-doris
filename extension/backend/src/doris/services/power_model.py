@@ -13,7 +13,7 @@ log (recorder_20260528_165058.mcap) by joining MAVLink ``BATTERY_STATUS``
 * LED: measured pack-current rise at 1700 us was 1.28 A vs the bench table's
   1.24 A (3% agreement), so the bench curve is trustworthy and the LED draws
   on the monitored pack rail.
-* Hotel (everything except the LED, lights off, idle): ~0.49 A ≈ 7-8 W.
+* Base (everything except the LED, lights off, idle): ~0.49 A ≈ 7-8 W.
 * Camera recording adds only ~1.5 W over idle (descent/bottom/ascent
   lights-off baseline rose from ~0.49 A to ~0.59 A).
 * Release/burn-wire relay showed no measurable current step at activation,
@@ -22,7 +22,7 @@ log (recorder_20260528_165058.mcap) by joining MAVLink ``BATTERY_STATUS``
 NOTE: these figures reflect whatever is on the autopilot's monitored power
 rail. The LED is definitely on it (delta matches the bench curve). If the
 Pi5/RadCAM are ever moved to a separate unmonitored converter, revisit
-``HOTEL_W`` / ``CAMERA_RECORDING_W``.
+``BASE_W`` / ``CAMERA_RECORDING_W``.
 """
 
 from __future__ import annotations
@@ -47,15 +47,15 @@ BATTERY_CAPACITY_WH = BATTERY_TOTAL_AH * BATTERY_NOMINAL_V    # 296 Wh
 BATTERY_RESERVE_PCT = 15.0
 
 # ── Component loads (empirical, see module docstring) ────────────────
-# Hotel = Raspberry Pi 5 + autopilot + sensors, everything but the LED.
-HOTEL_W = 8.0
+# Base = Raspberry Pi 5 + autopilot + sensors, everything but the LED.
+BASE_W = 8.0
 # Extra draw while the camera pipeline is actively recording video.
 CAMERA_RECORDING_W = 1.5
 # Burn-wire / drop-weight release: no measurable draw in the logs.
 RELEASE_W = 0.0
 # Surface recovery draw (terminal RECOVERY state, disarmed on the surface):
-# measured ~9.2 W in-log = hotel electronics + recovery beacon/strobe.
-RECOVERY_HOTEL_W = 9.2
+# measured ~9.2 W in-log = base electronics + recovery beacon/strobe.
+RECOVERY_BASE_W = 9.2
 # Whole-dive average draw measured in-log (~26 Wh over 140 min). Used as
 # the live time-remaining fallback when no instantaneous current is read.
 TYPICAL_DIVE_LOAD_W = 11.0
@@ -167,10 +167,10 @@ def phase_average_power_w(
     camera_duty_fraction: float = 0.0,
     voltage: float = BATTERY_NOMINAL_V,
 ) -> float:
-    """Average power (W) for a dive phase = hotel + LED + camera."""
+    """Average power (W) for a dive phase = base + LED + camera."""
     led = led_power_w(light_brightness_pct, voltage) * _clamp(light_duty_fraction, 0.0, 1.0)
     cam = CAMERA_RECORDING_W * _clamp(camera_duty_fraction, 0.0, 1.0)
-    return HOTEL_W + led + cam
+    return BASE_W + led + cam
 
 
 def usable_capacity_wh(reserve_pct: float = BATTERY_RESERVE_PCT) -> float:
@@ -264,17 +264,17 @@ def phase_breakdown(
     """Per-component energy (Wh) for one phase of a given duration."""
     ld = effective_light_duty(cfg)
     cd = effective_camera_duty(cfg)
-    hotel_wh = HOTEL_W * hours
+    base_wh = BASE_W * hours
     light_wh = led_power_w(cfg.brightness_pct, voltage) * ld * hours
     camera_wh = CAMERA_RECORDING_W * cd * hours
-    total_wh = hotel_wh + light_wh + camera_wh
+    total_wh = base_wh + light_wh + camera_wh
     return {
         "name": name,
         "hours": hours,
         "brightness_pct": cfg.brightness_pct,
         "light_duty": ld,
         "camera_duty": cd,
-        "hotel_wh": hotel_wh,
+        "base_wh": base_wh,
         "light_wh": light_wh,
         "camera_wh": camera_wh,
         "total_wh": total_wh,
@@ -329,7 +329,7 @@ def estimate_dive(
     p_asc = phases[2]["average_w"]
 
     energy_wh = sum(p["total_wh"] for p in phases)
-    hotel_wh = sum(p["hotel_wh"] for p in phases)
+    base_wh = sum(p["base_wh"] for p in phases)
     light_wh = sum(p["light_wh"] for p in phases)
     camera_wh = sum(p["camera_wh"] for p in phases)
     total_h = descent_h + bottom_h + ascent_h
@@ -341,10 +341,10 @@ def estimate_dive(
     remaining_after_dive_wh = BATTERY_CAPACITY_WH - energy_wh
     battery_life_h = BATTERY_CAPACITY_WH / avg_w if avg_w > 0 else 0.0
     # Time the vehicle can loiter on the surface in RECOVERY on whatever
-    # energy is left after the dive, running only the recovery hotel load.
+    # energy is left after the dive, running only the recovery base load.
     recovery_hours = (
-        max(0.0, remaining_after_dive_wh) / RECOVERY_HOTEL_W
-        if RECOVERY_HOTEL_W > 0
+        max(0.0, remaining_after_dive_wh) / RECOVERY_BASE_W
+        if RECOVERY_BASE_W > 0
         else 0.0
     )
 
@@ -365,10 +365,10 @@ def estimate_dive(
         "usable_wh": usable_wh,
         "remaining_after_dive_wh": remaining_after_dive_wh,
         "fits_within_reserve": remaining_after_dive_wh >= reserve_wh_val,
-        "recovery_hotel_w": RECOVERY_HOTEL_W,
+        "recovery_base_w": RECOVERY_BASE_W,
         "recovery_hours": recovery_hours,
         "phases": phases,
-        "hotel_wh": hotel_wh,
+        "base_wh": base_wh,
         "light_wh": light_wh,
         "camera_wh": camera_wh,
     }
