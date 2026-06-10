@@ -130,6 +130,26 @@ def _ensure_gst_init() -> None:
             )
 
 
+def prewarm() -> None:
+    """Initialise GStreamer ahead of the first recording.
+
+    ``Gst.init`` scans the plugin registry the first time it runs, which
+    measured ~4 s on the Pi during a real dive (see the gap between
+    ``RECORD /start called`` and ``GStreamer initialized`` in doris.log).
+    Because init was previously triggered lazily inside the first
+    ``start_recording`` call, that one-time cost landed squarely on the
+    critical path at bottom detection -- delaying the moment real frames
+    hit disk and, with it, the bottom light.  Calling this at extension
+    startup moves the cost off the dive path.  Idempotent and best-effort:
+    any failure is logged and swallowed so a GStreamer hiccup can never
+    block backend startup (recording will simply re-attempt init lazily).
+    """
+    try:
+        _ensure_gst_init()
+    except Exception:
+        logger.exception("GStreamer prewarm failed (will retry lazily on first record)")
+
+
 # ── module state ───────────────────────────────────────────────────────────────
 
 _state_lock = asyncio.Lock()
