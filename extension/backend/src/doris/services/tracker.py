@@ -68,6 +68,15 @@ TRIGGER_POST_TIMEOUT_S = 15.0  # mavlink2rest POST commonly takes 4-5s
 # truly disconnected tracker visible forever.
 TRACKER_STICKY_GRACE_S = 60.0
 
+# A HEARTBEAT is considered "live" when mavlink2rest last received it
+# within this window.  Detection is gated on message *recency*
+# (status.time.last_update age), NOT on mavlink2rest's per-message
+# frequency estimate: that estimate is a noisy EMA that sits below any
+# fixed threshold for long stretches even while the AGT heartbeats
+# steadily, which dropped the tile despite a live link (issue #55).
+# timesync.py trusts last_update age for the same component; we mirror it.
+HEARTBEAT_MAX_AGE_S = 30.0
+
 
 def _m2r_base() -> str:
     return blueos_services.mavlink2rest
@@ -92,6 +101,27 @@ def _decode_severity(raw_severity) -> int:
     if isinstance(raw_severity, int):
         return raw_severity
     return 6
+
+
+def _message_age_seconds(data: dict) -> float | None:
+    """Age of a mavlink2rest message from its ``status.time.last_update``.
+
+    Returns ``None`` when the timestamp is missing or unparseable.  Both
+    ``last_update`` and ``now`` come from the same host clock, so the
+    returned age is valid even when the absolute system clock is wrong
+    (mirrors the same helper in ``timesync.py``).
+    """
+    last_update = data.get("status", {}).get("time", {}).get("last_update")
+    if not last_update or not isinstance(last_update, str):
+        return None
+    s = last_update.replace("Z", "+00:00")
+    try:
+        dt = datetime.fromisoformat(s)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    return (datetime.now(tz=timezone.utc) - dt).total_seconds()
 
 
 class _StatusTextBuffer:
@@ -243,7 +273,21 @@ class ArtemisTrackerService:
             return None
 
     async def _get_heartbeat(self) -> dict | None:
-        """Check for a recent HEARTBEAT from the Artemis component."""
+        """Return the AGT HEARTBEAT message if one was received recently.
+
+        Presence is judged by message *recency* (``status.time.last_update``
+        age), NOT by mavlink2rest's per-message frequency estimate.  That
+        estimate is a noisy EMA that sits below any fixed threshold for
+        long stretches even while the AGT heartbeats steadily, which made
+        the tracker tile vanish despite a live link (issue #55).
+        ``timesync.py`` already trusts ``last_update`` age for the same
+        component; we mirror that here.
+
+        A stale cached HEARTBEAT (mavlink2rest keeps the last message
+        forever) is rejected once it ages past ``HEARTBEAT_MAX_AGE_S``.
+        When the timestamp is missing/unparseable we accept the message's
+        presence rather than risk a false negative (the bug being fixed).
+        """
         base = _m2r_base()
         url = f"{base}/mavlink/vehicles/1/components/{ARTEMIS_COMPONENT_ID}/messages/HEARTBEAT"
         try:
@@ -252,14 +296,19 @@ class ArtemisTrackerService:
                 return None
             resp.raise_for_status()
             data = resp.json()
-            time_info = data.get("status", {}).get("time", {})
-            freq = time_info.get("frequency", 0)
-            if freq < 0.05:
-                return None
-            return data.get("message")
         except Exception as e:
             logger.debug("No Artemis heartbeat: %s", e)
             return None
+
+        msg = data.get("message")
+        if not isinstance(msg, dict) or msg.get("type") != "HEARTBEAT":
+            return None
+
+        age = _message_age_seconds(data)
+        if age is not None and age > HEARTBEAT_MAX_AGE_S:
+            logger.debug("Artemis HEARTBEAT is stale (%.0fs old) — ignoring", age)
+            return None
+        return msg
 
     # ── STATUSTEXT subscriber ───────────────────────────────────────
 
