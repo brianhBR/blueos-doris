@@ -27,6 +27,7 @@ from .routes import (
     register_sensor_routes,
     register_system_routes,
 )
+from .services import ip_camera_recorder
 from .services.external_storage import start_external_storage_setup
 from .services.storage import DATA_ROOT
 from .services.usb_storage import start_usb_storage_probe
@@ -210,6 +211,16 @@ def create_app() -> Robyn:
 
         timesync_service.start_background_sync()
         start_dmesg_capture()
+
+        # Pre-warm GStreamer so the first dive recording doesn't pay the
+        # one-time ~4 s Gst.init() plugin-registry scan at bottom
+        # detection.  Run off the event loop (init blocks) and don't await
+        # it -- startup shouldn't wait on it, and recording falls back to
+        # lazy init if this hasn't finished yet.
+        try:
+            asyncio.get_event_loop().run_in_executor(None, ip_camera_recorder.prewarm)
+        except Exception as e:
+            logger.warning("GStreamer prewarm scheduling skipped: %s", e)
 
         logger.info("DORIS backend startup complete")
         asyncio.get_event_loop().create_task(_restart_autopilot(logger))

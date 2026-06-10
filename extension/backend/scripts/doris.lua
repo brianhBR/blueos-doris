@@ -1250,7 +1250,22 @@ function update()
         --                  + post-roll windows around each snapshot
         --                  (driven by tl_strobe_active below)
         local bottom_lgt_eff = cfg.btm_lgt
-        if ipcam_cfg.btm_cmod == 2 then
+        if ipcam_cfg.btm_cmod == 1 and ipcam_cfg.rec_en then
+            -- CONTINUOUS: the operator wants the light on cfg.btm_dly_ms
+            -- (light delay) after *video recording actually starts*, not
+            -- after bottom detection.  The RTSP connect + first-frame
+            -- latency (plus the one-time GStreamer init on the first dive
+            -- recording) can push real frames several seconds past bottom
+            -- detection, so we gate the light-delay clock on first-frame
+            -- just like INTERVAL mode.  cycle_start_ms is held at 0 until
+            -- the recorder confirms frames are on disk (set in the bottom
+            -- camera dispatcher below), so the light stays off through the
+            -- connect window and then lights cfg.btm_dly_ms later.
+            bottom_lgt_eff = cfg.btm_lgt
+                and not ipcam_state.cycle_awaiting_frames
+                and ipcam_state.cycle_start_ms > 0
+                and (now_ms - ipcam_state.cycle_start_ms) >= cfg.btm_dly_ms
+        elseif ipcam_cfg.btm_cmod == 2 then
             -- INTERVAL: the camera starts each cycle, the light comes on
             -- cfg.btm_dly_ms (light delay) after the record clock starts,
             -- and both turn off together when the record window ends.  The
@@ -1270,10 +1285,13 @@ function update()
             bottom_lgt_eff = cfg.btm_lgt and (pre_active or post_active)
         end
 
-        if ipcam_cfg.btm_cmod == 2 then
-            -- INTERVAL owns its light timing per-cycle (above).  The
-            -- one-time bottom settling delay is replaced by the camera
-            -- settle (cam_delay_done), which gates the first cycle.
+        if ipcam_cfg.btm_cmod == 2
+           or (ipcam_cfg.btm_cmod == 1 and ipcam_cfg.rec_en) then
+            -- INTERVAL and CONTINUOUS-recording own their light timing via
+            -- the first-frame-anchored bottom_lgt_eff above.  The one-time
+            -- bottom settling delay (bottom_delay_done, measured from
+            -- bottom detection) is replaced by the recording-start anchor
+            -- so the light tracks the camera, not the detection instant.
             update_lights(bottom_lgt_eff, now_ms)
         elseif not bottom_delay_done then
             update_lights(false, now_ms)
@@ -1295,10 +1313,49 @@ function update()
         elseif ipcam_cfg.btm_cmod == 1 then
             -- CONTINUOUS: start once after camera delay, keep running.
             -- seg=300 -> splitmuxsink rotates every 5 minutes so the
-            -- finalize step can produce on_bottom_chunkNN.mp4 files.
-            if cam_delay_done and not ipcam_recording then
-                ipcam_begin_phase(true, "on_bottom", 300)
-                ipcam_btm_started = ipcam_recording
+            -- finalize step can produce on_bottom_chunkNN.mp4 files.  The
+            -- recorder may already be live here (the zero-gap start fired
+            -- at bottom detection when there was no camera delay) or not
+            -- (a camera delay stopped descent recording); either way we
+            -- run a first-frame wait so the bottom light's delay clock
+            -- (cycle_start_ms) is anchored to real frames on disk rather
+            -- than bottom detection.
+            if ipcam_cfg.rec_en and cam_delay_done then
+                if not ipcam_state.cycle_started then
+                    ipcam_state.cycle_started         = true
+                    ipcam_state.cycle_awaiting_frames = true
+                    ipcam_state.cycle_wait_start_ms   = now_ms
+                    ipcam_state.cycle_start_ms        = 0
+                    if not ipcam_recording then
+                        ipcam_begin_phase(true, "on_bottom", 300)
+                    end
+                    ipcam_btm_started = ipcam_recording
+                elseif ipcam_state.cycle_awaiting_frames then
+                    -- Hold the light-delay clock until frames are confirmed
+                    -- on disk (or the safety timeout fires).  Recording is
+                    -- already running; we only gate the light here.
+                    local ff = ipcam_frames_flowing()
+                    local waited = now_ms - ipcam_state.cycle_wait_start_ms
+                    if ff == true then
+                        ipcam_state.cycle_awaiting_frames = false
+                        ipcam_state.cycle_start_ms        = now_ms
+                        reset_light_cycle(now_ms)
+                        gcs:send_text(MAV_SEVERITY.INFO,
+                            string.format(
+                                "DIVE: IPcam frames flowing after %.1fs, lights +%ds",
+                                waited / 1000.0,
+                                math.floor(cfg.btm_dly_ms / 1000)))
+                    elseif waited >= IPCAM_FIRST_FRAME_TIMEOUT_MS then
+                        ipcam_state.cycle_awaiting_frames = false
+                        ipcam_state.cycle_start_ms        = now_ms
+                        reset_light_cycle(now_ms)
+                        gcs:send_text(MAV_SEVERITY.WARNING,
+                            string.format(
+                                "DIVE: IPcam first-frame wait timed out (%.0fs), "
+                                .. "starting light clock anyway",
+                                waited / 1000.0))
+                    end
+                end
             end
         elseif ipcam_cfg.btm_cmod == 2 then
             -- VIDEO_INTERVAL: duty-cycle record for btm_rec_ms, pause
