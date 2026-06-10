@@ -1,5 +1,8 @@
 """Network-related models."""
 
+from datetime import datetime
+from typing import Literal
+
 from pydantic import BaseModel
 
 
@@ -39,4 +42,41 @@ class NetworkCredentials(BaseModel):
 
     ssid: str
     password: str | None = None
+
+
+# ── WLAN mode switching (single external radio AP <-> STA) ──────────
+
+WlanMode = Literal["ap", "sta_pending", "sta_connected"]
+WlanAttemptStatus = Literal["success", "failed"]
+
+
+class WlanLastAttempt(BaseModel):
+    """Outcome of the most recent AP <-> STA switch attempt.
+
+    Surfaced in the UI when the user reconnects to the AP after a failed
+    STA switch — without this they would have no way of knowing why their
+    browser session went dead and what to fix.
+    """
+
+    ssid: str
+    status: WlanAttemptStatus
+    error: str | None = None
+    timestamp: datetime
+
+
+class WlanState(BaseModel):
+    """Current state of the external radio (uap0) for AP/STA switching.
+
+    ``mode`` is the *intent* recorded by the DORIS extension:
+      - ``ap``: external radio is broadcasting the DORIS hotspot
+      - ``sta_pending``: switch initiated, connection attempt in flight
+      - ``sta_connected``: external radio is associated to a client WLAN
+    The intent always resets to ``ap`` on backend startup so a power
+    cycle reliably reverts to the hotspot.
+    """
+
+    mode: WlanMode
+    target_ssid: str | None = None
+    ip_address: str | None = None
+    last_attempt: WlanLastAttempt | None = None
 

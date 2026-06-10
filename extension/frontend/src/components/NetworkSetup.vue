@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { Wifi, Lock, RefreshCw, Signal, AlertCircle, CheckCircle, Smartphone } from 'lucide-vue-next'
-import { mdiIpOutline } from '@mdi/js'
+import { Wifi, Lock, RefreshCw, Signal, AlertCircle, CheckCircle, Smartphone, ArrowLeftRight } from 'lucide-vue-next'
 import { useWifiNetworks } from '../composables/useApi'
 
 const emit = defineEmits<{
@@ -13,11 +12,14 @@ const {
   connectionStatus: apiConnectionStatus,
   serialNumber: apiSerialNumber,
   hotspotSsid: apiHotspotSsid,
+  wlanState,
   scanning,
+  switching,
   fetchNetworks,
+  fetchWlanState,
   scanNetworks,
-  connectToNetwork,
-  disconnectFromNetwork,
+  switchToStaMode,
+  switchToApMode,
 } = useWifiNetworks()
 
 const dorisMACAddress = computed(() => apiConnectionStatus.value?.mac_address ?? '—')
@@ -26,14 +28,13 @@ const dorisHotspotName = computed(() => apiHotspotSsid.value ?? 'DORIS')
 const showAdvanced = ref(true)
 const selectedNetwork = ref<DisplayNetwork | null>(null)
 const password = ref('')
-const connectionStatus = ref<'idle' | 'connecting' | 'connected' | 'failed'>('idle')
 const manualSSID = ref('')
 const manualPassword = ref('')
-const useStaticIP = ref(false)
-const staticIPAddress = ref('')
-const subnetMask = ref('255.255.255.0')
-const gateway = ref('')
-const dnsServer = ref('')
+
+// AP/STA switch UX state
+const pendingSwitch = ref<{ ssid: string; password: string } | null>(null)
+const showSwitchConfirm = ref(false)
+const dismissedAttemptTimestamp = ref<string | null>(null)
 
 interface DisplayNetwork {
   ssid: string
@@ -46,78 +47,107 @@ interface DisplayNetwork {
 
 const networks = computed<DisplayNetwork[]>(() => {
   if (apiNetworks.value.length > 0) {
-    return apiNetworks.value.map((n) => ({
-      ssid: n.ssid,
-      signal: n.signal_strength,
-      frequency: n.frequency,
-      security: n.security,
-      saved: n.is_saved,
-      connected: n.is_connected,
-    }))
+    return apiNetworks.value
+      // Don't list our own AP as a join target — the user can't STA into
+      // their own hotspot, and showing it just invites confusion.
+      .filter(n => n.ssid !== dorisHotspotName.value)
+      .map((n) => ({
+        ssid: n.ssid,
+        signal: n.signal_strength,
+        frequency: n.frequency,
+        security: n.security,
+        saved: n.is_saved,
+        connected: n.is_connected,
+      }))
   }
   return []
 })
 
-const connectedNetwork = computed(() => networks.value.find((n) => n.connected))
-
 let pollInterval: number | undefined
+let stateInterval: number | undefined
 
 onMounted(() => {
   fetchNetworks()
+  fetchWlanState()
   if (apiConnectionStatus.value?.is_connected) {
-    connectionStatus.value = 'connected'
     emit('connect', true)
   }
   pollInterval = setInterval(fetchNetworks, 10000) as unknown as number
+  // Faster cadence for WLAN state so the user gets prompt UI feedback
+  // while a switch is in flight, and so the post-failure banner appears
+  // quickly when they reconnect to the AP.
+  stateInterval = setInterval(fetchWlanState, 3000) as unknown as number
 })
 
 onUnmounted(() => {
   if (pollInterval) clearInterval(pollInterval)
+  if (stateInterval) clearInterval(stateInterval)
 })
 
 const isScanning = computed(() => scanning.value)
+
+const currentMode = computed(() => wlanState.value?.mode ?? 'ap')
+const isApMode = computed(() => currentMode.value === 'ap')
+const isStaPending = computed(() => currentMode.value === 'sta_pending')
+const isStaConnected = computed(() => currentMode.value === 'sta_connected')
+
+// Show the failure banner only when:
+//   - we're back on the AP (sta_pending wouldn't be reachable anyway)
+//   - the most recent attempt was a failure
+//   - the user hasn't already dismissed *this* failure
+const failureBanner = computed(() => {
+  const attempt = wlanState.value?.last_attempt
+  if (!attempt || attempt.status !== 'failed') return null
+  if (!isApMode.value) return null
+  if (dismissedAttemptTimestamp.value === attempt.timestamp) return null
+  return attempt
+})
 
 const handleScan = async () => {
   await scanNetworks()
 }
 
-const handleConnect = async () => {
+const requestSwitch = (ssid: string, pwd: string) => {
+  pendingSwitch.value = { ssid, password: pwd }
+  showSwitchConfirm.value = true
+}
+
+const cancelSwitch = () => {
+  pendingSwitch.value = null
+  showSwitchConfirm.value = false
+}
+
+const confirmSwitch = async () => {
+  if (!pendingSwitch.value) return
+  const { ssid, password: pwd } = pendingSwitch.value
+  showSwitchConfirm.value = false
+  await switchToStaMode(ssid, pwd)
+  // Don't clear pendingSwitch yet — we want to remember what SSID we
+  // tried so the in-flight banner can show it. The poll loop will
+  // refresh wlanState; the AP-side connection will die any moment now.
+  password.value = ''
+  manualPassword.value = ''
+}
+
+const handleConnectFromList = () => {
   if (!selectedNetwork.value) return
-  connectionStatus.value = 'connecting'
   const ssid = selectedNetwork.value.ssid
   const pwd = selectedNetwork.value.saved ? '' : password.value
-  const success = await connectToNetwork(ssid, pwd)
-  if (success) {
-    connectionStatus.value = 'connected'
-    emit('connect', true)
-    await fetchNetworks()
-  } else {
-    connectionStatus.value = 'failed'
-  }
+  requestSwitch(ssid, pwd)
 }
 
-const handleDisconnect = async () => {
-  connectionStatus.value = 'connecting'
-  const success = await disconnectFromNetwork()
-  if (success) {
-    connectionStatus.value = 'idle'
-    selectedNetwork.value = null
-    emit('connect', false)
-    await fetchNetworks()
-  } else {
-    connectionStatus.value = 'failed'
-  }
+const handleManualConnect = () => {
+  if (!manualSSID.value) return
+  requestSwitch(manualSSID.value, manualPassword.value)
 }
 
-const handleManualConnect = async () => {
-  if (!manualSSID.value || !manualPassword.value) return
-  connectionStatus.value = 'connecting'
-  const success = await connectToNetwork(manualSSID.value, manualPassword.value)
-  if (success) {
-    connectionStatus.value = 'connected'
-    emit('connect', true)
-  } else {
-    connectionStatus.value = 'failed'
+const handleRestoreHotspot = async () => {
+  await switchToApMode()
+}
+
+const dismissFailureBanner = () => {
+  if (failureBanner.value) {
+    dismissedAttemptTimestamp.value = failureBanner.value.timestamp
   }
 }
 
@@ -127,10 +157,12 @@ const getSignalColor = (signal: number) => {
   return '#DD2C1D'
 }
 
-const manualConnectDisabled = () => {
-  if (!manualSSID.value || !manualPassword.value) return true
-  if (useStaticIP.value && (!staticIPAddress.value || !subnetMask.value || !gateway.value)) return true
-  return false
+const formatTimestamp = (iso: string): string => {
+  try {
+    return new Date(iso).toLocaleTimeString()
+  } catch {
+    return iso
+  }
 }
 </script>
 
@@ -145,7 +177,111 @@ const manualConnectDisabled = () => {
         Network Setup & Connection
       </h1>
 
-      <!-- Device Information -->
+      <!-- ── Current Mode Banner ────────────────────────────────── -->
+      <div
+        v-if="isApMode"
+        class="rounded-lg p-4 mb-4 flex items-center gap-3"
+        style="background-color: rgba(252, 216, 105, 0.1); border: 1px solid rgba(252, 216, 105, 0.3)"
+      >
+        <Smartphone class="w-5 h-5 flex-shrink-0" style="color: #FCD869" />
+        <div class="flex-1">
+          <p style="color: #FCD869">Hotspot mode</p>
+          <p class="text-sm" style="color: #96EEF2">Broadcasting <span class="font-mono">{{ dorisHotspotName }}</span> — connect a client to reach DORIS.</p>
+        </div>
+      </div>
+
+      <div
+        v-if="isStaPending"
+        class="rounded-lg p-4 mb-4 flex items-center gap-3"
+        style="background-color: rgba(65, 185, 195, 0.1); border: 1px solid rgba(65, 185, 195, 0.3)"
+      >
+        <RefreshCw class="w-5 h-5 animate-spin flex-shrink-0" style="color: #41B9C3" />
+        <div class="flex-1">
+          <p style="color: #41B9C3">Switching to client mode…</p>
+          <p class="text-sm" style="color: #96EEF2">
+            Joining <span class="font-mono">{{ wlanState?.target_ssid ?? pendingSwitch?.ssid ?? '…' }}</span>.
+            The DORIS hotspot is going down — your browser will lose this page within seconds.
+          </p>
+          <p class="text-sm mt-1" style="color: #96EEF2">
+            On success, find DORIS at <span class="font-mono">http://doris.local:8095</span> on the same network.
+            On failure, the hotspot will restart and you can reconnect here to see what went wrong.
+          </p>
+        </div>
+      </div>
+
+      <div
+        v-if="isStaConnected"
+        class="rounded-lg p-4 mb-4"
+        style="background-color: rgba(150, 238, 242, 0.1); border: 1px solid rgba(150, 238, 242, 0.4)"
+      >
+        <div class="flex items-center gap-3 mb-3">
+          <CheckCircle class="w-5 h-5 flex-shrink-0" style="color: #96EEF2" />
+          <div class="flex-1">
+            <p style="color: #96EEF2">Connected to client WLAN</p>
+            <p class="text-sm" style="color: #96EEF2">
+              Network: <span class="font-mono">{{ wlanState?.target_ssid ?? '—' }}</span>
+            </p>
+            <p v-if="wlanState?.ip_address" class="text-sm mt-1" style="color: #96EEF2">
+              Reach DORIS at
+              <span class="font-mono">http://doris.local:8095</span>
+              or
+              <span class="font-mono">http://{{ wlanState.ip_address }}:8095</span>
+            </p>
+          </div>
+        </div>
+        <div
+          class="rounded-lg p-3 mb-3"
+          style="background-color: rgba(255, 153, 55, 0.1); border: 1px solid rgba(255, 153, 55, 0.3)"
+        >
+          <div class="flex items-start gap-2">
+            <AlertCircle class="w-4 h-4 flex-shrink-0 mt-0.5" style="color: #FF9937" />
+            <p class="text-xs" style="color: #FF9937">
+              The DORIS hotspot is down while in client mode. Power-cycling DORIS will always restore the hotspot.
+            </p>
+          </div>
+        </div>
+        <button
+          @click="handleRestoreHotspot"
+          :disabled="switching"
+          class="w-full px-4 py-2 text-white rounded-lg transition-all disabled:opacity-50 hover:opacity-90 flex items-center justify-center gap-2"
+          style="background: linear-gradient(135deg, #FCD869 0%, #FF9937 100%)"
+        >
+          <ArrowLeftRight class="w-4 h-4" />
+          {{ switching ? 'Restoring…' : 'Restore DORIS Hotspot' }}
+        </button>
+      </div>
+
+      <!-- ── Last Attempt Failure Banner ───────────────────────── -->
+      <div
+        v-if="failureBanner"
+        class="rounded-lg p-4 mb-4"
+        style="background-color: rgba(221, 44, 29, 0.1); border: 1px solid rgba(221, 44, 29, 0.3)"
+      >
+        <div class="flex items-start gap-3">
+          <AlertCircle class="w-5 h-5 flex-shrink-0 mt-0.5" style="color: #DD2C1D" />
+          <div class="flex-1">
+            <p style="color: #DD2C1D">
+              Last attempt to join <span class="font-mono">{{ failureBanner.ssid }}</span> failed
+              <span class="text-xs" style="opacity: 0.7">({{ formatTimestamp(failureBanner.timestamp) }})</span>
+            </p>
+            <p v-if="failureBanner.error" class="text-sm mt-1" style="color: #DD2C1D; opacity: 0.85">
+              {{ failureBanner.error }}
+            </p>
+            <p class="text-sm mt-2" style="color: #DD2C1D; opacity: 0.85">
+              Hotspot has been restored. Double-check the password and signal strength, then try again.
+            </p>
+          </div>
+          <button
+            @click="dismissFailureBanner"
+            class="text-xs px-2 py-1 rounded hover:bg-white/10"
+            style="color: #DD2C1D"
+          >
+            Dismiss
+          </button>
+        </div>
+      </div>
+
+      <!-- ── Device Information ─────────────────────────────────── -->
       <div
         class="rounded-lg p-4 mb-4"
         style="background-color: rgba(14, 36, 70, 0.6); border: 1px solid rgba(65, 185, 195, 0.3)"
@@ -172,54 +308,7 @@ const manualConnectDisabled = () => {
         </div>
       </div>
 
-      <!-- Connection Status: Connected -->
-      <div
-        v-if="connectionStatus === 'connected' || connectedNetwork"
-        class="rounded-lg p-4 mb-4 flex items-center gap-3"
-        style="background-color: rgba(252, 216, 105, 0.1); border: 1px solid rgba(252, 216, 105, 0.3)"
-      >
-        <CheckCircle class="w-5 h-5 flex-shrink-0" style="color: #FCD869" />
-        <div class="flex-1">
-          <p style="color: #FCD869">Connected</p>
-          <p class="text-sm" style="color: #96EEF2">Network: {{ connectedNetwork?.ssid || selectedNetwork?.ssid || manualSSID }}</p>
-        </div>
-        <div v-if="apiConnectionStatus?.ip_address" class="flex items-center gap-1.5 flex-shrink-0">
-          <svg class="w-4 h-4" viewBox="0 0 24 24" style="color: #FCD869">
-            <path :d="mdiIpOutline" fill="currentColor" />
-          </svg>
-          <span class="text-sm font-mono" style="color: #FCD869">{{ apiConnectionStatus.ip_address }}</span>
-        </div>
-      </div>
-
-      <!-- Connection Status: Connecting -->
-      <div
-        v-if="connectionStatus === 'connecting'"
-        class="rounded-lg p-4 mb-4 flex items-center gap-3"
-        style="background-color: rgba(65, 185, 195, 0.1); border: 1px solid rgba(65, 185, 195, 0.3)"
-      >
-        <RefreshCw class="w-5 h-5 animate-spin" style="color: #41B9C3" />
-        <p style="color: #41B9C3">Connecting to network...</p>
-      </div>
-
-      <!-- Connection Status: Failed -->
-      <div
-        v-if="connectionStatus === 'failed'"
-        class="rounded-lg p-4 mb-4"
-        style="background-color: rgba(221, 44, 29, 0.1); border: 1px solid rgba(221, 44, 29, 0.3)"
-      >
-        <div class="flex items-center gap-3 mb-2">
-          <AlertCircle class="w-5 h-5" style="color: #DD2C1D" />
-          <p style="color: #DD2C1D">Connection Failed</p>
-        </div>
-        <p class="text-sm" style="color: #DD2C1D; opacity: 0.8">Troubleshooting tips:</p>
-        <ul class="text-sm list-disc ml-5 mt-1" style="color: #DD2C1D; opacity: 0.8">
-          <li>Check SSID and password are correct</li>
-          <li>Ensure router supports 2.4GHz (if 5GHz not supported)</li>
-          <li>Try restarting the system and router</li>
-        </ul>
-      </div>
-
-      <!-- Info Box -->
+      <!-- ── Info Box ────────────────────────────────────────────── -->
       <div
         class="rounded-lg p-4 mb-6"
         style="background-color: rgba(65, 185, 195, 0.1); border: 1px solid rgba(65, 185, 195, 0.3)"
@@ -228,21 +317,31 @@ const manualConnectDisabled = () => {
           <AlertCircle class="w-5 h-5 flex-shrink-0 mt-0.5" style="color: #41B9C3" />
           <div class="space-y-2">
             <p class="text-sm" style="color: #96EEF2">
-              DORIS supports both 2.4GHz and 5GHz networks. For best compatibility, 2.4GHz is recommended.
-              Previously connected networks will reconnect automatically when available.
+              The DORIS hotspot radio can either broadcast the DORIS hotspot <strong>or</strong>
+              connect to a local WLAN — not both at the same time. Joining a local network gives
+              DORIS internet access at the cost of taking the hotspot down for the duration of
+              the session.
             </p>
             <p class="text-sm" style="color: #96EEF2">
-              <strong>Startup Behavior:</strong> Every time DORIS is restarted, it automatically starts in hotspot mode. After startup, you will need to reconnect it to your preferred network.
+              <strong>2.4 GHz networks only.</strong> The external antenna is single-band 2.4 GHz,
+              so 5 GHz access points cannot be joined even when they appear in the scan list. Pick a
+              2.4 GHz SSID; if your router broadcasts both bands under the same name, make sure the
+              2.4 GHz radio is enabled.
+            </p>
+            <p class="text-sm" style="color: #96EEF2">
+              <strong>Startup behavior:</strong> Every time DORIS is restarted, the hotspot radio
+              reverts to hotspot mode. Saved networks are kept and will appear in the scan list,
+              but they are never auto-joined.
             </p>
           </div>
         </div>
       </div>
 
-      <!-- Scan Button -->
+      <!-- ── Scan Button ────────────────────────────────────────── -->
       <div class="flex items-center gap-3 mb-6">
         <button
           @click="handleScan"
-          :disabled="isScanning"
+          :disabled="isScanning || isStaPending"
           class="flex items-center gap-2 px-4 py-2 text-white rounded-lg transition-all disabled:opacity-50 hover:opacity-90"
           style="background: linear-gradient(135deg, #41B9C3 0%, #187D8B 100%)"
         >
@@ -254,7 +353,7 @@ const manualConnectDisabled = () => {
         </span>
       </div>
 
-      <!-- Available Networks -->
+      <!-- ── Available Networks ────────────────────────────────── -->
       <div class="space-y-2 mb-6">
         <h2 class="text-white mb-3">Available Networks</h2>
         <div
@@ -301,41 +400,13 @@ const manualConnectDisabled = () => {
             <span class="text-sm" style="color: #41B9C3">{{ network.signal }}%</span>
           </div>
 
-          <!-- Disconnect button for connected network -->
+          <!-- Password Input + Switch button for unsaved selected network -->
           <div
-            v-if="selectedNetwork?.ssid === network.ssid && network.connected"
+            v-if="selectedNetwork?.ssid === network.ssid && !network.saved"
             class="mt-4 pt-4"
             style="border-top: 1px solid rgba(65, 185, 195, 0.2)"
             @click.stop
           >
-            <button
-              @click="handleDisconnect"
-              class="w-full px-4 py-2 text-white rounded-lg transition-all hover:opacity-90"
-              style="background: linear-gradient(135deg, #DD2C1D 0%, #a82215 100%)"
-            >
-              Disconnect
-            </button>
-          </div>
-
-          <!-- Password Input for unsaved, not-connected selected network -->
-          <div
-            v-else-if="selectedNetwork?.ssid === network.ssid && !network.saved"
-            class="mt-4 pt-4"
-            style="border-top: 1px solid rgba(65, 185, 195, 0.2)"
-            @click.stop
-          >
-            <div
-              v-if="network.ssid !== dorisHotspotName"
-              class="rounded-lg p-3 mb-3"
-              style="background-color: rgba(255, 153, 55, 0.1); border: 1px solid rgba(255, 153, 55, 0.3)"
-            >
-              <div class="flex items-start gap-2">
-                <AlertCircle class="w-4 h-4 flex-shrink-0 mt-0.5" style="color: #FF9937" />
-                <p class="text-xs" style="color: #FF9937">
-                  <strong>Note:</strong> Once connected to this network, you will lose access to DORIS from the hotspot. You will need to access DORIS from the new network or power cycle DORIS to restore the hotspot.
-                </p>
-              </div>
-            </div>
             <input
               type="password"
               v-model="password"
@@ -344,45 +415,37 @@ const manualConnectDisabled = () => {
               style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.3)"
             />
             <button
-              @click="handleConnect"
-              class="w-full px-4 py-2 text-white rounded-lg transition-all hover:opacity-90"
+              @click="handleConnectFromList"
+              :disabled="!password || isStaPending"
+              class="w-full px-4 py-2 text-white rounded-lg transition-all hover:opacity-90 disabled:opacity-50 flex items-center justify-center gap-2"
               style="background: linear-gradient(135deg, #41B9C3 0%, #187D8B 100%)"
             >
-              Connect
+              <ArrowLeftRight class="w-4 h-4" />
+              Switch DORIS to this network
             </button>
           </div>
 
-          <!-- Connect button for saved, not-connected selected network -->
+          <!-- Switch button for saved selected network (no password needed) -->
           <div
             v-else-if="selectedNetwork?.ssid === network.ssid && network.saved"
             class="mt-4 pt-4"
             style="border-top: 1px solid rgba(65, 185, 195, 0.2)"
             @click.stop
           >
-            <div
-              v-if="network.ssid !== dorisHotspotName"
-              class="rounded-lg p-3 mb-3"
-              style="background-color: rgba(255, 153, 55, 0.1); border: 1px solid rgba(255, 153, 55, 0.3)"
-            >
-              <div class="flex items-start gap-2">
-                <AlertCircle class="w-4 h-4 flex-shrink-0 mt-0.5" style="color: #FF9937" />
-                <p class="text-xs" style="color: #FF9937">
-                  <strong>Note:</strong> Once connected to this network, you will lose access to DORIS from the hotspot. You will need to access DORIS from the new network or power cycle DORIS to restore the hotspot.
-                </p>
-              </div>
-            </div>
             <button
-              @click="handleConnect"
-              class="w-full px-4 py-2 text-white rounded-lg transition-all hover:opacity-90"
+              @click="handleConnectFromList"
+              :disabled="isStaPending"
+              class="w-full px-4 py-2 text-white rounded-lg transition-all hover:opacity-90 disabled:opacity-50 flex items-center justify-center gap-2"
               style="background: linear-gradient(135deg, #41B9C3 0%, #187D8B 100%)"
             >
-              Connect
+              <ArrowLeftRight class="w-4 h-4" />
+              Switch DORIS to this saved network
             </button>
           </div>
         </div>
       </div>
 
-      <!-- Advanced Options -->
+      <!-- ── Advanced Options ──────────────────────────────────── -->
       <div class="pt-6" style="border-top: 1px solid rgba(65, 185, 195, 0.2)">
         <button
           @click="showAdvanced = !showAdvanced"
@@ -400,7 +463,8 @@ const manualConnectDisabled = () => {
           >
             <h3 class="text-white mb-3">Manual Network Entry</h3>
             <p class="text-sm mb-4" style="color: #96EEF2">
-              Enter network details manually if your network isn't detected in the scan.
+              Enter network details manually if your network isn't detected in the scan
+              (e.g., a hidden SSID).
             </p>
             <div class="space-y-3">
               <input
@@ -417,125 +481,75 @@ const manualConnectDisabled = () => {
                 class="w-full px-4 py-2 text-white rounded-lg focus:outline-none"
                 style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.3)"
               />
-
-              <!-- Static IP Configuration -->
-              <div class="pt-3" style="border-top: 1px solid rgba(65, 185, 195, 0.1)">
-                <label class="flex items-center gap-2 mb-3 cursor-pointer">
-                  <input
-                    type="checkbox"
-                    v-model="useStaticIP"
-                    class="w-4 h-4 rounded"
-                    style="accent-color: #41B9C3"
-                  />
-                  <span class="text-sm" style="color: #96EEF2">Use Static IP Address</span>
-                </label>
-
-                <div v-if="useStaticIP" class="space-y-3 pl-6">
-                  <div>
-                    <label class="block text-xs mb-1" style="color: #96EEF2">IP Address *</label>
-                    <input
-                      type="text"
-                      v-model="staticIPAddress"
-                      placeholder="e.g., 192.168.1.100"
-                      class="w-full px-4 py-2 text-white rounded-lg focus:outline-none"
-                      style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.3)"
-                    />
-                  </div>
-                  <div>
-                    <label class="block text-xs mb-1" style="color: #96EEF2">Subnet Mask *</label>
-                    <input
-                      type="text"
-                      v-model="subnetMask"
-                      placeholder="e.g., 255.255.255.0"
-                      class="w-full px-4 py-2 text-white rounded-lg focus:outline-none"
-                      style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.3)"
-                    />
-                  </div>
-                  <div>
-                    <label class="block text-xs mb-1" style="color: #96EEF2">Gateway *</label>
-                    <input
-                      type="text"
-                      v-model="gateway"
-                      placeholder="e.g., 192.168.1.1"
-                      class="w-full px-4 py-2 text-white rounded-lg focus:outline-none"
-                      style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.3)"
-                    />
-                  </div>
-                  <div>
-                    <label class="block text-xs mb-1" style="color: #96EEF2">DNS Server (Optional)</label>
-                    <input
-                      type="text"
-                      v-model="dnsServer"
-                      placeholder="e.g., 8.8.8.8"
-                      class="w-full px-4 py-2 text-white rounded-lg focus:outline-none"
-                      style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.3)"
-                    />
-                  </div>
-                  <div
-                    class="rounded-lg p-3 mt-2"
-                    style="background-color: rgba(65, 185, 195, 0.1); border: 1px solid rgba(65, 185, 195, 0.2)"
-                  >
-                    <p class="text-xs" style="color: #96EEF2">
-                      <strong>Note:</strong> Ensure the static IP address is within the network's range and not already in use by another device.
-                    </p>
-                  </div>
-                </div>
-              </div>
-
               <button
                 @click="handleManualConnect"
-                class="w-full px-4 py-2 text-white rounded-lg transition-all disabled:opacity-50"
+                :disabled="!manualSSID || isStaPending"
+                class="w-full px-4 py-2 text-white rounded-lg transition-all disabled:opacity-50 flex items-center justify-center gap-2"
                 style="background: linear-gradient(135deg, #41B9C3 0%, #187D8B 100%)"
-                :disabled="manualConnectDisabled()"
               >
-                Connect to Manual Network
+                <ArrowLeftRight class="w-4 h-4" />
+                Switch DORIS to this network
               </button>
-
-              <div
-                v-if="manualSSID && manualPassword"
-                class="rounded-lg p-3 mt-3"
-                style="background-color: rgba(255, 153, 55, 0.1); border: 1px solid rgba(255, 153, 55, 0.3)"
-              >
-                <div class="flex items-start gap-2">
-                  <AlertCircle class="w-4 h-4 flex-shrink-0 mt-0.5" style="color: #FF9937" />
-                  <p class="text-xs" style="color: #FF9937">
-                    <strong>Note:</strong> Once connected to this network, you will lose access to DORIS from the hotspot. You will need to access DORIS from the new network or power cycle DORIS to restore the hotspot.
-                  </p>
-                </div>
-              </div>
             </div>
           </div>
+        </div>
+      </div>
+    </div>
 
-          <!-- Direct Connection Mode -->
-          <div
-            class="rounded-lg p-4"
-            style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)"
+    <!-- ── Switch Confirmation Modal ─────────────────────────── -->
+    <div
+      v-if="showSwitchConfirm && pendingSwitch"
+      class="fixed inset-0 z-50 flex items-center justify-center p-4"
+      style="background-color: rgba(0, 0, 0, 0.7)"
+      @click.self="cancelSwitch"
+    >
+      <div
+        class="max-w-md w-full rounded-xl p-6"
+        style="background-color: #0E2446; border: 1px solid rgba(65, 185, 195, 0.4)"
+      >
+        <h2 class="text-white text-lg mb-3 flex items-center gap-2">
+          <ArrowLeftRight class="w-5 h-5" style="color: #FCD869" />
+          Switch DORIS to client mode?
+        </h2>
+        <div
+          class="rounded-lg p-3 mb-3"
+          style="background-color: rgba(255, 153, 55, 0.1); border: 1px solid rgba(255, 153, 55, 0.3)"
+        >
+          <p class="text-sm" style="color: #FF9937">
+            DORIS will leave hotspot mode and try to join
+            <span class="font-mono">{{ pendingSwitch.ssid }}</span>.
+            Anyone connected to the DORIS hotspot will be disconnected immediately.
+          </p>
+        </div>
+        <ul class="text-sm space-y-2 mb-4" style="color: #96EEF2">
+          <li class="flex gap-2">
+            <span style="color: #FCD869">•</span>
+            <span>If the join succeeds, reach DORIS at <span class="font-mono">http://doris.local:8095</span> on the same network.</span>
+          </li>
+          <li class="flex gap-2">
+            <span style="color: #FCD869">•</span>
+            <span>If the join fails, the hotspot will be restarted automatically and you can reconnect here.</span>
+          </li>
+          <li class="flex gap-2">
+            <span style="color: #FCD869">•</span>
+            <span>Power cycling DORIS always restores the hotspot.</span>
+          </li>
+        </ul>
+        <div class="flex gap-3">
+          <button
+            @click="cancelSwitch"
+            class="flex-1 px-4 py-2 text-white rounded-lg transition-all hover:opacity-90"
+            style="background-color: rgba(255, 255, 255, 0.1); border: 1px solid rgba(255, 255, 255, 0.2)"
           >
-            <h3 class="text-white mb-3 flex items-center gap-2">
-              <Smartphone class="w-5 h-5" style="color: #41B9C3" />
-              Direct Device Connection
-            </h3>
-            <p class="text-sm mb-3" style="color: #96EEF2">
-              Connect directly to DORIS via hotspot mode when no WiFi network is available.
-            </p>
-            <div
-              class="rounded-lg p-3 mb-3"
-              style="background-color: rgba(255, 153, 55, 0.1); border: 1px solid rgba(255, 153, 55, 0.3)"
-            >
-              <div class="flex items-start gap-2">
-                <AlertCircle class="w-4 h-4 flex-shrink-0 mt-0.5" style="color: #FF9937" />
-                <p class="text-xs" style="color: #FF9937">
-                  <strong>Warning:</strong> Enabling hotspot mode will disconnect DORIS from its current network connection. You will need to reconnect your device to the DORIS hotspot ({{ dorisHotspotName }}) to access the interface.
-                </p>
-              </div>
-            </div>
-            <button
-              class="w-full px-4 py-2 text-white rounded-lg transition-all hover:opacity-90"
-              style="background: linear-gradient(135deg, #FCD869 0%, #FF9937 100%)"
-            >
-              Enable DORIS Hotspot
-            </button>
-          </div>
+            Cancel
+          </button>
+          <button
+            @click="confirmSwitch"
+            class="flex-1 px-4 py-2 text-white rounded-lg transition-all hover:opacity-90"
+            style="background: linear-gradient(135deg, #41B9C3 0%, #187D8B 100%)"
+          >
+            Switch now
+          </button>
         </div>
       </div>
     </div>

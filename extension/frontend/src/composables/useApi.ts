@@ -100,6 +100,29 @@ export interface NetworkFullInfo {
   hotspot_ssid: string | null
 }
 
+/**
+ * AP <-> STA mode switching state for the external WiFi radio.
+ *
+ * The external radio (`uap0`) runs *either* the DORIS hotspot *or* a
+ * client connection to a local WLAN, never both at once. The user
+ * triggers the switch from the Network Setup tab; ``mode`` reflects
+ * the DORIS-side intent and is always force-reset to ``ap`` on every
+ * backend startup so a power cycle reliably restores the hotspot.
+ */
+export interface WlanLastAttempt {
+  ssid: string
+  status: 'success' | 'failed'
+  error: string | null
+  timestamp: string
+}
+
+export interface WlanState {
+  mode: 'ap' | 'sta_pending' | 'sta_connected'
+  target_ssid: string | null
+  ip_address: string | null
+  last_attempt: WlanLastAttempt | null
+}
+
 export interface MissionSummary {
   id: string
   name: string
@@ -479,8 +502,10 @@ export function useWifiNetworks() {
   const connectionStatus = ref<ConnectionStatus | null>(null)
   const serialNumber = ref<string | null>(null)
   const hotspotSsid = ref<string | null>(null)
+  const wlanState = ref<WlanState | null>(null)
   const loading = ref(false)
   const scanning = ref(false)
+  const switching = ref(false)
   const error = ref<string | null>(null)
 
   async function fetchNetworks() {
@@ -558,20 +583,79 @@ export function useWifiNetworks() {
     }
   }
 
+  /**
+   * Read the current AP/STA intent from the backend. Polled by the
+   * Network Setup tab so the UI can show the post-failure banner once
+   * the user reconnects to the hotspot after a busted switch attempt.
+   */
+  async function fetchWlanState() {
+    try {
+      wlanState.value = await fetchApi<WlanState>('/network/wlan/status')
+    } catch (e) {
+      // Backend may be momentarily unreachable while the AP is being
+      // re-asserted after a failed switch — that's expected, don't
+      // surface as an error.
+      void e
+    }
+  }
+
+  /**
+   * Kick off the AP -> STA switch. Returns immediately with the new
+   * ``sta_pending`` state; the caller should expect the AP-side
+   * connection to drop within a few seconds. The actual outcome is
+   * observable via ``fetchWlanState`` once the user is back on a
+   * reachable network.
+   */
+  async function switchToStaMode(ssid: string, password: string): Promise<boolean> {
+    switching.value = true
+    error.value = null
+    try {
+      const result = await postApi<WlanState>('/network/wlan/connect', { ssid, password })
+      wlanState.value = result
+      return true
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to start WLAN switch'
+      return false
+    } finally {
+      switching.value = false
+    }
+  }
+
+  /** Tear down any STA association and put the external radio back into hotspot mode. */
+  async function switchToApMode(): Promise<boolean> {
+    switching.value = true
+    error.value = null
+    try {
+      const result = await postApi<WlanState>('/network/wlan/disconnect')
+      wlanState.value = result
+      return true
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to restore hotspot'
+      return false
+    } finally {
+      switching.value = false
+    }
+  }
+
   return {
     networks: readonly(networks),
     connectionStatus: readonly(connectionStatus),
     serialNumber: readonly(serialNumber),
     hotspotSsid: readonly(hotspotSsid),
+    wlanState: readonly(wlanState),
     loading: readonly(loading),
     scanning: readonly(scanning),
+    switching: readonly(switching),
     error: readonly(error),
     fetchNetworks,
     fetchStatus,
+    fetchWlanState,
     scanNetworks,
     connectToNetwork,
     disconnectFromNetwork,
     forgetNetwork,
+    switchToStaMode,
+    switchToApMode,
   }
 }
 
