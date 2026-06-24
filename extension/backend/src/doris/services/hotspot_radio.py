@@ -45,7 +45,7 @@ module inside ``blueos-core`` to add::
 
     "-c", "<auto-picked: 1 or 6>",
     "--ieee80211n",
-    "--ht_capab", "[SHORT-GI-20][LDPC][RX-STBC1][MAX-AMSDU-7935]",
+    "--ht_capab", "[SHORT-GI-20]",
     "--country", "US",
 
 right before the SSID/password arguments. The patched module is written
@@ -73,9 +73,14 @@ no ``channel/width/center`` line). Confirmed in field reports May
 2026 on a unit with no 2.4 GHz neighbours on the picker-chosen
 channel. Asking for HT20 directly removes the failure mode at the
 cost of nothing - the driver was downgrading to HT20 every time it
-actually completed a BSS bring-up anyway. The other capabilities
-(LDPC, SHORT-GI-20, RX-STBC1, MAX-AMSDU-7935) still lift real TCP
-throughput from ~25 Mbps (stock) to ~80 Mbps on this radio.
+actually completed a BSS bring-up anyway. Of the capabilities the
+earlier patch requested, only ``[SHORT-GI-20]`` is actually
+supported by the shipped morrownr 88x2bu driver; it still lifts
+real TCP throughput from ~25 Mbps (stock) to ~80 Mbps on this radio.
+``[LDPC]``, ``[RX-STBC1]`` and ``[MAX-AMSDU-7935]`` were removed
+because this radio does not advertise them - see the note at
+:data:`_CREATE_AP_24GHZ_FLAGS_TEMPLATE` for why requesting them
+stops the AP from coming up at all.
 
 Channel auto-selection
 ~~~~~~~~~~~~~~~~~~~~~~
@@ -96,7 +101,7 @@ gets the cleaner of the two antenna-compatible primaries.
 Measurements (channel 6, this radio + DORIS potted external antenna)
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 Stock ``wifi-manager`` (no ``ht_capab``):     ~25-30 Mbps real TCP.
-This patch (HT20 + full caps, channel 6):     ~82 Mbps down / 77 Mbps up
+This patch (HT20 + SHORT-GI-20, channel 6):   ~82 Mbps down / 77 Mbps up
 (``iperf3 -c 192.168.42.1 -p 5201 -t 20 -P 4``, May 2026, indoor
 2-3 m, 1 AP neighbour on ch 5). PHY ceiling for 2-stream HT20 + SGI
 is 144 Mbps and real-world TCP typically caps at 55-65% of PHY, so
@@ -138,12 +143,12 @@ Boot order
   3. ``blueos-bootstrap`` reads ``startup.json``, mounts the patched
      ``networkmanager.py`` over the stock one, then starts ``blueos-core``.
   4. ``wifi-manager`` sees ``uap0`` already exists -> runs ``create_ap``
-     on it with the 2.4 GHz HT20-with-full-caps flags installed at the
+     on it with the 2.4 GHz HT20 + SHORT-GI-20 flags installed at the
      previous DORIS extension start -> hostapd brings the AP up on the
-     auto-picked channel (1 or 6) with the rich ``ht_capab`` set.
+     auto-picked channel (1 or 6) with the ``[SHORT-GI-20]`` ht_capab.
 
 Result: hotspot broadcast from the Realtek's external antenna at 2.4
-GHz HT20 with the full set of HT capabilities the radio supports;
+GHz HT20 with the short-GI capability the radio supports;
 ~80 Mbps real-world TCP throughput, ~3x what stock ``wifi-manager``
 delivers. Onboard Broadcom is STA-only on ``wlan0``; in our testing
 its retransmit count dropped from ~14,900/min to ~30/min.
@@ -269,17 +274,33 @@ _CREATE_AP_ANCHOR_RE = re.compile(
 #
 # We therefore advertise HT20 only.  This costs nothing: every unit
 # that "worked" with the previous patch was running HT20 internally
-# already (per the lab measurement above).  The ht_capab caps we
-# keep - SHORT-GI-20, LDPC, RX-STBC1, MAX-AMSDU-7935 - are all
-# HT20-valid and lift real TCP throughput from ~25 Mbps stock to
-# ~80 Mbps.  The HT40-specific caps ([HT40+], SHORT-GI-40,
-# DSSS_CCK-40) are removed both because they would be ignored at
-# HT20 and to make sure hostapd has no path back to attempting an
-# HT40 BSS.
+# already (per the lab measurement above).
+#
+# Of the caps the earlier patch requested, only SHORT-GI-20 is
+# actually supported by the shipped morrownr 88x2bu driver, so it is
+# the only one we keep.  LDPC, RX-STBC1 and MAX-AMSDU-7935 are NOT
+# advertised by this radio - ``iw phy0 info`` on the shipped dongle
+# reports ``No RX STBC``, ``Max AMSDU length: 3839 bytes`` and no RX
+# LDPC line.  hostapd treats an unsupported configured ht_capab as
+# fatal: it logs ``Driver does not support configured HT capability
+# [LDPC]``, takes the interface ``COUNTRY_UPDATE -> DISABLED``,
+# reports ``AP-DISABLED`` / ``Unable to setup interface``, and
+# create_ap exits with ``Failed to run hostapd``.  So requesting any
+# of those three kept the BSS from starting *at all* - the end-user
+# symptom is "hotspot never appears after boot", with ``uap0`` stuck
+# ``DOWN`` and no hostapd process (field report June 2026, confirmed
+# on a Pi 5 unit running bh-0.4.8).  This is the same class of
+# driver-advertises-a-cap-it-can't-sustain bug as the HT40 and 5 GHz
+# failures documented above, except here even the capability *probe*
+# fails rather than the BSS dropping under load.
+#
+# The HT40-specific caps ([HT40+], SHORT-GI-40, DSSS_CCK-40) stay
+# removed too, both because they would be ignored at HT20 and to make
+# sure hostapd has no path back to attempting an HT40 BSS.
 _CREATE_AP_24GHZ_FLAGS_TEMPLATE = (
     '{indent}"-c", "{channel}",\n'
     '{indent}"--ieee80211n",\n'
-    '{indent}"--ht_capab", "[SHORT-GI-20][LDPC][RX-STBC1][MAX-AMSDU-7935]",\n'
+    '{indent}"--ht_capab", "[SHORT-GI-20]",\n'
     '{indent}"--country", "US",\n'
 )
 
@@ -936,8 +957,8 @@ async def _ensure_startup_bind() -> None:
 
 async def setup_hotspot_radio() -> None:
     """Install the host-side config that pins ``uap0`` to the USB Realtek
-    *and* makes the AP come up on 2.4 GHz HT20 with the full set of HT
-    capabilities the radio supports.
+    *and* makes the AP come up on 2.4 GHz HT20 with the SHORT-GI-20
+    capability the radio supports.
 
     Idempotent: writes are skipped where existing host content already
     matches. Both the udev rename and the bind-mounted wifi override only
