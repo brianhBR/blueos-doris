@@ -501,25 +501,24 @@ class NetworkService:
             logger.warning("Failed to configure mode for %s: %s", iface_name, e)
         return False
 
-    async def _get_secondary_interface_name(self) -> str | None:
-        """Return the name of the secondary (AP) WiFi interface, or None."""
-        try:
-            data = await self._client.list_interfaces()
-            if not data:
-                return None
-            interfaces = data.get("interfaces", [])
-            if len(interfaces) >= 2:
-                return interfaces[1].get("name")
-        except Exception:
-            pass
-        return None
-
     async def start_ap_watchdog(self) -> None:
-        """Background loop that re-asserts the wlan1 hotspot if it drops.
+        """Background loop that re-asserts the external-radio hotspot if
+        it drops.
 
         After a dive the vehicle loses all WiFi connections.  BlueOS /
-        NetworkManager may not automatically restart the AP on wlan1.
-        This watchdog detects that and brings it back.
+        NetworkManager may not automatically restart the AP on the
+        external radio (``uap0`` / ``wlan1``).  This watchdog detects
+        that and brings it back.
+
+        Works on both API generations.  On WiFi Manager v2 it uses the
+        per-interface hotspot status + mode APIs; on a v1-only build
+        (where the whole v2 interface/mode surface is absent) it falls
+        back to the v1 ``/hotspot`` flag plus a host-side liveness check
+        and re-enables via the legacy global hotspot toggle.  Before
+        this dispatch the watchdog was entirely v2-only: on a v1 unit
+        ``_resolve_hotspot_interface_name()`` returned ``None`` and the
+        old code ``continue``d every cycle, so a dropped AP needed a
+        manual reboot to come back.
 
         Suppressed while WLAN intent is ``sta_pending`` or
         ``sta_connected``: in those states the external radio is
@@ -534,21 +533,101 @@ class NetworkService:
                 state = await self.get_wlan_state()
                 if state.mode != "ap":
                     continue
-                iface = await self._get_secondary_interface_name()
-                if not iface:
-                    continue
-                hs = await self._client._v2.wifi_hotspot_status(iface)
-                if hs.get("enabled"):
-                    continue
-                logger.warning(
-                    "AP on %s is down, re-asserting hotspot mode", iface,
-                )
-                if await self._ensure_secondary_hotspot(iface):
-                    logger.info("AP on %s recovered by watchdog", iface)
+                # Mirror the v1/v2 dispatch used by the switch paths:
+                # _resolve_hotspot_interface_name() returns a name only
+                # when v2 is available, and None on v1-only builds.
+                v2_iface = await self._resolve_hotspot_interface_name()
+                if v2_iface:
+                    await self._recover_ap_v2(v2_iface)
                 else:
-                    logger.warning("AP watchdog: failed to recover %s", iface)
+                    await self._recover_ap_v1()
             except Exception as e:
                 logger.debug("AP watchdog check error: %s", e)
+
+    async def _recover_ap_v2(self, iface: str) -> None:
+        """v2 watchdog step: if the per-interface hotspot on *iface* is
+        down, re-assert hotspot mode."""
+        hs = await self._client._v2.wifi_hotspot_status(iface)
+        if hs.get("enabled"):
+            return
+        logger.warning("AP on %s is down, re-asserting hotspot mode", iface)
+        if await self._ensure_secondary_hotspot(iface):
+            logger.info("AP on %s recovered by watchdog", iface)
+        else:
+            logger.warning("AP watchdog: failed to recover %s", iface)
+
+    async def _recover_ap_v1(self) -> None:
+        """v1 watchdog step: re-enable the external-radio hotspot when it
+        has dropped.
+
+        Two independent health signals, because neither alone is
+        sufficient on v1:
+
+          * WiFi Manager's own ``/hotspot`` ``enabled`` flag — this is
+            what reads ``false`` when ``create_ap`` fails to start or was
+            never (re)launched (the exact state found in the field:
+            hotspot disabled, ``uap0`` DOWN, no hostapd process).
+          * The external interface being administratively ``UP`` on the
+            host — catches the rarer case where WiFi Manager still
+            believes the hotspot is enabled but ``create_ap`` / hostapd
+            died underneath it and left ``uap0`` DOWN.
+
+        Recovery is the legacy global hotspot toggle (the only lever v1
+        exposes), which re-runs ``create_ap`` on ``uap0``.  When the flag
+        is stale-``enabled`` but the link is down we cycle off→on so the
+        toggle actually re-launches ``create_ap`` instead of no-opping on
+        an already-"enabled" hotspot.
+        """
+        try:
+            hs = await self._client.get_hotspot()
+        except Exception as e:
+            logger.debug("[v1] AP watchdog: get_hotspot read failed: %s", e)
+            return
+        enabled = bool(hs.get("enabled")) if isinstance(hs, dict) else bool(hs)
+
+        iface = await self._resolve_external_iface_v1()
+        iface_down = bool(iface) and await self._v1_ap_iface_down(iface)
+
+        if enabled and not iface_down:
+            return  # healthy
+
+        logger.warning(
+            "[v1] AP watchdog: hotspot unhealthy (enabled=%s, iface=%s, "
+            "iface_down=%s); re-enabling",
+            enabled, iface, iface_down,
+        )
+        try:
+            if enabled:
+                # Stale flag: WiFi Manager thinks the hotspot is up but
+                # the link is down. A bare set_hotspot(True) would no-op,
+                # so cycle off first to force create_ap to re-launch.
+                await self._client.set_hotspot(False)
+                await asyncio.sleep(3)
+            await self._client.set_hotspot(True)
+            logger.info(
+                "[v1] AP watchdog: re-enabled hotspot on %s",
+                iface or "external radio",
+            )
+        except Exception as e:
+            logger.warning("[v1] AP watchdog: re-enable failed: %s", e)
+
+    async def _v1_ap_iface_down(self, iface: str) -> bool:
+        """Return True only when the host *definitively* reports *iface*
+        administratively DOWN.
+
+        Inconclusive or failed probes return False on purpose: the
+        Commander host-command path is intermittently flaky on this
+        hardware, and a false "down" reading would make the watchdog
+        needlessly bounce a perfectly good hotspot every cycle.  We only
+        act on an unambiguous DOWN.
+        """
+        ok, out = await _run_host_command(
+            f"ip -br link show {iface} 2>/dev/null"
+        )
+        if not ok or not out.strip():
+            return False
+        parts = out.split()
+        return len(parts) >= 2 and parts[1].upper() == "DOWN"
 
     # ── WLAN AP <-> STA mode switching ───────────────────────────────
     #
