@@ -164,7 +164,13 @@ class NetworkService:
         sec = await self._resolve_hotspot_interface_name()
         if sec:
             names.append(sec)
-        for n in ("wlan1", "wifi1"):
+        # On v1 builds _resolve_hotspot_interface_name() (v2 API) returns
+        # None, but the external radio is udev-renamed to uap0 — query it
+        # directly so the MAC actually resolves instead of coming back blank.
+        v1_iface = await self._resolve_external_iface_v1()
+        if v1_iface and v1_iface not in names:
+            names.append(v1_iface)
+        for n in ("uap0", "wlan1", "wifi1"):
             if n not in names:
                 names.append(n)
         try:
@@ -1004,6 +1010,38 @@ class NetworkService:
                 return cand
         return None
 
+    async def _v1_set_nm_managed(
+        self, iface: str, managed: bool, timeout: float = 10.0
+    ) -> bool:
+        """Force NetworkManager's runtime managed-state for *iface* and
+        wait until it takes effect.
+
+        Stashing the ``unmanaged-devices`` conf and reloading is **not**
+        enough on its own: ``nmcli general reload conf`` does not flip a
+        device that NM already marked unmanaged at startup, so an
+        ``nmcli connection up`` bound to ``uap0`` fails with "No suitable
+        device found … mismatching interface name". The explicit
+        per-device override below is the reliable lever and takes effect
+        immediately.
+        """
+        want = "yes" if managed else "no"
+        await _run_host_command(
+            f"sudo nmcli device set {iface} managed {want}"
+        )
+        deadline = asyncio.get_event_loop().time() + timeout
+        while asyncio.get_event_loop().time() < deadline:
+            ok, out = await _run_host_command(
+                f"nmcli -g GENERAL.NM-MANAGED device show {iface} 2>/dev/null"
+            )
+            if ok and out.strip().lower() == want:
+                return True
+            await asyncio.sleep(0.5)
+        logger.warning(
+            "[v1] %s did not reach NM-managed=%s within %.0fs",
+            iface, want, timeout,
+        )
+        return False
+
     async def _v1_switch_to_sta(self, iface: str, ssid: str, password: str) -> None:
         """Drive *iface* from AP mode to STA mode without the v2 mode API.
 
@@ -1052,6 +1090,18 @@ class NetworkService:
             f"sudo ip link set {iface} down; sleep 1; sudo ip link set {iface} up"
         )
         await asyncio.sleep(2)
+
+        # 3b. Explicitly hand the freed interface to NetworkManager. The
+        # conf stash + reload in step 1 alone leaves uap0 unmanaged, which
+        # makes the nmcli activation below fail with "No suitable device
+        # found … mismatching interface name".
+        if not await self._v1_set_nm_managed(iface, True):
+            await self._v1_restore_hotspot(iface, conn_name)
+            self._record_failure(
+                ssid,
+                f"NetworkManager would not manage {iface} for STA mode",
+            )
+            return
 
         # 4. Create + activate the nmcli connection.
         # Single-quote-escape SSID/password by replacing ' with '\''
@@ -1189,6 +1239,10 @@ class NetworkService:
             f"fi"
         )
         await _run_host_command("sudo nmcli general reload conf")
+        # Explicitly drop NM's runtime ownership too — the conf restore
+        # alone won't release a device NM is already managing, and
+        # create_ap needs uap0 free to bring the hotspot back up.
+        await self._v1_set_nm_managed(iface, False, timeout=5.0)
         await asyncio.sleep(1)
 
         # Bounce the link to clear any nmcli-supplicant state still
