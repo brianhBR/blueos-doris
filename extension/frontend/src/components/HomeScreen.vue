@@ -409,13 +409,20 @@ const handleConfigurationChange = async () => {
 
 async function handleStartDive() {
   if (!canStartDive.value) return
-  const diveData = {
+  const diveData: Record<string, unknown> = {
     dive_name: diveName.value.trim(),
     username: username.value.trim(),
     configuration: selectedConfiguration.value,
     estimated_depth: estimatedDepth.value.trim(),
     release_weight_date: releaseWeightDate.value,
     release_weight_time: releaseWeightTime.value,
+  }
+  // Capture the surface launch position so the dive record has a start
+  // location (the end position is filled in from the log at dive end).
+  const loc = location.value
+  if (loc && loc.fix_type !== 'none' && Number.isFinite(loc.latitude) && Number.isFinite(loc.longitude)) {
+    diveData.latitude = loc.latitude
+    diveData.longitude = loc.longitude
   }
   await startDive(selectedConfiguration.value, diveData)
 }

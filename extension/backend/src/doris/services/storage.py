@@ -295,15 +295,35 @@ def aggregate_usb_media_counts_by_dive_stem(
     return merged
 
 
-def _format_dive_duration(start: datetime, end: datetime) -> str:
-    sec = int((end - start).total_seconds())
-    if sec < 0:
-        return "—"
-    h, rem = sec // 3600, sec % 3600
+def _format_duration_seconds(sec: float) -> str | None:
+    """Format a duration in seconds as ``Hh Mm`` / ``Mm`` (None if invalid)."""
+    if sec is None or not math.isfinite(sec) or sec < 0:
+        return None
+    total = int(sec)
+    h, rem = total // 3600, total % 3600
     m = rem // 60
     if h:
         return f"{h}h {m}m"
     return f"{m}m"
+
+
+def _format_dive_duration(start: datetime, end: datetime) -> str:
+    out = _format_duration_seconds((end - start).total_seconds())
+    return out if out is not None else "—"
+
+
+def _optional_mission_duration_s(data: dict) -> float | None:
+    """On-mission duration (seconds since depth-gate crossing) if persisted."""
+    v = data.get("mission_duration_s")
+    if v is None:
+        return None
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(x) or x < 0:
+        return None
+    return x
 
 
 def _format_lat_lon_display(lat: float, lon: float) -> str:
@@ -312,6 +332,24 @@ def _format_lat_lon_display(lat: float, lon: float) -> str:
         return f"{abs(v):.4f}° {hem}"
 
     return f"{half(lat, 'N', 'S')}, {half(lon, 'E', 'W')}"
+
+
+def _location_display(
+    data: dict, lat_key: str, lon_key: str, text_key: str | None
+) -> str | None:
+    """Build a display string from a freeform location or a lat/lon pair."""
+    if text_key is not None:
+        raw = data.get(text_key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+    if lat_key in data and lon_key in data:
+        try:
+            return _format_lat_lon_display(
+                float(data[lat_key]), float(data[lon_key])
+            )
+        except (TypeError, ValueError):
+            return None
+    return None
 
 
 def _optional_depth_m(value: object) -> float | None:
@@ -378,7 +416,16 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
             ended = None
         status = str(data.get("status") or "unknown").lower()
 
-        if ended:
+        # Prefer the on-mission duration (time since the depth-gate crossing)
+        # recorded from the log; it excludes pre-dive surface setup time that
+        # inflates the started_at -> ended_at wall clock.
+        mission_dur_s = _optional_mission_duration_s(data)
+        mission_dur_label = (
+            _format_duration_seconds(mission_dur_s) if mission_dur_s is not None else None
+        )
+        if mission_dur_label is not None:
+            duration = mission_dur_label
+        elif ended:
             duration = _format_dive_duration(started, ended)
         elif status == "active":
             duration = _format_dive_duration(started, now) + " (ongoing)"
@@ -392,17 +439,10 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
 
         img, vid = counts.get(stem, (0, 0))
 
-        loc: str | None = None
-        raw_loc = data.get("location")
-        if isinstance(raw_loc, str) and raw_loc.strip():
-            loc = raw_loc.strip()
-        elif "latitude" in data and "longitude" in data:
-            try:
-                loc = _format_lat_lon_display(
-                    float(data["latitude"]), float(data["longitude"])
-                )
-            except (TypeError, ValueError):
-                pass
+        start_loc = _location_display(data, "latitude", "longitude", "location")
+        end_loc = _location_display(data, "end_latitude", "end_longitude", None)
+        # ``location`` stays populated for back-compat (it is the start fix).
+        loc = start_loc
 
         est_depth = _optional_depth_m(data.get("estimated_depth"))
         log_max = _optional_log_max_depth_m(data)
@@ -433,6 +473,8 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
                 date=started,
                 duration=duration,
                 location=loc,
+                start_location=start_loc,
+                end_location=end_loc,
                 max_depth=display_depth,
                 estimated_depth_m=est_depth,
                 log_max_depth_m=log_max,

@@ -44,7 +44,10 @@ interface DisplayMission {
   timeDisplay: string
   dateMs: number
   duration: string
+  /** Start fix (or '—'); used for the View Media handoff. */
   location: string
+  startLocation: string | null
+  endLocation: string | null
   maxDepthLabel: string
   maxDepthFromLog: boolean
   mcapRelativePath: string | null
@@ -84,7 +87,9 @@ const previousMissions = computed<DisplayMission[]>(() => {
         }) + ' UTC',
       dateMs,
       duration: m.duration,
-      location: m.location?.trim() ? m.location : '—',
+      location: m.start_location?.trim() ? m.start_location : (m.location?.trim() ? m.location : '—'),
+      startLocation: m.start_location?.trim() ? m.start_location : (m.location?.trim() ? m.location : null),
+      endLocation: m.end_location?.trim() ? m.end_location : null,
       maxDepthLabel: md,
       maxDepthFromLog,
       mcapRelativePath: m.mcap_relative_path ?? null,
@@ -408,9 +413,19 @@ const handleDeleteMission = async () => {
                   <Clock class="w-4 h-4" style="color: #96EEF2" />
                   <span class="text-sm" style="color: #96EEF2">{{ mission.duration }}</span>
                 </div>
-                <div class="flex items-center gap-2">
-                  <MapPin class="w-4 h-4" style="color: #96EEF2" />
-                  <span class="text-sm" style="color: #96EEF2">{{ mission.location }}</span>
+                <div class="flex items-start gap-2">
+                  <MapPin class="w-4 h-4 flex-shrink-0 mt-0.5" style="color: #96EEF2" />
+                  <div class="text-sm min-w-0" style="color: #96EEF2">
+                    <template v-if="mission.startLocation || mission.endLocation">
+                      <div v-if="mission.startLocation" class="break-words">
+                        <span class="opacity-60">Start:</span> {{ mission.startLocation }}
+                      </div>
+                      <div v-if="mission.endLocation" class="break-words">
+                        <span class="opacity-60">End:</span> {{ mission.endLocation }}
+                      </div>
+                    </template>
+                    <span v-else>—</span>
+                  </div>
                 </div>
                 <div class="flex items-center gap-2 flex-wrap">
                   <span class="text-sm" style="color: #96EEF2">

@@ -142,7 +142,10 @@ export interface DiveHistorySummary {
   status: string
   date: string
   duration: string
+  /** Start fix (kept for back-compat); prefer start_location/end_location. */
   location: string | null
+  start_location: string | null
+  end_location: string | null
   /** Shown in UI: log-derived when available, else user estimate. */
   max_depth: number | null
   estimated_depth_m: number | null
@@ -1052,7 +1055,7 @@ export function useDiveControl() {
   const sitlDropLoading = ref(false)
   const error = ref<string | null>(null)
 
-  async function startDive(configurationName?: string, diveData?: Record<string, string>): Promise<boolean> {
+  async function startDive(configurationName?: string, diveData?: Record<string, unknown>): Promise<boolean> {
     loading.value = true
     error.value = null
     try {
