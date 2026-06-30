@@ -132,20 +132,45 @@ class SensorService:
         return None, {}
 
     async def _get_camera_modules(self) -> list[ModuleInfo]:
-        """Get a ModuleInfo for each video stream from the Camera Manager."""
+        """Get a ModuleInfo for each video stream from the Camera Manager.
+
+        Connection status reflects whether the camera is actually
+        answering -- a direct (cached) HTTP snapshot probe -- rather than
+        MCM's ``stream.running`` flag.  ``stream.running`` reports the
+        camera as down whenever the Camera Manager stream happens to be
+        stopped, or while the onboard recorder owns the camera's single
+        RTSP slot, even though the camera is fully reachable; keying off
+        it produced frequent false "Not Connected" alarms on the home
+        page.  See ``ip_camera_recorder.is_camera_reachable``.
+        """
+        # Imported lazily (mirrors routes/sensors) so importing this
+        # service never forces the GStreamer-backed recorder module to load.
+        from . import ip_camera_recorder as iprec
+
         modules: list[ModuleInfo] = []
         try:
             streams = await self.get_video_streams()
+            if not streams:
+                return modules
+
+            if iprec.is_recording():
+                status, module_status = "connected", "Ready: Recording"
+            elif await iprec.is_camera_reachable():
+                status, module_status = "connected", "Ready: Active"
+            else:
+                status, module_status = "disconnected", "No response from camera"
+
+            connected = status == "connected"
             for stream in streams:
                 modules.append(
                     ModuleInfo(
                         id=f"camera-{stream.id}",
                         name=f"Camera ({stream.name})",
                         type="camera",
-                        status="connected" if stream.running else "disconnected",
-                        module_status="Ready: Active" if stream.running else "Stopped",
+                        status=status,
+                        module_status=module_status,
                         firmware_version=stream.firmware_version,
-                        last_reading=datetime.now().isoformat() if stream.running else None,
+                        last_reading=datetime.now().isoformat() if connected else None,
                     )
                 )
         except Exception as e:
