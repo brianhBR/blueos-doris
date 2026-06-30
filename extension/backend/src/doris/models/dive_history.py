@@ -13,7 +13,10 @@ class DiveHistoryEntry(BaseModel):
     status: str
     date: datetime
     duration: str
+    # location: start fix (kept for back-compat); start/end split out below.
     location: str | None = None
+    start_location: str | None = None
+    end_location: str | None = None
     # max_depth: recorder log when available, else user estimate (see storage layer).
     max_depth: float | None = None
     estimated_depth_m: float | None = None

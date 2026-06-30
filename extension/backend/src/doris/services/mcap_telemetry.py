@@ -413,6 +413,13 @@ class McapSummary:
     last_lat: float | None = None
     last_lon: float | None = None
     messages_seen: int = 0
+    # Highest DORIS state the dive reached (STATE NAMED_VALUE_FLOAT); 4 ==
+    # RECOVERY means the vehicle surfaced and the mission ran to completion.
+    max_mission_state: int | None = None
+    # Largest MSN_TIME (seconds since the depth-gate crossing) seen in the
+    # log -- the true on-mission duration, independent of pre-dive surface
+    # setup time captured by started_at.
+    max_mission_time_s: float | None = None
     # Magnetic declination the autopilot applied to derive true heading
     # (COMPASS_DEC, converted to degrees) and whether it was auto-set
     # (COMPASS_AUTODEC).  Read from the PARAM_VALUE stream.
@@ -508,6 +515,15 @@ def _update_aggregates(summary: McapSummary, col: str, val: float | str) -> None
         return
     if col == "depth_m":
         summary.max_depth_m = val if summary.max_depth_m is None else max(summary.max_depth_m, val)
+    elif col == "mission_state":
+        iv = int(val)
+        summary.max_mission_state = (
+            iv if summary.max_mission_state is None else max(summary.max_mission_state, iv)
+        )
+    elif col == "mission_time_s":
+        summary.max_mission_time_s = (
+            val if summary.max_mission_time_s is None else max(summary.max_mission_time_s, val)
+        )
     elif col == "external_temperature_c":
         summary.min_external_temperature_c = (
             val
@@ -543,6 +559,48 @@ def _extract_param(summary: McapSummary, m: dict[str, Any]) -> None:
         v = _f(m.get("param_value"))
         if v is not None:
             summary.compass_autodec = int(v)
+
+
+# DORIS state machine value that marks a fully-recovered (completed) dive.
+_RECOVERY_STATE = 4
+
+
+def apply_dive_summary_metadata(record: dict[str, Any], summary: McapSummary) -> bool:
+    """Persist log-derived metadata from a parsed ``.mcap`` onto a dive record.
+
+    Writes the recorded max depth, the dive's end position (last GPS fix) and
+    the on-mission duration (time since the depth-gate crossing) so the
+    Previous Dives page can show measured values instead of the operator's
+    pre-dive estimates.  Also upgrades a ``cancelled`` record to ``completed``
+    when the telemetry shows the dive reached RECOVERY -- this is the ground
+    truth, and covers dives the live status poll missed (e.g. the operator
+    pressed Stop after the vehicle had already surfaced, or the boat
+    reconnected only after RECOVERY).  Never downgrades a status.
+
+    Returns ``True`` if the record's ``status`` was changed.
+    """
+    if summary.max_depth_m is not None and math.isfinite(summary.max_depth_m):
+        record["log_max_depth_m"] = round(summary.max_depth_m, 2)
+
+    if summary.last_lat is not None and summary.last_lon is not None:
+        record["end_latitude"] = round(summary.last_lat, 7)
+        record["end_longitude"] = round(summary.last_lon, 7)
+
+    if (
+        summary.max_mission_time_s is not None
+        and math.isfinite(summary.max_mission_time_s)
+        and summary.max_mission_time_s > 0
+    ):
+        record["mission_duration_s"] = round(summary.max_mission_time_s, 1)
+
+    status_changed = False
+    if (
+        summary.max_mission_state == _RECOVERY_STATE
+        and str(record.get("status") or "").lower() == "cancelled"
+    ):
+        record["status"] = "completed"
+        status_changed = True
+    return status_changed
 
 
 # ── CSV export ─────────────────────────────────────────────────────────────

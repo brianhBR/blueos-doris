@@ -95,6 +95,7 @@ async def export_dive_csv_to_usb(dive_file: Path) -> dict:
     # Lazy imports to avoid import cycles (storage imports services too).
     from .mcap_telemetry import (
         McapSummary,
+        apply_dive_summary_metadata,
         build_dive_csv,
         dive_csv_filename,
         map_dive_stem_to_largest_mcap,
@@ -144,6 +145,21 @@ async def export_dive_csv_to_usb(dive_file: Path) -> dict:
             return {"status": "error", "error": f"summarize: {e}"}
     else:
         logger.info("CSV export: no .mcap matched %s", dive_id)
+
+    # Persist log-derived metadata (measured max depth, end position,
+    # on-mission duration) and reconcile the status against the recorded
+    # telemetry.  Done before the USB write so the dive record is enriched
+    # even when no USB stick is mounted to receive the CSV.
+    try:
+        status_changed = apply_dive_summary_metadata(record, summary)
+    except Exception:
+        logger.exception("CSV export: applying summary metadata failed for %s", dive_id)
+    else:
+        if status_changed:
+            logger.info(
+                "CSV export: %s reached RECOVERY in log -> status upgraded to completed",
+                dive_id,
+            )
 
     try:
         csv_text = build_dive_csv(record, summary, rel)

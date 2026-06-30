@@ -402,3 +402,71 @@ def test_empty_summary_still_emits_header() -> None:
     rows = list(csv.reader(io.StringIO(text)))
     header_idx = next(i for i, r in enumerate(rows) if r and r[0] == "timestamp_utc")
     assert not [r for r in rows[header_idx + 1 :] if r]
+
+
+def test_summarize_tracks_mission_state_and_time(tmp_path: Path) -> None:
+    """max_mission_state / max_mission_time_s aggregate the STATE and MSN_TIME
+    named floats so the dive record can record completion + on-mission time."""
+    mcap = tmp_path / "dive.mcap"
+    _write_mcap(
+        mcap,
+        [
+            [_named_float("STATE", 1.0), _named_float("MSN_TIME", 10.0), _named_float("DEPTH", 5.0)],
+            [_named_float("STATE", 2.0), _named_float("MSN_TIME", 120.0), _named_float("DEPTH", 30.0)],
+            [_named_float("STATE", 4.0), _named_float("MSN_TIME", 240.0), _named_float("DEPTH", 1.0)],
+        ],
+    )
+    s = summarize_mcap(mcap)
+    assert s.max_mission_state == 4
+    assert s.max_mission_time_s == 240.0
+    assert s.max_depth_m == 30.0
+
+
+def test_apply_dive_summary_metadata_upgrades_and_persists(tmp_path: Path) -> None:
+    """A cancelled dive whose log reached RECOVERY is upgraded to completed,
+    and measured depth / end position / on-mission duration are written back."""
+    from doris.services.mcap_telemetry import apply_dive_summary_metadata
+
+    mcap = tmp_path / "dive.mcap"
+    _write_mcap(
+        mcap,
+        [
+            _cycle(state=2, depth=10.0, temp=18.0, volt=15.9, climb=-0.4)
+            + [_named_float("MSN_TIME", 60.0)],
+            _cycle(state=4, depth=25.0, temp=16.5, volt=15.4, climb=0.0)
+            + [_named_float("MSN_TIME", 300.0)],
+        ],
+    )
+    s = summarize_mcap(mcap)
+
+    record = {"status": "cancelled"}
+    changed = apply_dive_summary_metadata(record, s)
+
+    assert changed is True
+    assert record["status"] == "completed"
+    assert record["log_max_depth_m"] == 25.0
+    assert record["mission_duration_s"] == 300.0
+    assert abs(record["end_latitude"] - 33.726114) < 1e-4
+    assert abs(record["end_longitude"] - (-118.2754125)) < 1e-4
+
+
+def test_apply_dive_summary_metadata_never_downgrades(tmp_path: Path) -> None:
+    """A dive that never reached RECOVERY keeps its cancelled status, and a
+    completed dive is left untouched."""
+    from doris.services.mcap_telemetry import apply_dive_summary_metadata
+
+    mcap = tmp_path / "dive.mcap"
+    _write_mcap(
+        mcap,
+        [_cycle(state=2, depth=12.0, temp=18.0, volt=15.9, climb=-0.4)],
+    )
+    s = summarize_mcap(mcap)
+
+    cancelled = {"status": "cancelled"}
+    assert apply_dive_summary_metadata(cancelled, s) is False
+    assert cancelled["status"] == "cancelled"
+    assert cancelled["log_max_depth_m"] == 12.0
+
+    completed = {"status": "completed"}
+    assert apply_dive_summary_metadata(completed, s) is False
+    assert completed["status"] == "completed"
