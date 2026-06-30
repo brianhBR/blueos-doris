@@ -216,6 +216,79 @@ IPCAM_SNAPSHOT_URL = os.environ.get(
 )
 _SNAPSHOT_TIMEOUT_S = 5.0
 
+# ── Camera reachability cache ──────────────────────────────────────────────────
+# Status displays (the home page "Connected Sensors" table polls every
+# 5 s, the sensor page polls a preview snapshot every 10 s) need to know
+# whether the camera is actually working.  MCM's ``stream.running`` flag
+# is a poor proxy: it reads False whenever the Camera Manager stream is
+# merely stopped -- or while the onboard recorder owns the camera's
+# single RTSP slot -- even though the camera is fully reachable and
+# serving HTTP snapshots.  Keying status off ``stream.running`` therefore
+# produced frequent, spurious "Not Connected" alarms on the home page.
+#
+# The reliable signal is "a snapshot JPEG can be fetched", which is
+# exactly what the sensor page already uses client-side.  We cache the
+# outcome of the most recent fetch so consumers share one answer instead
+# of each downloading a fresh JPEG: every real snapshot (preview poll,
+# timelapse capture) refreshes the cache for free, and stale entries are
+# refreshed in the background so status reads never block the caller.
+_REACHABILITY_TTL_S = 4.0
+_reachability_cache: tuple[float, bool] | None = None  # (monotonic_ts, reachable)
+_reachability_refresh_task: asyncio.Task[None] | None = None
+
+
+def _record_reachability(reachable: bool) -> None:
+    """Remember the outcome of the latest camera snapshot attempt."""
+    global _reachability_cache
+    _reachability_cache = (time.monotonic(), reachable)
+
+
+async def _refresh_reachability() -> None:
+    """Background probe that refreshes the reachability cache."""
+    try:
+        await fetch_camera_jpeg()  # updates the cache via _record_reachability
+    except Exception:  # pragma: no cover - defensive; fetch already catches
+        _record_reachability(False)
+
+
+def _schedule_reachability_refresh() -> None:
+    """Kick off a background reachability probe unless one is already running."""
+    global _reachability_refresh_task
+    task = _reachability_refresh_task
+    if task is not None and not task.done():
+        return
+    try:
+        _reachability_refresh_task = asyncio.ensure_future(_refresh_reachability())
+    except RuntimeError:
+        # No running event loop (e.g. called from a sync context); skip.
+        _reachability_refresh_task = None
+
+
+async def is_camera_reachable(*, max_age_s: float = _REACHABILITY_TTL_S) -> bool:
+    """Best-effort "is the IP camera answering?" check for status displays.
+
+    Resolution order:
+
+    * While the recorder owns the camera's RTSP/snapshot session the
+      camera is, by definition, working -- report reachable without
+      probing (a direct probe would only be refused and lie).
+    * On a cold cache, do a single blocking snapshot probe so the very
+      first status read is real rather than a guess.
+    * Otherwise return the cached outcome immediately and, if it is
+      older than ``max_age_s``, refresh it in the background.  This keeps
+      frequent status polls fast (never blocked on the camera) at the
+      cost of the value being at most one poll stale.
+    """
+    if is_recording():
+        return True
+    cached = _reachability_cache
+    if cached is None:
+        data, _reason = await fetch_camera_jpeg()
+        return data is not None
+    if (time.monotonic() - cached[0]) >= max_age_s:
+        _schedule_reachability_refresh()
+    return cached[1]
+
 
 def _data_root() -> Path:
     return Path(os.environ.get("DORIS_DATA_ROOT", "/tmp/storage"))
@@ -1081,14 +1154,19 @@ async def fetch_camera_jpeg() -> tuple[bytes | None, str]:
         async with httpx.AsyncClient(timeout=_SNAPSHOT_TIMEOUT_S) as client:
             resp = await client.get(IPCAM_SNAPSHOT_URL)
     except Exception as e:
+        _record_reachability(False)
         return None, f"http_error: {e}"
     if resp.status_code != 200:
+        _record_reachability(False)
         return None, f"http_status_{resp.status_code}"
     ctype = resp.headers.get("content-type", "")
     if not ctype.startswith("image"):
+        _record_reachability(False)
         return None, f"unexpected_content_type: {ctype!r}"
     if not resp.content or not resp.content.startswith(b"\xff\xd8"):
+        _record_reachability(False)
         return None, "not_jpeg_magic"
+    _record_reachability(True)
     return resp.content, "ok"
 
 
