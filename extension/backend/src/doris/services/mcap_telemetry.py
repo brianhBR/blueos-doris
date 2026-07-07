@@ -17,6 +17,7 @@ from __future__ import annotations
 import csv
 import io
 import json
+import logging
 import math
 import re
 from dataclasses import dataclass, field
@@ -25,6 +26,8 @@ from pathlib import Path
 from typing import Any
 
 from mcap.reader import make_reader
+
+logger = logging.getLogger(__name__)
 
 # ── MCAP → per-dive file mapping (lazy import storage helpers to avoid cycles) ──
 
@@ -428,11 +431,16 @@ class McapSummary:
     # Dynamically-discovered sensor columns (e.g. conductivity, co2, oxygen)
     # that aren't part of the fixed column set, sorted for stable output.
     extra_columns: list[str] = field(default_factory=list)
+    # True if _MAX_DECODED was hit and the export stops short of the actual
+    # end of the recording (see summarize_mcap). Surfaced in the CSV header
+    # so a shortened export is never silently mistaken for the full dive.
+    truncated: bool = False
 
 
 # Cap parsed (decoded) messages so a pathologically long recording can't stall
-# the request path; 2M decoded messages already covers a multi-hour dive.
-_MAX_DECODED = 2_000_000
+# the request path. DORIS emits ~78 decoded msg/s at steady state, so 10M
+# covers a ~35.6h dive (missions run up to ~30h) with headroom to spare.
+_MAX_DECODED = 10_000_000
 
 
 def summarize_mcap(path: Path) -> McapSummary:
@@ -470,6 +478,12 @@ def summarize_mcap(path: Path) -> McapSummary:
                     continue
                 decoded += 1
                 if decoded > _MAX_DECODED:
+                    summary.truncated = True
+                    logger.warning(
+                        "summarize_mcap: hit _MAX_DECODED=%d cap for %s; export truncated",
+                        _MAX_DECODED,
+                        path,
+                    )
                     break
                 try:
                     payload = json.loads(message.data)
@@ -763,6 +777,7 @@ def build_dive_csv(
     w.writerow(["compass_autodec", _cell(summary.compass_autodec)])
     w.writerow(["mcap_file", mcap_rel or ""])
     w.writerow(["telemetry_rows", str(len(summary.frames))])
+    w.writerow(["telemetry_truncated", "true" if summary.truncated else "false"])
     w.writerow([])
 
     # ── Section 2: per-second telemetry ──
