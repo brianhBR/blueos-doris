@@ -32,6 +32,17 @@ _MCAP_TELEMETRY_PATH = (
     REPO_ROOT / "extension" / "backend" / "src" / "doris" / "services" / "mcap_telemetry.py"
 )
 
+# Distinctive strings that must be present in the real DORIS mcap_telemetry.py.
+# Cheap sanity check against loading the wrong file (e.g. if this script is
+# copied out of the repo alongside a differently-sourced same-named module) --
+# fail with a clear message instead of silently running unrelated code.
+_REQUIRED_MARKERS = (
+    "doris_dive_export",
+    "def summarize_mcap",
+    "def build_dive_csv",
+    "def dive_csv_filename",
+)
+
 
 def _load_mcap_telemetry() -> ModuleType:
     """Import mcap_telemetry.py directly from its file.
@@ -43,6 +54,13 @@ def _load_mcap_telemetry() -> ModuleType:
     """
     if not _MCAP_TELEMETRY_PATH.is_file():
         raise SystemExit(f"Could not find mcap_telemetry.py at {_MCAP_TELEMETRY_PATH}")
+    source = _MCAP_TELEMETRY_PATH.read_text(encoding="utf-8", errors="replace")
+    missing = [marker for marker in _REQUIRED_MARKERS if marker not in source]
+    if missing:
+        raise SystemExit(
+            f"{_MCAP_TELEMETRY_PATH} does not look like the DORIS mcap_telemetry.py module "
+            f"(missing: {', '.join(missing)})."
+        )
     spec = importlib.util.spec_from_file_location("doris_mcap_telemetry", _MCAP_TELEMETRY_PATH)
     if spec is None or spec.loader is None:
         raise SystemExit(f"Failed to load module spec for {_MCAP_TELEMETRY_PATH}")
