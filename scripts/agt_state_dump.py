@@ -1,14 +1,18 @@
-"""Dump everything mavlink2rest knows about the AGT (component 191).
+"""Dump everything mavlink2rest knows about the AGT (component 192).
 
 Useful for diagnosing a stuck or silent Iridium test: shows the most
 recent message of every type the AGT has emitted plus the COMMAND_ACK
 the AGT sent for the test command.
+
+Note: the AGT uses component 192 (MAV_COMP_ID_ONBOARD_COMPUTER2).
+Component 191 is BlueOS's mavlink-server router, not the tracker.
 """
 import json
 import sys
 import urllib.request
 
 BASE = "http://blueos-wifi.local:6040"
+ARTEMIS_COMPONENT_ID = 192
 
 
 def get(path):
@@ -17,9 +21,9 @@ def get(path):
 
 
 def main():
-    data = get("/mavlink/vehicles/1/components/191")
+    data = get(f"/mavlink/vehicles/1/components/{ARTEMIS_COMPONENT_ID}")
     msgs = data.get("messages", {})
-    print(f"AGT (component 191) — {len(msgs)} message types cached\n")
+    print(f"AGT (component {ARTEMIS_COMPONENT_ID}) — {len(msgs)} message types cached\n")
     for name in sorted(msgs):
         entry = msgs[name]
         status = entry.get("status", {}).get("time", {})

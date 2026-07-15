@@ -155,6 +155,25 @@ def register_sensor_routes(app: Robyn) -> None:
                 headers={"Content-Type": "application/json"},
             )
 
+    @app.get("/api/v1/tracker/version")
+    async def get_tracker_version(request):
+        """Return the AGT firmware version and compatibility status.
+
+        Returns ``{version, min_required, compatible, known}``.  When the
+        version isn't cached yet, a MAV_CMD_USER_6 request is dispatched
+        and briefly awaited unless ``request=false`` is passed.
+        """
+        try:
+            do_request = request.query_params.get("request", "true") != "false"
+            version = await tracker_service.get_version(request=do_request)
+            return json.dumps(version)
+        except Exception as e:
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+
     @app.post("/api/v1/tracker/iridium-test")
     async def trigger_iridium_test(request):
         """Send COMMAND_LONG to AGT to trigger Iridium test."""

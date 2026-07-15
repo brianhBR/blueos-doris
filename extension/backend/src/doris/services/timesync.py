@@ -1,6 +1,6 @@
 """MAVLink-based system clock synchronisation.
 
-Reads SYSTEM_TIME from the Artemis Global Tracker (MAVLink component 191)
+Reads SYSTEM_TIME from the Artemis Global Tracker (MAVLink component 192)
 and sets the Linux system clock when drift exceeds a threshold.  The
 Artemis derives its time from GPS, so this gives microsecond-accurate UTC
 even when the Raspberry Pi has no RTC or NTP.
@@ -40,7 +40,7 @@ from ..config import blueos_services
 
 logger = logging.getLogger(__name__)
 
-ARTEMIS_COMPONENT_ID = 191
+ARTEMIS_COMPONENT_ID = 192
 MIN_DRIFT_S = 30
 POLL_INTERVAL_S = 30
 # Poll quickly until the first successful sync so we catch the brief
@@ -245,7 +245,7 @@ class TimeSyncService:
             return False
 
     async def try_sync_from_artemis(self) -> bool:
-        """Read SYSTEM_TIME from the Artemis (component 191) and sync if needed.
+        """Read SYSTEM_TIME from the Artemis (component 192) and sync if needed.
 
         Only trusts the time when the Artemis has a fresh GPS fix
         (fix_type >= 2) and the SYSTEM_TIME message itself is fresh.

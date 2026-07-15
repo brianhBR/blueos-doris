@@ -49,7 +49,7 @@ class SensorService:
         baro_modules = await self.barometer_service.get_modules()
         modules.extend(baro_modules)
 
-        # Get Artemis Global Tracker (component 191)
+        # Get Artemis Global Tracker (component 192)
         tracker_modules = await self.tracker_service.get_modules()
         modules.extend(tracker_modules)
 

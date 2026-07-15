@@ -30,6 +30,7 @@ interface DisplayModule {
   sampleRate?: number
   calibrationFile?: string
   moduleStatus: string
+  firmwareVersion?: string
 }
 
 interface Props {
@@ -627,6 +628,7 @@ watch(apiModules, (newModules) => {
       sampleRate: m.sample_rate ?? undefined,
       calibrationFile: m.firmware_version ?? undefined,
       moduleStatus: m.module_status,
+      firmwareVersion: m.firmware_version ?? undefined,
     }))
     if (!hadCamera && hasCameraModule.value) {
       startSnapshotSidecar()
@@ -902,6 +904,14 @@ const getStatusColor = (moduleStatus: string) => {
                   <span style="color: #96EEF2">Connection</span>
                   <span :style="{ color: mod.connected ? '#FCD869' : '#DD2C1D' }">
                     {{ mod.connected ? 'Connected' : 'Disconnected' }}
+                  </span>
+                </div>
+                <!-- AGT firmware version (populated once the backend has
+                     received/requested the "Doris AGT <version>" report). -->
+                <div v-if="mod.type === 'tracker'" class="flex items-center justify-between text-sm">
+                  <span style="color: #96EEF2">Firmware</span>
+                  <span :style="{ color: mod.firmwareVersion ? '#B8C7C9' : '#7A8A8C' }">
+                    {{ mod.firmwareVersion || 'Checking…' }}
                   </span>
                 </div>
               </template>

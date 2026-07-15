@@ -1,8 +1,13 @@
 """Artemis Global Tracker detection and GPS data service.
 
 Detects the SparkFun Artemis Global Tracker by checking for its
-HEARTBEAT on MAVLink component 191 (MAV_COMP_ID_ONBOARD_COMPUTER).
+HEARTBEAT on MAVLink component 192 (MAV_COMP_ID_ONBOARD_COMPUTER2).
 Reads GPS_RAW_INT from the same component for position data.
+
+Note: the AGT must NOT use component 191 (MAV_COMP_ID_ONBOARD_COMPUTER)
+because BlueOS's mavlink-server router advertises itself on 191, and
+the resulting identity collision makes the autopilot mis-route
+commands (e.g. the Iridium test) away from the real AGT.
 
 Iridium test support
 --------------------
@@ -13,7 +18,7 @@ between.  mavlink2rest only caches the *latest* STATUSTEXT, so HTTP
 polling regularly loses the ``IRIDIUM: …PASSED/FAILED`` message.
 
 To fix this we subscribe to the mavlink2rest STATUSTEXT WebSocket on
-first use, filter to component 191, and buffer the last 100 messages
+first use, filter to component 192, and buffer the last 100 messages
 with a monotonic id.  The frontend polls with ``?since_id=<n>`` and
 scans every new message for the test outcome — no STATUSTEXT can be
 missed even if the AGT emits dozens of messages between polls.
@@ -22,6 +27,7 @@ missed even if the AGT emits dozens of messages between polls.
 import asyncio
 import json
 import logging
+import re
 import time
 from collections import deque
 from datetime import datetime, timezone
@@ -34,7 +40,7 @@ from ..models.sensors import ModuleInfo
 
 logger = logging.getLogger(__name__)
 
-ARTEMIS_COMPONENT_ID = 191
+ARTEMIS_COMPONENT_ID = 192
 GPS_FIX_NAMES = {0: "No GPS", 1: "No Fix", 2: "2D Fix", 3: "3D Fix", 4: "DGPS", 5: "RTK Float", 6: "RTK Fixed"}
 
 GPS_FIX_TYPE_MAP: dict[str, int] = {
@@ -58,6 +64,38 @@ STATUSTEXT_BUFFER_SIZE = 100
 WS_RECONNECT_DELAY_S = 2.0
 WS_FIRST_CONNECT_TIMEOUT_S = 5.0  # max wait before sending first MAV_CMD_USER_4
 TRIGGER_POST_TIMEOUT_S = 15.0  # mavlink2rest POST commonly takes 4-5s
+
+# ── AGT firmware version ─────────────────────────────────────────
+# The AGT firmware reports its git-describe version as a STATUSTEXT
+# ("Doris AGT v0.1.0") once at boot and ~3x early in loop().  Because
+# our STATUSTEXT subscriber connects lazily (typically long after the
+# AGT booted) we cannot rely on catching that boot broadcast, so we
+# also request it explicitly with MAV_CMD_USER_6 — the firmware's
+# MAVLINK_CMD_VERSION (31015), which follows the same command pattern
+# as the Iridium test (MAV_CMD_USER_4).
+AGT_VERSION_PREFIX = "Doris AGT"
+AGT_VERSION_CMD = "MAV_CMD_USER_6"
+# Minimum AGT firmware this extension requires.  v0.2.0 is the first
+# firmware that advertises on component 192 (see the module docstring);
+# older firmware sat on component 191 and is invisible to this build.
+# Bump this in lockstep with breaking AGT protocol changes.
+MIN_AGT_FIRMWARE_VERSION = "v0.2.0"
+# Re-request the version at most this often while it's still unknown.
+VERSION_REQUEST_INTERVAL_S = 30.0
+
+_SEMVER_RE = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
+
+
+def _parse_semver(text: str) -> tuple[int, int, int] | None:
+    """Extract a (major, minor, patch) tuple from a version string.
+
+    Handles git-describe output like ``v0.1.0``, ``v0.1.0-dirty`` and
+    ``v0.1.0-3-gabc123`` by matching only the leading numeric core.
+    """
+    match = _SEMVER_RE.search(text or "")
+    if not match:
+        return None
+    return (int(match.group(1)), int(match.group(2)), int(match.group(3)))
 
 # Keep reporting the tracker (and therefore the Iridium button) for this
 # long after the last good HEARTBEAT.  mavlink2rest's per-message
@@ -168,6 +206,12 @@ class ArtemisTrackerService:
         # Monotonic timestamp of the most recent good HEARTBEAT, used to
         # keep the tracker tile sticky across mavlink2rest frequency dips.
         self._last_heartbeat_monotonic: float | None = None
+        # Cached AGT firmware version ("v0.1.0"), parsed from the
+        # "Doris AGT <version>" STATUSTEXT.  None until first seen/requested.
+        self._agt_version: str | None = None
+        # Monotonic timestamp of the last version request, to rate-limit
+        # the proactive re-request while the version is still unknown.
+        self._version_requested_monotonic: float | None = None
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -186,6 +230,9 @@ class ArtemisTrackerService:
         now = time.monotonic()
         if hb is not None:
             self._last_heartbeat_monotonic = now
+            # Tracker is present — make sure we learn its firmware version
+            # (rate-limited; no-op once known).
+            self._maybe_request_version()
         else:
             last = self._last_heartbeat_monotonic
             if last is None or (now - last) > TRACKER_STICKY_GRACE_S:
@@ -214,11 +261,12 @@ class ArtemisTrackerService:
                 status="connected",
                 module_status=status_text,
                 last_reading=datetime.now().isoformat(),
+                firmware_version=self._agt_version,
             )
         ]
 
     async def get_gps_data(self) -> dict | None:
-        """Read the latest GPS_RAW_INT from the Artemis (component 191)."""
+        """Read the latest GPS_RAW_INT from the Artemis (component 192)."""
         base = _m2r_base()
         url = f"{base}/mavlink/vehicles/1/components/{ARTEMIS_COMPONENT_ID}/messages/GPS_RAW_INT"
         try:
@@ -364,6 +412,7 @@ class ArtemisTrackerService:
                         if not text:
                             continue
                         sev = _decode_severity(msg.get("severity"))
+                        self._capture_version(text)
                         await self._statustext.add(text, sev)
             except asyncio.CancelledError:
                 logger.info("AGT STATUSTEXT subscriber cancelled")
@@ -451,6 +500,116 @@ class ArtemisTrackerService:
         self._ensure_statustext_subscriber()
         messages, latest_id = await self._statustext.since(since_id)
         return {"messages": messages, "latest_id": latest_id}
+
+    # ── Firmware version ────────────────────────────────────────────
+
+    def _capture_version(self, text: str) -> None:
+        """Parse and cache the version from a ``Doris AGT <version>`` STATUSTEXT."""
+        if not text.startswith(AGT_VERSION_PREFIX):
+            return
+        version = text[len(AGT_VERSION_PREFIX):].strip()
+        if version:
+            if version != self._agt_version:
+                logger.info("AGT firmware version: %s", version)
+            self._agt_version = version
+
+    async def request_version(self) -> bool:
+        """Ask the AGT to (re)broadcast its firmware version (MAV_CMD_USER_6).
+
+        The reply arrives asynchronously as a ``Doris AGT <version>``
+        STATUSTEXT and is picked up by the WebSocket subscriber, so this
+        only dispatches the request and reports whether the POST succeeded.
+        """
+        self._ensure_statustext_subscriber()
+        try:
+            await asyncio.wait_for(
+                self._ws_connected.wait(), timeout=WS_FIRST_CONNECT_TIMEOUT_S,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "STATUSTEXT subscriber did not connect within %.1fs; "
+                "version reply may be lost", WS_FIRST_CONNECT_TIMEOUT_S,
+            )
+        self._version_requested_monotonic = time.monotonic()
+
+        base = _m2r_base()
+        payload = {
+            "header": {"system_id": 255, "component_id": 0, "sequence": 0},
+            "message": {
+                "type": "COMMAND_LONG",
+                "target_system": 1,
+                "target_component": ARTEMIS_COMPONENT_ID,
+                "command": {"type": AGT_VERSION_CMD},
+                "confirmation": 0,
+                "param1": 0.0,
+                "param2": 0.0,
+                "param3": 0.0,
+                "param4": 0.0,
+                "param5": 0.0,
+                "param6": 0.0,
+                "param7": 0.0,
+            },
+        }
+        try:
+            resp = await self.client.post(
+                f"{base}/mavlink", json=payload, timeout=TRIGGER_POST_TIMEOUT_S,
+            )
+            resp.raise_for_status()
+            return True
+        except Exception as e:
+            logger.warning("Failed to request AGT version: %s", e)
+            return False
+
+    def _maybe_request_version(self) -> None:
+        """Fire a one-off, rate-limited version request while it's unknown.
+
+        Called from the (frequently polled) module scan so the tracker
+        tile eventually shows a firmware version without any user action,
+        without spamming a request on every poll.
+        """
+        if self._agt_version is not None:
+            return
+        last = self._version_requested_monotonic
+        if last is not None and (time.monotonic() - last) < VERSION_REQUEST_INTERVAL_S:
+            return
+        self._version_requested_monotonic = time.monotonic()
+        try:
+            asyncio.create_task(self.request_version(), name="agt-version-request")
+        except RuntimeError:
+            # No running event loop (e.g. called from a sync context); the
+            # next poll will retry once a loop is available.
+            pass
+
+    async def get_version(self, request: bool = True) -> dict:
+        """Return the AGT firmware version and its compatibility status.
+
+        Response shape::
+
+            {"version": "v0.1.0", "min_required": "v0.1.0",
+             "compatible": true, "known": true}
+
+        When ``request`` is true and the version isn't cached yet, this
+        sends a MAV_CMD_USER_6 request and waits briefly for the reply.
+        """
+        if self._agt_version is None and request:
+            await self.request_version()
+            for _ in range(10):  # ~3s total
+                if self._agt_version is not None:
+                    break
+                await asyncio.sleep(0.3)
+
+        version = self._agt_version
+        compatible: bool | None = None
+        current = _parse_semver(version) if version else None
+        minimum = _parse_semver(MIN_AGT_FIRMWARE_VERSION)
+        if current is not None and minimum is not None:
+            compatible = current >= minimum
+        return {
+            "version": version,
+            "min_required": MIN_AGT_FIRMWARE_VERSION,
+            "compatible": compatible,
+            "known": version is not None,
+        }
 
     async def close(self) -> None:
         if self._ws_task is not None and not self._ws_task.done():

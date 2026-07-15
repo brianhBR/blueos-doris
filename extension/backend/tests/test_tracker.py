@@ -29,6 +29,9 @@ def svc(monkeypatch) -> ArtemisTrackerService:
     s = ArtemisTrackerService()
     # GPS read is irrelevant to detection; keep it cheap and deterministic.
     monkeypatch.setattr(s, "get_gps_data", _async_return(None))
+    # Detection tests don't exercise versioning; suppress the proactive
+    # (network) version request so these stay hermetic.
+    monkeypatch.setattr(s, "_maybe_request_version", lambda: None)
     return s
 
 
@@ -130,6 +133,7 @@ async def test_low_frequency_heartbeat_still_shows_tile(monkeypatch):
     # keeps the tracker tile (the field symptom in #55).
     s = ArtemisTrackerService()
     monkeypatch.setattr(s, "get_gps_data", _async_return(None))
+    monkeypatch.setattr(s, "_maybe_request_version", lambda: None)
     _install_client(s, payload=_hb_payload(age_s=2.0, freq=0.0))
     modules = await s.get_modules()
     assert len(modules) == 1
@@ -174,6 +178,72 @@ async def test_grace_expiry_drops_tile(svc, monkeypatch):
     _set_clock(monkeypatch, 100.0 + tracker_mod.TRACKER_STICKY_GRACE_S + 1.0)
     _set_heartbeat(monkeypatch, svc, present=False)
     assert await svc.get_modules() == []
+
+
+# ── firmware version reporting ──────────────────────────────────────
+
+
+def test_parse_semver_variants():
+    assert tracker_mod._parse_semver("v0.1.0") == (0, 1, 0)
+    assert tracker_mod._parse_semver("0.1.0") == (0, 1, 0)
+    # git-describe dev builds carry a suffix that must be ignored.
+    assert tracker_mod._parse_semver("v0.1.0-dirty") == (0, 1, 0)
+    assert tracker_mod._parse_semver("v1.2.3-4-gabc123") == (1, 2, 3)
+    assert tracker_mod._parse_semver("dev") is None
+    assert tracker_mod._parse_semver("") is None
+
+
+def test_capture_version_from_statustext():
+    s = ArtemisTrackerService()
+    assert s._agt_version is None
+    s._capture_version("Doris AGT v0.2.1")
+    assert s._agt_version == "v0.2.1"
+    # Non-version STATUSTEXT must not clobber the cached value.
+    s._capture_version("IRIDIUM: Test starting")
+    assert s._agt_version == "v0.2.1"
+
+
+async def test_get_version_reports_compatible_without_request():
+    s = ArtemisTrackerService()
+    s._agt_version = tracker_mod.MIN_AGT_FIRMWARE_VERSION
+    result = await s.get_version(request=False)
+    assert result["version"] == tracker_mod.MIN_AGT_FIRMWARE_VERSION
+    assert result["known"] is True
+    assert result["compatible"] is True
+
+
+async def test_get_version_flags_incompatible_old_firmware():
+    s = ArtemisTrackerService()
+    s._agt_version = "v0.0.1"  # below any realistic minimum
+    result = await s.get_version(request=False)
+    # Only meaningful if the minimum is above v0.0.1, which it is.
+    assert result["compatible"] is (
+        _parse_ge("v0.0.1", tracker_mod.MIN_AGT_FIRMWARE_VERSION)
+    )
+
+
+async def test_get_version_unknown_without_request():
+    s = ArtemisTrackerService()
+    result = await s.get_version(request=False)
+    assert result["version"] is None
+    assert result["known"] is False
+    assert result["compatible"] is None
+
+
+def _parse_ge(a: str, b: str) -> bool:
+    return tracker_mod._parse_semver(a) >= tracker_mod._parse_semver(b)
+
+
+async def test_tracker_tile_carries_firmware_version(monkeypatch):
+    s = ArtemisTrackerService()
+    monkeypatch.setattr(s, "get_gps_data", _async_return(None))
+    # Avoid the proactive network request during this unit test.
+    monkeypatch.setattr(s, "_maybe_request_version", lambda: None)
+    _install_client(s, payload=_hb_payload(age_s=1.0))
+    s._agt_version = "v0.3.0"
+    modules = await s.get_modules()
+    assert len(modules) == 1
+    assert modules[0].firmware_version == "v0.3.0"
 
 
 async def test_recovered_heartbeat_resets_grace(svc, monkeypatch):
