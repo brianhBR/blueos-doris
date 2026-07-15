@@ -157,11 +157,11 @@ def register_sensor_routes(app: Robyn) -> None:
 
     @app.get("/api/v1/tracker/version")
     async def get_tracker_version(request):
-        """Return the AGT firmware version and compatibility status.
+        """Return the AGT firmware version, IMEI and compatibility status.
 
-        Returns ``{version, min_required, compatible, known}``.  When the
-        version isn't cached yet, a MAV_CMD_USER_6 request is dispatched
-        and briefly awaited unless ``request=false`` is passed.
+        Returns ``{version, imei, min_required, compatible, known}``.  When
+        the version isn't cached yet, an AGT_DEBUG (MAV_CMD_USER_3) request
+        is dispatched and briefly awaited unless ``request=false`` is passed.
         """
         try:
             do_request = request.query_params.get("request", "true") != "false"
@@ -179,6 +179,25 @@ def register_sensor_routes(app: Robyn) -> None:
         """Send COMMAND_LONG to AGT to trigger Iridium test."""
         try:
             result = await tracker_service.send_iridium_test()
+            return json.dumps(result)
+        except Exception as e:
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+
+    @app.post("/api/v1/tracker/debug")
+    async def trigger_debug(request):
+        """Send AGT_DEBUG (MAV_CMD_USER_3) to dump version + IMEI + GPS diag.
+
+        Returns ``{accepted, error, latest_id}``.  The AGT's reply burst is
+        buffered like any other STATUSTEXT, so the frontend polls
+        ``/api/v1/tracker/iridium-status?since_id=<latest_id>`` for the
+        ``Doris AGT ...`` / ``GPS: ...`` lines.
+        """
+        try:
+            result = await tracker_service.send_debug()
             return json.dumps(result)
         except Exception as e:
             return Response(

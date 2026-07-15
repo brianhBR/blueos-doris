@@ -73,8 +73,13 @@ class _FakeClient:
     def __init__(self, resp: _FakeResp) -> None:
         self._resp = resp
         self.is_closed = False
+        self.last_post: dict | None = None
 
     async def get(self, _url, *_a, **_k) -> _FakeResp:
+        return self._resp
+
+    async def post(self, url, *_a, json=None, **_k) -> _FakeResp:
+        self.last_post = {"url": url, "json": json}
         return self._resp
 
 
@@ -201,6 +206,74 @@ def test_capture_version_from_statustext():
     # Non-version STATUSTEXT must not clobber the cached value.
     s._capture_version("IRIDIUM: Test starting")
     assert s._agt_version == "v0.2.1"
+
+
+def test_capture_imei_from_separate_statustext():
+    s = ArtemisTrackerService()
+    s._capture_version("Doris AGT v0.3.0")
+    s._capture_version("Doris AGT IMEI:300234061234567")
+    assert s._agt_version == "v0.3.0"
+    assert s._agt_imei == "300234061234567"
+
+
+def test_capture_version_and_imei_combined_line():
+    s = ArtemisTrackerService()
+    s._capture_version("Doris AGT v0.3.0 IMEI:300234061234567")
+    assert s._agt_version == "v0.3.0"
+    assert s._agt_imei == "300234061234567"
+
+
+def test_capture_imei_line_does_not_clobber_version():
+    s = ArtemisTrackerService()
+    s._agt_version = "v0.3.0"
+    # An IMEI-only line has no semver core and must leave the version alone.
+    s._capture_version("Doris AGT IMEI:300234061234567")
+    assert s._agt_version == "v0.3.0"
+    assert s._agt_imei == "300234061234567"
+
+
+async def test_get_version_includes_imei():
+    s = ArtemisTrackerService()
+    s._agt_version = "v0.3.0"
+    s._agt_imei = "300234061234567"
+    result = await s.get_version(request=False)
+    assert result["imei"] == "300234061234567"
+
+
+# ── AGT command dispatch ────────────────────────────────────────────
+
+
+def _prime_command_client(monkeypatch, s: ArtemisTrackerService) -> None:
+    """Wire a fake client + a pre-connected subscriber for command sends."""
+    _install_client(s, payload={})
+    monkeypatch.setattr(s, "_ensure_statustext_subscriber", lambda: None)
+    s._ws_connected.set()
+
+
+async def test_send_iridium_test_sends_user4(monkeypatch):
+    s = ArtemisTrackerService()
+    _prime_command_client(monkeypatch, s)
+    result = await s.send_iridium_test()
+    assert result["accepted"] is True
+    msg = s._client.last_post["json"]["message"]
+    assert msg["command"]["type"] == "MAV_CMD_USER_4"
+    assert msg["target_component"] == tracker_mod.ARTEMIS_COMPONENT_ID
+
+
+async def test_send_debug_sends_user3_to_component_192(monkeypatch):
+    s = ArtemisTrackerService()
+    _prime_command_client(monkeypatch, s)
+    result = await s.send_debug()
+    assert result["accepted"] is True
+    msg = s._client.last_post["json"]["message"]
+    assert msg["command"]["type"] == "MAV_CMD_USER_3"
+    assert msg["target_component"] == tracker_mod.ARTEMIS_COMPONENT_ID
+
+
+def test_debug_command_is_user3_not_reboot():
+    # Safety net: the version/debug fetch must never be USER_5 (REBOOT) or
+    # USER_6 (invalid, mavlink2rest 404). It is AGT_DEBUG = USER_3.
+    assert tracker_mod.AGT_DEBUG_CMD == "MAV_CMD_USER_3"
 
 
 async def test_get_version_reports_compatible_without_request():

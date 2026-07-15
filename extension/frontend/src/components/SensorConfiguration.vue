@@ -17,6 +17,7 @@ import {
   mdiWaterOutline,
   mdiCogOutline,
   mdiChip,
+  mdiBugOutline,
 } from '@mdi/js'
 import { useSensors } from '../composables/useApi'
 import type { SensorModule as ApiSensorModule } from '../composables/useApi'
@@ -514,6 +515,89 @@ function resetIridiumTest() {
   iridiumDetailsOpen.value = false
 }
 
+// ── AGT debug (AGT_DEBUG / MAV_CMD_USER_3) ───────────────────────────
+//
+// Fire-and-trigger command that makes the AGT dump its version, IMEI (only
+// if the Iridium modem has been powered at least once this boot) and a
+// burst of `GPS: …` diagnostics as STATUSTEXT. The reply lands in the same
+// backend buffer as the Iridium transcript, so we poll `iridium-status`
+// from the baseline id for a short window and collect the debug lines.
+type DebugState = 'idle' | 'running' | 'done' | 'failed'
+const debugState = ref<DebugState>('idle')
+const debugOpen = ref(false)
+const debugTranscript = ref<IridiumMessage[]>([])
+const debugDetailsEl = ref<HTMLElement | null>(null)
+let debugPollInterval: number | undefined
+let debugLastSeenId = 0
+let debugDeadline = 0
+const DEBUG_COLLECT_MS = 6000  // AGT emits the dump within ~2s; allow margin
+
+const sortedDebugTranscript = computed(() =>
+  [...debugTranscript.value].sort((a, b) => a.timestamp.localeCompare(b.timestamp))
+)
+
+function isDebugLine(text: string): boolean {
+  return /^(Doris AGT|GPS:|RTC:)/i.test(text)
+}
+
+function pushDebug(m: IridiumMessage) {
+  if (!isDebugLine(m.text)) return
+  // De-dupe by id so repeated polls of the same buffered line don't stack.
+  if (m.id && debugTranscript.value.some(x => x.id === m.id)) return
+  debugTranscript.value.push(m)
+  if (debugTranscript.value.length > 50) {
+    debugTranscript.value.splice(0, debugTranscript.value.length - 50)
+  }
+  nextTick(() => {
+    const el = debugDetailsEl.value
+    if (el) el.scrollTop = el.scrollHeight
+  })
+}
+
+function stopDebugPolling() {
+  if (debugPollInterval) { clearInterval(debugPollInterval); debugPollInterval = undefined }
+}
+
+async function triggerDebug() {
+  if (debugState.value === 'running') return
+  debugState.value = 'running'
+  debugTranscript.value = []
+  debugOpen.value = true
+  try {
+    const resp = await fetch('/api/v1/tracker/debug', { method: 'POST' })
+    if (!resp.ok) throw new Error('Request failed')
+    const result = await resp.json()
+    if (!result.accepted) {
+      debugState.value = 'failed'
+      return
+    }
+    debugLastSeenId = typeof result.latest_id === 'number' ? result.latest_id : 0
+    debugDeadline = Date.now() + DEBUG_COLLECT_MS
+    stopDebugPolling()
+    debugPollInterval = setInterval(pollDebugStatus, 700) as unknown as number
+  } catch {
+    debugState.value = 'failed'
+  }
+}
+
+async function pollDebugStatus() {
+  try {
+    const resp = await fetch(`/api/v1/tracker/iridium-status?since_id=${debugLastSeenId}`)
+    if (resp.ok) {
+      const data = await resp.json()
+      const messages: IridiumMessage[] = Array.isArray(data.messages) ? data.messages : []
+      if (typeof data.latest_id === 'number' && data.latest_id > debugLastSeenId) {
+        debugLastSeenId = data.latest_id
+      }
+      for (const m of messages) pushDebug(m)
+    }
+  } catch { /* best effort */ }
+  if (Date.now() > debugDeadline) {
+    stopDebugPolling()
+    debugState.value = 'done'
+  }
+}
+
 function severityLabel(sev: number): string {
   // MAVLink MAV_SEVERITY enum
   switch (sev) {
@@ -667,6 +751,7 @@ onUnmounted(() => {
   if (trackerInterval) clearInterval(trackerInterval)
   if (lightKeepAlive) clearInterval(lightKeepAlive)
   stopIridiumPolling()
+  stopDebugPolling()
   if (snapshotUrl.value) URL.revokeObjectURL(snapshotUrl.value)
 })
 
@@ -1167,6 +1252,57 @@ const getStatusColor = (moduleStatus: string) => {
                     <span style="color: rgba(150, 238, 242, 0.5)">{{ m.timestamp.substring(11, 19) }}</span>
                     <span class="ml-2 inline-block w-12 text-center rounded text-[10px]" :style="{ color: severityColor(m.severity), border: `1px solid ${severityColor(m.severity)}40` }">{{ severityLabel(m.severity) }}</span>
                     <span class="ml-2" :style="{ color: severityColor(m.severity) }">{{ m.text }}</span>
+                  </div>
+                </div>
+              </div>
+
+              <!-- AGT debug: dump version + IMEI + GPS diagnostics on demand -->
+              <div class="mt-2">
+                <button
+                  type="button"
+                  :disabled="debugState === 'running'"
+                  class="w-full flex items-center justify-center gap-2 px-4 py-2 rounded-lg text-sm transition-all"
+                  :style="{
+                    backgroundColor: 'rgba(14, 36, 70, 0.5)',
+                    border: '1px solid rgba(65, 185, 195, 0.2)',
+                    color: '#96EEF2',
+                    opacity: debugState === 'running' ? '0.6' : '1',
+                    cursor: debugState === 'running' ? 'wait' : 'pointer',
+                  }"
+                  @click="triggerDebug()"
+                >
+                  <Loader2 v-if="debugState === 'running'" class="w-4 h-4 animate-spin" />
+                  <svg v-else class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+                    <path :d="mdiBugOutline" />
+                  </svg>
+                  <span v-if="debugState === 'running'">Collecting AGT debug…</span>
+                  <span v-else-if="debugState === 'done'">AGT Debug — Refresh</span>
+                  <span v-else-if="debugState === 'failed'">AGT Debug — Retry</span>
+                  <span v-else>AGT Debug</span>
+                </button>
+                <div v-if="debugState !== 'idle'" class="mt-2">
+                  <button
+                    type="button"
+                    class="text-xs underline transition-opacity hover:opacity-100"
+                    style="color: rgba(150, 238, 242, 0.7); opacity: 0.85"
+                    @click="debugOpen = !debugOpen"
+                  >
+                    {{ debugOpen ? 'Hide debug output' : `Show debug output (${debugTranscript.length} line${debugTranscript.length === 1 ? '' : 's'})` }}
+                  </button>
+                  <div
+                    v-if="debugOpen"
+                    ref="debugDetailsEl"
+                    class="mt-1 rounded p-2 text-xs font-mono overflow-y-auto"
+                    style="max-height: 12rem; background-color: rgba(0, 0, 0, 0.25); border: 1px solid rgba(65, 185, 195, 0.2)"
+                  >
+                    <div v-if="debugTranscript.length === 0" style="color: rgba(150, 238, 242, 0.5)">
+                      {{ debugState === 'running' ? 'Waiting for AGT response…' : 'No debug lines received — is the AGT on component 192 and accepting commands?' }}
+                    </div>
+                    <div v-for="(m, idx) in sortedDebugTranscript" :key="`dbg-${m.id}-${idx}`" class="py-0.5">
+                      <span style="color: rgba(150, 238, 242, 0.5)">{{ m.timestamp.substring(11, 19) }}</span>
+                      <span class="ml-2 inline-block w-12 text-center rounded text-[10px]" :style="{ color: severityColor(m.severity), border: `1px solid ${severityColor(m.severity)}40` }">{{ severityLabel(m.severity) }}</span>
+                      <span class="ml-2" :style="{ color: severityColor(m.severity) }">{{ m.text }}</span>
+                    </div>
                   </div>
                 </div>
               </div>
