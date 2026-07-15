@@ -9,11 +9,16 @@ from pathlib import Path
 import serial.tools.list_ports as list_ports
 
 from ..models.artemis import SerialPortInfo
+from ..utils import start_autopilot, stop_autopilot
 
 logger = logging.getLogger(__name__)
 
 FIRMWARE_UPLOAD_DIR = Path("/tmp/artemis_firmware")
 ARTEMIS_SVL_PATH = "/usr/bin/artemis_svl.py"
+
+# After /v1.0/stop returns, give mavlink-router a moment to fully release
+# the serial port before we hand it to the SVL bootloader.
+_AUTOPILOT_PORT_RELEASE_DELAY_S = 2.0
 
 # If an older SVL script exits 0 on failure, treat these log lines as failure.
 _ARTEMIS_FAILURE_MARKERS = (
@@ -87,6 +92,46 @@ class ArtemisService:
         baud: int,
         timeout: float,
     ) -> None:
+        # The autopilot holds the serial port via mavlink-router. Stop it
+        # before flashing and always start it again afterwards (even on
+        # failure) so we never leave the vehicle without MAVLink.
+        autopilot_stopped = False
+        try:
+            session.lines.append("Stopping autopilot to free serial port...")
+            autopilot_stopped = await stop_autopilot(logger)
+            if autopilot_stopped:
+                session.lines.append("Autopilot stopped.")
+                await asyncio.sleep(_AUTOPILOT_PORT_RELEASE_DELAY_S)
+            else:
+                session.lines.append(
+                    "Warning: could not stop autopilot via BlueOS; "
+                    "serial port may still be in use."
+                )
+
+            await self._invoke_svl(session, baud, timeout)
+        except Exception as e:
+            logger.exception("Flash error for session %s", session.session_id)
+            session.error = str(e)
+            session.lines.append(f"Error: {e}")
+        finally:
+            if autopilot_stopped:
+                session.lines.append("Restarting autopilot...")
+                if await start_autopilot(logger):
+                    session.lines.append("Autopilot restarted.")
+                else:
+                    session.lines.append(
+                        "Warning: failed to restart autopilot via BlueOS. "
+                        "Restart it manually from BlueOS."
+                    )
+            session.done = True
+
+    async def _invoke_svl(
+        self,
+        session: FlashSession,
+        baud: int,
+        timeout: float,
+    ) -> None:
+        """Run the SparkFun Variable Loader and stream its output."""
         cmd = [
             "python", ARTEMIS_SVL_PATH,
             session.port,
@@ -99,34 +144,27 @@ class ArtemisService:
         logger.info("Launching Artemis SVL: %s", " ".join(cmd))
         session.lines.append("Starting flash...")
 
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                *cmd,
-                stdout=asyncio.subprocess.PIPE,
-                stderr=asyncio.subprocess.STDOUT,
-            )
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.STDOUT,
+        )
 
-            assert proc.stdout is not None
-            while True:
-                line = await proc.stdout.readline()
-                if not line:
-                    break
-                text = line.decode(errors="replace").rstrip("\n\r")
-                if text:
-                    logger.info("Artemis [%s]: %s", session.session_id, text)
-                    session.lines.append(text)
+        assert proc.stdout is not None
+        while True:
+            line = await proc.stdout.readline()
+            if not line:
+                break
+            text = line.decode(errors="replace").rstrip("\n\r")
+            if text:
+                logger.info("Artemis [%s]: %s", session.session_id, text)
+                session.lines.append(text)
 
-            exit_code = await proc.wait()
-            output_lower = "\n".join(session.lines).lower()
-            failed_by_log = any(m in output_lower for m in _ARTEMIS_FAILURE_MARKERS)
-            session.success = exit_code == 0 and not failed_by_log
-            session.done = True
+        exit_code = await proc.wait()
+        output_lower = "\n".join(session.lines).lower()
+        failed_by_log = any(m in output_lower for m in _ARTEMIS_FAILURE_MARKERS)
+        session.success = exit_code == 0 and not failed_by_log
 
-            result_msg = "Upload Successful" if session.success else "Upload Failed"
-            session.lines.append(result_msg)
-            logger.info("Flash %s: %s", session.session_id, result_msg)
-        except Exception as e:
-            logger.exception("Flash error for session %s", session.session_id)
-            session.error = str(e)
-            session.lines.append(f"Error: {e}")
-            session.done = True
+        result_msg = "Upload Successful" if session.success else "Upload Failed"
+        session.lines.append(result_msg)
+        logger.info("Flash %s: %s", session.session_id, result_msg)

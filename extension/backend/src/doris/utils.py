@@ -68,6 +68,44 @@ async def restart_firmware(logger: logging.Logger) -> None:
         logger.warning("Failed to restart firmware: %s", e)
 
 
+async def stop_autopilot(logger: logging.Logger) -> bool:
+    """Stop the ArduPilot process via BlueOS autopilot-manager.
+
+    This also tears down the MAVLink router, which is what actually holds
+    the serial port open. Needed before flashing peripherals (e.g. an
+    Artemis sensor module) that share a UART with the autopilot.
+
+    Returns True on success.
+    """
+    url = f"{blueos_services.autopilot_manager}/v1.0/stop"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url)
+            resp.raise_for_status()
+        logger.info("Autopilot stop command sent successfully")
+        return True
+    except Exception as e:
+        logger.warning("Failed to stop autopilot: %s", e)
+        return False
+
+
+async def start_autopilot(logger: logging.Logger) -> bool:
+    """Start the ArduPilot process via BlueOS autopilot-manager.
+
+    Counterpart to :func:`stop_autopilot`. Returns True on success.
+    """
+    url = f"{blueos_services.autopilot_manager}/v1.0/start"
+    try:
+        async with httpx.AsyncClient(timeout=15.0) as client:
+            resp = await client.post(url)
+            resp.raise_for_status()
+        logger.info("Autopilot start command sent successfully")
+        return True
+    except Exception as e:
+        logger.warning("Failed to start autopilot: %s", e)
+        return False
+
+
 def disable_usb_autosuspend(logger: logging.Logger) -> None:
     """Set power/control to 'on' for all USB devices to prevent autosuspend."""
     usb_devices = Path("/sys/bus/usb/devices")
