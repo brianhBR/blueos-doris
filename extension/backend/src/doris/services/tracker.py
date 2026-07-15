@@ -65,16 +65,29 @@ WS_RECONNECT_DELAY_S = 2.0
 WS_FIRST_CONNECT_TIMEOUT_S = 5.0  # max wait before sending first MAV_CMD_USER_4
 TRIGGER_POST_TIMEOUT_S = 15.0  # mavlink2rest POST commonly takes 4-5s
 
-# ── AGT firmware version ─────────────────────────────────────────
-# The AGT firmware reports its git-describe version as a STATUSTEXT
-# ("Doris AGT v0.1.0") once at boot and ~3x early in loop().  Because
-# our STATUSTEXT subscriber connects lazily (typically long after the
-# AGT booted) we cannot rely on catching that boot broadcast, so we
-# also request it explicitly with MAV_CMD_USER_6 — the firmware's
-# MAVLINK_CMD_VERSION (31015), which follows the same command pattern
-# as the Iridium test (MAV_CMD_USER_4).
+# ── AGT firmware version / identity ──────────────────────────────
+# The AGT firmware reports its identity as STATUSTEXT lines prefixed
+# with "Doris AGT" — its git-describe version ("Doris AGT v0.2.0") and
+# the RockBlock modem IMEI ("Doris AGT IMEI:300234061234567") — once at
+# boot and ~3x early in loop().  Because our STATUSTEXT subscriber
+# connects lazily (typically long after the AGT booted) we cannot rely
+# on catching that boot broadcast, so we also request it explicitly.
+#
+# The request uses AGT_DEBUG = MAV_CMD_USER_3 (31012), which makes the
+# AGT dump its version + IMEI + GPS diagnostics as STATUSTEXT.  This is
+# the ONLY command we send to fetch the version.
+#
+# AGT command map — MAVLink only defines MAV_CMD_USER_1..5, so the old
+# version command on USER_6 (31015) was never valid (mavlink2rest 404s
+# it) and has been retired:
+#   31010 USER_1  LED_CONTROL
+#   31011 USER_2  MISSION_STATUS
+#   31012 USER_3  AGT_DEBUG      ← version + IMEI + GPS diag dump
+#   31013 USER_4  IRIDIUM_TEST
+#   31014 USER_5  REBOOT         ← DANGER: soft-reboots the AGT. Never
+#                                  send this as a background/poll action.
 AGT_VERSION_PREFIX = "Doris AGT"
-AGT_VERSION_CMD = "MAV_CMD_USER_6"
+AGT_DEBUG_CMD = "MAV_CMD_USER_3"
 # Minimum AGT firmware this extension requires.  v0.2.0 is the first
 # firmware that advertises on component 192 (see the module docstring);
 # older firmware sat on component 191 and is invisible to this build.
@@ -84,6 +97,10 @@ MIN_AGT_FIRMWARE_VERSION = "v0.2.0"
 VERSION_REQUEST_INTERVAL_S = 30.0
 
 _SEMVER_RE = re.compile(r"v?(\d+)\.(\d+)\.(\d+)")
+# RockBlock/Iridium 9603 IMEIs are 15 digits.  Accept an optional
+# "IMEI:"/"IMEI=" label so version and IMEI can share a line or arrive
+# as separate "Doris AGT ..." STATUSTEXT lines.
+_IMEI_RE = re.compile(r"IMEI[:=\s]*(\d{15})", re.IGNORECASE)
 
 
 def _parse_semver(text: str) -> tuple[int, int, int] | None:
@@ -209,6 +226,9 @@ class ArtemisTrackerService:
         # Cached AGT firmware version ("v0.1.0"), parsed from the
         # "Doris AGT <version>" STATUSTEXT.  None until first seen/requested.
         self._agt_version: str | None = None
+        # Cached RockBlock modem IMEI (15 digits), parsed from the
+        # "Doris AGT IMEI:<imei>" STATUSTEXT.  None until first seen.
+        self._agt_imei: str | None = None
         # Monotonic timestamp of the last version request, to rate-limit
         # the proactive re-request while the version is still unknown.
         self._version_requested_monotonic: float | None = None
@@ -424,44 +444,41 @@ class ArtemisTrackerService:
                 )
                 await asyncio.sleep(WS_RECONNECT_DELAY_S)
 
-    # ── Iridium test ────────────────────────────────────────────────
+    # ── AGT commands (fire-and-trigger) ─────────────────────────────
 
-    async def send_iridium_test(self) -> dict:
-        """Send COMMAND_LONG (MAV_CMD_USER_4) to trigger Iridium test.
+    async def _send_agt_command(self, cmd_type: str, label: str) -> dict:
+        """Send a fire-and-trigger COMMAND_LONG to the AGT (component 192).
 
-        Returns ``{accepted, error, latest_id}`` where ``latest_id`` is
-        the buffer id at the moment the command was sent so the frontend
-        can poll for messages newer than that.
+        Ensures the STATUSTEXT subscriber is connected first, otherwise on
+        the very first invocation per process the command goes out before
+        the WS handshake completes and the AGT's near-immediate reply burst
+        (e.g. "IRIDIUM: Test starting" or the AGT_DEBUG dump) arrives at
+        mavlink2rest with no listener and is lost.
+
+        Returns ``{accepted, error, latest_id}`` where ``latest_id`` is the
+        buffer id at send time so the frontend can poll for newer messages.
         """
         self._ensure_statustext_subscriber()
-        # Wait until the STATUSTEXT WebSocket subscriber is actually
-        # connected to mavlink2rest before dispatching the command.
-        # Without this, on the very first invocation per process the
-        # MAV_CMD_USER_4 goes out tens to hundreds of milliseconds before
-        # the WS handshake completes, and the AGT's near-immediate reply
-        # ("IRIDIUM: Test starting", and on a fast PASSED the result too)
-        # arrives at mavlink2rest with no listener and is lost.
         try:
             await asyncio.wait_for(
                 self._ws_connected.wait(), timeout=WS_FIRST_CONNECT_TIMEOUT_S,
             )
         except asyncio.TimeoutError:
             logger.warning(
-                "STATUSTEXT subscriber did not connect within %.1fs; "
-                "test command will be sent anyway but reply may be lost",
-                WS_FIRST_CONNECT_TIMEOUT_S,
+                "STATUSTEXT subscriber did not connect within %.1fs; %s "
+                "will be sent anyway but reply may be lost",
+                WS_FIRST_CONNECT_TIMEOUT_S, label,
             )
         baseline_id = await self._statustext.latest_id()
 
         base = _m2r_base()
-        post_url = f"{base}/mavlink"
         payload = {
             "header": {"system_id": 255, "component_id": 0, "sequence": 0},
             "message": {
                 "type": "COMMAND_LONG",
                 "target_system": 1,
                 "target_component": ARTEMIS_COMPONENT_ID,
-                "command": {"type": "MAV_CMD_USER_4"},
+                "command": {"type": cmd_type},
                 "confirmation": 0,
                 "param1": 0.0,
                 "param2": 0.0,
@@ -474,14 +491,28 @@ class ArtemisTrackerService:
         }
         try:
             resp = await self.client.post(
-                post_url, json=payload, timeout=TRIGGER_POST_TIMEOUT_S,
+                f"{base}/mavlink", json=payload, timeout=TRIGGER_POST_TIMEOUT_S,
             )
             resp.raise_for_status()
-            logger.info("Iridium test command sent to AGT (baseline_id=%d)", baseline_id)
+            logger.info("%s command sent to AGT (baseline_id=%d)", label, baseline_id)
             return {"accepted": True, "error": None, "latest_id": baseline_id}
         except Exception as e:
-            logger.warning("Failed to send Iridium test command: %s", e)
+            logger.warning("Failed to send %s command: %s", label, e)
             return {"accepted": False, "error": str(e), "latest_id": baseline_id}
+
+    async def send_iridium_test(self) -> dict:
+        """Trigger a one-off Iridium test (MAV_CMD_USER_4)."""
+        return await self._send_agt_command("MAV_CMD_USER_4", "Iridium test")
+
+    async def send_debug(self) -> dict:
+        """Trigger AGT_DEBUG (MAV_CMD_USER_3).
+
+        The AGT dumps its version, IMEI (if the modem has been powered at
+        least once this boot) and a burst of ``GPS: ...`` diagnostics as
+        STATUSTEXT.  All of it lands in the shared STATUSTEXT buffer, so the
+        frontend polls ``get_iridium_status`` from the returned baseline id.
+        """
+        return await self._send_agt_command(AGT_DEBUG_CMD, "AGT debug")
 
     async def get_iridium_status(self, since_id: int = 0) -> dict:
         """Return all AGT STATUSTEXT messages newer than ``since_id``.
@@ -504,21 +535,40 @@ class ArtemisTrackerService:
     # ── Firmware version ────────────────────────────────────────────
 
     def _capture_version(self, text: str) -> None:
-        """Parse and cache the version from a ``Doris AGT <version>`` STATUSTEXT."""
+        """Parse and cache AGT identity from a ``Doris AGT ...`` STATUSTEXT.
+
+        The firmware reports its version and RockBlock IMEI as "Doris AGT"
+        lines — either combined ("Doris AGT v0.2.0 IMEI:300234061234567")
+        or as separate lines.  Each field is captured independently so
+        neither clobbers a value that isn't present on a given line.
+        """
         if not text.startswith(AGT_VERSION_PREFIX):
             return
-        version = text[len(AGT_VERSION_PREFIX):].strip()
-        if version:
-            if version != self._agt_version:
-                logger.info("AGT firmware version: %s", version)
-            self._agt_version = version
+
+        imei_match = _IMEI_RE.search(text)
+        if imei_match:
+            imei = imei_match.group(1)
+            if imei != self._agt_imei:
+                logger.info("AGT RockBlock IMEI: %s", imei)
+            self._agt_imei = imei
+
+        # Strip the prefix and any IMEI clause, then treat the remainder
+        # as the version.  Only accept it when it carries a semver core so
+        # a bare "Doris AGT IMEI:..." line doesn't overwrite the version.
+        remainder = _IMEI_RE.sub("", text[len(AGT_VERSION_PREFIX):]).strip()
+        if remainder and _parse_semver(remainder) is not None:
+            if remainder != self._agt_version:
+                logger.info("AGT firmware version: %s", remainder)
+            self._agt_version = remainder
 
     async def request_version(self) -> bool:
-        """Ask the AGT to (re)broadcast its firmware version (MAV_CMD_USER_6).
+        """Ask the AGT to dump its identity via AGT_DEBUG (MAV_CMD_USER_3).
 
-        The reply arrives asynchronously as a ``Doris AGT <version>``
-        STATUSTEXT and is picked up by the WebSocket subscriber, so this
-        only dispatches the request and reports whether the POST succeeded.
+        AGT_DEBUG makes the AGT emit its version, IMEI (if known) and GPS
+        diagnostics as ``Doris AGT ...``/``GPS: ...`` STATUSTEXT lines.
+        The reply arrives asynchronously and is picked up by the WebSocket
+        subscriber, so this only dispatches the request and reports whether
+        the POST succeeded.
         """
         self._ensure_statustext_subscriber()
         try:
@@ -539,7 +589,7 @@ class ArtemisTrackerService:
                 "type": "COMMAND_LONG",
                 "target_system": 1,
                 "target_component": ARTEMIS_COMPONENT_ID,
-                "command": {"type": AGT_VERSION_CMD},
+                "command": {"type": AGT_DEBUG_CMD},
                 "confirmation": 0,
                 "param1": 0.0,
                 "param2": 0.0,
@@ -585,11 +635,12 @@ class ArtemisTrackerService:
 
         Response shape::
 
-            {"version": "v0.1.0", "min_required": "v0.1.0",
-             "compatible": true, "known": true}
+            {"version": "v0.2.0", "imei": "300234061234567",
+             "min_required": "v0.2.0", "compatible": true, "known": true}
 
         When ``request`` is true and the version isn't cached yet, this
-        sends a MAV_CMD_USER_6 request and waits briefly for the reply.
+        sends an AGT_DEBUG (MAV_CMD_USER_3) request and waits briefly for
+        the reply.
         """
         if self._agt_version is None and request:
             await self.request_version()
@@ -606,6 +657,7 @@ class ArtemisTrackerService:
             compatible = current >= minimum
         return {
             "version": version,
+            "imei": self._agt_imei,
             "min_required": MIN_AGT_FIRMWARE_VERSION,
             "compatible": compatible,
             "known": version is not None,
