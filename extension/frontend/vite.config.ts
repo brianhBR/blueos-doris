@@ -3,8 +3,11 @@ import vue from '@vitejs/plugin-vue'
 import { resolve } from 'path'
 
 export default defineConfig(({ mode }) => {
-  const env = loadEnv(mode, __dirname, '')
-  const isDemo = env.VITE_DEMO_MODE === 'true'
+  // Keyed off the explicit `--mode demo` rather than an env var: loadEnv
+  // with an empty prefix reads all of process.env, so a stray VITE_DEMO_MODE
+  // on a build machine must not be able to change the vehicle's base path.
+  const isDemo = mode === 'demo'
+  const env = isDemo ? loadEnv(mode, __dirname, '') : ({} as Record<string, string>)
 
   return {
     plugins: [vue()],
