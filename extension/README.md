@@ -2,6 +2,38 @@
 
 A BlueOS extension for deep ocean research and imaging operations.
 
+## bh-0.6 safe-surface wiring
+
+Lua owns release policy and mirrors every release request to both controllers:
+it drives the Navigator relay on `DORIS_RELAY_CH` and repeatedly sends the
+`RELAY` request over MAVLink, which AGT firmware v0.3.0 or newer uses to drive
+AGT Relay 2. One software build therefore covers legacy Navigator-wired systems
+and AGT-wired systems.
+
+Wire the release actuator to exactly one output. Never wire it to both
+Navigator SERVO14 and AGT Relay 2: two independent controller outputs driving
+one relay input is not a supported electrical configuration. Set
+`DORIS_RELAY_CH=-1` on AGT-wired systems to leave the Navigator output idle.
+
+The backend blocks mission start only when neither release path is usable. A
+single degraded path — for example AGT firmware older than v0.3.0, or Navigator
+frame parameters that do not match — starts the mission with a warning that
+release redundancy is reduced.
+
+AGT-requested host shutdown is disabled by default. Enable it only on an
+AGT-wired system and only after an end-to-end bench test, by setting
+`DORIS_AGT_SHUTDOWN_ENABLED=true` on the backend service; cutting host power
+takes the Navigator release output offline, so the backend refuses to start a
+mission when shutdown is enabled without a healthy AGT release path. A valid
+request must come from MAVLink system 1/component 192 and follow an `AGT_CAP=3`
+advertisement. The backend finalizes recording, runs `sync`, sends `PWR_ACK=1`
+from system 1/component 191, and only then asks BlueOS Commander to power off.
+
+The bh-0.6 MAVLink names are `RELAY` (Lua request), `AGT_CAP=3` (bit 0 AGT
+release ownership, bit 1 safe shutdown), `REL_STAT` (physical release state),
+`PWR_SHDN` (`1` requests shutdown and `0` resets the request), and `PWR_ACK=1`.
+Names are intentionally at most ten characters for `NAMED_VALUE_FLOAT`.
+
 ## Features
 
 - **Real-time System Status**: Battery, storage, and CPU monitoring

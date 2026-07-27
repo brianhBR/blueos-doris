@@ -88,11 +88,11 @@ TRIGGER_POST_TIMEOUT_S = 15.0  # mavlink2rest POST commonly takes 4-5s
 #                                  send this as a background/poll action.
 AGT_VERSION_PREFIX = "Doris AGT"
 AGT_DEBUG_CMD = "MAV_CMD_USER_3"
-# Minimum AGT firmware this extension requires.  v0.2.0 is the first
-# firmware that advertises on component 192 (see the module docstring);
-# older firmware sat on component 191 and is invisible to this build.
+# Minimum AGT firmware this extension requires.  v0.3.0 introduces the
+# safe-surface release status, capability handshake, and guarded shutdown
+# protocol.  Older firmware must never be reported as compatible.
 # Bump this in lockstep with breaking AGT protocol changes.
-MIN_AGT_FIRMWARE_VERSION = "v0.2.0"
+MIN_AGT_FIRMWARE_VERSION = "v0.3.0"
 # Re-request the version at most this often while it's still unknown.
 VERSION_REQUEST_INTERVAL_S = 30.0
 
@@ -674,3 +674,6 @@ class ArtemisTrackerService:
         if self._client is not None and not self._client.is_closed:
             await self._client.aclose()
             self._client = None
+
+
+tracker_service = ArtemisTrackerService()

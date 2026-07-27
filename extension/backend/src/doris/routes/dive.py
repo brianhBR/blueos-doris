@@ -25,7 +25,10 @@ from ..services.camera import CameraService
 from ..services.dive import DiveService
 from ..services.dive_finalize import finalize_dive
 from ..services.dive_records import find_latest_active_dive_record
+from ..services.frame import FrameService
+from ..services.safe_surface import safe_surface_service
 from ..services.storage import DATA_ROOT, StorageService, media_download_id_from_abs_path
+from ..services.tracker import tracker_service
 
 logger = logging.getLogger(__name__)
 
@@ -241,6 +244,24 @@ def _close_all_active_dive_records(new_status: str = "completed") -> int:
 def register_dive_routes(app: Robyn) -> None:
     @app.post("/api/v1/dive/start")
     async def start_dive(request):
+        firmware, frame = await asyncio.gather(
+            tracker_service.get_version(request=True),
+            FrameService().get_frame_status(),
+        )
+        readiness = safe_surface_service.evaluate_release_readiness(firmware, frame)
+        if not readiness["ready"]:
+            return Response(
+                status_code=409,
+                description=json.dumps({
+                    "success": False,
+                    "error": "No usable weight release path",
+                    "blockers": readiness["blockers"],
+                }),
+                headers={"Content-Type": "application/json"},
+            )
+        for warning in readiness["warnings"]:
+            logger.warning("Release path degraded at mission start: %s", warning)
+
         config = None
         try:
             body = json.loads(request.body) if request.body else {}

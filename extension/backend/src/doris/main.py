@@ -29,13 +29,14 @@ from .routes import (
 )
 from .services import ip_camera_recorder
 from .services.external_storage import start_external_storage_setup
-from .services.storage import DATA_ROOT
-from .services.usb_storage import start_usb_storage_probe
 from .services.frame import FrameService
-from .services.mdns import restart_avahi, setup_doris_local, start_hotspot_dns
 from .services.hotspot_radio import setup_hotspot_radio
-from .services.wifi_driver import setup_wifi_driver
+from .services.mdns import restart_avahi, setup_doris_local, start_hotspot_dns
+from .services.safe_surface import safe_surface_service
+from .services.storage import DATA_ROOT
 from .services.timesync import timesync_service
+from .services.usb_storage import start_usb_storage_probe
+from .services.wifi_driver import setup_wifi_driver
 from .utils import deploy_artemis_svl, deploy_lua_scripts, disable_usb_autosuspend, restart_firmware
 
 
@@ -210,6 +211,7 @@ def create_app() -> Robyn:
             logger.warning("USB storage probe skipped: %s", e)
 
         timesync_service.start_background_sync()
+        safe_surface_service.start()
         start_dmesg_capture()
 
         # Pre-warm GStreamer so the first dive recording doesn't pay the

@@ -118,6 +118,7 @@ assert(param:add_param(73, 15, "PRF_ID",   0),    "DORIS_PRF_ID")
 assert(param:add_param(73, 16, "UPL_DATE", 0),    "DORIS_UPL_DATE")
 assert(param:add_param(73, 17, "UPL_TIME", 0),    "DORIS_UPL_TIME")
 assert(param:add_param(73, 18, "MIN_VOLT", 14.0), "DORIS_MIN_VOLT")
+-- Navigator relay channel for the mirrored release output; -1 disables it.
 assert(param:add_param(73, 19, "RELAY_CH", 0),    "DORIS_RELAY_CH")
 assert(param:add_param(73, 20, "INJ_LEAK", 0),    "DORIS_INJ_LEAK")
 assert(param:add_param(73, 21, "MAX_DPTH", 6100), "DORIS_MAX_DPTH")
@@ -444,32 +445,51 @@ local function update_lights(enabled, now_ms)
     end
 end
 
-local function activate_relay()
+-- The release request is mirrored to both controllers: the AGT drives its own
+-- output from the RELAY named float published by update_telemetry, and
+-- ArduPilot drives DORIS_RELAY_CH.  Exactly one of the two outputs may be
+-- wired to the actuator; DORIS_RELAY_CH=-1 disables the Navigator output.
+local function navigator_relay_channel()
     local ch = DORIS_RELAY_CH:get()
-    if not ch then return end
+    if not ch then return nil end
     ch = math.floor(ch)
-    if ch < 0 then return end
-    relay:on(ch)
+    if ch < 0 then return nil end
+    return ch
+end
+
+local function relay_target_text(ch)
+    if ch then
+        return string.format("AGT + Navigator CH%d", ch)
+    end
+    return "AGT"
+end
+
+local function activate_relay()
     relay_active = true
+    local ch = navigator_relay_channel()
+    if ch then
+        relay:on(ch)
+    end
     if is_sitl then
         -- ~2 kg net positive buoyancy for ascent after weight drop in SITL
         param:set_and_save("SIM_BUOYANCY", 19.6)
         gcs:send_text(MAV_SEVERITY.INFO, "DIVE: SITL SIM_BUOYANCY set positive (19.6 N)")
     end
     gcs:send_text(MAV_SEVERITY.WARNING,
-        string.format("DIVE: Relay CH%d ON at %.1fm", ch, get_depth_m() or 0))
+        string.format("DIVE: Release ON at %.1fm (%s)",
+            get_depth_m() or 0, relay_target_text(ch)))
 end
 
 local function deactivate_relay()
     if not relay_active then return end
-    local ch = DORIS_RELAY_CH:get()
-    if not ch then return end
-    ch = math.floor(ch)
-    if ch < 0 then return end
-    relay:off(ch)
     relay_active = false
+    local ch = navigator_relay_channel()
+    if ch then
+        relay:off(ch)
+    end
     gcs:send_text(MAV_SEVERITY.INFO,
-        string.format("DIVE: Relay CH%d OFF at %.1fm", ch, get_depth_m() or 0))
+        string.format("DIVE: Release OFF at %.1fm (%s)",
+            get_depth_m() or 0, relay_target_text(ch)))
 end
 
 local function check_leak()

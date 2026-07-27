@@ -42,6 +42,43 @@ export interface StorageInfo {
   storage_type?: string
 }
 
+export interface SafeSurfaceStatus {
+  ready: boolean
+  blockers: string[]
+  warnings: string[]
+  navigator_release_available: boolean
+  agt_release_available: boolean
+  firmware: {
+    version: string | null
+    min_required: string
+    compatible: boolean | null
+    known: boolean
+  }
+  protocol: {
+    capabilities: number | null
+    capabilities_compatible: boolean
+    compatible: boolean
+    release_capability_ok: boolean
+    agt_release_path_ok: boolean
+    release_request_known: boolean
+    release_request_stale: boolean
+    release_actual_known: boolean
+    release_actual_stale: boolean
+    release_requested: boolean | null
+    release_actual: boolean | null
+    release_mismatch: boolean
+    agt_status_stale: boolean
+    shutdown_enabled: boolean
+    power_shutdown_requested: boolean
+    shutdown_state: string
+  }
+  frame: {
+    applied: boolean
+    release: Record<string, unknown>
+    critical_mismatches: Record<string, unknown>
+  }
+}
+
 export interface LocationInfo {
   latitude: number
   longitude: number
@@ -435,6 +472,34 @@ export function useStorage() {
   }
 
   return { storage: readonly(storage), loading: readonly(loading), error: readonly(error), fetchStorage }
+}
+
+export function useSafeSurfaceStatus() {
+  const status = ref<SafeSurfaceStatus | null>(null)
+  const loading = ref(false)
+  const error = ref<string | null>(null)
+
+  async function fetchSafeSurfaceStatus(): Promise<SafeSurfaceStatus | null> {
+    loading.value = true
+    error.value = null
+    try {
+      status.value = await fetchApi<SafeSurfaceStatus>('/safe-surface/status')
+      return status.value
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to verify safe-surface status'
+      status.value = null
+      return null
+    } finally {
+      loading.value = false
+    }
+  }
+
+  return {
+    status: readonly(status),
+    loading: readonly(loading),
+    error: readonly(error),
+    fetchSafeSurfaceStatus,
+  }
 }
 
 export function useLocation() {
