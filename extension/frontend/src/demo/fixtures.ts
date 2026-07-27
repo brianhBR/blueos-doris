@@ -155,10 +155,12 @@ export const systemTime = {
 // ── Sensors ─────────────────────────────────────────────────────────
 
 /**
- * Mirrors what `SensorService.get_connected_modules` actually emits:
- * camera streams, ping devices, light channels, barometer, thermometer,
- * and the Artemis tracker. Ids, name formats, and module_status strings
- * follow the backend services rather than being invented.
+ * Mirrors what `SensorService.get_connected_modules` emits. Ids, name
+ * formats, and module_status strings follow the backend services rather
+ * than being invented.
+ *
+ * The service also enumerates ping/sonar devices, but this demo vehicle
+ * has none attached, so no `ping-*` module appears.
  *
  * `power_usage` and `sample_rate` are left at the model defaults (0.0 and
  * null) because no service ever populates them.
@@ -176,18 +178,6 @@ export const sensorModules: SensorModule[] = [
     power_usage: 0.0,
     sample_rate: null,
     firmware_version: null,
-  },
-  {
-    // services/sensors.py: id=f"ping-{device_id}", name=f"{ping_type} ({port})"
-    id: 'ping-0',
-    name: 'Ping1D (/dev/ttyUSB0)',
-    type: 'sensor',
-    status: 'connected',
-    module_status: 'Ready: Active',
-    last_reading: minutesAgo(0.05),
-    power_usage: 0.0,
-    sample_rate: null,
-    firmware_version: '3.28.0',
   },
   {
     // services/lights.py: LIGHT_CHANNELS = {13: "Lights 1"}
