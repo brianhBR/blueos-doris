@@ -29,6 +29,7 @@ const normalize = p => p.replace(/\$\{[^}]*\}/g, 'X').split('?')[0].replace(/\/+
 
 const calls = new Map() // "METHOD /path" -> Set(source files)
 const looseCalls = new Map() // same, from the method-less bare-string scan
+const prefixOnly = new Set() // bare prefix constants, never endpoints themselves
 
 function record(method, path, file, target = calls) {
   const norm = normalize(path)
@@ -57,10 +58,20 @@ for (const file of files) {
     const method = /method\s*:\s*['"](\w+)['"]/.exec(m[2] || '')?.[1]?.toUpperCase() ?? 'GET'
     record(method, path || '/', file)
   }
-  for (const m of src.matchAll(/fetch\s*\(\s*`\$\{(?:API_BASE|API_V1)\}([^`]*)`([^)]*)\)/g)) {
-    const method = /method\s*:\s*['"](\w+)['"]/.exec(m[2] || '')?.[1]?.toUpperCase() ?? 'GET'
-    record(method, m[1], file)
+  // Paths assembled from a local prefix constant, e.g.
+  // `const IPCAM_RECORD_API = '/api/v1/ipcam/record'` used as
+  // fetch(`${IPCAM_RECORD_API}/status`). Resolving these matters: the
+  // suffix is invisible to the bare-string scan above.
+  const prefixes = new Map([['API_BASE', ''], ['API_V1', '']])
+  for (const m of src.matchAll(/const\s+(\w+)\s*=\s*['"]([^'"]*\/api\/v1[^'"]*)['"]/g)) {
+    prefixes.set(m[1], m[2].replace(/^.*\/api\/v1/, ''))
   }
+  for (const m of src.matchAll(/fetch\s*\(\s*`\$\{(\w+)\}([^`]*)`([^)]*)\)/g)) {
+    if (!prefixes.has(m[1])) continue
+    const method = /method\s*:\s*['"](\w+)['"]/.exec(m[3] || '')?.[1]?.toUpperCase() ?? 'GET'
+    record(method, prefixes.get(m[1]) + m[2], file)
+  }
+  for (const p of prefixes.values()) if (p) prefixOnly.add(normalize(p))
 
   // URL builders that never reach fetch() directly (href/src bindings).
   // The method is unknowable here, so these are provisional GETs and are
@@ -72,7 +83,8 @@ for (const file of files) {
 
 const knownPaths = new Set([...calls.keys()].map(k => k.split(' ')[1]))
 for (const [key, sources] of looseCalls) {
-  if (!knownPaths.has(key.split(' ')[1])) calls.set(key, sources)
+  const path = key.split(' ')[1]
+  if (!knownPaths.has(path) && !prefixOnly.has(path)) calls.set(key, sources)
 }
 
 // ── Collect demo routes ─────────────────────────────────────────────

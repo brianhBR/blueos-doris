@@ -32,6 +32,7 @@ const state = {
   configurations: f.configurations.map(c => ({ ...c })),
   wlan: { ...f.wlanState },
   lightBrightness: 0,
+  ipcamRecording: false,
 }
 
 function jsonBody(init: RequestInit): Record<string, unknown> {
@@ -287,8 +288,23 @@ const routes: Route[] = [
   { method: 'POST', pattern: /^\/tracker\/debug$/, handler: () => ({ success: true, message: 'AGT_DEBUG sent (demo)' }) },
 
   // ── IP camera recording ──
-  { method: 'GET', pattern: /^\/ipcam\/record$/, handler: () => ({ recording: false }) },
-  { method: 'POST', pattern: /^\/ipcam\/record$/, handler: () => ({ success: true, recording: false, message: 'Recording unavailable in demo' }) },
+  { method: 'GET', pattern: /^\/ipcam\/record\/status$/, handler: () => ({ recording: state.ipcamRecording }) },
+  {
+    method: 'POST',
+    pattern: /^\/ipcam\/record\/start$/,
+    handler: () => {
+      state.ipcamRecording = true
+      return { success: true, message: 'Recording started (demo)' }
+    },
+  },
+  {
+    method: 'POST',
+    pattern: /^\/ipcam\/record\/stop$/,
+    handler: () => {
+      state.ipcamRecording = false
+      return { success: true, message: 'Recording stopped (demo)' }
+    },
+  },
 ]
 
 /** Endpoints that return something other than JSON. */

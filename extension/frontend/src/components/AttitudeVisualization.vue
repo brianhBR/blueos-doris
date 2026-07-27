@@ -7,7 +7,9 @@ import { DRACOLoader } from 'three/examples/jsm/loaders/DRACOLoader.js'
 import { Wifi, WifiOff } from 'lucide-vue-next'
 import { useAttitudeWs } from '../composables/useAttitudeWs'
 
-const MODEL_PATH = '/models/doris.glb'
+// BASE_URL is '/' on the vehicle and the Pages subpath for the demo build.
+const MODEL_PATH = `${import.meta.env.BASE_URL}models/doris.glb`
+const DRACO_PATH = `${import.meta.env.BASE_URL}draco/`
 const LERP = 0.15
 
 const { attitude, connected } = useAttitudeWs()
@@ -56,7 +58,7 @@ function initScene() {
   scene.add(fill)
 
   const draco = new DRACOLoader()
-  draco.setDecoderPath('/draco/')
+  draco.setDecoderPath(DRACO_PATH)
   const loader = new GLTFLoader()
   loader.setDRACOLoader(draco)
 
