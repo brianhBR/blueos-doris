@@ -54,40 +54,42 @@ function time(number: string, unit: TimeValue['unit'] = 'seconds'): TimeValue {
   return { number, unit }
 }
 
+/** Field-for-field the defaults from models/configuration.py CameraSettings. */
 function cameraSettings(overrides: Partial<CameraSettings> = {}): CameraSettings {
   return {
-    enabled: true,
-    camera_type: 'timelapse',
-    capture_frequency: 30,
+    enabled: false,
+    camera_type: 'continuous-video',
+    capture_frequency: 10,
     capture_frequency_unit: 'seconds',
-    video_record: time('30'),
-    video_pause: time('5', 'minutes'),
+    video_record: time('10'),
+    video_pause: time('5'),
     timelapse_light_pre: time('2'),
     timelapse_light_post: time('1'),
-    resolution: '4056x3040',
-    image_type: 'still',
-    file_format: 'jpeg',
-    video_file_format: 'mp4',
+    resolution: '4K',
+    image_type: 'High-Rez JPG',
+    file_format: 'JPEG',
+    video_file_format: '.MP4',
     frame_rate: 30,
     focus: 'auto',
-    iso: '400',
-    white_balance: 'underwater',
-    exposure: 'auto',
+    iso: 'auto',
+    white_balance: 'auto',
+    exposure: '0',
     sharpness: 'medium',
     sleep_timer_enabled: false,
-    sleep_timer: time('10', 'minutes'),
+    sleep_timer: time('', 'hours'),
     ...overrides,
   }
 }
 
+/** Field-for-field the defaults from models/configuration.py LightSettings. */
 function lightSettings(overrides: Partial<LightSettings> = {}): LightSettings {
   return {
-    enabled: true,
-    mode: 'interval',
-    brightness: 65,
-    match_camera_interval: true,
-    on_time: time('3'),
-    off_time: time('27'),
+    enabled: false,
+    mode: 'continuous',
+    brightness: 60,
+    match_camera_interval: false,
+    on_time: time('10'),
+    off_time: time('5'),
     ...overrides,
   }
 }
@@ -152,75 +154,96 @@ export const systemTime = {
 
 // ── Sensors ─────────────────────────────────────────────────────────
 
+/**
+ * Mirrors what `SensorService.get_connected_modules` actually emits:
+ * camera streams, ping devices, light channels, barometer, thermometer,
+ * and the Artemis tracker. Ids, name formats, and module_status strings
+ * follow the backend services rather than being invented.
+ *
+ * `power_usage` and `sample_rate` are left at the model defaults (0.0 and
+ * null) because no service ever populates them.
+ */
 export const sensorModules: SensorModule[] = [
   {
-    id: 'ctd',
-    name: 'CTD (Conductivity/Temp/Depth)',
-    type: 'ctd',
-    status: 'connected',
-    module_status: 'Sampling at 1 Hz',
-    last_reading: minutesAgo(0.1),
-    power_usage: 0.8,
-    sample_rate: 1,
-    firmware_version: '2.4.1',
-  },
-  {
-    id: 'camera',
-    name: 'Imaging Camera',
+    // services/sensors.py: id=f"camera-{stream.id}", name=f"Camera ({stream.name})"
+    // The stream name is BlueOS Camera Manager config, not a code constant.
+    id: 'camera-1',
+    name: 'Camera (DORIS IP Camera)',
     type: 'camera',
     status: 'connected',
-    module_status: 'Idle — armed for next dive',
-    last_reading: minutesAgo(3),
-    power_usage: 2.1,
+    module_status: 'Ready: Active',
+    last_reading: minutesAgo(0.05),
+    power_usage: 0.0,
     sample_rate: null,
-    firmware_version: '1.9.0',
+    firmware_version: null,
   },
   {
-    id: 'lights',
-    name: 'Lumen Light Array',
+    // services/sensors.py: id=f"ping-{device_id}", name=f"{ping_type} ({port})"
+    id: 'ping-0',
+    name: 'Ping1D (/dev/ttyUSB0)',
+    type: 'sensor',
+    status: 'connected',
+    module_status: 'Ready: Active',
+    last_reading: minutesAgo(0.05),
+    power_usage: 0.0,
+    sample_rate: null,
+    firmware_version: '3.28.0',
+  },
+  {
+    // services/lights.py: LIGHT_CHANNELS = {13: "Lights 1"}
+    id: 'light-ch13',
+    name: 'Lights 1 (SERVO13)',
     type: 'light',
     status: 'connected',
-    module_status: 'Standby at 0%',
-    last_reading: minutesAgo(3),
-    power_usage: 0.1,
+    module_status: 'Ready: Idle',
+    last_reading: null,
+    power_usage: 0.0,
     sample_rate: null,
-    firmware_version: '1.2.3',
+    firmware_version: null,
   },
   {
-    id: 'artemis',
-    name: 'Artemis Surface Tracker',
+    // services/barometer.py: module_status=f"Ready: {press_abs:.1f} hPa"
+    id: 'barometer',
+    name: 'Barometer',
+    type: 'sensor',
+    status: 'connected',
+    module_status: 'Ready: 1013.2 hPa',
+    last_reading: null,
+    power_usage: 0.0,
+    sample_rate: null,
+    firmware_version: null,
+  },
+  {
+    // services/barometer.py: module_status=f"Ready: {temp_c:.1f} °C"
+    id: 'thermometer',
+    name: 'Thermometer',
+    type: 'sensor',
+    status: 'connected',
+    module_status: 'Ready: 11.4 °C',
+    last_reading: null,
+    power_usage: 0.0,
+    sample_rate: null,
+    firmware_version: null,
+  },
+  {
+    // services/tracker.py: "{fix_type_name} | {lat:.6f}, {lon:.6f} | {sats} sats"
+    id: 'artemis-tracker',
+    name: 'Artemis Global Tracker',
     type: 'tracker',
     status: 'connected',
-    module_status: 'GPS lock, Iridium registered',
-    last_reading: minutesAgo(1),
-    power_usage: 0.5,
+    module_status: '3D Fix | 47.601900, -122.378200 | 11 sats',
+    last_reading: minutesAgo(0.5),
+    power_usage: 0.0,
     sample_rate: null,
-    firmware_version: '0.8.2',
-  },
-  {
-    id: 'imu',
-    name: 'Inertial Measurement Unit',
-    type: 'imu',
-    status: 'connected',
-    module_status: 'Calibrated',
-    last_reading: minutesAgo(0.05),
-    power_usage: 0.2,
-    sample_rate: 50,
-    firmware_version: '4.5.7',
+    firmware_version: '1.0.1',
   },
 ]
 
-export const sensorReadings: Record<string, SensorReading[]> = {
-  ctd: [
-    { sensor_id: 'ctd', sensor_name: 'Temperature', value: 11.42, unit: '°C', timestamp: minutesAgo(0.1), quality: 98 },
-    { sensor_id: 'ctd', sensor_name: 'Salinity', value: 30.18, unit: 'PSU', timestamp: minutesAgo(0.1), quality: 97 },
-    { sensor_id: 'ctd', sensor_name: 'Depth', value: 0.0, unit: 'm', timestamp: minutesAgo(0.1), quality: 99 },
-  ],
-  imu: [
-    { sensor_id: 'imu', sensor_name: 'Roll', value: 1.8, unit: '°', timestamp: minutesAgo(0.05), quality: 100 },
-    { sensor_id: 'imu', sensor_name: 'Pitch', value: -0.6, unit: '°', timestamp: minutesAgo(0.05), quality: 100 },
-  ],
-}
+/**
+ * `SensorService.get_sensor_readings` always returns an empty list — the
+ * Ping Service exposes no per-sensor history — so the demo does the same.
+ */
+export const sensorReadings: Record<string, SensorReading[]> = {}
 
 // ── Network ─────────────────────────────────────────────────────────
 
@@ -257,12 +280,14 @@ export const wlanState: WlanState = {
 
 // ── Dive ────────────────────────────────────────────────────────────
 
+// services/dive.py: PARAM_NAME = "DORIS_START"; _DORIS_STATE_NAMES maps
+// -1 CONFIG, 0 MISSION_START, 1 DESCENT, 2 ON_BOTTOM, 3 ASCENT, 4 RECOVERY.
 export const diveStatus: DiveStatus = {
-  param: 'DORIS_DIVE_STATE',
+  param: 'DORIS_START',
   value: 0,
   active: false,
-  doris_script_state: 0,
-  doris_script_state_name: 'IDLE',
+  doris_script_state: -1,
+  doris_script_state_name: 'CONFIG',
 }
 
 export const diveMission: DiveMissionState = {
@@ -349,57 +374,75 @@ export const armingStatus: ArmingStatus = {
 
 // ── Media ───────────────────────────────────────────────────────────
 
-function image(n: number, dive: string, diveName: string, minutes: number): MediaFile {
+/**
+ * Filenames follow ip_camera_recorder.py:
+ *   snapshots  photos/radcam_<stamp>_<phase>_<seq:05d>.jpg
+ *   finalized  radcam_<stamp>_<phase>_cyc<CC>_part<NN>_<NNNNN>_t<open>.mp4
+ * where <stamp> is the dive-scoped %Y%m%d_%H%M%S and <open> is the
+ * fragment's UTC open time as %Y%m%dt%H%M%S. The intermediate .ts
+ * segments are deleted at finalize, so they never appear in the UI.
+ */
+function image(n: number, stamp: string, diveName: string, phase: string, minutes: number): MediaFile {
+  const filename = `radcam_${stamp}_${phase}_${String(n).padStart(5, '0')}.jpg`
+  const path = `dive_${stamp}/photos/${filename}`
   return {
-    id: `img_${dive}_${n}`,
-    filename: `IMG_${String(n).padStart(4, '0')}.jpg`,
+    id: path,
+    filename,
     media_type: 'image',
     size_bytes: 4_100_000 + n * 9_311,
     duration_seconds: null,
-    resolution: '4056x3040',
+    resolution: '4K',
     created_at: minutesAgo(minutes + n * 0.5),
-    mission_id: dive,
+    mission_id: `dive_${stamp}`,
     dive_name: diveName,
     thumbnail_url: null,
-    download_url: `/api/v1/media/download?path=${dive}/IMG_${String(n).padStart(4, '0')}.jpg`,
+    download_url: `/api/v1/media/download?path=${encodeURIComponent(path)}`,
     is_synced: n % 3 !== 0,
   }
 }
 
-function video(n: number, dive: string, diveName: string, minutes: number): MediaFile {
+function video(n: number, stamp: string, diveName: string, phase: string, opened: string, minutes: number): MediaFile {
+  const filename =
+    `radcam_${stamp}_${phase}_cyc01_part${String(n - 1).padStart(2, '0')}` +
+    `_${String(n - 1).padStart(5, '0')}_t${opened}.mp4`
+  const path = `dive_${stamp}/${filename}`
   return {
-    id: `vid_${dive}_${n}`,
-    filename: `VID_${String(n).padStart(4, '0')}.mp4`,
+    id: path,
+    filename,
     media_type: 'video',
     size_bytes: 182_000_000 + n * 1_400_000,
-    duration_seconds: 30,
-    resolution: '1920x1080',
-    created_at: minutesAgo(minutes + n * 4),
-    mission_id: dive,
+    duration_seconds: 300,
+    resolution: '4K',
+    created_at: minutesAgo(minutes + n * 5),
+    mission_id: `dive_${stamp}`,
     dive_name: diveName,
     thumbnail_url: null,
-    download_url: `/api/v1/media/download?path=${dive}/VID_${String(n).padStart(4, '0')}.mp4`,
+    download_url: `/api/v1/media/download?path=${encodeURIComponent(path)}`,
     is_synced: n % 2 === 0,
   }
 }
 
+const DIVE_A = '20260726_143210'
+const DIVE_B = '20260724_091845'
+
 export const mediaFiles: MediaFile[] = [
-  ...Array.from({ length: 8 }, (_, i) => image(i + 1, 'dive_20260726_1432', 'Elliott Bay Transect 4', 1500)),
-  ...Array.from({ length: 3 }, (_, i) => video(i + 1, 'dive_20260726_1432', 'Elliott Bay Transect 4', 1500)),
-  ...Array.from({ length: 6 }, (_, i) => image(i + 1, 'dive_20260724_0918', 'Blakely Rock Wall', 4400)),
-  ...Array.from({ length: 2 }, (_, i) => video(i + 1, 'dive_20260724_0918', 'Blakely Rock Wall', 4400)),
+  ...Array.from({ length: 8 }, (_, i) => image(i + 1, DIVE_A, 'Elliott Bay Transect 4', 'on_bottom', 1500)),
+  ...Array.from({ length: 3 }, (_, i) => video(i + 1, DIVE_A, 'Elliott Bay Transect 4', 'on_bottom', '20260726t143512', 1500)),
+  ...Array.from({ length: 6 }, (_, i) => image(i + 1, DIVE_B, 'Blakely Rock Wall', 'on_bottom', 4400)),
+  ...Array.from({ length: 2 }, (_, i) => video(i + 1, DIVE_B, 'Blakely Rock Wall', 'descent', '20260724t092003', 4400)),
   {
-    id: 'mcap_20260726',
-    filename: 'telemetry.mcap',
+    // finalize writes a manifest.json alongside the MP4s in the dive dir
+    id: `dive_${DIVE_A}/manifest.json`,
+    filename: 'manifest.json',
     media_type: 'data',
-    size_bytes: 24_800_000,
+    size_bytes: 18_442,
     duration_seconds: null,
     resolution: null,
-    created_at: minutesAgo(1500),
-    mission_id: 'dive_20260726_1432',
+    created_at: minutesAgo(1400),
+    mission_id: `dive_${DIVE_A}`,
     dive_name: 'Elliott Bay Transect 4',
     thumbnail_url: null,
-    download_url: '/api/v1/media/download?path=dive_20260726_1432/telemetry.mcap',
+    download_url: `/api/v1/media/download?path=${encodeURIComponent(`dive_${DIVE_A}/manifest.json`)}`,
     is_synced: true,
   },
 ]
@@ -443,31 +486,33 @@ function configuration(name: string, diveName: string, depth: string, ageDays: n
     name,
     dive_name: diveName,
     estimated_depth: depth,
+    // Phase defaults follow DescentPhase / BottomPhase / AscentPhase:
+    // descent and ascent are off by default, bottom enables both.
     descent: {
-      camera: cameraSettings({ camera_type: 'timelapse', capture_frequency: 60 }),
-      light: lightSettings({ brightness: 40 }),
+      camera: cameraSettings(),
+      light: lightSettings(),
     },
     bottom: {
-      camera: cameraSettings({ camera_type: 'video-interval' }),
-      camera_delay: time('2', 'minutes'),
-      light: lightSettings({ brightness: 80 }),
-      light_delay: time('2', 'minutes'),
+      camera: cameraSettings({ enabled: true }),
+      camera_delay: time('30'),
+      light: lightSettings({ enabled: true }),
+      light_delay: time('30'),
     },
     ascent: {
-      same_as_descent: true,
-      camera: cameraSettings({ enabled: false }),
-      light: lightSettings({ enabled: false }),
+      same_as_descent: false,
+      camera: cameraSettings(),
+      light: lightSettings(),
       release_weight: {
         method: 'elapsed',
-        elapsed: time('90', 'minutes'),
-        release_date: new Date(BOOT).toISOString().slice(0, 10),
-        release_time: '14:30',
+        elapsed: time('6', 'hours'),
+        release_date: '2026-02-02',
+        release_time: '12:00',
       },
     },
     recovery: {
-      activate_mast_light: true,
-      update_frequency: '5 minutes',
-      use_iridium: true,
+      activate_mast_light: false,
+      update_frequency: '5min',
+      use_iridium: false,
       use_lora: false,
     },
     created_at: daysAgo(ageDays),
@@ -489,43 +534,49 @@ export const configurationSummaries: ConfigurationSummary[] = configurations.map
 
 // ── Notifications ───────────────────────────────────────────────────
 
+/**
+ * Uses the exact templates from `NotificationService`, including the
+ * `{key}-{hex8}` id format. Only notifications that service can actually
+ * emit appear here — nothing fires on the SOFTWARE category, and the
+ * storage warnings start at 80%, so a 27%-full disk produces none.
+ */
 export const notifications: NotificationItemApi[] = [
   {
-    id: 'n1',
+    id: 'dive_completed-7c1a94e2',
     type: 'success',
     category: 'mission',
-    title: 'Dive completed',
-    message: 'Elliott Bay Transect 4 finished successfully. 214 images and 6 videos captured.',
-    timestamp: minutesAgo(1440),
+    title: 'Dive Completed',
+    message: 'DORIS has completed the dive mission and returned to the surface.',
+    timestamp: minutesAgo(1332),
     read: false,
-    link_to: 'alldives',
+    link_to: 'location',
   },
   {
-    id: 'n2',
-    type: 'warning',
-    category: 'system',
-    title: 'Storage above 25%',
-    message: 'External SSD is 27% full. Consider offloading media before the next deployment.',
-    timestamp: minutesAgo(300),
-    read: false,
-    link_to: 'media',
-  },
-  {
-    id: 'n3',
+    id: 'net_connected-3b8f0d51',
     type: 'info',
     category: 'network',
-    title: 'Iridium check-in received',
-    message: 'Surface tracker reported position 47.6019, -122.3782.',
-    timestamp: minutesAgo(180),
+    title: 'Network Connected',
+    message: 'Successfully connected to RV Falkor Deck.',
+    timestamp: minutesAgo(240),
+    read: false,
+    link_to: null,
+  },
+  {
+    id: 'dive_started-a04e7b6c',
+    type: 'success',
+    category: 'mission',
+    title: 'Dive Started',
+    message: 'DORIS has begun its dive mission. Monitoring in progress.',
+    timestamp: minutesAgo(1440),
     read: true,
     link_to: null,
   },
   {
-    id: 'n4',
-    type: 'info',
-    category: 'software',
-    title: 'Extension updated',
-    message: 'DORIS extension updated to bh-1.4.0.',
+    id: 'net_disconnected-e59c2a17',
+    type: 'warning',
+    category: 'network',
+    title: 'Network Disconnected',
+    message: 'Lost connection to Dock Office.',
     timestamp: minutesAgo(2880),
     read: true,
     link_to: null,
