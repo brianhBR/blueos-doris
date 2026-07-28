@@ -76,6 +76,11 @@ jobs:
         uses: docker/metadata-action@v6
         with:
           images: ghcr.io/${{ github.repository_owner }}/${{ env.IMAGE_PREFIX }}${{ env.IMAGE_NAME }}
+          # Without this the action defaults to latest=auto, which appends
+          # latest on its own whenever the type=match rule below hits -- so a
+          # bh- tag claimed latest no matter what the explicit entry said.
+          flavor: |
+            latest=false
           tags: |
             type=ref,event=branch
             type=ref,event=pr
