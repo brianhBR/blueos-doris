@@ -44,6 +44,15 @@
   the MAVLink stream, and the dive record is closed at that point.
 - Dive records and mission state are written atomically, so a power cut cannot
   leave a truncated file that is unreadable on the next boot.
+- USB verification now compares each copy against its source size instead of
+  rejecting anything empty.  A log that the source system left empty is not a
+  failed copy, and treating it as one failed the whole run at the last step
+  after every file had already been written.  Truncated copies are still caught.
+- RadCam Spy collection skips sessions that were opened but never written, and
+  matches session filenames exactly rather than looking for any date-like run of
+  digits in the name.
+- `.ndjson` counts as a data file, so collected RadCam Spy logs appear in the
+  Data tab rather than sitting unlisted on the stick.
 
 ### RadCam Spy logs
 

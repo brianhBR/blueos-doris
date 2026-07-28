@@ -53,7 +53,12 @@ _USB_HEADROOM_MB = 128.0
 # window is padded before testing for overlap.
 _RADCAM_WINDOW_PAD = timedelta(minutes=5)
 
-_RADCAM_STAMP_RE = re.compile(r"(?P<stamp>\d{8}[_-]?\d{6})")
+# radcam_<YYYYMMDD>_<HHMMSS>.ndjson, the name the spy extension opens a session
+# with.  Anchored to the whole filename so an unrelated run of digits elsewhere
+# in a name cannot be mistaken for a session start.
+_RADCAM_LOG_RE = re.compile(
+    r"^radcam_(?P<date>\d{8})_(?P<time>\d{6})\.ndjson$", re.IGNORECASE
+)
 
 _STEP_LABELS: tuple[tuple[str, str], ...] = (
     ("preflight", "Check dive and USB capacity"),
@@ -254,6 +259,16 @@ def _copy_verified(src: Path, dest: Path) -> int:
         raise
     os.replace(tmp, dest)
     return written
+
+
+def _note_copy(ctx: dict, dest: Path, expected: int | None = None) -> None:
+    """Register a file for the USB verification step.
+
+    ``expected`` is the source size where we have one, so verification can
+    catch a truncated copy.  Files another service produced directly on the
+    stick have no source to compare against and are only checked for presence.
+    """
+    ctx["copied"].append((dest, expected))
 
 
 def _recorder_base_stamp() -> str | None:
@@ -571,10 +586,15 @@ class DiveProcessingService:
 
         def _copy() -> list[str]:
             names: list[str] = []
-            for src in sorted(logs_dir.glob("*.ndjson")):
+            for src in sorted(logs_dir.glob("radcam_*.ndjson")):
                 try:
                     stat = src.stat()
                 except OSError:
+                    continue
+                # The extension leaves a zero-byte file behind for a session it
+                # opened but never wrote to.  Nothing to carry, and an empty
+                # file on the stick is indistinguishable from a failed copy.
+                if stat.st_size == 0:
                     continue
                 session_end = datetime.fromtimestamp(stat.st_mtime, tz=timezone.utc)
                 session_start = (
@@ -622,6 +642,8 @@ class DiveProcessingService:
                         continue
                     body = await client.get(f"{base}/api/logs/{name}")
                     body.raise_for_status()
+                    if not body.content:
+                        continue
                     tmp = dest / f"{name}.part"
                     tmp.write_bytes(body.content)
                     os.replace(tmp, dest / name)
@@ -644,7 +666,7 @@ class DiveProcessingService:
             raise RuntimeError(result.get("error", "archive failed"))
         files = result.get("files", [])
         for path in files:
-            ctx["copied"].append(Path(path))
+            _note_copy(ctx, Path(path))
         return f"{len(files)} autopilot log(s) copied"
 
     async def _step_mcap(self, session: ProcessingSession, ctx: dict) -> str:
@@ -672,7 +694,7 @@ class DiveProcessingService:
 
         dest = usb_dir / "telemetry" / mcap_path.name
         written = await asyncio.to_thread(_copy_verified, mcap_path, dest)
-        ctx["copied"].append(dest)
+        _note_copy(ctx, dest, written)
         ctx["record"]["mcap_usb_file"] = str(dest)
         return f"{mcap_path.name} ({written / (1024 * 1024):.1f} MB)"
 
@@ -691,7 +713,7 @@ class DiveProcessingService:
         except Exception as e:
             logger.warning("Could not reload dive record after CSV export: %s", e)
         if result.get("file"):
-            ctx["copied"].append(Path(result["file"]))
+            _note_copy(ctx, Path(result["file"]))
         return f"{result.get('rows', 0)} row(s) exported"
 
     async def _step_media(self, session: ProcessingSession, ctx: dict) -> str:
@@ -706,18 +728,18 @@ class DiveProcessingService:
             videos = 0
             photos = 0
             for src in sorted(dive_dir.glob("*.mp4")):
-                _copy_verified(src, usb_dir / "video" / src.name)
-                ctx["copied"].append(usb_dir / "video" / src.name)
+                written = _copy_verified(src, usb_dir / "video" / src.name)
+                _note_copy(ctx, usb_dir / "video" / src.name, written)
                 videos += 1
             for src in sorted(dive_dir.rglob("*.jpg")):
-                _copy_verified(src, usb_dir / "photos" / src.name)
-                ctx["copied"].append(usb_dir / "photos" / src.name)
+                written = _copy_verified(src, usb_dir / "photos" / src.name)
+                _note_copy(ctx, usb_dir / "photos" / src.name, written)
                 photos += 1
             for src in sorted((dive_dir / "logs").rglob("*")):
                 if src.is_file():
                     rel = src.relative_to(dive_dir / "logs")
-                    _copy_verified(src, usb_dir / "logs" / rel)
-                    ctx["copied"].append(usb_dir / "logs" / rel)
+                    written = _copy_verified(src, usb_dir / "logs" / rel)
+                    _note_copy(ctx, usb_dir / "logs" / rel, written)
             return videos, photos
 
         videos, photos = await asyncio.to_thread(_copy_media)
@@ -736,13 +758,13 @@ class DiveProcessingService:
 
         def _copy_record() -> int:
             count = 0
-            _copy_verified(dive_file, usb_dir / dive_file.name)
-            ctx["copied"].append(usb_dir / dive_file.name)
+            written = _copy_verified(dive_file, usb_dir / dive_file.name)
+            _note_copy(ctx, usb_dir / dive_file.name, written)
             count += 1
             if dive_dir is not None:
                 for manifest in sorted(dive_dir.glob("*_manifest.json")):
-                    _copy_verified(manifest, usb_dir / manifest.name)
-                    ctx["copied"].append(usb_dir / manifest.name)
+                    written = _copy_verified(manifest, usb_dir / manifest.name)
+                    _note_copy(ctx, usb_dir / manifest.name, written)
                     count += 1
             return count
 
@@ -750,21 +772,28 @@ class DiveProcessingService:
         return f"{copied} file(s) copied"
 
     async def _step_verify_usb(self, session: ProcessingSession, ctx: dict) -> str:
-        copied: list[Path] = ctx.get("copied") or []
+        copied: list[tuple[Path, int | None]] = ctx.get("copied") or []
         if ctx.get("usb_dir") is None:
             raise StepSkipped("no USB stick")
         if not copied:
             raise StepSkipped("nothing was copied to USB")
 
         def _verify() -> int:
-            missing = [p for p in copied if not p.exists()]
+            missing = [dest for dest, _ in copied if not dest.exists()]
             if missing:
                 names = ", ".join(p.name for p in missing[:5])
                 raise OSError(f"{len(missing)} file(s) missing on USB: {names}")
-            empty = [p for p in copied if p.stat().st_size == 0]
-            if empty:
-                names = ", ".join(p.name for p in empty[:5])
-                raise OSError(f"{len(empty)} empty file(s) on USB: {names}")
+            # Compare against the source size rather than flagging anything
+            # empty: a log the source system left empty is not a bad copy, and
+            # failing here would discard an otherwise complete bundle.
+            truncated = [
+                dest
+                for dest, expected in copied
+                if expected is not None and dest.stat().st_size != expected
+            ]
+            if truncated:
+                names = ", ".join(p.name for p in truncated[:5])
+                raise OSError(f"{len(truncated)} truncated file(s) on USB: {names}")
             return len(copied)
 
         count = await asyncio.to_thread(_verify)
@@ -779,10 +808,10 @@ class DiveProcessingService:
 
 def _radcam_stamp_from_name(name: str) -> datetime | None:
     """Parse the session start out of a RadCam Spy log filename."""
-    match = _RADCAM_STAMP_RE.search(name)
+    match = _RADCAM_LOG_RE.match(name)
     if match is None:
         return None
-    raw = match.group("stamp").replace("-", "").replace("_", "")
+    raw = f"{match.group('date')}{match.group('time')}"
     try:
         return datetime.strptime(raw, "%Y%m%d%H%M%S").replace(tzinfo=timezone.utc)
     except ValueError:

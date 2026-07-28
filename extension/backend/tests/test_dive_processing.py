@@ -352,6 +352,51 @@ def test_copy_verified_cleans_up_when_the_write_fails(tmp_path, monkeypatch):
     assert list(dest.parent.glob("*.part")) == []
 
 
+def _processing_session() -> module.ProcessingSession:
+    return module.ProcessingSession(
+        session_id="t",
+        dive_id="dive_0001",
+        dive_file="x",
+        steps=[module.ProcessingStep(key=k, label=v) for k, v in module._STEP_LABELS],
+    )
+
+
+def test_verify_usb_accepts_a_source_file_that_was_always_empty(tmp_path):
+    """An empty extension log is not a failed copy, and must not sink the run."""
+    service = DiveProcessingService()
+    usb = tmp_path / "usb"
+    usb.mkdir()
+    empty = usb / "extension.log"
+    empty.touch()
+
+    ctx = {"usb_dir": usb, "copied": [(empty, 0)]}
+    detail = asyncio.run(service._step_verify_usb(_processing_session(), ctx))
+
+    assert "1 file(s)" in detail
+
+
+def test_verify_usb_rejects_a_truncated_copy(tmp_path):
+    service = DiveProcessingService()
+    usb = tmp_path / "usb"
+    usb.mkdir()
+    short = usb / "telemetry.mcap"
+    short.write_bytes(b"x" * 10)
+
+    ctx = {"usb_dir": usb, "copied": [(short, 4096)]}
+    with pytest.raises(OSError, match="truncated"):
+        asyncio.run(service._step_verify_usb(_processing_session(), ctx))
+
+
+def test_verify_usb_rejects_a_file_that_never_landed(tmp_path):
+    service = DiveProcessingService()
+    usb = tmp_path / "usb"
+    usb.mkdir()
+
+    ctx = {"usb_dir": usb, "copied": [(usb / "gone.bin", 12)]}
+    with pytest.raises(OSError, match="missing"):
+        asyncio.run(service._step_verify_usb(_processing_session(), ctx))
+
+
 # ── RadCam Spy log selection ──────────────────────────────────────────────
 
 
@@ -360,6 +405,32 @@ def test_radcam_stamp_parsing():
         2026, 7, 27, 10, 15, 0, tzinfo=timezone.utc
     )
     assert _radcam_stamp_from_name("no-timestamp.ndjson") is None
+    # A digit run somewhere else in the name is not a session start.
+    assert _radcam_stamp_from_name("export_of_20260727_101500_notes.ndjson") is None
+
+
+def test_radcam_collection_skips_empty_session_logs(tmp_path, monkeypatch):
+    """An opened-but-unwritten session carries nothing worth copying."""
+    logs_dir = tmp_path / "radcam" / "logs"
+    logs_dir.mkdir(parents=True)
+    written = logs_dir / "radcam_20260727_100500.ndjson"
+    written.write_text('{"t":1}\n')
+    empty = logs_dir / "radcam_20260727_101500.ndjson"
+    empty.touch()
+    for f in (written, empty):
+        _set_mtime(f, datetime(2026, 7, 27, 10, 30, tzinfo=timezone.utc))
+
+    monkeypatch.setattr(module.settings, "radcam_spy_logs_dir", str(logs_dir))
+    service = DiveProcessingService()
+    start = datetime(2026, 7, 27, 10, 0, tzinfo=timezone.utc)
+    dest = tmp_path / "out"
+
+    names = asyncio.run(
+        service._collect_radcam_from_mount(start, start + timedelta(hours=1), dest)
+    )
+
+    assert names == [written.name]
+    assert not (dest / empty.name).exists()
 
 
 def test_radcam_collection_picks_only_overlapping_sessions(tmp_path, monkeypatch):
