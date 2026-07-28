@@ -13,6 +13,7 @@ DATA_ROOT/dives/.
 import asyncio
 import json
 import logging
+import os
 import re
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,8 +24,13 @@ from ..services import binlog, dive_csv_export
 from ..services import ip_camera_recorder as iprec
 from ..services.camera import CameraService
 from ..services.dive import DiveService
-from ..services.dive_finalize import finalize_dive
-from ..services.dive_records import find_latest_active_dive_record
+from ..services.dive_processing import dive_processing_service, quiesce_dive
+from ..services.dive_records import (
+    find_latest_active_dive_record,
+    set_mission_terminal_status,
+    update_active_dive_record,
+    write_json_atomic,
+)
 from ..services.frame import FrameService
 from ..services.safe_surface import safe_surface_service
 from ..services.storage import DATA_ROOT, StorageService, media_download_id_from_abs_path
@@ -73,47 +79,54 @@ def _sync_mission_state_from_vehicle(status_dict: dict) -> None:
         ms["activated_at"] = datetime.now(tz=timezone.utc).isoformat()
         changed = True
     elif st in ("pending", "active") and not active:
-        completed = bool(status_dict.get("completed", False))
+        # This runs off UI polling, so it can arrive long after the dive ended
+        # -- including after the AGT cut power and the operator power cycled on
+        # deck, by which point Lua has restarted in CONFIG and reports neither
+        # active nor completed.  Treating that as a cancellation would mislabel
+        # every successful dive, so an absent recovery signal only downgrades
+        # the mission when nothing else witnessed the end of the dive.
+        completed = bool(status_dict.get("completed", False)) or _recovery_was_seen()
         new_status = "completed" if completed else "cancelled"
         ms["status"] = new_status
         ms[f"{new_status}_at"] = datetime.now(tz=timezone.utc).isoformat()
         changed = True
         try:
-            updated = _update_active_dive_record(new_status)
+            _update_active_dive_record(new_status)
         except Exception as e:
             logger.warning("Failed to mark dive record %s: %s", new_status, e)
-            updated = None
-        if updated is not None:
-            _schedule_binlog_archive(updated)
-            _schedule_csv_export(updated)
     if changed:
-        try:
-            MISSION_STATE_PATH.write_text(json.dumps(ms, indent=2, default=str))
-        except Exception as e:
-            logger.warning("Failed to update mission_state.json: %s", e)
+        _write_mission_state({k: v for k, v in ms.items() if not k.startswith("_")})
+
+
+def _recovery_was_seen() -> bool:
+    """True if anything already observed this dive reach RECOVERY.
+
+    Quiesce stamps the dive record when Lua enters RECOVERY, and the
+    safe-surface service latches the same observation from the MAVLink stream.
+    Either is proof the dive finished rather than being abandoned.
+    """
+    if safe_surface_service.recovery_seen():
+        return True
+    record = _find_latest_active_dive_record()
+    if record is None:
+        return False
+    return bool(record.get("dive_stamp")) and record.get("processing_state") is not None
+
+
+def _write_dive_record(dive_file: Path, record: dict) -> None:
+    write_json_atomic(dive_file, record)
 
 
 def _write_mission_state(payload: dict) -> None:
     DATA_ROOT.mkdir(parents=True, exist_ok=True)
     try:
-        MISSION_STATE_PATH.write_text(json.dumps(payload, indent=2, default=str))
+        write_json_atomic(MISSION_STATE_PATH, payload)
     except Exception as e:
         logger.warning("Failed to write mission_state.json: %s", e)
 
 
 def _set_mission_terminal_status(new_status: str) -> None:
-    if new_status not in ("cancelled", "completed"):
-        return
-    if not MISSION_STATE_PATH.exists():
-        return
-    try:
-        ms = json.loads(MISSION_STATE_PATH.read_text())
-        ms["status"] = new_status
-        key = "cancelled_at" if new_status == "cancelled" else "completed_at"
-        ms[key] = datetime.now(tz=timezone.utc).isoformat()
-        MISSION_STATE_PATH.write_text(json.dumps(ms, indent=2, default=str))
-    except Exception as e:
-        logger.warning("Failed to set mission status %s: %s", new_status, e)
+    set_mission_terminal_status(MISSION_STATE_PATH, new_status)
 
 
 def _next_dive_filename() -> Path:
@@ -129,89 +142,14 @@ def _next_dive_filename() -> Path:
 
 
 def _update_active_dive_record(new_status: str) -> Path | None:
-    """Find the most recent active dive record and update its status.
-
-    Returns the path of the dive record that was updated, or ``None`` if
-    no active dive was found.  The caller uses the returned path to
-    schedule downstream finalize work (e.g. BIN log archive).
-    """
-    DIVES_DIR.mkdir(parents=True, exist_ok=True)
-    pattern = re.compile(r"^dive_(\d{4})\.json$")
-    dive_files = []
-    for f in DIVES_DIR.iterdir():
-        m = pattern.match(f.name)
-        if m:
-            dive_files.append((int(m.group(1)), f))
-    dive_files.sort(reverse=True)
-
-    for _, dive_file in dive_files:
-        try:
-            record = json.loads(dive_file.read_text())
-            if record.get("status") == "active":
-                record["status"] = new_status
-                record["ended_at"] = datetime.now(tz=timezone.utc).isoformat()
-                dive_file.write_text(json.dumps(record, indent=2, default=str))
-                logger.info(f"Dive record updated: {dive_file.name} -> {new_status}")
-                return dive_file
-        except Exception as e:
-            logger.warning(f"Error reading {dive_file.name}: {e}")
-    return None
+    """Close the most recent active dive record; returns its path or None."""
+    return update_active_dive_record(DIVES_DIR, new_status)
 
 
 def _find_latest_active_dive_record() -> dict | None:
     """Most recent 'active' dive record, used to reconstruct the banner
     configuration name after a restart/reconnect (issue #38)."""
     return find_latest_active_dive_record(DIVES_DIR)
-
-
-def _schedule_binlog_archive(dive_file: Path) -> None:
-    """Fire-and-forget background BIN log archive for a finalized dive.
-
-    Picks up the dive's BIN log(s) from the firmware logs dir and copies
-    them to USB (where they'll surface in the Data tab).  Failures are
-    logged but never bubble up to the caller — finalization happens on
-    the request path and must not block on a slow USB write.
-    """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        logger.debug("No running loop; skipping BIN archive for %s", dive_file)
-        return
-
-    async def _runner() -> None:
-        try:
-            result = await binlog.archive_dive_bin_logs(dive_file)
-            logger.info("BIN archive (%s): %s", dive_file.name, result)
-        except Exception:
-            logger.exception("BIN archive failed for %s", dive_file)
-
-    loop.create_task(_runner())
-
-
-def _schedule_csv_export(dive_file: Path) -> None:
-    """Fire-and-forget background dive-data CSV export to USB.
-
-    Parses the dive's ``.mcap`` once at dive end and writes the CSV to
-    USB so the "Export dive data" button can serve it instantly instead
-    of re-parsing on the request path.  Like the BIN archive this runs on
-    the request path's event loop and must never bubble failures up: a
-    missing USB drive or unreadable log just leaves the on-demand export
-    as the fallback.
-    """
-    try:
-        loop = asyncio.get_running_loop()
-    except RuntimeError:
-        logger.debug("No running loop; skipping CSV export for %s", dive_file)
-        return
-
-    async def _runner() -> None:
-        try:
-            result = await dive_csv_export.export_dive_csv_to_usb(dive_file)
-            logger.info("CSV export (%s): %s", dive_file.name, result)
-        except Exception:
-            logger.exception("CSV export failed for %s", dive_file)
-
-    loop.create_task(_runner())
 
 
 def _close_all_active_dive_records(new_status: str = "completed") -> int:
@@ -233,7 +171,8 @@ def _close_all_active_dive_records(new_status: str = "completed") -> int:
                 except OSError:
                     ended = datetime.now(tz=timezone.utc).isoformat()
                 record["ended_at"] = ended
-                f.write_text(json.dumps(record, indent=2, default=str))
+                record.setdefault("processing_state", "pending")
+                _write_dive_record(f, record)
                 logger.info(f"Stale dive closed: {f.name} -> {new_status}")
                 closed += 1
         except Exception as e:
@@ -422,16 +361,13 @@ def register_dive_routes(app: Robyn) -> None:
         except Exception as e:
             logger.warning(f"Failed to stop IP camera recorder: {e}")
 
-        # Update the most recent active dive record
-        updated_dive_file: Path | None = None
+        # Update the most recent active dive record.  A cancelled dive still
+        # has recoverable data, so it is left marked for processing rather than
+        # exported here: the operator runs Process Dive when they are ready.
         try:
-            updated_dive_file = _update_active_dive_record("cancelled")
+            _update_active_dive_record("cancelled")
         except Exception as e:
             logger.warning(f"Failed to update dive record: {e}")
-
-        if updated_dive_file is not None:
-            _schedule_binlog_archive(updated_dive_file)
-            _schedule_csv_export(updated_dive_file)
 
         try:
             _set_mission_terminal_status("cancelled")
@@ -442,20 +378,27 @@ def register_dive_routes(app: Robyn) -> None:
 
     @app.post("/api/v1/dive/finalize")
     async def dive_finalize(request):
-        """Produce per-phase MP4s from this dive's .ts segments.
+        """Quiesce the dive so payload power can be cut safely.
 
-        Called by the Lua dive script on RECOVERY entry (fire-and-
-        forget).  Also callable manually from the UI or curl.
+        Called by the Lua dive script on RECOVERY entry (fire-and-forget).
+        This is deliberately cheap: it stops the recorder so the last video
+        segment closes cleanly, records how the dive should later be
+        processed, and closes the dive record while we still have proof the
+        dive reached RECOVERY.  It must finish in seconds, because the AGT is
+        waiting on it before cutting power to the Pi, camera, and lights.
+
+        The expensive work -- ffmpeg, USB copies, telemetry parsing -- is
+        deferred to ``POST /dive/history/:dive_id/process``, which the
+        operator triggers from the Previous Dives page on deck.
 
         Optional inputs (query string OR JSON body):
 
-        * ``stamp``: dive stamp; defaults to the most recent recording
-          session's ``base_stamp``.
+        * ``stamp``: dive stamp; defaults to the recorder's current
+          ``base_stamp``.
         * ``bottom_mode``: ``DORIS_BTM_CMOD`` value (1=continuous,
-          2=interval, 3=timelapse).  Selects the bottom-phase output
-          strategy: continuous yields one MP4 per 5-min chunk,
-          interval yields one MP4 per ipcam start/stop cycle, anything
-          else falls back to the legacy concat-into-one behavior.
+          2=interval, 3=timelapse).  Stored on the dive record so the
+          deferred processing job can pick the right bottom-phase strategy
+          long after the autopilot parameter has changed.
         """
         try:
             body = json.loads(request.body) if request.body else {}
@@ -476,20 +419,66 @@ def register_dive_routes(app: Robyn) -> None:
                 bottom_mode = int(bm_raw)
             except (TypeError, ValueError):
                 bottom_mode = None
-        try:
-            result = await finalize_dive(stamp, bottom_mode=bottom_mode)
-        except Exception as e:
-            logger.exception("dive finalize failed")
-            return Response(
-                status_code=500,
-                description=json.dumps({"success": False, "error": str(e)}),
-                headers={"Content-Type": "application/json"},
-            )
+
+        result = await quiesce_dive(stamp=stamp, bottom_mode=bottom_mode)
         return Response(
             status_code=200,
             description=json.dumps(result, default=str),
             headers={"Content-Type": "application/json"},
         )
+
+    @app.post("/api/v1/dive/history/:dive_id/process")
+    async def dive_history_process(request):
+        """Start deferred post-dive processing for one dive."""
+        dive_id = request.path_params.get("dive_id", "").strip()
+        if not re.fullmatch(r"dive_\d{4}", dive_id):
+            return Response(
+                status_code=400,
+                description=json.dumps({"error": "Invalid dive id"}),
+                headers={"Content-Type": "application/json"},
+            )
+        dive_file = DIVES_DIR / f"{dive_id}.json"
+        if not dive_file.exists():
+            return Response(
+                status_code=404,
+                description=json.dumps({"error": f"{dive_id} not found"}),
+                headers={"Content-Type": "application/json"},
+            )
+        try:
+            session_id = dive_processing_service.start(dive_file)
+        except RuntimeError as e:
+            return Response(
+                status_code=409,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
+        return json.dumps({"session_id": session_id, "dive_id": dive_id})
+
+    @app.get("/api/v1/dive/process/status")
+    async def dive_process_status(request):
+        """Poll a processing run. Query params: session_id, from_line.
+
+        Omitting ``session_id`` returns the most recent run, so the UI can
+        recover its progress view after a reload.
+        """
+        session_id = request.query_params.get("session_id", "")
+        if session_id:
+            session = dive_processing_service.get_session(session_id)
+        else:
+            session = dive_processing_service.active_session()
+        if session is None:
+            return json.dumps({"session": None})
+
+        from_line = 0
+        try:
+            from_line = int(request.query_params.get("from_line", "0") or "0")
+        except (TypeError, ValueError):
+            from_line = 0
+
+        payload = session.to_dict()
+        payload["lines"] = session.lines[from_line:]
+        payload["total_lines"] = len(session.lines)
+        return json.dumps({"session": payload}, default=str)
 
     @app.post("/api/v1/dive/sitl/simulate_drop")
     async def sitl_simulate_drop(request):

@@ -324,3 +324,62 @@ async def test_ack_precedes_poweroff(monkeypatch):
         "PWR_ACK=1",
         "sudo systemctl poweroff",
     ]
+
+
+def test_recovery_is_latched_from_the_lua_state():
+    """A late UI poll needs proof the dive finished, not just that it stopped."""
+    service = SafeSurfaceService()
+    assert service.recovery_seen() is False
+
+    service.process_named_value(1, 1, "STATE", 3.0)  # ASCENT
+    assert service.recovery_seen() is False
+
+    service.process_named_value(1, 1, "STATE", 4.0)  # RECOVERY
+    assert service.recovery_seen() is True
+
+    # Lua restarting in CONFIG after a deck power cycle must not clear it.
+    service.process_named_value(1, 1, "STATE", -1.0)
+    assert service.recovery_seen() is True
+
+
+def test_recovery_latch_ignores_other_senders():
+    service = SafeSurfaceService()
+    service.process_named_value(1, 192, "STATE", 4.0)
+    service.process_named_value(2, 1, "STATE", 4.0)
+    assert service.recovery_seen() is False
+
+
+async def test_shutdown_defers_heavy_processing(monkeypatch, tmp_path):
+    """The AGT holds power up while it waits, so this path must stay cheap."""
+    monkeypatch.setattr(module.settings, "agt_shutdown_enabled", True)
+    service = SafeSurfaceService()
+    service._shutdown_request_latched = True
+
+    from doris.services import dive_processing
+
+    monkeypatch.setattr(dive_processing, "_data_root", lambda: tmp_path)
+
+    def _explode(*args, **kwargs):
+        raise AssertionError("shutdown must not run post-processing")
+
+    monkeypatch.setattr(dive_processing.binlog, "archive_dive_bin_logs", _explode)
+    monkeypatch.setattr(
+        dive_processing.dive_csv_export, "export_dive_csv_to_usb", _explode
+    )
+
+    events: list[str] = []
+
+    async def command(command):
+        events.append(command)
+        return True
+
+    async def send_ack(name, value):
+        events.append(f"{name}={value:g}")
+        return True
+
+    monkeypatch.setattr(service, "_run_host_command", command)
+    monkeypatch.setattr(service, "_send_named_float", send_ack)
+
+    await service._shutdown_sequence()
+
+    assert events == ["sync", "PWR_ACK=1", "sudo systemctl poweroff"]

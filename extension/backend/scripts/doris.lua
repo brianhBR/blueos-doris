@@ -1590,9 +1590,11 @@ function update()
         arming:disarm()
         DORIS_START:set_and_save(0)
         -- Fire dive-finalize exactly once on first RECOVERY tick so the
-        -- extension rolls per-phase .ts segments into MP4s + manifest.
-        -- Done before recovery_done so even if disarm is slow we still
-        -- trigger the concat promptly.
+        -- extension stops the recorder, records the bottom mode, and closes
+        -- the dive record.  This is deliberately quick: the AGT holds payload
+        -- power up until it returns, and the heavy video/USB work waits for
+        -- the operator to press Process Dive on deck.  Done before
+        -- recovery_done so a slow disarm cannot delay it.
         if not ipcam_state.finalize_sent then
             ipcam_finalize()
             ipcam_state.finalize_sent = true

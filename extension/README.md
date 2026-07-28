@@ -26,13 +26,56 @@ AGT-wired system and only after an end-to-end bench test, by setting
 takes the Navigator release output offline, so the backend refuses to start a
 mission when shutdown is enabled without a healthy AGT release path. A valid
 request must come from MAVLink system 1/component 192 and follow an `AGT_CAP=3`
-advertisement. The backend finalizes recording, runs `sync`, sends `PWR_ACK=1`
+advertisement. The backend quiesces the dive, runs `sync`, sends `PWR_ACK=1`
 from system 1/component 191, and only then asks BlueOS Commander to power off.
+
+Component 191 is `MAV_COMP_ID_ONBOARD_COMPUTER`, which BlueOS's mavlink-server
+also advertises for itself. That is deliberate, so an operator on a laptop can
+supply the acknowledgement too, but it means the router has to forward a message
+whose source matches its own advertised ID. That has not been confirmed on
+hardware: if it is dropped, the AGT never sees an acknowledgement and leaves
+payload power on, which is safe but silent. Watch for the AGT's
+`POWER: BlueOS shutdown ACK` status text when bench testing the handshake.
 
 The bh-0.6 MAVLink names are `RELAY` (Lua request), `AGT_CAP=3` (bit 0 AGT
 release ownership, bit 1 safe shutdown), `REL_STAT` (physical release state),
 `PWR_SHDN` (`1` requests shutdown and `0` resets the request), and `PWR_ACK=1`.
 Names are intentionally at most ten characters for `NAMED_VALUE_FLOAT`.
+
+## Post-dive processing
+
+Reaching the surface no longer processes the dive. `POST /api/v1/dive/finalize`,
+which Lua fires on its first RECOVERY tick, now only quiesces: it stops the
+camera recorder so the trailing video segment is complete, records the dive stamp
+and bottom mode on the dive record, closes the dive as completed, and marks it
+pending processing. It has to finish in seconds, because the AGT holds payload
+power up until it returns.
+
+Everything expensive runs later, when an operator presses **Process Dive** on the
+Previous Dives page with the vehicle on deck:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/dive/history/:dive_id/process` | Start a run; returns a `session_id`, or 409 if one is already in flight |
+| `GET /api/v1/dive/process/status?session_id=&from_line=` | Poll steps and log lines; omit `session_id` to re-attach to the latest run |
+
+The job builds per-phase MP4s, verifies them before releasing the raw `.ts`
+segments, then copies the telemetry `.mcap`, autopilot BIN logs, videos, photos,
+extension logs, RadCam Spy session logs overlapping the dive, and the dive record
+to the USB stick. Every copy is size-verified and the stick is flushed before the
+UI reports it safe to remove. Only one run happens at a time, runs are safe to
+repeat, and steps needing a USB stick are skipped rather than failed so
+processing without one still builds videos and enriches the dive record.
+
+To collect RadCam Spy logs while that extension is stopped, add a read-only bind
+to this extension's Custom Settings under `HostConfig.Binds`:
+
+```
+"/usr/blueos/extensions/radcam-spy:/tmp/storage/radcam_spy:ro"
+```
+
+Without it the logs are fetched over that extension's HTTP API instead, which
+only answers while it is running.
 
 ## Features
 

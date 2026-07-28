@@ -46,6 +46,13 @@ class Settings(BaseSettings):
     ipcam_recordings_subdir: str = "userdata/ipcam_recordings"
     ipcam_segment_seconds_default: int = 1800
 
+    # RadCam Spy extension logs, collected into the per-dive USB bundle by the
+    # post-dive processing job.  The bind mount is optional and read-only; when
+    # it is absent we fall back to that extension's HTTP API, which only
+    # answers while it is running.
+    radcam_spy_port: int = 9850
+    radcam_spy_logs_dir: str = "/tmp/storage/radcam_spy/logs"
+
     # Removable USB for RTSP segments (same idea as BlueOS_videorecorder DropCam usb_storage)
     usb_mount_point: str = "/mnt/usb"
     usb_doris_folder: str = "DORIS"
@@ -141,6 +148,10 @@ class BlueOSServices:
     @property
     def recorder_extractor(self) -> str:
         return self._url(settings.recorder_extractor_port)
+
+    @property
+    def radcam_spy(self) -> str:
+        return self._url(settings.radcam_spy_port)
 
 
 blueos_services = BlueOSServices()

@@ -376,9 +376,33 @@ async def _ffmpeg_segment_ts_to_mp4(
     return True, "ok"
 
 
+def _consume_sources(
+    files: list[Path], delete_sources: bool,
+) -> tuple[int, list[str]]:
+    """Drop a phase's source ``.ts`` files, or defer their removal.
+
+    Returns ``(inputs_deleted, pending_deletions)``.  With
+    ``delete_sources=False`` nothing is unlinked and the caller gets the
+    absolute paths it is now responsible for deleting -- used by the
+    deferred post-dive job, which verifies the produced MP4s before
+    anything irreversible happens.
+    """
+    if not delete_sources:
+        return 0, [str(f.resolve()) for f in files if f.exists()]
+    removed = 0
+    for f in files:
+        try:
+            f.unlink()
+            removed += 1
+        except OSError:
+            pass
+    return removed, []
+
+
 async def _finalize_continuous_resegment(
     files: list[Path], rec_dir: Path, dive_stamp: str,
     phase: str = "on_bottom",
+    delete_sources: bool = True,
 ) -> list[dict]:
     """Concat all of one phase's ``.ts`` then slice into 5-min MP4s.
 
@@ -401,8 +425,11 @@ async def _finalize_continuous_resegment(
     rename ``chunk00`` -> ``chunk01`` etc. so the operator-visible
     numbering is 1-based and matches the rest of the codebase.
 
-    On success, deletes both the staging file AND the source ``.ts``
-    files.  On any ffmpeg failure, leaves all inputs in place so the
+    On success, deletes the staging file and -- unless
+    ``delete_sources`` is False -- the source ``.ts`` files too; when
+    it is False their paths are reported in ``pending_deletions``
+    instead.  The staging file is an internal temporary and is always
+    removed.  On any ffmpeg failure, leaves all inputs in place so the
     operator can recover manually.
     """
     if not files:
@@ -423,6 +450,7 @@ async def _finalize_continuous_resegment(
         "input_count": len(files),
         "input_bytes": src_bytes,
         "inputs_deleted": 0,
+        "pending_deletions": [],
         "staging": str(staging),
         "outputs": [],
         "success": False,
@@ -550,14 +578,9 @@ async def _finalize_continuous_resegment(
             })
 
     # All chunks landed; safe to drop the source .ts files.
-    removed = 0
-    for f in files:
-        try:
-            f.unlink()
-            removed += 1
-        except OSError:
-            pass
+    removed, pending = _consume_sources(files, delete_sources)
     summary["inputs_deleted"] = removed
+    summary["pending_deletions"] = pending
 
     summary["outputs"] = [str(p) for p in renamed]
     summary["success"] = True
@@ -602,6 +625,7 @@ def _split_tagged_legacy(
 
 async def _finalize_interval_by_cyc(
     files: list[Path], rec_dir: Path, dive_stamp: str,
+    delete_sources: bool = True,
 ) -> list[dict]:
     """INTERVAL bottom: one MP4 per ipcam_start/stop cycle, via cyc<CC>.
 
@@ -653,6 +677,7 @@ async def _finalize_interval_by_cyc(
             "input_count": len(group),
             "input_bytes": src_bytes,
             "inputs_deleted": 0,
+            "pending_deletions": [],
             "output": str(out_path),
             "output_bytes": 0,
             "output_duration_s": None,
@@ -664,20 +689,16 @@ async def _finalize_interval_by_cyc(
             entry["output_bytes"] = (
                 out_path.stat().st_size if out_path.exists() else 0
             )
-            removed = 0
-            for f in group:
-                try:
-                    f.unlink()
-                    removed += 1
-                except OSError:
-                    pass
+            removed, pending = _consume_sources(group, delete_sources)
             entry["inputs_deleted"] = removed
+            entry["pending_deletions"] = pending
         results.append(entry)
 
     if by_legacy_part:
         results.extend(
             await _finalize_interval_by_part_legacy(
                 by_legacy_part, rec_dir, dive_stamp,
+                delete_sources=delete_sources,
             )
         )
     return results
@@ -685,6 +706,7 @@ async def _finalize_interval_by_cyc(
 
 async def _finalize_interval_by_part_legacy(
     by_part: dict[str, list[Path]], rec_dir: Path, dive_stamp: str,
+    delete_sources: bool = True,
 ) -> list[dict]:
     """One-time bridge for pre-cyc<CC> .ts files.
 
@@ -715,6 +737,7 @@ async def _finalize_interval_by_part_legacy(
             "input_count": len(group),
             "input_bytes": src_bytes,
             "inputs_deleted": 0,
+            "pending_deletions": [],
             "output": str(out_path),
             "output_bytes": 0,
             "output_duration_s": None,
@@ -726,20 +749,16 @@ async def _finalize_interval_by_part_legacy(
             entry["output_bytes"] = (
                 out_path.stat().st_size if out_path.exists() else 0
             )
-            removed = 0
-            for f in group:
-                try:
-                    f.unlink()
-                    removed += 1
-                except OSError:
-                    pass
+            removed, pending = _consume_sources(group, delete_sources)
             entry["inputs_deleted"] = removed
+            entry["pending_deletions"] = pending
         results.append(entry)
     return results
 
 
 async def finalize_dive(
     stamp: str | None = None, bottom_mode: int | None = None,
+    delete_sources: bool = True,
 ) -> dict:
     """Group this dive's segments by phase, produce per-phase MP4s.
 
@@ -752,6 +771,11 @@ async def finalize_dive(
     ``None`` (legacy callers, manual curl, or older Lua) the on_bottom
     phase falls back to the historical concat-into-one-MP4 behavior so
     pre-existing dives still finalize cleanly.
+
+    ``delete_sources=False`` produces the MP4s but keeps every source
+    ``.ts`` on disk; the paths that would have been unlinked are listed
+    per phase and unioned into the manifest's ``pending_deletions`` so
+    a deferred job can verify the outputs before removing them.
 
     Returns a manifest dict.  Does nothing (``success=true``, empty
     phase list) if no matching files exist -- e.g. pure-TIMELAPSE dives
@@ -777,7 +801,7 @@ async def finalize_dive(
             "success": True, "reason": "no_stamp",
             "message": "No active or last-known dive stamp; nothing to finalize",
             "finalize_started_at": started_at,
-            "phases": [], "snapshots": [],
+            "phases": [], "snapshots": [], "pending_deletions": [],
         }
 
     rec_root = _recordings_dir()
@@ -787,7 +811,7 @@ async def finalize_dive(
             "message": f"{rec_root} does not exist",
             "dive_stamp": dive_stamp,
             "finalize_started_at": started_at,
-            "phases": [], "snapshots": [],
+            "phases": [], "snapshots": [], "pending_deletions": [],
         }
 
     # Per-dive subfolder is where the recorder writes today.  The flat
@@ -854,6 +878,7 @@ async def finalize_dive(
             phase_results.extend(
                 await _finalize_continuous_resegment(
                     files, rec_dir, dive_stamp,
+                    delete_sources=delete_sources,
                 )
             )
             continue
@@ -861,6 +886,7 @@ async def finalize_dive(
             phase_results.extend(
                 await _finalize_interval_by_cyc(
                     files, rec_dir, dive_stamp,
+                    delete_sources=delete_sources,
                 )
             )
             continue
@@ -871,6 +897,7 @@ async def finalize_dive(
             phase_results.extend(
                 await _finalize_continuous_resegment(
                     files, rec_dir, dive_stamp, phase=phase,
+                    delete_sources=delete_sources,
                 )
             )
             continue
@@ -895,6 +922,7 @@ async def finalize_dive(
             "input_count": len(files),
             "input_bytes": source_bytes,
             "inputs_deleted": 0,
+            "pending_deletions": [],
             "output": str(out_path),
             "output_bytes": 0,
             "output_duration_s": None,
@@ -910,14 +938,9 @@ async def finalize_dive(
             # Delete the originals only on a successful concat.  On
             # failure we keep the .ts segments so the operator can
             # recover manually.
-            removed = 0
-            for f in files:
-                try:
-                    f.unlink()
-                    removed += 1
-                except OSError:
-                    pass
+            removed, pending = _consume_sources(files, delete_sources)
             entry["inputs_deleted"] = removed
+            entry["pending_deletions"] = pending
         phase_results.append(entry)
 
     snapshot_results: list[dict] = []
@@ -944,6 +967,16 @@ async def finalize_dive(
         None, _copy_diagnostic_logs, rec_dir,
     )
 
+    # Flat de-duplicated union of every phase's preserved sources, so a
+    # deferred job has one list to walk after verifying the outputs.
+    pending_deletions: list[str] = []
+    seen_pending: set[str] = set()
+    for p in phase_results:
+        for path_str in p.get("pending_deletions", ()):
+            if path_str not in seen_pending:
+                seen_pending.add(path_str)
+                pending_deletions.append(path_str)
+
     finished_at = datetime.now(tz=timezone.utc).isoformat()
     bottom_mode_label = {
         1: "continuous",
@@ -959,6 +992,7 @@ async def finalize_dive(
         "bottom_mode_id": bottom_mode,
         "phases": phase_results,
         "snapshots": snapshot_results,
+        "pending_deletions": pending_deletions,
         "logs": logs_summary,
         "success": all(p["success"] for p in phase_results) if phase_results else True,
     }

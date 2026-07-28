@@ -33,6 +33,8 @@ from ..config import blueos_services, settings
 logger = logging.getLogger(__name__)
 
 AUTOPILOT_COMPONENT_ID = 1
+# doris.lua's STATE_RECOVERY, the terminal mission state.
+LUA_STATE_RECOVERY = 4
 AGT_COMPONENT_ID = 192
 CAP_AGT_RELEASE_OWNER = 1 << 0
 CAP_SAFE_SHUTDOWN = 1 << 1
@@ -176,6 +178,9 @@ class SafeSurfaceState:
     last_agt_update: str | None = None
     shutdown_state: str = "disabled"
     shutdown_error: str | None = None
+    # Latched once Lua reports RECOVERY, so a late UI poll can tell a finished
+    # dive apart from an abandoned one even after the vehicle has restarted.
+    recovery_seen: bool = False
 
 
 class SafeSurfaceService:
@@ -237,6 +242,10 @@ class SafeSurfaceService:
             self.state.last_release_request_monotonic = time.monotonic()
             self.state.last_release_request = datetime.now(timezone.utc).isoformat()
             self._log_release_mismatch()
+            return
+        if component_id == AUTOPILOT_COMPONENT_ID and name == "STATE":
+            if abs(value - LUA_STATE_RECOVERY) <= 0.1:
+                self.state.recovery_seen = True
             return
         if component_id != AGT_COMPONENT_ID:
             return
@@ -344,14 +353,22 @@ class SafeSurfaceService:
             self._shutdown_request_latched = False
             logger.exception("AGT safe shutdown failed")
 
-    async def _flush_and_finalize(self) -> None:
-        """Stop and finalize the camera recorder before acknowledgement."""
-        from . import ip_camera_recorder
-        from .dive_finalize import finalize_dive
+    def recovery_seen(self) -> bool:
+        """True once Lua has reported RECOVERY on this run."""
+        return self.state.recovery_seen
 
-        if ip_camera_recorder.is_recording():
-            await ip_camera_recorder.stop_recording()
-        await finalize_dive()
+    async def _flush_and_finalize(self) -> None:
+        """Quiesce the dive before acknowledging the AGT's shutdown request.
+
+        Only cheap work belongs here.  The AGT holds payload power up while it
+        waits for the acknowledgement, so running ffmpeg or USB copies at this
+        point would burn the surface battery we are trying to save and risk
+        being killed mid-write.  Video and exports are deferred to the
+        operator-triggered processing job.
+        """
+        from .dive_processing import quiesce_dive
+
+        await quiesce_dive()
 
     async def _send_named_float(self, name: str, value: float) -> bool:
         payload = _named_float_payload(name, value)
