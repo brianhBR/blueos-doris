@@ -95,7 +95,7 @@ local STATE_ASCENT        = 3
 local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-assert(param:add_table(73, "DORIS_", 38),
+assert(param:add_table(73, "DORIS_", 40),
        "DIVE: could not add DORIS_ param table")
 
 -- mission control
@@ -153,6 +153,12 @@ assert(param:add_param(73, 36, "BTM_PAUS", 0),    "DORIS_BTM_PAUS")
 -- BTM_PAUS.  Effective minimum capture frequency = PRE + PST + 1 s.
 assert(param:add_param(73, 37, "TL_PRE_S", 2),    "DORIS_TL_PRE_S")
 assert(param:add_param(73, 38, "TL_PST_S", 1),    "DORIS_TL_PST_S")
+-- Surface arrival without a GPS fix.  A fix can take over half an hour after
+-- surfacing in heavy seas, and the mission cannot end until surface is
+-- declared, so depth alone must also be able to declare it.  SRF_DPT is the
+-- depth every sample must stay under, SRF_SEC how long it must hold.
+assert(param:add_param(73, 39, "SRF_DPT", 1.5),  "DORIS_SRF_DPT")
+assert(param:add_param(73, 40, "SRF_SEC", 30),   "DORIS_SRF_SEC")
 
 
 local DORIS_START    = Parameter("DORIS_START")
@@ -182,6 +188,8 @@ local DORIS_BRN_MIN  = Parameter("DORIS_BRN_MIN")
 local DORIS_ASC_DPT  = Parameter("DORIS_ASC_DPT")  -- deprecated
 local DORIS_ASC_THR  = Parameter("DORIS_ASC_THR")
 local DORIS_ASC_AVG  = Parameter("DORIS_ASC_AVG")
+local DORIS_SRF_DPT  = Parameter("DORIS_SRF_DPT")
+local DORIS_SRF_SEC  = Parameter("DORIS_SRF_SEC")
 
 -- GPS self-heal: reboot up to 2 times if the GPS driver never receives
 -- data.  DORIS_GPS_RBT counts reboots and persists in EEPROM so the
@@ -242,6 +250,16 @@ local dr = { buf = {}, idx = 0, count = 0, size = 60 }
 -- ?????????? ascent-rate circular buffer (relay deactivation confirmation) ?????????????????????????????????
 local ar = { buf = {}, idx = 0, count = 0, size = 240 }
 
+-- ?????????? surface-depth circular buffer (GPS-free surface arrival) ?????????????????????????????????????
+local sr = { buf = {}, idx = 0, count = 0, size = 60 }
+
+-- A stuck depth sensor reads shallow and perfectly steady, which is exactly
+-- what floating looks like, so the surface test also requires the reading to
+-- move.  Measured across 146 surface windows on three dives, the quietest held
+-- a 0.070 m standard deviation and never fewer than two distinct values; a
+-- frozen channel gives zero.
+local SURFACE_LIVENESS_M = 0.02
+
 local function init_ring(r, window_sec)
     r.size  = math.max(math.ceil(window_sec / (UPDATE_INTERVAL_MS / 1000.0)), 10)
     r.buf   = {}
@@ -261,6 +279,25 @@ local function get_ring_avg(r)
     local sum = 0
     for i = 1, r.count do sum = sum + r.buf[i] end
     return sum / r.count
+end
+
+local function get_ring_bounds(r)
+    if r.count == 0 then return nil, nil end
+    local lo, hi = r.buf[1], r.buf[1]
+    for i = 2, r.count do
+        local v = r.buf[i]
+        if v < lo then lo = v end
+        if v > hi then hi = v end
+    end
+    return lo, hi
+end
+
+-- Both ascent-phase rings are reset together on entry to ASCENT, which is
+-- reachable from five places (emergency deploy, three failsafe paths, and the
+-- normal bottom-timer release).
+local function init_ascent_rings()
+    init_ring(ar, DORIS_ASC_AVG:get() or 120)
+    init_ring(sr, DORIS_SRF_SEC:get() or 30)
 end
 
 -- ?????????? runtime state ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
@@ -313,6 +350,7 @@ local cfg = {
     lgt_pwm     = LIGHT_PWM_MIN,
     btm_thr_mps = 0.05,
     dpt_gat_m   = 5.0,
+    srf_dpt_m   = 1.5,
     lgt_mod     = 0,
     lgt_on_ms   = 10000,
     lgt_off_ms  = 5000,
@@ -585,6 +623,7 @@ local function snapshot_config()
     local lgt_on  = DORIS_LGT_ON:get()
     local lgt_off = DORIS_LGT_OFF:get()
     local btm_dly = DORIS_BTM_DLY:get()
+    local srf_dpt = DORIS_SRF_DPT:get() or 1.5
 
     cfg.rls_sec_ms  = math.max(rls_sec, 1) * 1000
     cfg.dsc_lgt     = DORIS_DSC_LGT:get() >= 1
@@ -593,6 +632,9 @@ local function snapshot_config()
     cfg.lgt_pwm     = brightness_to_pwm(brt)
     cfg.btm_thr_mps = math.max(btm_thr, 0.1) / 100.0
     cfg.dpt_gat_m   = math.max(dpt_gat, 2.0)
+    -- Never looser than the GPS-assisted gate: the depth-only path is the
+    -- weaker evidence of the two, so it must not be the easier one to satisfy.
+    cfg.srf_dpt_m   = math.min(math.max(srf_dpt, 0.5), cfg.dpt_gat_m)
     cfg.lgt_mod     = lgt_mod >= 1 and 1 or 0
     cfg.lgt_on_ms   = math.max(lgt_on, 1) * 1000
     cfg.lgt_off_ms  = math.max(lgt_off, 1) * 1000
@@ -601,6 +643,9 @@ local function snapshot_config()
     gcs:send_text(MAV_SEVERITY.INFO,
         string.format("DIVE: gate=%.1fm rls=%ds thr=%.1fcm/s avg=%ds",
             cfg.dpt_gat_m, rls_sec, btm_thr, btm_avg))
+    gcs:send_text(MAV_SEVERITY.INFO,
+        string.format("DIVE: surface fallback %.1fm held %ds",
+            cfg.srf_dpt_m, DORIS_SRF_SEC:get() or 30))
     gcs:send_text(MAV_SEVERITY.INFO,
         string.format("DIVE: lights dsc=%d btm=%d asc=%d brt=%d%% pwm=%d mode=%s RC9=%s",
             cfg.dsc_lgt and 1 or 0, cfg.btm_lgt and 1 or 0,
@@ -1044,7 +1089,7 @@ function update()
                     start_val, cfg_depth))
             activate_relay()
             ascent_start_ms = now_ms
-            init_ring(ar, DORIS_ASC_AVG:get() or 120)
+            init_ascent_rings()
             reset_light_cycle(now_ms)
             ipcam_stop()
             recovery_done = false
@@ -1111,7 +1156,7 @@ function update()
     elseif state == STATE_MISSION_START then
         if check_failsafes() then
             ascent_start_ms = now_ms
-            init_ring(ar, DORIS_ASC_AVG:get() or 120)
+            init_ascent_rings()
             reset_light_cycle(now_ms)
             -- 5-min (300s) chunking for ascent too (#33).
             ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent", 300)
@@ -1170,7 +1215,7 @@ function update()
     elseif state == STATE_DESCENT then
         if check_failsafes() then
             ascent_start_ms = now_ms
-            init_ring(ar, DORIS_ASC_AVG:get() or 120)
+            init_ascent_rings()
             reset_light_cycle(now_ms)
             -- 5-min (300s) chunking for ascent too (#33).
             ipcam_begin_phase(ipcam_cfg.asc_rec, "ascent", 300)
@@ -1243,7 +1288,7 @@ function update()
     elseif state == STATE_ON_BOTTOM then
         if check_failsafes() then
             ascent_start_ms = now_ms
-            init_ring(ar, DORIS_ASC_AVG:get() or 120)
+            init_ascent_rings()
             reset_light_cycle(now_ms)
             -- Keep 5-min (300s) chunking for ascent (#33); the bottom
             -- continuous path already set splitmuxsink to 300s.
@@ -1515,7 +1560,7 @@ function update()
                     bottom_elapsed / 1000.0))
             activate_relay()
             ascent_start_ms = now_ms
-            init_ring(ar, DORIS_ASC_AVG:get() or 120)
+            init_ascent_rings()
             reset_light_cycle(now_ms)
             -- Keep 5-min (300s) chunking for ascent (#33); the bottom
             -- continuous path already set splitmuxsink to 300s.
@@ -1566,18 +1611,38 @@ function update()
                 gcs:send_text(MAV_SEVERITY.INFO,
                     string.format("DIVE: ascending, depth=%.2fm", depth))
             end
-            -- Surface arrival requires BOTH a GPS fix AND a shallow depth.
-            -- GPS fix alone is not enough: a transient sat acquisition at
-            -- mid-water (e.g. while the antenna briefly clears, or a cached
-            -- fix) would otherwise prematurely deactivate the burn relay,
-            -- stop recording, and disarm into RECOVERY.  cfg.dpt_gat_m is
-            -- the same depth gate used to declare "underwater" at mission
-            -- start, so we use it symmetrically here for "above water".
+            add_ring_sample(sr, depth)
+            -- Two ways to declare the surface.  GPS is the fast path, but a
+            -- fix alone is not enough: a transient acquisition at mid-water
+            -- (antenna briefly clearing, or a cached fix) would otherwise
+            -- deactivate the burn relay, stop recording, and disarm into
+            -- RECOVERY early.  It is paired with cfg.dpt_gat_m, the same gate
+            -- used to declare "underwater" at mission start.
+            --
+            -- The fallback is depth alone, because acquisition has taken as
+            -- long as 38 minutes after surfacing and the mission cannot end
+            -- until the surface is declared.  Every sample in the window must
+            -- be shallow, and the window must also have moved: a frozen depth
+            -- channel reads shallow and steady, which is what floating looks
+            -- like.
             local gps_stat = gps:status(0)
+            local surfaced = nil
             if gps_stat and gps_stat >= 3 and depth < cfg.dpt_gat_m then
+                surfaced = string.format("GPS fix, depth=%.2fm < gate=%.1fm",
+                    depth, cfg.dpt_gat_m)
+            elseif sr.count >= sr.size then
+                local lo, hi = get_ring_bounds(sr)
+                if hi < cfg.srf_dpt_m
+                   and (hi - lo) >= SURFACE_LIVENESS_M then
+                    surfaced = string.format(
+                        "no fix, depth < %.1fm for %ds, span=%.3fm",
+                        cfg.srf_dpt_m,
+                        sr.size * UPDATE_INTERVAL_MS / 1000, hi - lo)
+                end
+            end
+            if surfaced then
                 gcs:send_text(MAV_SEVERITY.INFO,
-                    string.format("DIVE: surface reached (GPS fix, depth=%.2fm < gate=%.1fm)",
-                        depth, cfg.dpt_gat_m))
+                    string.format("DIVE: surface reached (%s)", surfaced))
                 deactivate_relay()
                 ipcam_stop()
                 state = STATE_RECOVERY

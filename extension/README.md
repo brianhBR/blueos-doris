@@ -42,6 +42,23 @@ release ownership, bit 1 safe shutdown), `REL_STAT` (physical release state),
 `PWR_SHDN` (`1` requests shutdown and `0` resets the request), and `PWR_ACK=1`.
 Names are intentionally at most ten characters for `NAMED_VALUE_FLOAT`.
 
+## Surface detection
+
+`ASCENT` ends in one of two ways. The fast path is a 3D GPS fix together with
+depth under `DORIS_DPT_GAT`, unchanged. The fallback is depth alone: every
+sample in a `DORIS_SRF_SEC` window (default 30 s) shallower than `DORIS_SRF_DPT`
+(default 1.5 m, and never allowed above `DORIS_DPT_GAT`), with the window
+spanning at least 0.02 m.
+
+The fallback exists because a fix used to be mandatory, and measured over four
+dives it arrived 17 s, 6.8 min, 30.4 min, and 38.7 min after the vehicle was
+already floating — `RECOVERY` followed within a second of the fix every time, so
+acquisition was the only thing gating the end of the mission.
+
+The span requirement is what makes depth safe to rely on. A stuck sensor reads
+shallow and perfectly steady, which is indistinguishable from floating; across
+146 surface windows the quietest real one still held 0.070 m of spread.
+
 ## Post-dive processing
 
 Reaching the surface no longer processes the dive. `POST /api/v1/dive/finalize`,

@@ -2,6 +2,23 @@
 
 ## bh-0.6
 
+- Surfacing no longer waits on a GPS fix.  `ASCENT` previously ended only when a
+  3D fix arrived alongside shallow depth, and measured over four dives that fix
+  took 17 s, 6.8 min, 30.4 min, and 38.7 min after the vehicle was already
+  floating, with `RECOVERY` following within a second every time.  A fix was the
+  sole thing gating the end of the mission.  The fix remains the fast path, but
+  depth alone now also qualifies: every sample in a `DORIS_SRF_SEC` window
+  (default 30 s) must be shallower than `DORIS_SRF_DPT` (default 1.5 m), and the
+  window must span at least 0.02 m so a frozen depth channel — which reads
+  shallow and perfectly steady, exactly like floating — cannot qualify.  Across
+  146 surface windows the quietest still held 0.070 m of spread.
+- Added `DORIS_SRF_DPT` and `DORIS_SRF_SEC` as parameters 39 and 40, and grew
+  the `DORIS_` table from 38 to 40 slots.  Existing indices are unchanged, so
+  saved parameter files stay valid.
+- EKF vertical velocity is deliberately not used for surface detection.  It
+  remains the right signal for the sustained-ascent check, but at the surface it
+  drifts badly: averaged over 30 s it implied up to 17.3 m of vertical travel
+  while depth moved at most 0.36 m.
 - Mirrored the drop-weight release to both controllers.  Lua remains the
   mission-policy owner: it drives the Navigator relay on `DORIS_RELAY_CH` and
   publishes the requested state as MAVLink `NAMED_VALUE_FLOAT RELAY` every
