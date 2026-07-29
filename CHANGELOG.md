@@ -2,6 +2,16 @@
 
 ## bh-0.6
 
+- Deploying `doris.lua` no longer writes through the live file.  The copy
+  truncated the script the autopilot reads and streamed ~75 KB back into it, so
+  a script load landing inside that window compiled whatever prefix was on disk
+  and failed with a syntax error at an arbitrary line, or a bogus complaint
+  about exceeding the local variable limit.  A concurrent reader was measured
+  observing the destination at zero bytes.  Since the file is only rewritten
+  when its hash changes, this surfaced on the first boot after an upgrade.  The
+  script is now written beside its destination and renamed into place, so a
+  reader sees either the whole old file or the whole new one.
+
 - Surfacing no longer waits on a GPS fix.  `ASCENT` previously ended only when a
   3D fix arrived alongside shallow depth, and measured over four dives that fix
   took 17 s, 6.8 min, 30.4 min, and 38.7 min after the vehicle was already
