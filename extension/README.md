@@ -174,6 +174,16 @@ Set the environment variable to point to your BlueOS instance:
 export DORIS_BLUEOS_ADDRESS=http://192.168.2.2
 ```
 
+### Editing `doris.lua`
+
+ArduPilot vendors Lua with `MAXVARS` lowered from upstream's 200 to 100, so the
+main chunk may hold at most 100 locals open — that is, `local` declarations at
+column 0. Desktop Lua and SITL will not catch an overrun; the vehicle rejects the
+script and names whichever declaration landed on slot 101, which is normally not
+the line that needs changing. `tests/test_lua_limits.py` counts the chunk and
+fails while ten slots remain. When it does, group related values into a table
+(as the `prm` parameter handles are) rather than freeing a single slot.
+
 ### Building for Production
 
 ```bash

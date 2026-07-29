@@ -24,7 +24,11 @@ def test_lua_mirrors_the_release_to_both_controllers():
     assert "relay:on(ch)" in lua
     assert "relay:off(ch)" in lua
     assert "gcs:send_named_float('RELAY',    relay_active and 1 or 0)" in lua
-    assert 'local DORIS_RELAY_CH = Parameter("DORIS_RELAY_CH")' in lua
+    # Which Navigator output fires is operator-configurable; assert the handle
+    # exists and is what navigator_relay_channel() reads, not how it is declared.
+    assert 'Parameter("DORIS_RELAY_CH")' in lua
+    channel = lua.split("local function navigator_relay_channel()", 1)[1]
+    assert "RELAY_CH:get()" in channel.split("\nend", 1)[0]
     assert lua.count("activate_relay()") >= 5
 
 

@@ -161,42 +161,49 @@ assert(param:add_param(73, 39, "SRF_DPT", 1.5),  "DORIS_SRF_DPT")
 assert(param:add_param(73, 40, "SRF_SEC", 30),   "DORIS_SRF_SEC")
 
 
-local DORIS_START    = Parameter("DORIS_START")
-local DORIS_BTM_TIM  = Parameter("DORIS_BTM_TIM")
-local DORIS_DSC_LGT  = Parameter("DORIS_DSC_LGT")
-local DORIS_BTM_LGT  = Parameter("DORIS_BTM_LGT")
-local DORIS_ASC_LGT  = Parameter("DORIS_ASC_LGT")
-local DORIS_LGT_BRT  = Parameter("DORIS_LGT_BRT")
-local DORIS_STATE    = Parameter("DORIS_STATE")
-local DORIS_BTM_THR  = Parameter("DORIS_BTM_THR")
-local DORIS_BTM_AVG  = Parameter("DORIS_BTM_AVG")
-local DORIS_DPT_GAT  = Parameter("DORIS_DPT_GAT")
-local DORIS_LGT_MOD  = Parameter("DORIS_LGT_MOD")
-local DORIS_LGT_ON   = Parameter("DORIS_LGT_ON")
-local DORIS_LGT_OFF  = Parameter("DORIS_LGT_OFF")
-local DORIS_BTM_DLY  = Parameter("DORIS_BTM_DLY")
-local DORIS_PRF_ID   = Parameter("DORIS_PRF_ID")
-local DORIS_UPL_DATE = Parameter("DORIS_UPL_DATE")
-local DORIS_UPL_TIME = Parameter("DORIS_UPL_TIME")
-local DORIS_MIN_VOLT = Parameter("DORIS_MIN_VOLT")
-local DORIS_RELAY_CH = Parameter("DORIS_RELAY_CH")
-local DORIS_INJ_LEAK = Parameter("DORIS_INJ_LEAK")
-local DORIS_MAX_DPTH = Parameter("DORIS_MAX_DPTH")
-local DORIS_LGT_TST  = Parameter("DORIS_LGT_TST")
-local DORIS_GPS_RBT  = Parameter("DORIS_GPS_RBT")
-local DORIS_BRN_MIN  = Parameter("DORIS_BRN_MIN")
-local DORIS_ASC_DPT  = Parameter("DORIS_ASC_DPT")  -- deprecated
-local DORIS_ASC_THR  = Parameter("DORIS_ASC_THR")
-local DORIS_ASC_AVG  = Parameter("DORIS_ASC_AVG")
-local DORIS_SRF_DPT  = Parameter("DORIS_SRF_DPT")
-local DORIS_SRF_SEC  = Parameter("DORIS_SRF_SEC")
+-- Parameter handles live in one table rather than in a local apiece.
+-- ArduPilot builds Lua with MAXVARS lowered from upstream's 200 to 100
+-- (lparser.c), and this chunk had grown past that, so the script stopped
+-- compiling at whichever declaration happened to land on slot 101. A table
+-- costs one slot no matter how many parameters get added later.
+local prm = {
+    START    = Parameter("DORIS_START"),
+    BTM_TIM  = Parameter("DORIS_BTM_TIM"),
+    DSC_LGT  = Parameter("DORIS_DSC_LGT"),
+    BTM_LGT  = Parameter("DORIS_BTM_LGT"),
+    ASC_LGT  = Parameter("DORIS_ASC_LGT"),
+    LGT_BRT  = Parameter("DORIS_LGT_BRT"),
+    STATE    = Parameter("DORIS_STATE"),
+    BTM_THR  = Parameter("DORIS_BTM_THR"),
+    BTM_AVG  = Parameter("DORIS_BTM_AVG"),
+    DPT_GAT  = Parameter("DORIS_DPT_GAT"),
+    LGT_MOD  = Parameter("DORIS_LGT_MOD"),
+    LGT_ON   = Parameter("DORIS_LGT_ON"),
+    LGT_OFF  = Parameter("DORIS_LGT_OFF"),
+    BTM_DLY  = Parameter("DORIS_BTM_DLY"),
+    PRF_ID   = Parameter("DORIS_PRF_ID"),
+    UPL_DATE = Parameter("DORIS_UPL_DATE"),
+    UPL_TIME = Parameter("DORIS_UPL_TIME"),
+    MIN_VOLT = Parameter("DORIS_MIN_VOLT"),
+    RELAY_CH = Parameter("DORIS_RELAY_CH"),
+    INJ_LEAK = Parameter("DORIS_INJ_LEAK"),
+    MAX_DPTH = Parameter("DORIS_MAX_DPTH"),
+    LGT_TST  = Parameter("DORIS_LGT_TST"),
+    GPS_RBT  = Parameter("DORIS_GPS_RBT"),
+    BRN_MIN  = Parameter("DORIS_BRN_MIN"),
+    ASC_DPT  = Parameter("DORIS_ASC_DPT"),  -- deprecated
+    ASC_THR  = Parameter("DORIS_ASC_THR"),
+    ASC_AVG  = Parameter("DORIS_ASC_AVG"),
+    SRF_DPT  = Parameter("DORIS_SRF_DPT"),
+    SRF_SEC  = Parameter("DORIS_SRF_SEC"),
+}
 
 -- GPS self-heal: reboot up to 2 times if the GPS driver never receives
 -- data.  DORIS_GPS_RBT counts reboots and persists in EEPROM so the
 -- limit survives script restarts.  Cleared only when pre-arm passes.
 local gps_reboot_attempted = false
 do
-    local rbt = DORIS_GPS_RBT:get() or 0
+    local rbt = prm.GPS_RBT:get() or 0
     if rbt >= 2 then
         gps_reboot_attempted = true
         gcs:send_text(MAV_SEVERITY.INFO,
@@ -209,7 +216,7 @@ end
 
 -- DORIS_START persists in EEPROM across reboots.
 -- Cleared only in RECOVERY after a mission completes.
-DORIS_STATE:set(-1)
+prm.STATE:set(-1)
 param:set_and_save("DISARM_DELAY", 0)
 
 -- ArduPilot arming checks: enable only checks relevant to DORIS.
@@ -296,8 +303,8 @@ end
 -- reachable from five places (emergency deploy, three failsafe paths, and the
 -- normal bottom-timer release).
 local function init_ascent_rings()
-    init_ring(ar, DORIS_ASC_AVG:get() or 120)
-    init_ring(sr, DORIS_SRF_SEC:get() or 30)
+    init_ring(ar, prm.ASC_AVG:get() or 120)
+    init_ring(sr, prm.SRF_SEC:get() or 30)
 end
 
 -- ?????????? runtime state ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
@@ -488,7 +495,7 @@ end
 -- ArduPilot drives DORIS_RELAY_CH.  Exactly one of the two outputs may be
 -- wired to the actuator; DORIS_RELAY_CH=-1 disables the Navigator output.
 local function navigator_relay_channel()
-    local ch = DORIS_RELAY_CH:get()
+    local ch = prm.RELAY_CH:get()
     if not ch then return nil end
     ch = math.floor(ch)
     if ch < 0 then return nil end
@@ -531,7 +538,7 @@ local function deactivate_relay()
 end
 
 local function check_leak()
-    local val = DORIS_INJ_LEAK:get()
+    local val = prm.INJ_LEAK:get()
     if val and val > 0 then
         return true
     end
@@ -539,27 +546,27 @@ local function check_leak()
 end
 
 local function validate_profile()
-    local prf_id = DORIS_PRF_ID:get() or 0
+    local prf_id = prm.PRF_ID:get() or 0
     if prf_id <= 0 then
         return false, "no profile loaded (PRF_ID=0)"
     end
 
-    local upl_date = DORIS_UPL_DATE:get() or 0
+    local upl_date = prm.UPL_DATE:get() or 0
     if upl_date <= 0 then
         return false, "no upload timestamp (UPL_DATE=0)"
     end
 
-    local rls = DORIS_BTM_TIM:get() or 0
+    local rls = prm.BTM_TIM:get() or 0
     if rls <= 0 then
         return false, "BTM_TIM must be > 0"
     end
 
-    local min_v = DORIS_MIN_VOLT:get() or 0
+    local min_v = prm.MIN_VOLT:get() or 0
     if min_v < 10.0 or min_v > 25.0 then
         return false, string.format("MIN_VOLT %.1f out of range 10-25", min_v)
     end
 
-    local brt = DORIS_LGT_BRT:get() or 0
+    local brt = prm.LGT_BRT:get() or 0
     if brt < 0 or brt > 100 then
         return false, string.format("LGT_BRT %.0f out of range 0-100", brt)
     end
@@ -591,7 +598,7 @@ local function check_failsafes()
         return true
     end
 
-    local min_volt = DORIS_MIN_VOLT:get() or 14.0
+    local min_volt = prm.MIN_VOLT:get() or 14.0
     if batt_voltage > 1.0 and batt_voltage < min_volt then
         gcs:send_text(MAV_SEVERITY.CRITICAL,
             string.format("DIVE: FAILSAFE low battery %.1fV < %.1fV, releasing weight",
@@ -600,7 +607,7 @@ local function check_failsafes()
         return true
     end
 
-    local max_depth = DORIS_MAX_DPTH:get() or 6100
+    local max_depth = prm.MAX_DPTH:get() or 6100
     local depth = get_depth_m()
     if depth and depth > max_depth then
         gcs:send_text(MAV_SEVERITY.CRITICAL,
@@ -614,21 +621,21 @@ local function check_failsafes()
 end
 
 local function snapshot_config()
-    local rls_sec = DORIS_BTM_TIM:get()
-    local brt     = DORIS_LGT_BRT:get()
-    local btm_thr = DORIS_BTM_THR:get()
-    local btm_avg = DORIS_BTM_AVG:get()
-    local dpt_gat = DORIS_DPT_GAT:get()
-    local lgt_mod = DORIS_LGT_MOD:get()
-    local lgt_on  = DORIS_LGT_ON:get()
-    local lgt_off = DORIS_LGT_OFF:get()
-    local btm_dly = DORIS_BTM_DLY:get()
-    local srf_dpt = DORIS_SRF_DPT:get() or 1.5
+    local rls_sec = prm.BTM_TIM:get()
+    local brt     = prm.LGT_BRT:get()
+    local btm_thr = prm.BTM_THR:get()
+    local btm_avg = prm.BTM_AVG:get()
+    local dpt_gat = prm.DPT_GAT:get()
+    local lgt_mod = prm.LGT_MOD:get()
+    local lgt_on  = prm.LGT_ON:get()
+    local lgt_off = prm.LGT_OFF:get()
+    local btm_dly = prm.BTM_DLY:get()
+    local srf_dpt = prm.SRF_DPT:get() or 1.5
 
     cfg.rls_sec_ms  = math.max(rls_sec, 1) * 1000
-    cfg.dsc_lgt     = DORIS_DSC_LGT:get() >= 1
-    cfg.btm_lgt     = DORIS_BTM_LGT:get() >= 1
-    cfg.asc_lgt     = DORIS_ASC_LGT:get() >= 1
+    cfg.dsc_lgt     = prm.DSC_LGT:get() >= 1
+    cfg.btm_lgt     = prm.BTM_LGT:get() >= 1
+    cfg.asc_lgt     = prm.ASC_LGT:get() >= 1
     cfg.lgt_pwm     = brightness_to_pwm(brt)
     cfg.btm_thr_mps = math.max(btm_thr, 0.1) / 100.0
     cfg.dpt_gat_m   = math.max(dpt_gat, 2.0)
@@ -645,7 +652,7 @@ local function snapshot_config()
             cfg.dpt_gat_m, rls_sec, btm_thr, btm_avg))
     gcs:send_text(MAV_SEVERITY.INFO,
         string.format("DIVE: surface fallback %.1fm held %ds",
-            cfg.srf_dpt_m, DORIS_SRF_SEC:get() or 30))
+            cfg.srf_dpt_m, prm.SRF_SEC:get() or 30))
     gcs:send_text(MAV_SEVERITY.INFO,
         string.format("DIVE: lights dsc=%d btm=%d asc=%d brt=%d%% pwm=%d mode=%s RC9=%s",
             cfg.dsc_lgt and 1 or 0, cfg.btm_lgt and 1 or 0,
@@ -999,7 +1006,7 @@ function update()
         script_start_ms = now_ms
     end
     last_update_ms = now_ms
-    DORIS_STATE:set(state)
+    prm.STATE:set(state)
 
     -- read battery voltage each cycle for pre-arm and telemetry
     local v = battery:voltage(0)
@@ -1010,13 +1017,13 @@ function update()
     -- light test: when DORIS_LGT_TST > 0, override lights to that % brightness.
     -- Auto-clears after 10000 ms so lights don't stay stuck on
     -- if the "off" PARAM_SET is lost.
-    local lgt_tst = DORIS_LGT_TST:get() or 0
+    local lgt_tst = prm.LGT_TST:get() or 0
     if lgt_tst > 0 and RC9 then
         if lgt_tst_start_ms == 0 then
             lgt_tst_start_ms = now_ms
         end
         if now_ms - lgt_tst_start_ms > 10000 then
-            DORIS_LGT_TST:set(0)
+            prm.LGT_TST:set(0)
             RC9:set_override(LIGHT_PWM_MIN)
             lgt_tst_start_ms = 0
         else
@@ -1038,7 +1045,7 @@ function update()
     -- Returns to CONFIG so the vehicle can be re-armed for another dive
     -- without a script restart.
     if state >= STATE_MISSION_START and state <= STATE_ASCENT then
-        if DORIS_START:get() <= 0 then
+        if prm.START:get() <= 0 then
             gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: CANCELLED by operator")
             deactivate_relay()
             if RC9 then RC9:set_override(LIGHT_PWM_MIN) end
@@ -1062,11 +1069,11 @@ function update()
             if boot_age_s >= 30 then
                 local gps_stat = gps:status(0)
                 if not gps_stat or gps_stat < 3 then
-                    local rbt = (DORIS_GPS_RBT:get() or 0) + 1
+                    local rbt = (prm.GPS_RBT:get() or 0) + 1
                     gcs:send_text(MAV_SEVERITY.WARNING,
                         string.format("DIVE: No GPS fix after 30s, reboot %d/2",
                             rbt))
-                    DORIS_GPS_RBT:set_and_save(rbt)
+                    prm.GPS_RBT:set_and_save(rbt)
                     vehicle:reboot(false)
                     return update, UPDATE_INTERVAL_MS
                 else
@@ -1082,7 +1089,7 @@ function update()
         -- and the vehicle is properly monitored to the surface.
         local cfg_depth = get_depth_m()
         if cfg_depth and cfg_depth > 2.0 and not prearm_passed then
-            local start_val = DORIS_START:get() or 0
+            local start_val = prm.START:get() or 0
             gcs:send_text(MAV_SEVERITY.CRITICAL,
                 string.format(
                     "DIVE: DEPLOYED in CONFIG (START=%d, depth=%.1fm)! Emergency weight release + ASCENT",
@@ -1097,9 +1104,9 @@ function update()
             return update, UPDATE_INTERVAL_MS
         end
 
-        if DORIS_START:get() >= 1 then
+        if prm.START:get() >= 1 then
             -- Surface pre-arm checks
-            local min_volt = DORIS_MIN_VOLT:get() or 14.0
+            local min_volt = prm.MIN_VOLT:get() or 14.0
             local gps_ok = false
             local gps_stat = gps:status(0)
             if gps_stat and gps_stat >= 3 then
@@ -1112,10 +1119,10 @@ function update()
             if gps_ok and batt_ok and leak_ok and profile_ok then
                 prearm_passed = true
                 gps_reboot_attempted = true
-                DORIS_GPS_RBT:set_and_save(0)
+                prm.GPS_RBT:set_and_save(0)
                 surface_pressure = baro:get_pressure() or surface_pressure
                 local num_sats = gps:num_sats(0) or 0
-                local prf_id = DORIS_PRF_ID:get() or 0
+                local prf_id = prm.PRF_ID:get() or 0
                 gcs:send_text(MAV_SEVERITY.INFO,
                     string.format("DIVE: Pre-arm PASSED (GPS %d sats, %.1fV, profile #%d, Pref=%.0fPa)",
                         num_sats, batt_voltage, prf_id, surface_pressure))
@@ -1200,7 +1207,7 @@ function update()
                         string.format("DIVE: gate crossed (%.2fm), mission started",
                             depth))
                     dive_start_ms = now_ms
-                    init_ring(dr, DORIS_BTM_AVG:get())
+                    init_ring(dr, prm.BTM_AVG:get())
                     reset_light_cycle(now_ms)
                     -- Descent rotates at 5-min (300s) boundaries so
                     -- finalize chunks it into 5-min MP4s like the
@@ -1590,10 +1597,10 @@ function update()
             end
 
             local burn_elapsed = now_ms - ascent_start_ms
-            local brn_min_ms = (DORIS_BRN_MIN:get() or 7200) * 1000
+            local brn_min_ms = (prm.BRN_MIN:get() or 7200) * 1000
             if burn_elapsed >= brn_min_ms then
                 local avg = get_ring_avg(ar)
-                local thr = (DORIS_ASC_THR:get() or 10) / 100.0
+                local thr = (prm.ASC_THR:get() or 10) / 100.0
                 if avg and ar.count >= ar.size and avg >= thr then
                     gcs:send_text(MAV_SEVERITY.INFO,
                         string.format(
@@ -1653,7 +1660,7 @@ function update()
     elseif state == STATE_RECOVERY then
         if RC9 then RC9:set_override(LIGHT_PWM_MIN) end
         arming:disarm()
-        DORIS_START:set_and_save(0)
+        prm.START:set_and_save(0)
         -- Fire dive-finalize exactly once on first RECOVERY tick so the
         -- extension stops the recorder, records the bottom mode, and closes
         -- the dive record.  This is deliberately quick: the AGT holds payload
@@ -1697,15 +1704,15 @@ if not arm_auth_id then
 end
 
 do
-    local prf = DORIS_PRF_ID:get() or 0
+    local prf = prm.PRF_ID:get() or 0
     if prf > 0 then
         gcs:send_text(MAV_SEVERITY.INFO,
             string.format("DIVE: script loaded, profile #%d (uploaded %d), START=%d",
-                prf, DORIS_UPL_DATE:get() or 0, DORIS_START:get() or 0))
+                prf, prm.UPL_DATE:get() or 0, prm.START:get() or 0))
     else
         gcs:send_text(MAV_SEVERITY.INFO,
             string.format("DIVE: script loaded, no profile loaded, START=%d",
-                DORIS_START:get() or 0))
+                prm.START:get() or 0))
     end
 end
 

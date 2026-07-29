@@ -2,15 +2,28 @@
 
 ## bh-0.6
 
+- `doris.lua` loads on the vehicle again.  ArduPilot vendors Lua with `MAXVARS`
+  lowered from upstream's 200 to 100, so the 107 locals this chunk had grown to
+  compiled fine on a desktop Lua and were rejected on the autopilot with
+  `doris.lua:894: too many local variables (limit is 100) in main function near
+  'ipcam_start'`.  That line is where the count crossed 100, not where anything
+  is wrong, which is why the message pointed at unrelated camera code.  The 29
+  `DORIS_*` `Parameter` handles now live in one `prm` table instead of a local
+  apiece, putting the chunk at 79 of 100.  Parameter names, indices and defaults
+  are untouched, so existing parameter files still load.  A test now counts the
+  chunk's locals and fails while there are still ten slots left, since the count
+  had sat at 99 and the next feature to land was always going to break it.
+
 - Deploying `doris.lua` no longer writes through the live file.  The copy
   truncated the script the autopilot reads and streamed ~75 KB back into it, so
   a script load landing inside that window compiled whatever prefix was on disk
-  and failed with a syntax error at an arbitrary line, or a bogus complaint
-  about exceeding the local variable limit.  A concurrent reader was measured
-  observing the destination at zero bytes.  Since the file is only rewritten
-  when its hash changes, this surfaced on the first boot after an upgrade.  The
-  script is now written beside its destination and renamed into place, so a
-  reader sees either the whole old file or the whole new one.
+  and failed with a syntax error at an arbitrary line.  A concurrent reader was
+  measured observing the destination at zero bytes.  Since the file is only
+  rewritten when its hash changes, this could only surface on the first boot
+  after an upgrade.  The script is now written beside its destination and renamed
+  into place, so a reader sees either the whole old file or the whole new one.
+  This was found while chasing the local-variable failure above and is a real
+  race, but it was not that failure's cause.
 
 - Surfacing no longer waits on a GPS fix.  `ASCENT` previously ended only when a
   3D fix arrived alongside shallow depth, and measured over four dives that fix
