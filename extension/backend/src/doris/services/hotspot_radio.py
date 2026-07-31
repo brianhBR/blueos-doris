@@ -130,6 +130,41 @@ ceiling on this hardware. The legacy-patch regex
 upgrading from a previous extension that wrote a 5 GHz patch are
 cleanly migrated to the 2.4 GHz config.
 
+Part 3: raise the Pi 5 USB current budget
+------------------------------------------
+A Pi 5 caps *total* USB draw at 600 mA unless
+``usb_max_current_enable=1`` is set in ``/boot/firmware/config.txt``,
+which lifts the budget to 1600 mA. The Realtek dongle declares 500 mA
+and a USB flash drive can declare up to 896 mA (essentially the USB 3
+ceiling), so the stock cap leaves no headroom at all.
+
+When the rail trips over-current protection the dongle is dropped off
+the bus and re-enumerated as a *new* phy, which leaves ``hostapd``
+bound to the interface that no longer exists. The end state is a
+zombie AP: ``create_ap`` and ``hostapd`` are still running and
+``wifi-manager`` still reports ``hotspot=true``, but ``uap0`` has no
+SSID, no channel, no address, and ``txpower -100.00 dBm`` - so nothing
+beacons and the vehicle silently loses its access point. Note this is
+the same ``txpower -100.00 dBm`` signature as the HT40 failure
+documented at :data:`_CREATE_AP_24GHZ_FLAGS_TEMPLATE`; the
+distinguishing evidence is the over-current/re-enumeration pair in
+``dmesg``. Observed on the vehicle in July 2026 about nine minutes
+into a boot::
+
+    usb usb1-port1: over-current change #1
+    usb 1-1: USB disconnect, device number 2
+    rtl88x2bu 1-1:1.0: Runtime PM usage count underflow!
+    usb 1-1: new high-speed USB device number 4 using xhci-hcd
+    rtl88x2bu 1-1:1.0 uap0: renamed from wlan1
+
+The over-current notification arrives on every root-hub port at once
+because the Pi shares one sense circuit across the whole USB rail, so
+the logs cannot attribute the trip to an individual device.
+
+:func:`_ensure_usb_max_current` stages the setting for the next boot.
+It is deliberately append-only and never rewrites ``config.txt`` - see
+that function for why.
+
 Boot order
 ----------
   1. Kernel + USB enumeration -> ``rtl88x2bu`` loads -> udev rule renames
@@ -316,6 +351,34 @@ NM_CONF_CONTENT = (
     "# Keep NetworkManager from grabbing uap0; hostapd / create_ap drives it.\n"
     "[keyfile]\n"
     "unmanaged-devices=interface-name:uap0\n"
+)
+
+# Firmware config that governs the Pi 5 USB current budget. See "Part 3"
+# in the module docstring for the failure this prevents.
+BOOT_CONFIG_PATH = "/boot/firmware/config.txt"
+BOOT_CONFIG_BACKUP_PATH = "/boot/firmware/config.txt.doris-usb-current.bak"
+USB_MAX_CURRENT_SETTING = "usb_max_current_enable=1"
+
+# Appended verbatim to config.txt. Emitted through a single-quoted
+# ``printf``, so this must stay free of single quotes and percent signs.
+#
+# The leading empty entry produces a blank separator line, and the
+# explicit ``[all]`` header is load-bearing: config.txt settings are
+# scoped by the most recent section header, and the file ships with
+# model-conditional sections (``[cm4]``, ``[cm5]``, ``[pi5]``) that may
+# appear last. Appending a bare ``usb_max_current_enable=1`` would
+# inherit whichever section happened to be open at the end of the file,
+# so on a vehicle whose config.txt ends inside ``[cm4]`` the setting
+# would silently never apply.
+USB_MAX_CURRENT_BLOCK_LINES = (
+    "",
+    "[all]",
+    "# Managed by DORIS extension (services/hotspot_radio.py).",
+    "# Raise the Pi 5 USB rail budget from 600 mA to 1600 mA. The Realtek AP",
+    "# dongle declares 500 mA and USB storage up to 896 mA, so the stock cap",
+    "# leaves no headroom: the rail trips over-current under load, drops the",
+    "# dongle off the bus, and takes the hotspot down with it.",
+    USB_MAX_CURRENT_SETTING,
 )
 
 
@@ -934,18 +997,143 @@ async def _ensure_startup_bind() -> None:
         )
 
 
+async def _ensure_usb_max_current() -> bool:
+    """Stage ``usb_max_current_enable=1`` in the Pi 5 boot config.
+
+    Lifts the total USB current budget from 600 mA to 1600 mA so the
+    Realtek AP dongle and USB storage can draw their declared maximum
+    without tripping the rail. See "Part 3" in the module docstring for
+    the over-current failure this prevents.
+
+    Returns ``True`` when the setting is active or staged, ``False``
+    when we skipped or could not apply it. Nothing is gated on the
+    result - a vehicle with the stock budget still boots and still
+    brings up an AP, it is just liable to lose the dongle under load.
+
+    **Only takes effect on the next reboot.** Firmware reads
+    ``config.txt`` at boot and there is no runtime equivalent, so this
+    stages the change and logs it, consistent with how the udev rename
+    and the bind-mounted wifi override are handled.
+
+    Append-only by design, and this is the important part. Every other
+    host file in this module goes through :func:`_write_host_file`,
+    which does a read-modify-rewrite of the whole file. That is fine
+    for files we own outright and can regenerate from constants, but
+    ``config.txt`` is neither: it is owned by the OS image, carries
+    board-specific overlay and GPIO configuration we did not write, and
+    a truncated or mis-decoded rewrite leaves a Pi that will not boot -
+    recoverable only by pulling the card. :func:`_read_host_file` routes
+    file contents through Commander, whose ``repr()``-encoded transport
+    has silently corrupted content before (see
+    :func:`_decode_commander_field`, which exists because of exactly
+    that bug). Appending via ``tee -a`` keeps the existing bytes
+    untouched no matter how badly a read goes, so the worst case is a
+    duplicated stanza rather than an unbootable vehicle.
+
+    Guards, in order: skip non-Pi-5 boards, where the setting is
+    meaningless; short-circuit if the firmware already reports the
+    raised budget; leave the file alone if *any*
+    ``usb_max_current_enable`` line already exists, including
+    ``=0``, since an explicit operator choice should not be silently
+    overridden and a second line would make the effective value depend
+    on parse order; and refuse to touch the file at all if the one-time
+    backup cannot be taken.
+    """
+    ok, model = await _run_host_command(
+        "cat /proc/device-tree/model 2>/dev/null | tr -d '\\0'"
+    )
+    if not ok or "Raspberry Pi 5" not in model:
+        logger.info(
+            "USB current limit: board reports %r, not a Pi 5 - skipping",
+            model.strip() or "unknown",
+        )
+        return False
+
+    ok, active = await _run_host_command(
+        "vcgencmd get_config usb_max_current_enable 2>/dev/null"
+    )
+    if ok and USB_MAX_CURRENT_SETTING in active:
+        logger.info("USB rail already running at the raised 1600 mA budget")
+        return True
+
+    ok, declared = await _run_host_command(
+        f"grep -n '^[[:space:]]*usb_max_current_enable' {BOOT_CONFIG_PATH}"
+        " 2>/dev/null; true"
+    )
+    if ok and declared.strip():
+        logger.info(
+            "USB current limit already declared in %s (%s); reboot to activate",
+            BOOT_CONFIG_PATH,
+            "; ".join(declared.split()),
+        )
+        return True
+
+    ok, _ = await _run_host_command(
+        f"test -f {BOOT_CONFIG_BACKUP_PATH} ||"
+        f" sudo cp -p {BOOT_CONFIG_PATH} {BOOT_CONFIG_BACKUP_PATH}"
+    )
+    if not ok:
+        logger.warning(
+            "Could not back up %s; refusing to modify the boot config",
+            BOOT_CONFIG_PATH,
+        )
+        return False
+
+    block = "\\n".join(USB_MAX_CURRENT_BLOCK_LINES) + "\\n"
+    ok, _ = await _run_host_command(
+        f"printf '{block}' | sudo tee -a {BOOT_CONFIG_PATH} >/dev/null"
+    )
+    if not ok:
+        logger.warning(
+            "Failed to append %s to %s (backup at %s)",
+            USB_MAX_CURRENT_SETTING, BOOT_CONFIG_PATH, BOOT_CONFIG_BACKUP_PATH,
+        )
+        return False
+
+    ok, count = await _run_host_command(
+        f"grep -c '^{USB_MAX_CURRENT_SETTING}$' {BOOT_CONFIG_PATH} 2>/dev/null; true"
+    )
+    if not ok or count.strip() != "1":
+        logger.warning(
+            "Post-append check of %s expected exactly one %r line but counted "
+            "%r; the boot config may now be inconsistent. Backup is at %s.",
+            BOOT_CONFIG_PATH,
+            USB_MAX_CURRENT_SETTING,
+            count.strip(),
+            BOOT_CONFIG_BACKUP_PATH,
+        )
+        return False
+
+    logger.info(
+        "Raised USB rail budget to 1600 mA in %s; reboot to activate "
+        "(backup at %s)",
+        BOOT_CONFIG_PATH,
+        BOOT_CONFIG_BACKUP_PATH,
+    )
+    return True
+
+
 async def setup_hotspot_radio() -> None:
     """Install the host-side config that pins ``uap0`` to the USB Realtek
     *and* makes the AP come up on 2.4 GHz HT20 with the full set of HT
     capabilities the radio supports.
 
+    Also raises the Pi 5 USB current budget so the dongle cannot be
+    dropped off the bus by an over-current trip; see
+    :func:`_ensure_usb_max_current`.
+
     Idempotent: writes are skipped where existing host content already
-    matches. Both the udev rename and the bind-mounted wifi override only
-    take full effect on the next reboot, so this function never restarts
-    services or kicks the running hotspot - it just stages everything for
-    the next boot. The running AP keeps working at default settings in the
-    meantime.
+    matches. The udev rename, the bind-mounted wifi override and the USB
+    current budget all only take full effect on the next reboot, so this
+    function never restarts services or kicks the running hotspot - it
+    just stages everything for the next boot. The running AP keeps
+    working at default settings in the meantime.
     """
+    # Runs first and unconditionally: it is independent of the hotspot
+    # config below, and the early return on write failure must not skip
+    # it.
+    await _ensure_usb_max_current()
+
     rule_ok = await _write_host_file(UDEV_RULE_PATH, UDEV_RULE_CONTENT)
     nm_ok = await _write_host_file(NM_CONF_PATH, NM_CONF_CONTENT)
 
