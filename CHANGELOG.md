@@ -2,6 +2,18 @@
 
 ## bh-0.6
 
+- A named float's name now ends at its terminator instead of absorbing the
+  padding behind it.  The field is a fixed ten characters and a sender is free
+  to leave anything in the bytes past the terminator; AGT firmware through
+  v0.3.0 left fragments of the adjacent string literals there, sending
+  `AGT_CAP\0RE`, `REL_STAT\0P` and `PWR_SHDN\0v`.  Deleting every NUL rather
+  than truncating at the first turned those into `AGT_CAPRE`, `REL_STATP` and
+  `PWR_SHDNv`, so every message in the safe-surface protocol was dropped as
+  unknown: no capability advertisement, no release status, and the AGT release
+  path shown as unavailable while the AGT was announcing it once a second.  AGT
+  v0.3.1 clears its padding and is the actual fix, but truncating is what the
+  wire format means and it cannot be broken by a sender that does not.
+
 - `doris.lua` loads on the vehicle again.  ArduPilot vendors Lua with `MAXVARS`
   lowered from upstream's 200 to 100, so the 107 locals this chunk had grown to
   compiled fine on a desktop Lua and were rejected on the autopilot with

@@ -6,9 +6,22 @@ import json
 from doris.services import safe_surface as module
 from doris.services.safe_surface import (
     SafeSurfaceService,
+    _decode_name,
     _named_float_payload,
     parse_named_value,
 )
+
+
+def _raw_message(component: int, raw_name: list[str], value: float) -> str:
+    """A named float whose ten-byte name field is passed through verbatim."""
+    return json.dumps({
+        "header": {"system_id": 1, "component_id": component},
+        "message": {
+            "type": "NAMED_VALUE_FLOAT",
+            "name": raw_name,
+            "value": value,
+        },
+    })
 
 
 def _message(component: int, name: str, value: float, system: int = 1) -> str:
@@ -55,6 +68,45 @@ def test_parse_named_value():
         1, 192, "AGT_CAP", 3.0,
     )
     assert parse_named_value(json.dumps({"message": {"type": "STATUSTEXT"}})) is None
+
+
+def test_decode_name_truncates_at_the_terminator():
+    """Padding past the terminator is the sender's business, not part of the name.
+
+    These are the exact ten-byte fields the AGT was measured transmitting: the
+    packer copied all ten bytes out of a shorter string literal, so fragments of
+    whatever the linker put next in .rodata trailed the terminator. Deleting
+    every NUL instead of stopping at the first one produced 'AGT_CAPRE' and
+    'PWR_SHDNv', which match no name we handle.
+    """
+    assert _decode_name(list("AGT_CAP\x00RE")) == "AGT_CAP"
+    assert _decode_name(list("PWR_SHDN\x00v")) == "PWR_SHDN"
+    assert _decode_name(list("REL_STAT\x00P")) == "REL_STAT"
+    assert _decode_name(list("AGT_CAP\x00\x00\x00")) == "AGT_CAP"
+    assert _decode_name(list("ABCDEFGHIJ")) == "ABCDEFGHIJ"
+    assert _decode_name("AGT_CAP\x00RE") == "AGT_CAP"
+    assert _decode_name(None) == ""
+
+
+def test_agt_protocol_survives_uncleared_name_padding():
+    """The messages must land even from a sender that leaves its padding dirty.
+
+    This is the whole failure: with the names unrecognised the service saw no
+    capability advertisement and no release status, so it reported the AGT
+    release path unavailable while the AGT was in fact announcing it once a
+    second.
+    """
+    service = SafeSurfaceService()
+    for raw, value in (
+        (list("AGT_CAP\x00RE"), float(module.REQUIRED_CAPABILITIES)),
+        (list("REL_STAT\x00P"), 0.0),
+    ):
+        parsed = parse_named_value(_raw_message(192, raw, value))
+        assert parsed is not None
+        service.process_named_value(*parsed)
+
+    assert service.state.capabilities == module.REQUIRED_CAPABILITIES
+    assert service.state.release_actual is False
 
 
 def test_parse_named_value_rejects_nonfinite_and_malformed_values():

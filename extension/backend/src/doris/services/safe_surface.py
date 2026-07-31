@@ -47,10 +47,22 @@ MAX_CAPABILITY_MASK = 0xFF
 
 
 def _decode_name(raw_name: object) -> str:
-    """Decode MAVLink's ten-character name field."""
+    """Decode MAVLink's ten-character name field.
+
+    The field is NUL-terminated whenever the name is shorter than ten
+    characters, and nothing obliges a sender to clear the bytes after that
+    terminator. The AGT did not: it transmitted ``AGT_CAP\\0RE`` and
+    ``PWR_SHDN\\0v``, trailing fragments of the neighbouring name literals.
+    Deleting every NUL turned those into ``AGT_CAPRE`` and ``PWR_SHDNv``, which
+    match nothing, so the whole safe-surface protocol was silently ignored.
+    Truncating at the terminator is both what the wire format means and the
+    reading that cannot be broken by a sender's padding.
+    """
     if isinstance(raw_name, list):
-        return "".join(str(char) for char in raw_name if char != "\x00").strip()
-    return str(raw_name or "").replace("\x00", "").strip()
+        text = "".join(str(char) for char in raw_name)
+    else:
+        text = str(raw_name or "")
+    return text.split("\x00", 1)[0].strip()
 
 
 def parse_named_value(raw: str) -> tuple[int, int, str, float] | None:
