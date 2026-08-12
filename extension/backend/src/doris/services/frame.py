@@ -254,7 +254,13 @@ class FrameService:
         critical_names = set(frame.get("critical_params", [])) if frame else set()
 
         orientation_val = params.get("AHRS_ORIENTATION")
-        orientation_map = {0: "None", 24: "Pitch90", 25: "Pitch270"}
+        orientation_map = {
+            0: "None",
+            8: "Roll180",
+            24: "Pitch90",
+            25: "Pitch270",
+            34: "Pitch270Roll180",
+        }
 
         servo_functions = {}
         for ch in range(1, 17):

@@ -90,7 +90,11 @@ function animate() {
     smooth.roll += (attitude.value.roll_rad - smooth.roll) * LERP
     smooth.pitch += (attitude.value.pitch_rad - smooth.pitch) * LERP
     smooth.yaw += (attitude.value.yaw_rad - smooth.yaw) * LERP
-    vehicleModel.rotation.set(-smooth.pitch, -smooth.yaw, smooth.roll, 'ZYX')
+    // Aerospace attitude is a yaw->pitch->roll (3-2-1) intrinsic sequence.
+    // With Three.js Y-up, that maps to yaw about Y, pitch about X, roll about Z,
+    // which requires Euler order 'YXZ'. Any other order couples the axes so that
+    // e.g. a pure yaw appears as roll once pitch/roll are non-zero.
+    vehicleModel.rotation.set(-smooth.pitch, -smooth.yaw, smooth.roll, 'YXZ')
   }
 
   controls.update()
