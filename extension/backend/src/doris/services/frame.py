@@ -1,8 +1,9 @@
 """Vehicle frame configuration service.
 
 Manages the DORIS frame definition: a set of ArduPilot parameters that
-configure a thrusterless deep-ocean lander with lights on SERVO13 and
-a drop-weight relay on SERVO14.
+configure a thrusterless deep-ocean lander with lights on SERVO13 and a
+drop-weight relay on SERVO14.  The Navigator relay mirrors the AGT release
+output so either controller can actuate a release; only one is ever wired.
 
 The service can pull all current vehicle parameters via mavlink2rest,
 apply the DORIS frame overrides, and report frame status.
@@ -244,7 +245,7 @@ class FrameService:
     async def get_frame_status(self) -> dict:
         """Read key frame parameters and report current vehicle frame state.
 
-        Returns detailed status for critical subsystems (lights, relay, battery)
+        Returns detailed status for critical subsystems (lights, release wiring, battery)
         and reports any mismatches against the frame definition.
         """
         params = await self.fetch_key_params()
@@ -295,7 +296,7 @@ class FrameService:
         )
         relay_ok = all(
             self._compare_param(params.get(p, -999), frame_params.get(p, -998))
-            for p in ("SERVO14_FUNCTION", "RELAY1_FUNCTION")
+            for p in ("SERVO14_FUNCTION", "RELAY1_FUNCTION", "RELAY1_PIN")
             if p in frame_params
         )
         battery_ok = all(
@@ -324,6 +325,7 @@ class FrameService:
             },
             "relay": {
                 "ok": relay_ok,
+                "navigator_output_available": relay_ok,
                 "servo14_function": int(params.get("SERVO14_FUNCTION", -1)),
                 "expected_function": int(frame_params.get("SERVO14_FUNCTION", -1)),
                 "relay1_function": int(params.get("RELAY1_FUNCTION", -1)),
@@ -360,14 +362,22 @@ class FrameService:
         if FRAME_SENTINEL.exists():
             try:
                 sentinel = json.loads(FRAME_SENTINEL.read_text())
-                logger.info(
-                    "Frame '%s' was applied on %s (v%s), skipping — "
-                    "use /api/v1/frame/apply to re-apply manually",
+                applied_version = sentinel.get("version")
+                if applied_version == frame_version:
+                    logger.info(
+                        "Frame '%s' was applied on %s (v%s), skipping — "
+                        "use /api/v1/frame/apply to re-apply manually",
+                        frame_name,
+                        sentinel.get("applied_at", "?"),
+                        applied_version,
+                    )
+                    return True
+                logger.warning(
+                    "Frame '%s' profile changed from v%s to v%s; applying update",
                     frame_name,
-                    sentinel.get("applied_at", "?"),
-                    sentinel.get("version", "?"),
+                    applied_version,
+                    frame_version,
                 )
-                return True
             except (json.JSONDecodeError, OSError):
                 pass
 

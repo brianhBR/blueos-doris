@@ -14,7 +14,7 @@ from ..models.sensors import (
 from .barometer import BarometerService
 from .base import BlueOSClient
 from .lights import LightService
-from .tracker import ArtemisTrackerService
+from .tracker import tracker_service
 
 logger = logging.getLogger(__name__)
 
@@ -27,7 +27,7 @@ class SensorService:
         self.camera_manager = BlueOSClient(blueos_services.camera_manager)
         self.light_service = LightService()
         self.barometer_service = BarometerService()
-        self.tracker_service = ArtemisTrackerService()
+        self.tracker_service = tracker_service
 
     async def get_connected_modules(self) -> list[ModuleInfo]:
         """Get all connected modules."""

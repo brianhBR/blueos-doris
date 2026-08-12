@@ -1,13 +1,16 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, nextTick, onMounted, onUnmounted } from 'vue'
+import type { ComponentPublicInstance } from 'vue'
 import {
   Database, Calendar, Clock, MapPin, Camera, Image, FileText, Play,
-  Download, Trash2, AlertTriangle, Archive, Search, X, Loader2
+  Download, Trash2, AlertTriangle, Archive, Search, X, Loader2,
+  Cog, RefreshCw, ChevronDown, ChevronUp, Circle, CircleCheck, CircleMinus,
+  CircleX, Usb
 } from 'lucide-vue-next'
-import { useDiveHistory, useMedia } from '../composables/useApi'
+import { useDiveHistory, useDiveProcessing, useMedia } from '../composables/useApi'
 import { enqueueBulkDownload } from '../composables/useDownloads'
 import { parseBackendDateTime } from '../parseBackendTime'
-import type { DiveHistorySummary, MediaFile } from '../composables/useApi'
+import type { DiveHistorySummary, DiveProcessingState, MediaFile } from '../composables/useApi'
 import type { Screen, DiveData } from '../types'
 
 const emit = defineEmits<{
@@ -16,6 +19,15 @@ const emit = defineEmits<{
 
 const { dives: apiDives, loading, error, fetchDives, deleteDiveRecord } = useDiveHistory()
 const { files: mediaFiles, fetchFiles } = useMedia()
+const {
+  session: processingSession,
+  lines: processingLines,
+  starting: processingStarting,
+  isProcessing,
+  finishedSteps,
+  totalSteps,
+  startProcessing,
+} = useDiveProcessing()
 
 function mcapDownloadHref(relativePath: string): string {
   return `/api/v1/media/download?path=${encodeURIComponent(relativePath)}`
@@ -53,6 +65,10 @@ interface DisplayMission {
   mcapRelativePath: string | null
   images: number
   videos: number
+  /** null on dives recorded before processing became operator-triggered. */
+  processingState: DiveProcessingState | null
+  processingError: string | null
+  processingFinishedAt: string | null
 }
 
 const previousMissions = computed<DisplayMission[]>(() => {
@@ -95,6 +111,9 @@ const previousMissions = computed<DisplayMission[]>(() => {
       mcapRelativePath: m.mcap_relative_path ?? null,
       images: m.image_count,
       videos: m.video_count,
+      processingState: m.processing_state ?? null,
+      processingError: m.processing_error ?? null,
+      processingFinishedAt: m.processing_finished_at ?? null,
     }
   })
 })
@@ -244,6 +263,88 @@ async function handleDownloadAllFiles(mission: DisplayMission) {
     downloadingAllIds.value = withId(downloadingAllIds.value, mission.id, false)
   }
 }
+
+// Post-dive processing. The backend runs one job at a time and the live
+// session is shared app-wide, so the card state comes from the session when
+// it belongs to this dive and falls back to the stored history state.
+const processingStartErrors = ref<Record<string, string>>({})
+const stepsPanelOpen = ref(true)
+
+// The panel lives inside the dive `v-for`, so a plain template ref would be
+// collected into an array; a function ref keeps hold of the single console
+// element that is actually rendered.
+const processingLogEl = ref<HTMLElement | null>(null)
+
+function setProcessingLogEl(el: Element | ComponentPublicInstance | null) {
+  processingLogEl.value = el instanceof HTMLElement ? el : null
+}
+
+function isLiveDive(missionId: string): boolean {
+  return processingSession.value?.dive_id === missionId
+}
+
+const liveSteps = computed(() => processingSession.value?.steps ?? [])
+
+const liveStepNumber = computed(
+  () => Math.min(finishedSteps.value + 1, Math.max(totalSteps.value, 1)),
+)
+
+function processingStateFor(mission: DisplayMission): DiveProcessingState {
+  const live = processingSession.value
+  if (live && live.dive_id === mission.id) {
+    if (!live.done) return 'running'
+    return live.success ? 'complete' : 'failed'
+  }
+  return mission.processingState ?? 'pending'
+}
+
+function processingErrorFor(mission: DisplayMission): string | null {
+  const live = processingSession.value
+  if (live && live.dive_id === mission.id && live.done && !live.success) {
+    return live.error ?? 'Processing failed'
+  }
+  return mission.processingError
+}
+
+function processedAtLabel(mission: DisplayMission): string {
+  if (!mission.processingFinishedAt) return 'Run post-dive processing again'
+  const dt = parseBackendDateTime(mission.processingFinishedAt)
+  if (Number.isNaN(dt.getTime())) return 'Run post-dive processing again'
+  return `Processed ${dt.toLocaleString(undefined, { timeZone: 'UTC' })} UTC`
+}
+
+async function handleProcessDive(mission: DisplayMission) {
+  if (isProcessing.value || processingStarting.value) return
+  if (processingStartErrors.value[mission.id]) {
+    const next = { ...processingStartErrors.value }
+    delete next[mission.id]
+    processingStartErrors.value = next
+  }
+  const result = await startProcessing(mission.id)
+  if (!result.ok) {
+    processingStartErrors.value = {
+      ...processingStartErrors.value,
+      [mission.id]: result.error ?? 'Could not start processing. Please try again.',
+    }
+  }
+}
+
+watch(() => processingSession.value?.session_id, () => {
+  stepsPanelOpen.value = true
+})
+
+// A finished run rewrites the dive record, so pull the list immediately
+// instead of waiting out the 15 s poll.
+watch(() => processingSession.value?.done, (done, wasDone) => {
+  if (done && !wasDone) fetchDives()
+})
+
+watch(processingLines, async () => {
+  await nextTick()
+  if (processingLogEl.value) {
+    processingLogEl.value.scrollTop = processingLogEl.value.scrollHeight
+  }
+})
 
 const filteredMissions = computed(() => {
   return previousMissions.value
@@ -453,6 +554,79 @@ const handleDeleteMission = async () => {
 
             <!-- Action Buttons (vertical stack on right) -->
             <div class="flex flex-col gap-2 flex-shrink-0">
+              <div
+                v-if="processingStateFor(mission) === 'complete'"
+                class="flex items-center gap-2"
+              >
+                <span
+                  class="flex-1 px-4 py-2 rounded-lg flex items-center justify-center gap-2 text-sm whitespace-nowrap"
+                  style="background-color: rgba(0, 212, 170, 0.12); border: 1px solid rgba(0, 212, 170, 0.35); color: #00D4AA"
+                  :title="processedAtLabel(mission)"
+                >
+                  <CircleCheck class="w-4 h-4 flex-shrink-0" />
+                  Processed
+                </span>
+                <button
+                  type="button"
+                  @click="handleProcessDive(mission)"
+                  :disabled="isProcessing || processingStarting"
+                  title="Run post-dive processing again — safe to repeat"
+                  class="px-3 py-2 rounded-lg flex items-center gap-2 text-sm whitespace-nowrap transition-all hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
+                  style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid #41B9C3; color: #41B9C3"
+                >
+                  <RefreshCw class="w-4 h-4 flex-shrink-0" />
+                  Run again
+                </button>
+              </div>
+              <button
+                v-else-if="processingStateFor(mission) === 'running'"
+                type="button"
+                disabled
+                title="Building videos, collecting logs and copying files to the USB stick"
+                class="px-4 py-2 rounded-lg flex items-center justify-center gap-2 text-sm whitespace-nowrap opacity-70 cursor-wait"
+                style="background-color: rgba(0, 212, 170, 0.2); border: 1px solid rgba(0, 212, 170, 0.5); color: #00D4AA"
+              >
+                <Loader2 class="w-4 h-4 flex-shrink-0 animate-spin" />
+                Processing…
+              </button>
+              <button
+                v-else-if="processingStateFor(mission) === 'failed'"
+                type="button"
+                @click="handleProcessDive(mission)"
+                :disabled="isProcessing || processingStarting"
+                :title="processingErrorFor(mission) ?? 'Processing failed — run it again'"
+                class="px-4 py-2 rounded-lg flex items-center justify-center gap-2 text-sm whitespace-nowrap transition-all hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
+                style="background-color: rgba(221, 44, 29, 0.2); border: 1px solid #DD2C1D; color: #DD2C1D"
+              >
+                <AlertTriangle class="w-4 h-4 flex-shrink-0" />
+                Retry
+              </button>
+              <button
+                v-else
+                type="button"
+                @click="handleProcessDive(mission)"
+                :disabled="isProcessing || processingStarting"
+                title="Build the dive videos, collect the logs and copy everything to the USB stick"
+                class="px-4 py-2 rounded-lg flex items-center justify-center gap-2 text-sm whitespace-nowrap transition-all hover:opacity-90 disabled:opacity-50 disabled:cursor-not-allowed"
+                style="background-color: rgba(0, 212, 170, 0.2); border: 1px solid rgba(0, 212, 170, 0.5); color: #00D4AA"
+              >
+                <Cog class="w-4 h-4 flex-shrink-0" />
+                Process Dive
+              </button>
+              <span
+                v-if="processingStateFor(mission) === 'failed' && processingErrorFor(mission)"
+                class="text-xs text-center break-words"
+                style="color: #FF4757; max-width: 16rem"
+              >
+                {{ processingErrorFor(mission) }}
+              </span>
+              <span
+                v-if="processingStartErrors[mission.id]"
+                class="text-xs text-center break-words"
+                style="color: #FCD869; max-width: 16rem"
+              >
+                {{ processingStartErrors[mission.id] }}
+              </span>
               <a
                 v-if="mission.mcapRelativePath"
                 :href="mcapDownloadHref(mission.mcapRelativePath)"
@@ -558,6 +732,119 @@ const handleDeleteMission = async () => {
                 <Trash2 class="w-4 h-4" />
                 Delete Dive
               </button>
+            </div>
+          </div>
+
+          <!-- Processing progress for the dive currently being processed -->
+          <div
+            v-if="isLiveDive(mission.id)"
+            class="mt-4 rounded-lg overflow-hidden"
+            style="background-color: rgba(0, 0, 0, 0.25); border: 1px solid rgba(65, 185, 195, 0.25)"
+          >
+            <button
+              type="button"
+              class="w-full px-4 py-2.5 flex items-center justify-between gap-3 text-sm text-left transition-all hover:opacity-90"
+              @click="stepsPanelOpen = !stepsPanelOpen"
+            >
+              <span class="flex items-center gap-2 min-w-0" style="color: #96EEF2">
+                <Loader2
+                  v-if="!processingSession?.done"
+                  class="w-4 h-4 flex-shrink-0 animate-spin"
+                  style="color: #FCD869"
+                />
+                <CircleCheck
+                  v-else-if="processingSession?.success"
+                  class="w-4 h-4 flex-shrink-0"
+                  style="color: #00D4AA"
+                />
+                <CircleX v-else class="w-4 h-4 flex-shrink-0" style="color: #FF4757" />
+                <span v-if="!processingSession?.done" class="truncate">
+                  Processing — step {{ liveStepNumber }} of {{ totalSteps }}
+                </span>
+                <span v-else-if="processingSession?.success" class="truncate">Processing complete</span>
+                <span v-else class="truncate">Processing failed</span>
+              </span>
+              <ChevronUp v-if="stepsPanelOpen" class="w-4 h-4 flex-shrink-0" style="color: #96EEF2" />
+              <ChevronDown v-else class="w-4 h-4 flex-shrink-0" style="color: #96EEF2" />
+            </button>
+
+            <div v-if="stepsPanelOpen" class="px-4 pb-4 space-y-3">
+              <ul class="space-y-1.5">
+                <li
+                  v-for="step in liveSteps"
+                  :key="step.key"
+                  class="flex items-start gap-2"
+                >
+                  <CircleCheck
+                    v-if="step.status === 'done'"
+                    class="w-4 h-4 flex-shrink-0 mt-0.5"
+                    style="color: #00D4AA"
+                  />
+                  <CircleMinus
+                    v-else-if="step.status === 'skipped'"
+                    class="w-4 h-4 flex-shrink-0 mt-0.5"
+                    style="color: #96EEF2; opacity: 0.55"
+                  />
+                  <CircleX
+                    v-else-if="step.status === 'failed'"
+                    class="w-4 h-4 flex-shrink-0 mt-0.5"
+                    style="color: #FF4757"
+                  />
+                  <Loader2
+                    v-else-if="step.status === 'running'"
+                    class="w-4 h-4 flex-shrink-0 mt-0.5 animate-spin"
+                    style="color: #FCD869"
+                  />
+                  <Circle
+                    v-else
+                    class="w-4 h-4 flex-shrink-0 mt-0.5"
+                    style="color: #41B9C3; opacity: 0.45"
+                  />
+                  <div class="min-w-0">
+                    <p
+                      class="text-sm break-words"
+                      :style="{ color: '#96EEF2', opacity: step.status === 'pending' ? 0.6 : 1 }"
+                    >
+                      {{ step.label }}
+                      <span v-if="step.status === 'skipped'" class="text-xs ml-1 opacity-75">(skipped)</span>
+                    </p>
+                    <p
+                      v-if="step.detail"
+                      class="text-xs break-words"
+                      style="color: #96EEF2; opacity: 0.7"
+                    >
+                      {{ step.detail }}
+                    </p>
+                  </div>
+                </li>
+              </ul>
+
+              <div
+                v-if="processingSession?.done && processingSession?.safe_to_remove_usb"
+                class="rounded-lg px-3 py-2 flex items-center gap-2 text-sm"
+                style="background-color: rgba(0, 212, 170, 0.15); border: 1px solid rgba(0, 212, 170, 0.4); color: #00D4AA"
+              >
+                <Usb class="w-4 h-4 flex-shrink-0" />
+                All files are written — the USB stick is safe to remove.
+              </div>
+
+              <div
+                v-if="processingSession?.done && !processingSession?.success"
+                class="rounded-lg px-3 py-2 flex items-start gap-2 text-sm break-words"
+                style="background-color: rgba(221, 44, 29, 0.15); border: 1px solid rgba(221, 44, 29, 0.4); color: #FF4757"
+              >
+                <AlertTriangle class="w-4 h-4 flex-shrink-0 mt-0.5" />
+                {{ processingSession?.error || 'Processing failed. Please try again.' }}
+              </div>
+
+              <div
+                v-if="processingLines.length > 0"
+                :ref="setProcessingLogEl"
+                class="rounded-lg px-3 py-2 overflow-y-auto text-xs leading-relaxed"
+                style="background-color: rgba(0, 0, 0, 0.4); border: 1px solid rgba(65, 185, 195, 0.15); max-height: 160px; color: #B9D7DA; font-family: 'JetBrains Mono', 'Fira Code', monospace"
+              >
+                <div v-for="(line, i) in processingLines" :key="i">{{ line }}</div>
+              </div>
             </div>
           </div>
         </div>

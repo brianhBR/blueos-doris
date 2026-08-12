@@ -112,6 +112,7 @@ LABEL permissions='\
       "/usr/blueos/extensions/doris/notifications:/tmp/storage/notifications",\
       "/usr/blueos/extensions/doris/dives:/tmp/storage/dives",\
       "/usr/blueos/userdata:/tmp/storage/userdata",\
+      "/usr/blueos/extensions/radcam-spy:/tmp/storage/radcam_spy:ro",\
       "/usr/blueos/extensions/doris/nginx:/tmp/nginx",\
       "/etc/avahi:/tmp/avahi",\
       "/sys:/sys:rw"\

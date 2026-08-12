@@ -31,7 +31,9 @@ logger = logging.getLogger(__name__)
 
 IMAGE_EXTENSIONS = frozenset(("jpg", "jpeg", "png", "gif", "bmp", "tiff", "raw", "dng"))
 VIDEO_EXTENSIONS = frozenset(("mp4", "avi", "mov", "mkv", "webm", "ts"))
-DATA_EXTENSIONS = frozenset(("csv", "json", "bin", "log", "txt", "bag", "mcap", "lua"))
+DATA_EXTENSIONS = frozenset(
+    ("csv", "json", "ndjson", "bin", "log", "txt", "bag", "mcap", "lua")
+)
 ALL_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS | DATA_EXTENSIONS
 
 DATA_ROOT = Path(os.environ.get("DORIS_DATA_ROOT", "/tmp/storage"))
@@ -484,9 +486,27 @@ def build_dive_history_list(root: Path) -> list[DiveHistoryEntry]:
                 configuration=str(data.get("configuration") or ""),
                 bin_log_files=bin_log_rel,
                 bin_log_status=bin_log_status,
+                processing_state=_opt_str(data.get("processing_state")),
+                processing_finished_at=_parse_dt(data.get("processing_finished_at")),
+                processing_error=_opt_str(data.get("processing_error")),
             )
         )
     return entries
+
+
+def _opt_str(value: object) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return value.strip()
+
+
+def _parse_dt(value: object) -> datetime | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
 
 
 def delete_dive_record_file(root: Path, dive_id: str) -> bool:
