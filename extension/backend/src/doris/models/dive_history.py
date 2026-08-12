@@ -30,3 +30,9 @@ class DiveHistoryEntry(BaseModel):
     # DATA_ROOT) that the frontend can pass to ``/api/v1/media/download``.
     bin_log_files: list[str] = []
     bin_log_status: str | None = None
+    # Deferred post-dive processing (services.dive_processing).  ``pending``
+    # means the dive is quiesced and waiting for the operator to press
+    # "Process Dive"; older records predate the field and report None.
+    processing_state: str | None = None
+    processing_finished_at: datetime | None = None
+    processing_error: str | None = None

@@ -1,5 +1,6 @@
 """System API routes."""
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -7,8 +8,11 @@ from datetime import datetime, timezone
 from robyn import Response, Robyn
 
 from ..services.external_storage import get_migration_status
+from ..services.frame import FrameService
+from ..services.safe_surface import safe_surface_service
 from ..services.system import SystemService
 from ..services.timesync import timesync_service
+from ..services.tracker import tracker_service
 
 logger = logging.getLogger(__name__)
 
@@ -124,6 +128,30 @@ def register_system_routes(app: Robyn) -> None:
 
         result = await timesync_service.try_sync_from_client(client_dt)
         return json.dumps(result)
+
+    @app.get("/api/v1/safe-surface/status")
+    async def get_safe_surface_status(request):
+        """Report the health of both mirrored release paths."""
+        firmware, frame = await asyncio.gather(
+            tracker_service.get_version(request=True),
+            FrameService().get_frame_status(),
+        )
+        readiness = safe_surface_service.evaluate_release_readiness(firmware, frame)
+
+        return json.dumps({
+            "ready": readiness["ready"],
+            "blockers": readiness["blockers"],
+            "warnings": readiness["warnings"],
+            "navigator_release_available": readiness["navigator_release_available"],
+            "agt_release_available": readiness["agt_release_available"],
+            "firmware": firmware,
+            "protocol": readiness["protocol"],
+            "frame": {
+                "applied": frame.get("frame_applied", False),
+                "release": frame.get("relay", {}),
+                "critical_mismatches": frame.get("critical_mismatches", {}),
+            },
+        })
 
     @app.get("/api/v1/health")
     async def health_check(request):

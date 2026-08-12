@@ -1,8 +1,8 @@
 <script setup lang="ts">
 import { ref, computed, onMounted, onUnmounted } from 'vue'
-import { HardDrive, Loader2, AlertTriangle, Clock } from 'lucide-vue-next'
+import { HardDrive, Loader2, AlertTriangle, Clock, CircleCheck, CircleX, Usb, X } from 'lucide-vue-next'
 import type { Screen, DiveData } from './types'
-import { useDiveControl, useNotifications, useStorageMigration, useArmingStatus } from './composables/useApi'
+import { useDiveControl, useDiveProcessing, useNotifications, useStorageMigration, useArmingStatus } from './composables/useApi'
 import Navigation from './components/Navigation.vue'
 import Footer from './components/Footer.vue'
 import HomeScreen from './components/HomeScreen.vue'
@@ -37,6 +37,46 @@ const showArmingBanner = computed(() => armingStatus.value?.waiting_to_arm === t
 const armingReasons = computed(() =>
   (armingStatus.value?.reasons ?? []).map(r => r.text.replace(/^(PreArm:|Arm:)\s*/i, '').trim())
 )
+
+// Post-dive processing runs for minutes; the bar keeps it visible on every
+// screen and stays up after it finishes until the operator dismisses it.
+const {
+  session: processingSession,
+  isProcessing: processingActive,
+  currentStep: processingStep,
+  finishedSteps: processingFinishedSteps,
+  totalSteps: processingTotalSteps,
+  progressPercent: processingPercent,
+  dismissed: processingDismissed,
+  dismissProcessing,
+} = useDiveProcessing()
+
+const showProcessingBar = computed(
+  () => processingSession.value !== null && !processingDismissed.value,
+)
+
+const processingStepNumber = computed(() =>
+  Math.min(processingFinishedSteps.value + 1, Math.max(processingTotalSteps.value, 1)),
+)
+
+const processingBarStyle = computed(() => {
+  if (processingActive.value) {
+    return {
+      background: 'linear-gradient(90deg, #0E2446 0%, #004D64 100%)',
+      borderBottom: '1px solid rgba(65, 185, 195, 0.4)',
+    }
+  }
+  if (processingSession.value?.success) {
+    return {
+      backgroundColor: 'rgba(0, 212, 170, 0.15)',
+      borderBottom: '1px solid rgba(0, 212, 170, 0.5)',
+    }
+  }
+  return {
+    backgroundColor: 'rgba(221, 44, 29, 0.15)',
+    borderBottom: '1px solid rgba(221, 44, 29, 0.5)',
+  }
+})
 
 const clockSyncFailed = ref(false)
 const clockSyncMessage = ref('')
@@ -206,6 +246,63 @@ const setConnected = (connected: boolean) => {
       <span class="text-sm" style="color: #FF6B6B">
         External storage setup failed: {{ migrationStatus?.error }}
       </span>
+    </div>
+
+    <div
+      v-if="showProcessingBar"
+      class="w-full py-2.5 px-4 flex flex-col items-center gap-1.5"
+      :style="processingBarStyle"
+      style="font-family: Montserrat, sans-serif"
+    >
+      <div class="w-full flex items-center justify-center gap-3">
+        <Loader2 v-if="processingActive" class="w-5 h-5 flex-shrink-0 animate-spin" style="color: #96EEF2" />
+        <CircleCheck
+          v-else-if="processingSession?.success"
+          class="w-5 h-5 flex-shrink-0"
+          style="color: #00D4AA"
+        />
+        <CircleX v-else class="w-5 h-5 flex-shrink-0" style="color: #DD2C1D" />
+
+        <span v-if="processingActive" class="text-white text-sm font-medium">
+          Processing {{ processingSession?.dive_id }} —
+          {{ processingStep?.label || 'Getting started…' }}
+          <span class="opacity-80">
+            (step {{ processingStepNumber }} of {{ processingTotalSteps }})
+          </span>
+        </span>
+        <span v-else-if="processingSession?.success" class="text-sm font-medium" style="color: #00D4AA">
+          Finished processing {{ processingSession?.dive_id }}.
+          <span v-if="processingSession?.safe_to_remove_usb" class="inline-flex items-center gap-1 ml-1">
+            <Usb class="w-4 h-4" />
+            The USB stick is safe to remove.
+          </span>
+        </span>
+        <span v-else class="text-sm font-medium" style="color: #FF6B6B">
+          Processing {{ processingSession?.dive_id }} failed:
+          {{ processingSession?.error || 'unknown error' }}
+        </span>
+
+        <button
+          v-if="!processingActive"
+          type="button"
+          title="Dismiss"
+          class="ml-2 p-1 rounded transition-opacity hover:opacity-70"
+          @click="dismissProcessing"
+        >
+          <X class="w-4 h-4" style="color: #96EEF2" />
+        </button>
+      </div>
+
+      <div
+        v-if="processingActive"
+        class="w-full max-w-xl h-1.5 rounded-full overflow-hidden"
+        style="background-color: rgba(255, 255, 255, 0.15)"
+      >
+        <div
+          class="h-full rounded-full transition-all"
+          :style="{ width: `${processingPercent}%`, backgroundColor: '#00D4AA' }"
+        />
+      </div>
     </div>
 
     <Navigation

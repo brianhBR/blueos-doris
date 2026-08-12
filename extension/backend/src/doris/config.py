@@ -12,6 +12,10 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8095
     debug: bool = False
+    # Mission completion powers off the payload by default. Operators can
+    # persistently suppress the ACK/cutoff from the AGT sensor panel while
+    # bench testing; this environment setting remains the deployment default.
+    agt_shutdown_enabled: bool = True
 
     # BlueOS settings - defaults to host.docker.internal for Docker
     # When running as BlueOS extension, use host.docker.internal to access BlueOS services
@@ -41,6 +45,13 @@ class Settings(BaseSettings):
     # IP camera recorder (RTSP -> segmented MPEG-TS via gst-launch; URL is hardcoded in service)
     ipcam_recordings_subdir: str = "userdata/ipcam_recordings"
     ipcam_segment_seconds_default: int = 1800
+
+    # RadCam Spy extension logs, collected into the per-dive USB bundle by the
+    # post-dive processing job.  The bind mount is optional and read-only; when
+    # it is absent we fall back to that extension's HTTP API, which only
+    # answers while it is running.
+    radcam_spy_port: int = 9850
+    radcam_spy_logs_dir: str = "/tmp/storage/radcam_spy/logs"
 
     # Removable USB for RTSP segments (same idea as BlueOS_videorecorder DropCam usb_storage)
     usb_mount_point: str = "/mnt/usb"
@@ -137,6 +148,10 @@ class BlueOSServices:
     @property
     def recorder_extractor(self) -> str:
         return self._url(settings.recorder_extractor_port)
+
+    @property
+    def radcam_spy(self) -> str:
+        return self._url(settings.radcam_spy_port)
 
 
 blueos_services = BlueOSServices()

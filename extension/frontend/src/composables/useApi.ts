@@ -4,7 +4,7 @@
  * Backend API base: /api/v1
  * See backend OpenAPI spec at /openapi.json for full endpoint docs.
  */
-import { ref, readonly, computed } from 'vue'
+import { ref, readonly, computed, onMounted } from 'vue'
 import { enqueueDownload, enqueueBulkDownload } from './useDownloads'
 
 const API_BASE = '/api/v1'
@@ -40,6 +40,44 @@ export interface StorageInfo {
   available_gb: number
   used_percent: number
   storage_type?: string
+}
+
+export interface SafeSurfaceStatus {
+  ready: boolean
+  blockers: string[]
+  warnings: string[]
+  navigator_release_available: boolean
+  agt_release_available: boolean
+  firmware: {
+    version: string | null
+    min_required: string
+    compatible: boolean | null
+    known: boolean
+  }
+  protocol: {
+    capabilities: number | null
+    capabilities_compatible: boolean
+    compatible: boolean
+    release_capability_ok: boolean
+    agt_release_path_ok: boolean
+    release_request_known: boolean
+    release_request_stale: boolean
+    release_actual_known: boolean
+    release_actual_stale: boolean
+    release_requested: boolean | null
+    release_actual: boolean | null
+    release_mismatch: boolean
+    agt_status_stale: boolean
+    shutdown_enabled: boolean
+    bench_mode: boolean
+    power_shutdown_requested: boolean
+    shutdown_state: string
+  }
+  frame: {
+    applied: boolean
+    release: Record<string, unknown>
+    critical_mismatches: Record<string, unknown>
+  }
 }
 
 export interface LocationInfo {
@@ -135,6 +173,14 @@ export interface MissionSummary {
   video_count: number
 }
 
+/**
+ * Post-dive processing lifecycle for one dive record.
+ *
+ * `null` on dives recorded before processing became an operator-triggered
+ * step — those have never been offered to the job runner.
+ */
+export type DiveProcessingState = 'pending' | 'running' | 'complete' | 'failed'
+
 /** Persisted dive records from GET /dive/history (dives/dive_*.json). */
 export interface DiveHistorySummary {
   id: string
@@ -154,6 +200,9 @@ export interface DiveHistorySummary {
   image_count: number
   video_count: number
   configuration?: string
+  processing_state: DiveProcessingState | null
+  processing_finished_at: string | null
+  processing_error: string | null
 }
 
 export interface MissionConfig {
@@ -435,6 +484,34 @@ export function useStorage() {
   }
 
   return { storage: readonly(storage), loading: readonly(loading), error: readonly(error), fetchStorage }
+}
+
+export function useSafeSurfaceStatus() {
+  const status = ref<SafeSurfaceStatus | null>(null)
+  const loading = ref(false)
+  const error = ref<string | null>(null)
+
+  async function fetchSafeSurfaceStatus(): Promise<SafeSurfaceStatus | null> {
+    loading.value = true
+    error.value = null
+    try {
+      status.value = await fetchApi<SafeSurfaceStatus>('/safe-surface/status')
+      return status.value
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to verify safe-surface status'
+      status.value = null
+      return null
+    } finally {
+      loading.value = false
+    }
+  }
+
+  return {
+    status: readonly(status),
+    loading: readonly(loading),
+    error: readonly(error),
+    fetchSafeSurfaceStatus,
+  }
 }
 
 export function useLocation() {
@@ -792,6 +869,208 @@ export function useDiveHistory() {
     error: readonly(error),
     fetchDives,
     deleteDiveRecord,
+  }
+}
+
+// ── Post-dive processing composables ────────────────────────────────
+
+export type DiveProcessingStepStatus = 'pending' | 'running' | 'done' | 'skipped' | 'failed'
+
+export interface DiveProcessingStep {
+  key: string
+  label: string
+  status: DiveProcessingStepStatus
+  /** Human-readable outcome, e.g. the USB path a step wrote to. */
+  detail: string
+}
+
+export interface DiveProcessingSession {
+  session_id: string
+  dive_id: string
+  steps: DiveProcessingStep[]
+  started_at: string
+  finished_at: string | null
+  done: boolean
+  success: boolean
+  error: string | null
+  safe_to_remove_usb: boolean
+  /** Only the lines from the requested `from_line` onward. */
+  lines: string[]
+  total_lines: number
+}
+
+export interface DiveProcessingStatusResponse {
+  session: DiveProcessingSession | null
+}
+
+export interface DiveProcessingStartResult {
+  ok: boolean
+  session_id: string | null
+  /** Backend message; the 409 conflict text when another dive is busy. */
+  error: string | null
+  conflict: boolean
+}
+
+const PROCESSING_POLL_MS = 1500
+
+/**
+ * Processing state is module-level (like the download queue) because the
+ * Previous Dives page and the app-wide status bar have to watch the same
+ * run: the backend allows one job at a time, and the operator needs to see
+ * it whichever screen they navigate to.
+ */
+const processingSession = ref<DiveProcessingSession | null>(null)
+const processingLines = ref<string[]>([])
+const processingStarting = ref(false)
+const processingError = ref<string | null>(null)
+const processingDismissedId = ref<string | null>(null)
+let processingLineCursor = 0
+let processingPollTimer: number | undefined
+
+function applyProcessingStatus(next: DiveProcessingSession | null, fromLine: number) {
+  if (!next) {
+    processingSession.value = null
+    processingLines.value = []
+    processingLineCursor = 0
+    return
+  }
+  const isNewSession = next.session_id !== processingSession.value?.session_id
+  if (isNewSession || fromLine === 0) {
+    processingLines.value = [...next.lines]
+  } else if (next.lines.length > 0) {
+    processingLines.value = [...processingLines.value, ...next.lines]
+  }
+  processingLineCursor = next.total_lines
+  processingSession.value = next
+}
+
+function stopProcessingPolling() {
+  if (processingPollTimer !== undefined) {
+    clearInterval(processingPollTimer)
+    processingPollTimer = undefined
+  }
+}
+
+function startProcessingPolling() {
+  if (processingPollTimer !== undefined) return
+  processingPollTimer = window.setInterval(() => {
+    void refreshProcessingStatus()
+  }, PROCESSING_POLL_MS)
+}
+
+/**
+ * Read the run's progress. Called with no argument it asks the backend for
+ * the most recent session, which is how a reloaded page re-attaches to a
+ * job that is still going.
+ */
+async function refreshProcessingStatus(sessionId?: string): Promise<void> {
+  const target = sessionId ?? processingSession.value?.session_id
+  const known = target !== undefined && target === processingSession.value?.session_id
+  const fromLine = known ? processingLineCursor : 0
+  const params: Record<string, string> = { from_line: String(fromLine) }
+  if (target) params.session_id = target
+  try {
+    const res = await fetchApi<DiveProcessingStatusResponse>('/dive/process/status', params)
+    applyProcessingStatus(res.session, fromLine)
+  } catch {
+    // A job runs for minutes over a boat-deck WiFi link; a dropped poll is
+    // not a reason to abandon the progress view, the next tick retries.
+    return
+  }
+  if (processingSession.value && !processingSession.value.done) {
+    startProcessingPolling()
+  } else {
+    stopProcessingPolling()
+  }
+}
+
+/**
+ * Ask the backend to process `diveId`. Never throws: the caller gets the
+ * backend's own message back so a 409 ("Already processing dive_0041…")
+ * can be shown verbatim.
+ */
+async function startProcessing(diveId: string): Promise<DiveProcessingStartResult> {
+  processingStarting.value = true
+  processingError.value = null
+  try {
+    const response = await fetch(
+      `${API_BASE}/dive/history/${encodeURIComponent(diveId)}/process`,
+      { method: 'POST' },
+    )
+    const body = await response.json().catch(() => null) as
+      { session_id?: string; dive_id?: string; error?: string } | null
+    if (!response.ok) {
+      const message = body?.error || `Failed to start processing (${response.status})`
+      processingError.value = message
+      return { ok: false, session_id: null, error: message, conflict: response.status === 409 }
+    }
+    const sessionId = body?.session_id ?? null
+    processingDismissedId.value = null
+    await refreshProcessingStatus(sessionId ?? undefined)
+    return { ok: true, session_id: sessionId, error: null, conflict: false }
+  } catch (e) {
+    const message = e instanceof Error ? e.message : 'Failed to start processing'
+    processingError.value = message
+    return { ok: false, session_id: null, error: message, conflict: false }
+  } finally {
+    processingStarting.value = false
+  }
+}
+
+export function useDiveProcessing() {
+  const isProcessing = computed(
+    () => processingSession.value !== null && !processingSession.value.done,
+  )
+
+  const currentStep = computed<DiveProcessingStep | null>(
+    () => processingSession.value?.steps.find(s => s.status === 'running') ?? null,
+  )
+
+  const totalSteps = computed(() => processingSession.value?.steps.length ?? 0)
+
+  const finishedSteps = computed(
+    () =>
+      processingSession.value?.steps.filter(
+        s => s.status === 'done' || s.status === 'skipped' || s.status === 'failed',
+      ).length ?? 0,
+  )
+
+  const progressPercent = computed(() => {
+    if (totalSteps.value === 0) return 0
+    return Math.round((finishedSteps.value / totalSteps.value) * 100)
+  })
+
+  const dismissed = computed(
+    () =>
+      processingSession.value !== null
+      && processingDismissedId.value === processingSession.value.session_id,
+  )
+
+  /** Hide a finished run from the status bar; the run itself is untouched. */
+  function dismissProcessing() {
+    if (processingSession.value) {
+      processingDismissedId.value = processingSession.value.session_id
+    }
+  }
+
+  onMounted(() => {
+    void refreshProcessingStatus()
+  })
+
+  return {
+    session: readonly(processingSession),
+    lines: readonly(processingLines),
+    starting: readonly(processingStarting),
+    error: readonly(processingError),
+    isProcessing,
+    currentStep,
+    totalSteps,
+    finishedSteps,
+    progressPercent,
+    dismissed,
+    startProcessing,
+    refreshProcessingStatus,
+    dismissProcessing,
   }
 }
 

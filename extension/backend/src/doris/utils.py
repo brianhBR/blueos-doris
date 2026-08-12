@@ -2,7 +2,9 @@
 
 import hashlib
 import logging
+import os
 import shutil
+import tempfile
 from pathlib import Path
 
 import httpx
@@ -17,6 +19,35 @@ SCRIPT_SEARCH_PATHS = [
     Path("/app/scripts"),
     Path(__file__).resolve().parents[3] / "scripts",
 ]
+
+
+def _atomic_copy(src: Path, dest: Path) -> None:
+    """Replace ``dest`` with ``src`` in a single step.
+
+    ArduPilot reads this file on its own schedule, so it must never observe a
+    partial one. Copying straight onto ``dest`` truncates it and then streams
+    ~75 KB back in; a script load landing inside that window compiles whatever
+    prefix happens to be on disk and reports a syntax error at an arbitrary
+    line, or a bogus complaint about the local variable limit. Writing beside
+    the destination and renaming means a reader sees either the whole old file
+    or the whole new one.
+    """
+    fd, tmp_name = tempfile.mkstemp(dir=str(dest.parent), prefix=".doris.lua.")
+    tmp = Path(tmp_name)
+    try:
+        with open(fd, "wb") as fh:
+            fh.write(src.read_bytes())
+            fh.flush()
+            # The rename below only orders the directory entry. Without this the
+            # contents could still be in flight when power is cut, leaving a
+            # correctly named but empty script.
+            os.fsync(fh.fileno())
+        shutil.copystat(src, tmp)
+        os.chmod(tmp, 0o644)  # mkstemp creates 0600; ArduPilot runs as another user
+        os.replace(tmp, dest)
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
 
 
 def deploy_lua_scripts(logger: logging.Logger) -> bool:
@@ -48,7 +79,7 @@ def deploy_lua_scripts(logger: logging.Logger) -> bool:
             if src_hash == dest_hash:
                 logger.info("doris.lua already up to date (sha256=%s…)", src_hash[:12])
                 return False
-        shutil.copy2(src, dest)
+        _atomic_copy(src, dest)
         logger.info("Deployed %s -> %s", src, dest)
         return True
     except Exception as e:

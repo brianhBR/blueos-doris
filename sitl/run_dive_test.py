@@ -24,8 +24,10 @@ What it does (in order):
    ``--max-bottom-min``, the runner manually rotates the recorder to
    ascent so the test can complete and any captured video is finalised
    into per-phase MP4s.
-5. After the dive ends (RECOVERY or hard cap), optionally polls
-   ``GET /api/v1/media/files`` until the per-phase MP4s for this
+5. After the dive ends (RECOVERY or hard cap), ``--finalize`` emulates the
+   delayed AGT shutdown request by quiescing the dive, starts the same deferred
+   Process Dive job used by the UI, then polls ``GET /api/v1/media/files`` until
+   the per-phase MP4s for this
    dive's ``base_stamp`` appear and stop growing.  Discovery is by
    filename prefix so it catches every per-phase output the
    extension may produce, including the multi-file bottom shapes:
@@ -36,15 +38,9 @@ What it does (in order):
        dive_<stamp>_on_bottom_videoNN.mp4  (interval, per-cycle)
        dive_<stamp>_ascent.mp4          (always one per dive)
 
-   .. note::
-      The Lua dive script already issues
-      ``POST /api/v1/dive/finalize`` exactly once on RECOVERY entry
-      (``ipcam_state.finalize_sent`` guard).  This runner used to
-      issue a second POST itself, which collided with the in-flight
-      Lua-triggered finalize: two ``ffmpeg -y`` processes wrote the
-      same output, the second HTTP handler blocked on the first
-      ffmpeg job, and ``[4] finalize`` would sit until the runner's
-      180s timeout.  We now never POST; we only observe.
+   Lua deliberately leaves the active dive open through RECOVERY so telemetry
+   remains in the MCAP during the AGT's surface dwell. SITL has no physical
+   power controller, so this runner performs the quiesce explicitly.
 
 Usage examples:
 
@@ -141,22 +137,19 @@ def main() -> int:
                         "After this the runner stops the dive whatever "
                         "state it's in.")
     p.add_argument("--finalize", action="store_true",
-                   help="After the dive ends, poll GET /api/v1/media/files "
+                   help="After the dive ends, quiesce it, start deferred "
+                        "Process Dive, then poll GET /api/v1/media/files "
                         "until this dive's per-phase MP4s appear and stop "
                         "growing.  Discovery is by filename prefix "
                         "(dive_<stamp>_*.mp4) so multi-chunk bottom outputs "
                         "(_on_bottom_chunkNN.mp4 in continuous mode, "
                         "_on_bottom_videoNN.mp4 in interval mode) are "
                         "picked up alongside the single-file _descent.mp4 "
-                        "and _ascent.mp4.  Does NOT POST "
-                        "/api/v1/dive/finalize -- the Lua script already "
-                        "fires that exactly once on RECOVERY entry; a "
-                        "second POST collides with the in-flight ffmpeg "
-                        "jobs.")
+                        "and _ascent.mp4.")
     p.add_argument("--finalize-wait-s", type=float, default=300.0,
                    help="Hard cap on the post-RECOVERY observation window "
-                        "(default: 300s).  Lua's finalize finishes in well "
-                        "under this for normal dives.")
+                        "(default: 300s).  Deferred processing normally "
+                        "finishes within this window.")
     args = p.parse_args()
 
     print(f"== DORIS SITL dive test ==")
@@ -289,17 +282,33 @@ def main() -> int:
     print(f"\n== dive finished t={fmt_mmss(elapsed)}, last state={last_state} ==")
 
     if args.finalize:
-        print("\n[4] waiting for on-device finalize (passive observe)")
+        print("\n[4] quiescing dive and starting deferred processing")
         if dive_stamp is None:
             print("    (no base_stamp captured during the dive; skipping wait)")
             return 0
 
-        # Lua already POSTed /api/v1/dive/finalize on its first RECOVERY
-        # tick.  We just observe via /api/v1/media/files until this
-        # dive's per-phase MP4s appear and stop growing.  No POST here
-        # -- a second finalize call collides with the in-flight ffmpeg
-        # jobs (two `ffmpeg -y` writers on the same output).
-        #
+        quiesced = post(
+            args.vehicle,
+            "/api/v1/dive/finalize",
+            {"stamp": dive_stamp},
+        )
+        print(f"    quiesce -> {quiesced}")
+        history = get(args.vehicle, "/api/v1/dive/history")
+        if not isinstance(history, list) or not history:
+            print("    FAIL: no completed dive found after quiesce")
+            return 3
+        dive_id = history[0].get("id")
+        if not dive_id:
+            print("    FAIL: latest dive has no id")
+            return 3
+        processing = post(
+            args.vehicle,
+            f"/api/v1/dive/history/{dive_id}/process",
+        )
+        print(f"    process {dive_id} -> {processing}")
+        if processing.get("_error"):
+            return 3
+
         # The prefix glob ``dive_<stamp>_*.mp4`` deliberately catches
         # every per-phase output the extension may produce, so a
         # continuous-mode dive (multiple _on_bottom_chunkNN.mp4) or an

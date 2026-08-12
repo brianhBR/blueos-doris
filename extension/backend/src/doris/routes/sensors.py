@@ -8,7 +8,7 @@ from ..models.sensors import SensorConfig
 from ..services.barometer import BarometerService
 from ..services.camera import CameraService
 from ..services.sensors import SensorService
-from ..services.tracker import ArtemisTrackerService
+from ..services.tracker import tracker_service
 
 
 def register_sensor_routes(app: Robyn) -> None:
@@ -16,7 +16,6 @@ def register_sensor_routes(app: Robyn) -> None:
 
     sensor_service = SensorService()
     camera_service = CameraService()
-    tracker_service = ArtemisTrackerService()
     barometer_service = BarometerService()
 
     @app.get("/api/v1/sensors/modules")

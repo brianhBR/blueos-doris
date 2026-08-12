@@ -2,6 +2,137 @@
 
 A BlueOS extension for deep ocean research and imaging operations.
 
+## bh-0.6 safe-surface wiring
+
+Lua owns release policy and mirrors every release request to both controllers:
+it drives the Navigator relay on `DORIS_RELAY_CH` and repeatedly sends the
+`RELAY` request over MAVLink, which AGT firmware v0.3.0 or newer uses to drive
+AGT Relay 2. One software build therefore covers legacy Navigator-wired systems
+and AGT-wired systems.
+
+Wire the release actuator to exactly one output. Never wire it to both
+Navigator SERVO14 and AGT Relay 2: two independent controller outputs driving
+one relay input is not a supported electrical configuration. Set
+`DORIS_RELAY_CH=-1` on AGT-wired systems to leave the Navigator output idle.
+
+The backend blocks mission start only when neither release path is usable. A
+single degraded path — for example AGT firmware older than v0.3.0, or Navigator
+frame parameters that do not match — starts the mission with a warning that
+release redundancy is reduced.
+
+AGT-requested host shutdown is enabled by default and is independent of which
+controller owns the release actuator. Lua's repeated terminal `STATE=4` is the
+AGT's sole surface authority; after a three-minute powered logging dwell the AGT
+sends `PWR_SHDN=1`. The backend quiesces the dive, runs `sync`, sends
+`PWR_ACK=1` from system 1/component 191, and only then asks BlueOS Commander to
+power off. Operators can persistently enable **Bench mode** on the AGT sensor
+card: BlueOS still closes the dive on `PWR_SHDN`, but withholds both `PWR_ACK`
+and host poweroff so the payload remains powered.
+
+Component 191 is `MAV_COMP_ID_ONBOARD_COMPUTER`, which BlueOS's mavlink-server
+also advertises for itself. That is deliberate, so an operator on a laptop can
+supply the acknowledgement too, but it means the router has to forward a message
+whose source matches its own advertised ID. That has not been confirmed on
+hardware: if it is dropped, the AGT never sees an acknowledgement and leaves
+payload power on, which is safe but silent. Watch for the AGT's
+`POWER: BlueOS shutdown ACK` status text when bench testing the handshake.
+
+The bh-0.6 MAVLink names are `RELAY` (Lua request), `AGT_CAP=3` (bit 0 AGT
+release ownership, bit 1 safe shutdown), `REL_STAT` (physical release state),
+`PWR_SHDN` (`1` requests shutdown and `0` resets the request), and `PWR_ACK=1`.
+Only capability bit 1 gates the shutdown ACK; release readiness evaluates bit 0
+separately. Names are intentionally at most ten characters for
+`NAMED_VALUE_FLOAT`.
+
+## How the AGT reaches the autopilot
+
+The AGT is a MAVLink serial device. `ardupilot-manager` hands it to ArduPilot
+as **port G**, which the Linux HAL maps to SERIAL6, and the DORIS frame sets
+`SERIAL6_PROTOCOL=2` and `SERIAL6_BAUD=57` to match. The frame also sets
+`GPS_TYPE=14` (the MAV backend), so position arrives as `GPS_INPUT` over that
+link rather than from a GPS attached to a port of its own. One link therefore
+carries the AGT's GPS, the release named floats and the safe-surface
+handshake — lose it and all three go at once, with the AGT tile going blank as
+the only outward sign.
+
+The extension reconciles this mapping on startup, so it is not a manual step.
+It will not touch the configuration unless it has to, because writing it
+restarts the autopilot:
+
+- An entry that already resolves to the AGT is left alone, whatever it is
+  named. Renaming a working port is not worth a restart.
+- A missing or stale entry is rewritten to the adapter's
+  `/dev/serial/by-id` name.
+- Ports other than the AGT's are passed through untouched, and an empty port
+  list is refused rather than completed, since the Navigator's UARTs cannot be
+  reconstructed from here.
+- The repair is skipped entirely while a dive record is open or the vehicle is
+  armed.
+
+Prefer `by-id` over `by-path` if you ever set this by hand. `by-path` encodes
+the physical USB socket, and a Pi 5 puts its USB-2 and USB-3 sockets behind
+different host controllers, so moving the plug renames the device. The saved
+entry then names something that does not exist and `ardupilot-manager` drops it
+silently — no error, no log line, just a vehicle that dives with no AGT.
+
+Note that the AGT is only ever reachable through one path at a time. Adding a
+serial endpoint on the same device in BlueOS's MAVLink endpoint list puts a
+second reader on the same tty, and the two readers split the byte stream
+between them.
+
+## Surface detection
+
+`ASCENT` ends in one of two ways. The fast path is a 3D GPS fix together with
+depth under `DORIS_DPT_GAT`, unchanged. The fallback is depth alone: every
+sample in a `DORIS_SRF_SEC` window (default 30 s) shallower than `DORIS_SRF_DPT`
+(default 1.5 m, and never allowed above `DORIS_DPT_GAT`), with the window
+spanning at least 0.02 m.
+
+The fallback exists because a fix used to be mandatory, and measured over four
+dives it arrived 17 s, 6.8 min, 30.4 min, and 38.7 min after the vehicle was
+already floating — `RECOVERY` followed within a second of the fix every time, so
+acquisition was the only thing gating the end of the mission.
+
+The span requirement is what makes depth safe to rely on. A stuck sensor reads
+shallow and perfectly steady, which is indistinguishable from floating; across
+146 surface windows the quietest real one still held 0.070 m of spread.
+
+## Post-dive processing
+
+Reaching the surface no longer processes or immediately closes the dive. Lua
+keeps terminal `STATE=4` and telemetry publishing while the AGT holds the payload
+up for its three-minute surface-logging dwell. When `PWR_SHDN=1` arrives, the
+shutdown service quiesces in seconds: it stops any remaining camera recorder,
+records the dive stamp and bottom mode, closes the dive as completed, and marks
+it pending processing. The bottom mode is recovered from the dive's saved
+configuration snapshot because Lua no longer calls the finalize endpoint.
+
+Everything expensive runs later, when an operator presses **Process Dive** on the
+Previous Dives page with the vehicle on deck:
+
+| Endpoint | Purpose |
+|---|---|
+| `POST /api/v1/dive/history/:dive_id/process` | Start a run; returns a `session_id`, or 409 if one is already in flight |
+| `GET /api/v1/dive/process/status?session_id=&from_line=` | Poll steps and log lines; omit `session_id` to re-attach to the latest run |
+
+The job builds per-phase MP4s, verifies them before releasing the raw `.ts`
+segments, then copies the telemetry `.mcap`, autopilot BIN logs, videos, photos,
+extension logs, RadCam Spy session logs overlapping the dive, and the dive record
+to the USB stick. Every copy is size-verified and the stick is flushed before the
+UI reports it safe to remove. Only one run happens at a time, runs are safe to
+repeat, and steps needing a USB stick are skipped rather than failed so
+processing without one still builds videos and enriches the dive record.
+
+To collect RadCam Spy logs while that extension is stopped, add a read-only bind
+to this extension's Custom Settings under `HostConfig.Binds`:
+
+```
+"/usr/blueos/extensions/radcam-spy:/tmp/storage/radcam_spy:ro"
+```
+
+Without it the logs are fetched over that extension's HTTP API instead, which
+only answers while it is running.
+
 ## Features
 
 - **Real-time System Status**: Battery, storage, and CPU monitoring
@@ -81,6 +212,16 @@ Set the environment variable to point to your BlueOS instance:
 ```bash
 export DORIS_BLUEOS_ADDRESS=http://192.168.2.2
 ```
+
+### Editing `doris.lua`
+
+ArduPilot vendors Lua with `MAXVARS` lowered from upstream's 200 to 100, so the
+main chunk may hold at most 100 locals open — that is, `local` declarations at
+column 0. Desktop Lua and SITL will not catch an overrun; the vehicle rejects the
+script and names whichever declaration landed on slot 101, which is normally not
+the line that needs changing. `tests/test_lua_limits.py` counts the chunk and
+fails while ten slots remain. When it does, group related values into a table
+(as the `prm` parameter handles are) rather than freeing a single slot.
 
 ### Building for Production
 
