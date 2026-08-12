@@ -53,8 +53,8 @@ lack an open-stamp fall back to the historical index-based names
 (``dive_<stamp>_on_bottom_videoNN.mp4`` / ``_chunkNN.mp4`` /
 ``_<phase>.mp4``).
 
-Invoked at ``POST /api/v1/dive/finalize`` after the Lua dive state
-machine reaches RECOVERY.
+Invoked by the operator-triggered Process Dive job after the shutdown handshake
+has quiesced the active dive.
 """
 
 from __future__ import annotations

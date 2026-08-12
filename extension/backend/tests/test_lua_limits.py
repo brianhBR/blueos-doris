@@ -110,3 +110,20 @@ def test_parameter_keys_match_their_parameter_names():
     )
     assert pairs, "no Parameter handles found in the prm table"
     assert [(k, n) for k, n in pairs if k != n] == []
+
+
+def test_recovery_does_not_finalize_the_dive_early():
+    """BlueOS must keep the active dive open for the AGT surface dwell."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    assert "/api/v1/dive/finalize" not in body
+    recovery = body.split("elseif state == STATE_RECOVERY then", 1)[1]
+    assert "state =" not in recovery.split("return update, UPDATE_INTERVAL_MS", 1)[0]
+
+
+def test_telemetry_runs_before_terminal_recovery_dispatch():
+    """STATE=4 and DORS telemetry continue on every terminal recovery tick."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    update = body.split("function update()", 1)[1]
+    assert update.index("update_telemetry(now_ms)") < update.index(
+        "elseif state == STATE_RECOVERY then"
+    )

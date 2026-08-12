@@ -8,11 +8,9 @@ The protocol uses MAVLink ``NAMED_VALUE_FLOAT`` messages:
   BlueOS flushes recording and storage, publishes ``PWR_ACK=1``, then asks BlueOS
   Commander to power off the host.
 
-Lua mirrors every release request to the Navigator relay and to the AGT, so a
-mission only needs one of the two release paths to be healthy.  Cutting host
-power removes the Navigator path entirely, so the shutdown handshake is
-disabled by default and must only be enabled when the actuator is wired to the
-AGT.  STATUSTEXT is deliberately not accepted as a control input.
+Lua's repeated terminal ``STATE=4`` is the sole surface authority used by the
+AGT. BlueOS only confirms that storage is safe; release relay ownership is not
+part of that decision. STATUSTEXT is deliberately not accepted as control.
 """
 
 from __future__ import annotations
@@ -23,12 +21,13 @@ import logging
 import math
 import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import httpx
 import websockets
 
-from ..config import blueos_services, settings
+from ..config import blueos_services
+from .shutdown_policy import automatic_payload_shutdown_enabled
 
 logger = logging.getLogger(__name__)
 
@@ -38,7 +37,7 @@ LUA_STATE_RECOVERY = 4
 AGT_COMPONENT_ID = 192
 CAP_AGT_RELEASE_OWNER = 1 << 0
 CAP_SAFE_SHUTDOWN = 1 << 1
-REQUIRED_CAPABILITIES = CAP_AGT_RELEASE_OWNER | CAP_SAFE_SHUTDOWN
+REQUIRED_CAPABILITIES = CAP_SAFE_SHUTDOWN
 
 STATUS_STALE_S = 5.0
 RECONNECT_DELAY_S = 2.0
@@ -196,11 +195,13 @@ class SafeSurfaceState:
 
 
 class SafeSurfaceService:
-    """Track the AGT protocol and execute an opt-in shutdown handshake."""
+    """Track the AGT protocol and execute the deployment shutdown handshake."""
 
     def __init__(self) -> None:
         self.state = SafeSurfaceState(
-            shutdown_state="idle" if settings.agt_shutdown_enabled else "disabled"
+            shutdown_state=(
+                "idle" if automatic_payload_shutdown_enabled() else "bench_disabled"
+            )
         )
         self._task: asyncio.Task | None = None
         self._shutdown_task: asyncio.Task | None = None
@@ -252,7 +253,7 @@ class SafeSurfaceService:
                 return
             self.state.release_requested = requested
             self.state.last_release_request_monotonic = time.monotonic()
-            self.state.last_release_request = datetime.now(timezone.utc).isoformat()
+            self.state.last_release_request = datetime.now(UTC).isoformat()
             self._log_release_mismatch()
             return
         if component_id == AUTOPILOT_COMPONENT_ID and name == "STATE":
@@ -284,7 +285,7 @@ class SafeSurfaceService:
             return
 
         self.state.last_agt_update_monotonic = time.monotonic()
-        self.state.last_agt_update = datetime.now(timezone.utc).isoformat()
+        self.state.last_agt_update = datetime.now(UTC).isoformat()
 
     def _log_release_mismatch(self) -> None:
         """Log only release mismatch transitions to avoid 2 Hz log spam."""
@@ -312,15 +313,18 @@ class SafeSurfaceService:
                 self._shutdown_task = None
                 self.state.shutdown_error = None
                 self.state.shutdown_state = (
-                    "idle" if settings.agt_shutdown_enabled else "disabled"
+                    "idle"
+                    if automatic_payload_shutdown_enabled()
+                    else "bench_disabled"
                 )
             return
         if self._shutdown_request_latched:
             return
-        if not settings.agt_shutdown_enabled:
+        if not automatic_payload_shutdown_enabled():
             self._shutdown_request_latched = True
-            self.state.shutdown_state = "disabled"
-            logger.warning("Ignored AGT shutdown request: feature is disabled")
+            self._shutdown_task = asyncio.create_task(
+                self._bench_quiesce_sequence(), name="agt-bench-quiesce"
+            )
             return
         capabilities = self.state.capabilities or 0
         if self.state.firmware_compatible is not True:
@@ -343,6 +347,21 @@ class SafeSurfaceService:
         self._shutdown_task = asyncio.create_task(
             self._shutdown_sequence(), name="agt-safe-shutdown"
         )
+
+    async def _bench_quiesce_sequence(self) -> None:
+        """Close the dive on an AGT request without ACKing or powering off."""
+        self.state.shutdown_state = "bench_quiescing"
+        try:
+            await self._flush_and_finalize()
+            self.state.shutdown_state = "bench_disabled"
+            logger.warning(
+                "AGT shutdown request quiesced, but bench mode withheld PWR_ACK"
+            )
+        except Exception as error:
+            self.state.shutdown_state = "error"
+            self.state.shutdown_error = str(error)
+            self._shutdown_request_latched = False
+            logger.exception("AGT bench-mode quiesce failed")
 
     async def _shutdown_sequence(self) -> None:
         """Flush data, acknowledge the AGT, then request host poweroff."""
@@ -455,6 +474,7 @@ class SafeSurfaceService:
             and release_actual_known
             and not mismatch
         )
+        shutdown_enabled = automatic_payload_shutdown_enabled()
         return {
             "capabilities": capabilities,
             "required_capabilities": REQUIRED_CAPABILITIES,
@@ -472,7 +492,8 @@ class SafeSurfaceService:
             "release_mismatch": mismatch,
             "agt_status_stale": capability_stale or release_actual_stale,
             "last_agt_update": self.state.last_agt_update,
-            "shutdown_enabled": settings.agt_shutdown_enabled,
+            "shutdown_enabled": shutdown_enabled,
+            "bench_mode": not shutdown_enabled,
             "power_shutdown_requested": self.state.power_shutdown_requested,
             "shutdown_state": self.state.shutdown_state,
             "shutdown_error": self.state.shutdown_error,
@@ -481,10 +502,9 @@ class SafeSurfaceService:
     def evaluate_release_readiness(self, firmware: dict, frame: dict) -> dict:
         """Judge the two mirrored release paths for a mission start decision.
 
-        A mission needs only one healthy path, so a degraded path is a warning
-        while losing both is a blocker.  When the AGT is allowed to power off
-        the host the Navigator path disappears mid-recovery, so that
-        configuration additionally demands a healthy AGT path.
+        A mission needs only one healthy release path, so a degraded path is a
+        warning while losing both is a blocker. Payload shutdown is independent
+        of release ownership and therefore adds no AGT-release prerequisite.
         """
         protocol = self.status(firmware)
         navigator_ok = bool(
@@ -506,13 +526,6 @@ class SafeSurfaceService:
             blockers.append("Neither the Navigator nor the AGT release path is available")
             blockers.extend(navigator_reasons)
             blockers.extend(agt_reasons)
-        if settings.agt_shutdown_enabled and not agt_ok:
-            blockers.append(
-                "AGT host shutdown is enabled, which requires a healthy AGT "
-                "release path because host power loss disables the Navigator output"
-            )
-            blockers.extend(r for r in agt_reasons if r not in blockers)
-
         return {
             "ready": not blockers,
             "blockers": blockers,

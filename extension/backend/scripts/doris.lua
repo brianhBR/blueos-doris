@@ -393,12 +393,11 @@ end
 -- IPCAM: HOST=127.0.0.1, BIND_PORT=9979 (inlined)
 local ipcam_recording        = false
 local ipcam_btm_started      = false
--- All remaining runtime state for the interval / timelapse / finalize
--- orchestrators lives in a single table so we stay well under Lua's
+-- All remaining runtime state for the interval / timelapse orchestrators
+-- lives in a single table so we stay well under Lua's
 -- per-closure upvalue cap.  cycle_start_ms == 0 means "duty cycle not
 -- yet initialized for this bottom visit"; last_snap_ms == 0 means "no
--- timelapse snapshot fired yet"; finalize_sent flips true exactly once
--- per dive at RECOVERY entry.
+-- timelapse snapshot fired yet.
 local ipcam_state = {
     cycle_start_ms  = 0,
     cycle_is_record = false,
@@ -421,7 +420,6 @@ local ipcam_state = {
     -- reused as ``tl_last_snap_ms`` (when the most recent snapshot
     -- actually fired) to drive the post-roll light hold.
     next_snap_ms    = 0,
-    finalize_sent   = false,
 }
 
 -- ?????????? helpers ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
@@ -795,9 +793,8 @@ local function update_telemetry(now_ms)
 end
 
 local function ipcam_http_send(first_line, host, port)
-    -- SITL short-circuit removed: the Lua now drives /rec/* and
-    -- /api/v1/dive/finalize directly in both SITL and production so
-    -- the same code path is exercised at every stage.  On BlueOS the
+    -- SITL short-circuit removed: Lua drives /rec/* directly in both SITL
+    -- and production so the same code path is exercised at every stage. On BlueOS the
     -- autopilot container and the extension container share the host
     -- network namespace, so 127.0.0.1:8095 resolves to the extension.
     local sock = Socket(0)
@@ -887,17 +884,6 @@ local function ipcam_http_snapshot(host, port, phase)
         host, port)
 end
 
-local function ipcam_http_finalize(host, port, btm_cmod)
-    -- bottom_mode tells the extension how to slice the on_bottom
-    -- phase: 1=continuous (one MP4 per 5-min chunk), 2=interval (one
-    -- MP4 per ipcam start/stop cycle), other=legacy concat-into-one.
-    local q = ""
-    if btm_cmod and btm_cmod > 0 then
-        q = string.format("?bottom_mode=%d", math.floor(btm_cmod))
-    end
-    return ipcam_http_send("POST /api/v1/dive/finalize" .. q, host, port)
-end
-
 local function ipcam_start(phase, seg_s)
     if ipcam_recording then return end
     if not ipcam_cfg.rec_en then return end
@@ -957,23 +943,6 @@ local function ipcam_snapshot(phase)
         return
     end
     ipcam_http_snapshot("127.0.0.1", 8095, phase or "manual")
-end
-
--- Fire a single POST /api/v1/dive/finalize at RECOVERY entry so the
--- extension turns the dive's .ts segments into per-phase MP4s (+
--- manifest JSON) on the device.  Fire-and-forget; the dive script is
--- done by this point and the HTTP response isn't needed.  We pass
--- ipcam_cfg.btm_cmod so the extension knows how to slice the
--- on_bottom phase (1=continuous chunk-per-5min, 2=interval session-
--- per-cycle, other=legacy concat-into-one).
-local function ipcam_finalize()
-    if ipcam_http_finalize("127.0.0.1", 8095, ipcam_cfg.btm_cmod) then
-        gcs:send_text(MAV_SEVERITY.INFO,
-            string.format("DIVE: IPcam finalize requested (btm_cmod=%d)",
-                math.floor(ipcam_cfg.btm_cmod or 0)))
-    else
-        gcs:send_text(MAV_SEVERITY.WARNING, "DIVE: IPcam finalize POST FAILED")
-    end
 end
 
 -- Unified phase-entry handler for the phases that use continuous video:
@@ -1661,16 +1630,9 @@ function update()
         if RC9 then RC9:set_override(LIGHT_PWM_MIN) end
         arming:disarm()
         prm.START:set_and_save(0)
-        -- Fire dive-finalize exactly once on first RECOVERY tick so the
-        -- extension stops the recorder, records the bottom mode, and closes
-        -- the dive record.  This is deliberately quick: the AGT holds payload
-        -- power up until it returns, and the heavy video/USB work waits for
-        -- the operator to press Process Dive on deck.  Done before
-        -- recovery_done so a slow disarm cannot delay it.
-        if not ipcam_state.finalize_sent then
-            ipcam_finalize()
-            ipcam_state.finalize_sent = true
-        end
+        -- Keep terminal STATE=4 and telemetry flowing throughout the AGT's
+        -- powered surface-logging dwell. BlueOS closes the active dive only
+        -- after the AGT sends PWR_SHDN; processing remains operator-triggered.
         if not recovery_done and not arming:is_armed() then
             deactivate_relay()
             local total = dive_start_ms > 0

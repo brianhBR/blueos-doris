@@ -56,7 +56,10 @@ def _healthy_frame() -> dict:
 def _healthy_agt_service() -> SafeSurfaceService:
     service = SafeSurfaceService()
     service.process_named_value(
-        1, 192, "AGT_CAP", float(module.REQUIRED_CAPABILITIES)
+        1,
+        192,
+        "AGT_CAP",
+        float(module.CAP_AGT_RELEASE_OWNER | module.CAP_SAFE_SHUTDOWN),
     )
     service.process_named_value(1, 192, "REL_STAT", 0.0)
     service.process_named_value(1, 1, "RELAY", 0.0)
@@ -169,7 +172,7 @@ def test_wrong_source_cannot_change_shutdown_state():
     service = SafeSurfaceService()
     service.process_named_value(1, 191, "PWR_SHDN", 1.0)
     service.process_named_value(255, 192, "PWR_SHDN", 1.0)
-    assert service.state.shutdown_state in {"disabled", "idle"}
+    assert service.state.shutdown_state in {"bench_disabled", "idle"}
     assert service.state.power_shutdown_requested is False
     assert service._shutdown_task is None
 
@@ -189,7 +192,7 @@ def test_ack_payload_uses_agt_accepted_source():
 
 
 def test_shutdown_requires_verified_firmware(monkeypatch):
-    monkeypatch.setattr(module.settings, "agt_shutdown_enabled", True)
+    monkeypatch.setattr(module, "automatic_payload_shutdown_enabled", lambda: True)
     service = SafeSurfaceService()
     service.process_named_value(1, 192, "AGT_CAP", 3.0)
     service.process_named_value(1, 192, "PWR_SHDN", 1.0)
@@ -198,7 +201,7 @@ def test_shutdown_requires_verified_firmware(monkeypatch):
 
 
 def test_shutdown_requires_fresh_capability(monkeypatch):
-    monkeypatch.setattr(module.settings, "agt_shutdown_enabled", True)
+    monkeypatch.setattr(module, "automatic_payload_shutdown_enabled", lambda: True)
     monkeypatch.setattr(module.time, "monotonic", lambda: 100.0)
     service = SafeSurfaceService()
     service.process_named_value(1, 192, "AGT_CAP", 3.0)
@@ -212,7 +215,7 @@ def test_shutdown_requires_fresh_capability(monkeypatch):
 
 
 async def test_repeated_shutdown_request_spawns_one_task(monkeypatch):
-    monkeypatch.setattr(module.settings, "agt_shutdown_enabled", True)
+    monkeypatch.setattr(module, "automatic_payload_shutdown_enabled", lambda: True)
     service = SafeSurfaceService()
     service.process_named_value(1, 192, "AGT_CAP", 3.0)
     service.status({"compatible": True})
@@ -237,8 +240,32 @@ async def test_repeated_shutdown_request_spawns_one_task(monkeypatch):
     assert service.state.shutdown_state == "idle"
 
 
+async def test_bench_mode_quiesces_without_ack_or_poweroff(monkeypatch):
+    monkeypatch.setattr(module, "automatic_payload_shutdown_enabled", lambda: False)
+    service = SafeSurfaceService()
+    events = []
+
+    async def flush():
+        events.append("flush")
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("bench mode must not ACK or power off")
+
+    monkeypatch.setattr(service, "_flush_and_finalize", flush)
+    monkeypatch.setattr(service, "_send_named_float", forbidden)
+    monkeypatch.setattr(service, "_run_host_command", forbidden)
+
+    service.process_named_value(1, 192, "PWR_SHDN", 1.0)
+    assert service._shutdown_task is not None
+    await service._shutdown_task
+
+    assert events == ["flush"]
+    assert service.state.shutdown_state == "bench_disabled"
+    assert service.state.power_shutdown_requested is True
+
+
 async def test_failed_shutdown_allows_retry(monkeypatch):
-    monkeypatch.setattr(module.settings, "agt_shutdown_enabled", True)
+    monkeypatch.setattr(module, "automatic_payload_shutdown_enabled", lambda: True)
     service = SafeSurfaceService()
     service._shutdown_request_latched = True
 
@@ -334,19 +361,15 @@ def test_release_mismatch_only_removes_the_agt_path():
     assert any("disagree" in w for w in readiness["warnings"])
 
 
-def test_enabled_shutdown_requires_the_agt_release_path(monkeypatch):
-    monkeypatch.setattr(module.settings, "agt_shutdown_enabled", True)
+def test_enabled_shutdown_does_not_require_the_agt_release_path(monkeypatch):
+    monkeypatch.setattr(module, "automatic_payload_shutdown_enabled", lambda: True)
     degraded = SafeSurfaceService().evaluate_release_readiness(
         OLD_FIRMWARE, _healthy_frame()
     )
-    assert degraded["ready"] is False
-    assert any("host shutdown is enabled" in b for b in degraded["blockers"])
-
-    healthy = _healthy_agt_service().evaluate_release_readiness(
-        COMPATIBLE_FIRMWARE, _healthy_frame()
-    )
-    assert healthy["ready"] is True
-    assert healthy["blockers"] == []
+    assert degraded["ready"] is True
+    assert degraded["blockers"] == []
+    assert degraded["navigator_release_available"] is True
+    assert degraded["agt_release_available"] is False
 
 
 async def test_ack_precedes_poweroff(monkeypatch):
@@ -403,7 +426,7 @@ def test_recovery_latch_ignores_other_senders():
 
 async def test_shutdown_defers_heavy_processing(monkeypatch, tmp_path):
     """The AGT holds power up while it waits, so this path must stay cheap."""
-    monkeypatch.setattr(module.settings, "agt_shutdown_enabled", True)
+    monkeypatch.setattr(module, "automatic_payload_shutdown_enabled", lambda: True)
     service = SafeSurfaceService()
     service._shutdown_request_latched = True
 

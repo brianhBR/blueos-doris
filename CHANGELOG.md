@@ -2,6 +2,17 @@
 
 ## bh-0.6
 
+- Surface shutdown now has one authority: Lua continuously publishes terminal
+  `STATE=4`, the AGT keeps the payload and MCAP logging alive for three minutes,
+  then `PWR_SHDN=1` tells BlueOS to quiesce, sync, ACK, and halt. Lua no longer
+  closes the dive on its first recovery tick; the shutdown service recovers the
+  camera bottom mode from the saved configuration snapshot when it closes the
+  dive after the dwell.
+- Automatic payload shutdown is now the deployment default and no longer
+  requires the release actuator to be wired to the AGT. A persistent **Bench
+  mode** toggle on the AGT sensor card still quiesces the dive but withholds
+  `PWR_ACK` and host poweroff, leaving the payload powered for testing.
+
 - The AGT's serial port is now the extension's responsibility rather than a
   setup step someone has to remember.  The AGT reaches ArduPilot over an
   ordinary MAVLink serial link that `ardupilot-manager` hands to the autopilot
@@ -87,10 +98,9 @@
   backend, and replaced the mission-start gate with a two-path check: a mission
   is blocked only when neither release path is usable, and a single degraded
   path is reported as a warning.
-- Added a source-validated AGT shutdown handshake. Host shutdown is
-  opt-in (`DORIS_AGT_SHUTDOWN_ENABLED=true`) and disabled by default.  Because
-  cutting host power also disables the Navigator release output, enabling it
-  additionally requires a healthy AGT release path.
+- Added a source-validated AGT shutdown handshake. Host shutdown is enabled by
+  default for deployments and can be persistently disabled with the AGT-card
+  Bench mode toggle. Release-path readiness is evaluated separately.
 - Kept the DORIS frame at profile v6 (`RELAY1_FUNCTION=1`, `RELAY1_PIN=14`,
   `SERVO14_FUNCTION=-1`), so upgrading does not change autopilot parameters or
   disturb an existing installation.

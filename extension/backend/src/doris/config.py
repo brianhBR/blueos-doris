@@ -12,10 +12,10 @@ class Settings(BaseSettings):
     host: str = "0.0.0.0"
     port: int = 8095
     debug: bool = False
-    # Host poweroff from the AGT safe-surface handshake is opt-in.  Enabling it
-    # asserts that the release actuator is wired to the AGT, because cutting
-    # host power takes the mirrored Navigator release output offline.
-    agt_shutdown_enabled: bool = False
+    # Mission completion powers off the payload by default. Operators can
+    # persistently suppress the ACK/cutoff from the AGT sensor panel while
+    # bench testing; this environment setting remains the deployment default.
+    agt_shutdown_enabled: bool = True
 
     # BlueOS settings - defaults to host.docker.internal for Docker
     # When running as BlueOS extension, use host.docker.internal to access BlueOS services

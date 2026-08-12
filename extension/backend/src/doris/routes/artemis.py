@@ -10,6 +10,7 @@ import logging
 from robyn import Response, Robyn
 
 from ..services.artemis import ArtemisService
+from ..services.shutdown_policy import get_shutdown_policy, set_bench_mode
 
 logger = logging.getLogger(__name__)
 
@@ -18,6 +19,39 @@ def register_artemis_routes(app: Robyn) -> None:
     """Register Artemis-related API routes."""
 
     artemis_service = ArtemisService()
+
+    @app.get("/api/v1/artemis/shutdown-policy")
+    async def get_agt_shutdown_policy(request):
+        """Return the persistent bench override for payload shutdown."""
+        return json.dumps(get_shutdown_policy())
+
+    @app.put("/api/v1/artemis/shutdown-policy")
+    async def update_agt_shutdown_policy(request):
+        """Persist whether automatic payload cutoff is disabled for bench use."""
+        try:
+            data = request.json()
+        except Exception:
+            return Response(
+                status_code=400,
+                description=json.dumps({"error": "Invalid JSON body"}),
+                headers={"Content-Type": "application/json"},
+            )
+        bench_mode = data.get("bench_mode") if isinstance(data, dict) else None
+        if not isinstance(bench_mode, bool):
+            return Response(
+                status_code=400,
+                description=json.dumps({"error": "'bench_mode' must be a boolean"}),
+                headers={"Content-Type": "application/json"},
+            )
+        try:
+            return json.dumps(set_bench_mode(bench_mode))
+        except OSError as error:
+            logger.exception("Failed to persist AGT shutdown policy")
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(error)}),
+                headers={"Content-Type": "application/json"},
+            )
 
     @app.get("/api/v1/artemis/ports")
     async def list_ports(request):

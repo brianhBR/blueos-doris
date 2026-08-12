@@ -291,6 +291,52 @@ interface TrackerGPS {
 
 const trackerGps = ref<TrackerGPS | null>(null)
 let trackerInterval: number | undefined
+const agtBenchMode = ref(false)
+const agtShutdownPolicyLoading = ref(false)
+const agtShutdownPolicyError = ref('')
+
+async function fetchAgtShutdownPolicy() {
+  agtShutdownPolicyLoading.value = true
+  agtShutdownPolicyError.value = ''
+  try {
+    const response = await fetch('/api/v1/artemis/shutdown-policy')
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const policy = await response.json()
+    agtBenchMode.value = Boolean(policy.bench_mode)
+  } catch (error) {
+    agtShutdownPolicyError.value =
+      error instanceof Error ? error.message : 'Could not load shutdown policy'
+  } finally {
+    agtShutdownPolicyLoading.value = false
+  }
+}
+
+async function setAgtBenchMode(enabled: boolean) {
+  const previous = agtBenchMode.value
+  agtBenchMode.value = enabled
+  agtShutdownPolicyLoading.value = true
+  agtShutdownPolicyError.value = ''
+  try {
+    const response = await fetch('/api/v1/artemis/shutdown-policy', {
+      method: 'PUT',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ bench_mode: enabled }),
+    })
+    const result = await response.json().catch(() => ({}))
+    if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`)
+    agtBenchMode.value = Boolean(result.bench_mode)
+  } catch (error) {
+    agtBenchMode.value = previous
+    agtShutdownPolicyError.value =
+      error instanceof Error ? error.message : 'Could not save shutdown policy'
+  } finally {
+    agtShutdownPolicyLoading.value = false
+  }
+}
+
+function onAgtBenchModeChange(event: Event) {
+  void setAgtBenchMode((event.target as HTMLInputElement).checked)
+}
 
 async function refreshTrackerGps() {
   try {
@@ -741,6 +787,7 @@ let pollInterval: number | undefined
 
 onMounted(() => {
   fetchModules()
+  void fetchAgtShutdownPolicy()
   pollInterval = setInterval(fetchModules, 5000) as unknown as number
 })
 
@@ -1183,6 +1230,54 @@ const getStatusColor = (moduleStatus: string) => {
               <div class="flex items-center justify-end px-2 py-1" style="background-color: rgba(14, 36, 70, 0.8)">
                 <span class="text-xs" style="color: rgba(150, 238, 242, 0.4)">Updates every 5s</span>
               </div>
+            </div>
+
+            <!-- Persistent deployment/bench shutdown policy -->
+            <div
+              v-if="mod.type === 'tracker'"
+              class="mt-3 rounded-lg p-3"
+              style="background-color: rgba(14, 36, 70, 0.6); border: 1px solid rgba(65, 185, 195, 0.25)"
+            >
+              <div class="flex items-start justify-between gap-4">
+                <div>
+                  <div class="text-sm font-medium" style="color: #96EEF2">
+                    Bench mode
+                  </div>
+                  <p class="mt-1 text-xs leading-relaxed" style="color: rgba(150, 238, 242, 0.65)">
+                    {{ agtBenchMode
+                      ? 'Automatic payload cutoff is disabled. BlueOS will close the dive but withhold PWR_ACK.'
+                      : 'Deployment default: mission completion shuts down BlueOS and cuts payload power.' }}
+                  </p>
+                </div>
+                <label class="relative inline-flex cursor-pointer items-center">
+                  <input
+                    type="checkbox"
+                    class="peer sr-only"
+                    :checked="agtBenchMode"
+                    :disabled="agtShutdownPolicyLoading"
+                    @change="onAgtBenchModeChange"
+                  />
+                  <span
+                    class="h-6 w-11 rounded-full transition-colors"
+                    :style="{
+                      backgroundColor: agtBenchMode ? '#FCD869' : 'rgba(150, 238, 242, 0.2)',
+                      opacity: agtShutdownPolicyLoading ? '0.5' : '1',
+                    }"
+                  >
+                    <span
+                      class="block h-5 w-5 rounded-full bg-white transition-transform"
+                      :style="{
+                        marginTop: '2px',
+                        marginLeft: '2px',
+                        transform: agtBenchMode ? 'translateX(20px)' : 'translateX(0)',
+                      }"
+                    />
+                  </span>
+                </label>
+              </div>
+              <p v-if="agtShutdownPolicyError" class="mt-2 text-xs" style="color: #F87171">
+                {{ agtShutdownPolicyError }}
+              </p>
             </div>
 
             <!-- Iridium test button -->

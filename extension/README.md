@@ -20,14 +20,14 @@ single degraded path — for example AGT firmware older than v0.3.0, or Navigato
 frame parameters that do not match — starts the mission with a warning that
 release redundancy is reduced.
 
-AGT-requested host shutdown is disabled by default. Enable it only on an
-AGT-wired system and only after an end-to-end bench test, by setting
-`DORIS_AGT_SHUTDOWN_ENABLED=true` on the backend service; cutting host power
-takes the Navigator release output offline, so the backend refuses to start a
-mission when shutdown is enabled without a healthy AGT release path. A valid
-request must come from MAVLink system 1/component 192 and follow an `AGT_CAP=3`
-advertisement. The backend quiesces the dive, runs `sync`, sends `PWR_ACK=1`
-from system 1/component 191, and only then asks BlueOS Commander to power off.
+AGT-requested host shutdown is enabled by default and is independent of which
+controller owns the release actuator. Lua's repeated terminal `STATE=4` is the
+AGT's sole surface authority; after a three-minute powered logging dwell the AGT
+sends `PWR_SHDN=1`. The backend quiesces the dive, runs `sync`, sends
+`PWR_ACK=1` from system 1/component 191, and only then asks BlueOS Commander to
+power off. Operators can persistently enable **Bench mode** on the AGT sensor
+card: BlueOS still closes the dive on `PWR_SHDN`, but withholds both `PWR_ACK`
+and host poweroff so the payload remains powered.
 
 Component 191 is `MAV_COMP_ID_ONBOARD_COMPUTER`, which BlueOS's mavlink-server
 also advertises for itself. That is deliberate, so an operator on a laptop can
@@ -40,7 +40,9 @@ payload power on, which is safe but silent. Watch for the AGT's
 The bh-0.6 MAVLink names are `RELAY` (Lua request), `AGT_CAP=3` (bit 0 AGT
 release ownership, bit 1 safe shutdown), `REL_STAT` (physical release state),
 `PWR_SHDN` (`1` requests shutdown and `0` resets the request), and `PWR_ACK=1`.
-Names are intentionally at most ten characters for `NAMED_VALUE_FLOAT`.
+Only capability bit 1 gates the shutdown ACK; release readiness evaluates bit 0
+separately. Names are intentionally at most ten characters for
+`NAMED_VALUE_FLOAT`.
 
 ## How the AGT reaches the autopilot
 
@@ -97,12 +99,13 @@ shallow and perfectly steady, which is indistinguishable from floating; across
 
 ## Post-dive processing
 
-Reaching the surface no longer processes the dive. `POST /api/v1/dive/finalize`,
-which Lua fires on its first RECOVERY tick, now only quiesces: it stops the
-camera recorder so the trailing video segment is complete, records the dive stamp
-and bottom mode on the dive record, closes the dive as completed, and marks it
-pending processing. It has to finish in seconds, because the AGT holds payload
-power up until it returns.
+Reaching the surface no longer processes or immediately closes the dive. Lua
+keeps terminal `STATE=4` and telemetry publishing while the AGT holds the payload
+up for its three-minute surface-logging dwell. When `PWR_SHDN=1` arrives, the
+shutdown service quiesces in seconds: it stops any remaining camera recorder,
+records the dive stamp and bottom mode, closes the dive as completed, and marks
+it pending processing. The bottom mode is recovered from the dive's saved
+configuration snapshot because Lua no longer calls the finalize endpoint.
 
 Everything expensive runs later, when an operator presses **Process Dive** on the
 Previous Dives page with the vehicle on deck:

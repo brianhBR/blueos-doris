@@ -95,8 +95,30 @@ def test_quiesce_does_no_heavy_work(tmp_path, monkeypatch):
     assert result["success"] is True
 
 
+def test_quiesce_recovers_bottom_mode_from_dive_snapshot(tmp_path, monkeypatch):
+    dives = tmp_path / "dives"
+    dive_file = _write_dive(
+        dives,
+        2,
+        configuration_snapshot={
+            "bottom": {"camera": {"camera_type": "video-interval"}}
+        },
+    )
+    monkeypatch.setattr(module, "_data_root", lambda: tmp_path)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "doris.services.ip_camera_recorder",
+        _FakeRecorder(recording=False),
+    )
+
+    result = asyncio.run(quiesce_dive())
+
+    assert result["bottom_mode"] == 2
+    assert json.loads(dive_file.read_text())["bottom_mode"] == 2
+
+
 def test_quiesce_is_idempotent(tmp_path, monkeypatch):
-    """Lua fires it on RECOVERY and the shutdown handshake fires it again."""
+    """Repeated shutdown requests cannot rewrite a completed dive."""
     dives = tmp_path / "dives"
     dive_file = _write_dive(dives, 3)
     monkeypatch.setattr(module, "_data_root", lambda: tmp_path)

@@ -69,6 +69,7 @@ export interface SafeSurfaceStatus {
     release_mismatch: boolean
     agt_status_stale: boolean
     shutdown_enabled: boolean
+    bench_mode: boolean
     power_shutdown_requested: boolean
     shutdown_state: string
   }

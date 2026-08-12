@@ -170,8 +170,8 @@ async def quiesce_dive(
     the recorder's stamp is cleared for the next dive and ``DORIS_BTM_CMOD`` can
     change before anyone gets round to processing this dive.
 
-    Safe to call repeatedly: Lua fires it on the first RECOVERY tick and the
-    shutdown handshake calls it again before acknowledging.
+    Safe to call repeatedly. The shutdown handshake calls it after the AGT's
+    powered surface-logging dwell and before acknowledging.
     """
     data_root = _data_root()
     dives_dir = data_root / "dives"
@@ -202,6 +202,18 @@ async def quiesce_dive(
             record = json.loads(dive_file.read_text())
             if resolved_stamp:
                 record["dive_stamp"] = resolved_stamp
+            if bottom_mode is None:
+                camera_type = (
+                    record.get("configuration_snapshot", {})
+                    .get("bottom", {})
+                    .get("camera", {})
+                    .get("camera_type")
+                )
+                bottom_mode = {
+                    "continuous-video": 1,
+                    "video-interval": 2,
+                    "timelapse": 3,
+                }.get(camera_type)
             if bottom_mode is not None:
                 record["bottom_mode"] = bottom_mode
             record.setdefault("processing_state", "pending")
