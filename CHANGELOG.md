@@ -2,6 +2,29 @@
 
 ## bh-0.6
 
+- The AGT's serial port is now the extension's responsibility rather than a
+  setup step someone has to remember.  The AGT reaches ArduPilot over an
+  ordinary MAVLink serial link that `ardupilot-manager` hands to the autopilot
+  as port G (SERIAL6, which the frame already configures for MAVLink2 at
+  57600).  Because the frame also sets `GPS_TYPE=14`, position arrives as
+  `GPS_INPUT` over that same link, so the port carries the AGT's GPS, its
+  release named floats and the safe-surface handshake together.
+  `ardupilot-manager` records the device by its `/dev/serial/by-path` name,
+  which encodes the physical USB socket; a Pi 5 puts its USB-2 and USB-3
+  sockets behind different host controllers, so moving the plug renames the
+  device, the saved entry points at nothing, and the entry is dropped without
+  a word in any log.  One vehicle dived with no AGT telemetry at all and the
+  only visible symptom was a blank tile.  Startup now checks that port G
+  resolves to the AGT and repairs it when it does not, recording the
+  `/dev/serial/by-id` name, which follows the adapter rather than the socket.
+  Writing that configuration restarts the autopilot, so it is only written
+  when the mapping is genuinely broken: an entry that already resolves to the
+  AGT is left alone whatever it is called, and the repair is skipped outright
+  while a dive record is open or the vehicle is armed.  Ports other than the
+  AGT's are passed through untouched, and a port list that comes back empty is
+  refused rather than completed from here, since the Navigator's own UARTs
+  cannot be reconstructed from this end.
+
 - A named float's name now ends at its terminator instead of absorbing the
   padding behind it.  The field is a fixed ten characters and a sender is free
   to leave anything in the bytes past the terminator; AGT firmware through

@@ -42,6 +42,42 @@ release ownership, bit 1 safe shutdown), `REL_STAT` (physical release state),
 `PWR_SHDN` (`1` requests shutdown and `0` resets the request), and `PWR_ACK=1`.
 Names are intentionally at most ten characters for `NAMED_VALUE_FLOAT`.
 
+## How the AGT reaches the autopilot
+
+The AGT is a MAVLink serial device. `ardupilot-manager` hands it to ArduPilot
+as **port G**, which the Linux HAL maps to SERIAL6, and the DORIS frame sets
+`SERIAL6_PROTOCOL=2` and `SERIAL6_BAUD=57` to match. The frame also sets
+`GPS_TYPE=14` (the MAV backend), so position arrives as `GPS_INPUT` over that
+link rather than from a GPS attached to a port of its own. One link therefore
+carries the AGT's GPS, the release named floats and the safe-surface
+handshake — lose it and all three go at once, with the AGT tile going blank as
+the only outward sign.
+
+The extension reconciles this mapping on startup, so it is not a manual step.
+It will not touch the configuration unless it has to, because writing it
+restarts the autopilot:
+
+- An entry that already resolves to the AGT is left alone, whatever it is
+  named. Renaming a working port is not worth a restart.
+- A missing or stale entry is rewritten to the adapter's
+  `/dev/serial/by-id` name.
+- Ports other than the AGT's are passed through untouched, and an empty port
+  list is refused rather than completed, since the Navigator's UARTs cannot be
+  reconstructed from here.
+- The repair is skipped entirely while a dive record is open or the vehicle is
+  armed.
+
+Prefer `by-id` over `by-path` if you ever set this by hand. `by-path` encodes
+the physical USB socket, and a Pi 5 puts its USB-2 and USB-3 sockets behind
+different host controllers, so moving the plug renames the device. The saved
+entry then names something that does not exist and `ardupilot-manager` drops it
+silently — no error, no log line, just a vehicle that dives with no AGT.
+
+Note that the AGT is only ever reachable through one path at a time. Adding a
+serial endpoint on the same device in BlueOS's MAVLink endpoint list puts a
+second reader on the same tty, and the two readers split the byte stream
+between them.
+
 ## Surface detection
 
 `ASCENT` ends in one of two ways. The fast path is a 3D GPS fix together with

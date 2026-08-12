@@ -28,6 +28,8 @@ from .routes import (
     register_system_routes,
 )
 from .services import ip_camera_recorder
+from .services.agt_serial import reconcile_agt_serial
+from .services.dive_records import find_latest_active_dive_record
 from .services.external_storage import start_external_storage_setup
 from .services.frame import FrameService
 from .services.hotspot_radio import setup_hotspot_radio
@@ -160,6 +162,16 @@ def create_app() -> Robyn:
             await setup_hotspot_radio()
         except Exception as e:
             logger.warning("Hotspot radio setup skipped: %s", e)
+
+        # Runs before the frame apply because writing the serial configuration
+        # restarts the autopilot, which would cut a param sweep in half.
+        try:
+            dive_active = (
+                find_latest_active_dive_record(DATA_ROOT / "dives") is not None
+            )
+            await reconcile_agt_serial(dive_in_progress=dive_active)
+        except Exception as e:
+            logger.warning("AGT serial port check skipped: %s", e)
 
         frame_service = FrameService()
         try:
