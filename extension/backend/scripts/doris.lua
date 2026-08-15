@@ -636,7 +636,7 @@ local function snapshot_config()
     cfg.asc_lgt     = prm.ASC_LGT:get() >= 1
     cfg.lgt_pwm     = brightness_to_pwm(brt)
     cfg.btm_thr_mps = math.max(btm_thr, 0.1) / 100.0
-    cfg.dpt_gat_m   = math.max(dpt_gat, 2.0)
+    cfg.dpt_gat_m   = math.max(dpt_gat, 0.0)
     -- Never looser than the GPS-assisted gate: the depth-only path is the
     -- weaker evidence of the two, so it must not be the easier one to satisfy.
     cfg.srf_dpt_m   = math.min(math.max(srf_dpt, 0.5), cfg.dpt_gat_m)
