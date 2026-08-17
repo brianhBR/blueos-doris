@@ -933,3 +933,194 @@ async def test_write_host_file_skips_when_existing_matches(
     # No host commands should have been issued at all - the
     # short-circuit must fire before chunked writes start.
     assert rec.calls == [], rec.calls
+
+
+# ---------------------------------------------------------------------
+# _ensure_usb_max_current: raises the Pi 5 USB budget 600mA -> 1600mA so
+# an over-current trip cannot drop the AP dongle off the bus. The
+# behaviour that matters most here is that it never *rewrites*
+# config.txt - a truncated or mis-decoded rewrite of the boot config
+# leaves a Pi that will not boot.
+# ---------------------------------------------------------------------
+
+
+PI5_MODEL = "Raspberry Pi 5 Model B Rev 1.0"
+
+
+def _mutating_calls(calls: list[str]) -> list[str]:
+    """Commands that could alter config.txt (as opposed to inspecting it)."""
+    return [c for c in calls if hotspot_radio.BOOT_CONFIG_PATH in c and "grep" not in c]
+
+
+async def test_ensure_usb_max_current_appends_never_rewrites(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)          # board model
+    patched_command.respond(True, "usb_max_current_enable=0")  # firmware
+    patched_command.respond(True, "")                 # grep: not declared
+    patched_command.respond(True, "")                 # backup
+    patched_command.respond(True, "")                 # append
+    patched_command.respond(True, "1")                # post-append count
+
+    assert await hotspot_radio._ensure_usb_max_current() is True
+
+    appends = [c for c in patched_command.calls if "tee -a" in c]
+    assert len(appends) == 1, patched_command.calls
+    assert hotspot_radio.USB_MAX_CURRENT_SETTING in appends[0]
+
+    # The whole point: nothing may truncate or replace the boot config.
+    joined = " ".join(patched_command.calls)
+    assert "tee -a" in joined
+    for forbidden in ("tee /boot", f"> {hotspot_radio.BOOT_CONFIG_PATH}", "base64 -d"):
+        assert forbidden not in joined, (
+            f"{forbidden!r} would rewrite {hotspot_radio.BOOT_CONFIG_PATH} rather "
+            "than append to it; a bad rewrite of the boot config bricks the Pi"
+        )
+
+
+async def test_ensure_usb_max_current_emits_explicit_all_section(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)
+    patched_command.respond(True, "usb_max_current_enable=0")
+    patched_command.respond(True, "")
+    patched_command.respond(True, "")
+    patched_command.respond(True, "")
+    patched_command.respond(True, "1")
+
+    await hotspot_radio._ensure_usb_max_current()
+
+    append = next(c for c in patched_command.calls if "tee -a" in c)
+    # Without an explicit [all] the setting inherits whatever
+    # model-conditional section happens to end the file, and silently
+    # never applies on a board that does not match it.
+    assert "[all]" in append
+    assert append.index("[all]") < append.index(hotspot_radio.USB_MAX_CURRENT_SETTING)
+
+
+async def test_ensure_usb_max_current_block_is_printf_safe() -> None:
+    # The block is emitted inside a single-quoted printf, so a quote
+    # would truncate the command and a percent sign would be read as a
+    # format specifier.
+    for line in hotspot_radio.USB_MAX_CURRENT_BLOCK_LINES:
+        assert "'" not in line, f"single quote breaks the printf: {line!r}"
+        assert "%" not in line, f"percent is a printf format specifier: {line!r}"
+
+
+async def test_ensure_usb_max_current_skips_non_pi5(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, "Raspberry Pi 4 Model B Rev 1.4")
+
+    assert await hotspot_radio._ensure_usb_max_current() is False
+    assert _mutating_calls(patched_command.calls) == [], patched_command.calls
+
+
+async def test_ensure_usb_max_current_skips_when_model_unreadable(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(False, "")
+
+    assert await hotspot_radio._ensure_usb_max_current() is False
+    assert _mutating_calls(patched_command.calls) == [], patched_command.calls
+
+
+async def test_ensure_usb_max_current_short_circuits_when_already_active(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)
+    patched_command.respond(True, "usb_max_current_enable=1")
+
+    assert await hotspot_radio._ensure_usb_max_current() is True
+    assert _mutating_calls(patched_command.calls) == [], patched_command.calls
+
+
+async def test_ensure_usb_max_current_leaves_existing_declaration_alone(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)
+    patched_command.respond(True, "usb_max_current_enable=0")
+    patched_command.respond(True, "69:usb_max_current_enable=1")
+
+    assert await hotspot_radio._ensure_usb_max_current() is True
+    assert _mutating_calls(patched_command.calls) == [], patched_command.calls
+
+
+async def test_ensure_usb_max_current_respects_explicit_opt_out(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)
+    patched_command.respond(True, "usb_max_current_enable=0")
+    # An operator who deliberately set =0 must not be overridden, and a
+    # second line would make the effective value depend on parse order.
+    patched_command.respond(True, "42:usb_max_current_enable=0")
+
+    assert await hotspot_radio._ensure_usb_max_current() is True
+    assert _mutating_calls(patched_command.calls) == [], patched_command.calls
+
+
+async def test_ensure_usb_max_current_aborts_when_backup_fails(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)
+    patched_command.respond(True, "usb_max_current_enable=0")
+    patched_command.respond(True, "")
+    patched_command.respond(False, "cp: cannot create regular file")
+
+    assert await hotspot_radio._ensure_usb_max_current() is False
+    assert not any("tee -a" in c for c in patched_command.calls), (
+        "must not append to the boot config when the backup failed - the "
+        "backup is the only rollback path"
+    )
+
+
+async def test_ensure_usb_max_current_reports_failure_on_bad_post_check(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)
+    patched_command.respond(True, "usb_max_current_enable=0")
+    patched_command.respond(True, "")
+    patched_command.respond(True, "")
+    patched_command.respond(True, "")
+    patched_command.respond(True, "2")  # duplicated stanza
+
+    assert await hotspot_radio._ensure_usb_max_current() is False
+
+
+async def test_ensure_usb_max_current_reports_failure_when_append_fails(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)
+    patched_command.respond(True, "usb_max_current_enable=0")
+    patched_command.respond(True, "")
+    patched_command.respond(True, "")
+    patched_command.respond(False, "tee: permission denied")
+
+    assert await hotspot_radio._ensure_usb_max_current() is False
+
+
+async def test_setup_hotspot_radio_runs_usb_current_before_early_return(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The udev/NM write failure path returns early; the USB budget must
+    # already have been staged by then, since it is unrelated to the
+    # hotspot config that failed.
+    async def failing_write(path: str, content: str) -> bool:
+        return False
+
+    usb_calls: list[bool] = []
+
+    async def fake_usb() -> bool:
+        usb_calls.append(True)
+        return True
+
+    monkeypatch.setattr(hotspot_radio, "_write_host_file", failing_write)
+    monkeypatch.setattr(hotspot_radio, "_ensure_usb_max_current", fake_usb)
+    monkeypatch.setattr(hotspot_radio, "_run_host_command", _RunHostCommandRecorder())
+
+    await hotspot_radio.setup_hotspot_radio()
+
+    assert usb_calls == [True], (
+        "_ensure_usb_max_current must run before the early return on "
+        "hotspot-config write failure"
+    )
