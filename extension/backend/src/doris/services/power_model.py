@@ -53,8 +53,8 @@ BASE_W = 8.0
 CAMERA_RECORDING_W = 1.5
 # Burn-wire / drop-weight release: no measurable draw in the logs.
 RELEASE_W = 0.0
-# Surface recovery draw (terminal RECOVERY state, disarmed on the surface):
-# measured ~9.2 W in-log = base electronics + recovery beacon/strobe.
+# Surface recovery draw (terminal RECOVERY state, armed for dwell logging but
+# with no thrusters): measured ~9.2 W in-log = base electronics + beacon/strobe.
 RECOVERY_BASE_W = 9.2
 # Whole-dive average draw measured in-log (~26 Wh over 140 min). Used as
 # the live time-remaining fallback when no instantaneous current is read.

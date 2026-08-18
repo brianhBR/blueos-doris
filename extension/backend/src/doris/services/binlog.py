@@ -229,8 +229,8 @@ async def wait_until_quiescent(
     """Wait until ``path`` mtime+size stop changing for ``idle_s`` seconds.
 
     Returns ``True`` when the file went idle, ``False`` if the budget
-    expired.  Used to avoid copying a BIN file the autopilot is still
-    writing to (the ``RECOVERY`` state is reached just before disarm).
+    expired. Used to avoid copying a BIN file the autopilot is still writing
+    until the AGT surface dwell completes and BlueOS disarms.
     """
     deadline = asyncio.get_event_loop().time() + max_wait_s
     last: tuple[float, int] | None = None

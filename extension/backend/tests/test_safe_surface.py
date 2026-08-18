@@ -7,6 +7,8 @@ from doris.services import safe_surface as module
 from doris.services.safe_surface import (
     SafeSurfaceService,
     _decode_name,
+    _disarm_payload,
+    _heartbeat_armed,
     _named_float_payload,
     parse_named_value,
 )
@@ -191,6 +193,28 @@ def test_ack_payload_uses_agt_accepted_source():
     assert payload["message"]["value"] == 1.0
 
 
+def test_disarm_payload_targets_the_autopilot():
+    payload = _disarm_payload()
+    message = payload["message"]
+
+    assert message["command"]["type"] == "MAV_CMD_COMPONENT_ARM_DISARM"
+    assert message["target_system"] == 1
+    assert message["target_component"] == 1
+    assert message["param1"] == 0.0
+
+
+def test_heartbeat_armed_decodes_mavlink2rest_base_mode():
+    assert _heartbeat_armed({
+        "type": "HEARTBEAT",
+        "base_mode": {"bits": module.MAV_MODE_FLAG_SAFETY_ARMED},
+    }) is True
+    assert _heartbeat_armed({
+        "type": "HEARTBEAT",
+        "base_mode": {"bits": 0},
+    }) is False
+    assert _heartbeat_armed({"type": "STATUSTEXT"}) is None
+
+
 def test_shutdown_requires_verified_firmware(monkeypatch):
     monkeypatch.setattr(module, "automatic_payload_shutdown_enabled", lambda: True)
     service = SafeSurfaceService()
@@ -245,13 +269,13 @@ async def test_bench_mode_quiesces_without_ack_or_poweroff(monkeypatch):
     service = SafeSurfaceService()
     events = []
 
-    async def flush():
-        events.append("flush")
+    async def disarm_and_finalize():
+        events.extend(["disarm", "flush"])
 
     async def forbidden(*args, **kwargs):
         raise AssertionError("bench mode must not ACK or power off")
 
-    monkeypatch.setattr(service, "_flush_and_finalize", flush)
+    monkeypatch.setattr(service, "_disarm_and_finalize", disarm_and_finalize)
     monkeypatch.setattr(service, "_send_named_float", forbidden)
     monkeypatch.setattr(service, "_run_host_command", forbidden)
 
@@ -259,7 +283,7 @@ async def test_bench_mode_quiesces_without_ack_or_poweroff(monkeypatch):
     assert service._shutdown_task is not None
     await service._shutdown_task
 
-    assert events == ["flush"]
+    assert events == ["disarm", "flush"]
     assert service.state.shutdown_state == "bench_disabled"
     assert service.state.power_shutdown_requested is True
 
@@ -269,10 +293,12 @@ async def test_failed_shutdown_allows_retry(monkeypatch):
     service = SafeSurfaceService()
     service._shutdown_request_latched = True
 
-    async def fail_flush():
+    async def fail_disarm_and_finalize():
         raise RuntimeError("flush failed")
 
-    monkeypatch.setattr(service, "_flush_and_finalize", fail_flush)
+    monkeypatch.setattr(
+        service, "_disarm_and_finalize", fail_disarm_and_finalize
+    )
     await service._shutdown_sequence()
     assert service.state.shutdown_state == "error"
     assert service._shutdown_request_latched is False
@@ -376,8 +402,8 @@ async def test_ack_precedes_poweroff(monkeypatch):
     service = SafeSurfaceService()
     events = []
 
-    async def flush():
-        events.append("flush")
+    async def disarm_and_finalize():
+        events.extend(["disarm", "flush"])
 
     async def command(command):
         events.append(command)
@@ -387,18 +413,42 @@ async def test_ack_precedes_poweroff(monkeypatch):
         events.append(f"{name}={value:g}")
         return True
 
-    monkeypatch.setattr(service, "_flush_and_finalize", flush)
+    monkeypatch.setattr(service, "_disarm_and_finalize", disarm_and_finalize)
     monkeypatch.setattr(service, "_run_host_command", command)
     monkeypatch.setattr(service, "_send_named_float", send_ack)
 
     await service._shutdown_sequence()
 
     assert events == [
+        "disarm",
         "flush",
         "sync",
         "PWR_ACK=1",
         "sudo systemctl poweroff",
     ]
+
+
+async def test_unconfirmed_disarm_withholds_ack_and_poweroff(monkeypatch):
+    service = SafeSurfaceService()
+    events = []
+
+    async def disarm():
+        events.append("disarm")
+        return False
+
+    async def forbidden(*args, **kwargs):
+        raise AssertionError("failed disarm must stop the shutdown sequence")
+
+    monkeypatch.setattr(service, "_disarm_autopilot", disarm)
+    monkeypatch.setattr(service, "_flush_and_finalize", forbidden)
+    monkeypatch.setattr(service, "_send_named_float", forbidden)
+    monkeypatch.setattr(service, "_run_host_command", forbidden)
+
+    await service._shutdown_sequence()
+
+    assert events == ["disarm"]
+    assert service.state.shutdown_state == "error"
+    assert service.state.shutdown_error == "autopilot disarm was not confirmed"
 
 
 def test_recovery_is_latched_from_the_lua_state():
@@ -452,9 +502,19 @@ async def test_shutdown_defers_heavy_processing(monkeypatch, tmp_path):
         events.append(f"{name}={value:g}")
         return True
 
+    async def disarm():
+        events.append("disarm")
+        return True
+
+    monkeypatch.setattr(service, "_disarm_autopilot", disarm)
     monkeypatch.setattr(service, "_run_host_command", command)
     monkeypatch.setattr(service, "_send_named_float", send_ack)
 
     await service._shutdown_sequence()
 
-    assert events == ["sync", "PWR_ACK=1", "sudo systemctl poweroff"]
+    assert events == [
+        "disarm",
+        "sync",
+        "PWR_ACK=1",
+        "sudo systemctl poweroff",
+    ]

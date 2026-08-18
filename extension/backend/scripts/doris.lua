@@ -46,9 +46,9 @@
    Battery failsafe actions are also disabled; the script monitors
    voltage directly via DORIS_MIN_VOLT.
 
-   RECOVERY is a terminal state: the autopilot is disarmed and all
-   outputs are safe.  The system stays running for data retrieval but
-   is safe for a hard power-off.
+   RECOVERY is a terminal state: outputs are safe, but the autopilot remains
+   armed so MCAP and BIN logging continue through the AGT's surface dwell.
+   BlueOS disarms when the AGT requests shutdown.
 
    Requires: ArduSub with Lua scripting enabled (SCR_ENABLE = 1)
 --]]
@@ -983,28 +983,22 @@ function update()
 
     update_telemetry(now_ms)
 
-    -- RECOVERY keepalive: publish STATE=4 above, perform terminal actions once,
-    -- then reschedule immediately. The AGT requires consecutive fresh recovery
-    -- reports before its three-minute surface dwell can begin. Keeping this
-    -- path ahead of profile authorization and light-test dispatch also ensures
-    -- unrelated terminal-state work cannot interrupt the shutdown handshake.
+    -- RECOVERY keepalive: stay armed so ArduPilot keeps MCAP/BIN logging while
+    -- publishing STATE=4 throughout the AGT's three-minute surface dwell.
+    -- PWR_SHDN tells BlueOS when the dwell is complete; BlueOS then disarms,
+    -- closes the logs, syncs storage, and acknowledges the AGT.
     if state == STATE_RECOVERY then
         if RC9 then RC9:set_override(LIGHT_PWM_MIN) end
         if not recovery_done then
-            if arming:is_armed() then
-                arming:disarm()
-            end
-            if not arming:is_armed() then
-                prm.START:set_and_save(0)
-                deactivate_relay()
-                local total = dive_start_ms > 0
-                    and (now_ms - dive_start_ms) / 1000.0 or 0
-                gcs:send_text(MAV_SEVERITY.INFO,
-                    string.format(
-                        "DIVE: mission complete (%.1fs), safe for power-off",
-                        total))
-                recovery_done = true
-            end
+            prm.START:set_and_save(0)
+            deactivate_relay()
+            local total = dive_start_ms > 0
+                and (now_ms - dive_start_ms) / 1000.0 or 0
+            gcs:send_text(MAV_SEVERITY.INFO,
+                string.format(
+                    "DIVE: surface dwell logging started (mission %.1fs)",
+                    total))
+            recovery_done = true
         end
         return update, UPDATE_INTERVAL_MS
     end
