@@ -19,7 +19,6 @@ import {
   useConfigurations,
   useDiveControl,
   useLocation,
-  useSafeSurfaceStatus,
   useSensors,
   useStorage,
   useSystemStatus,
@@ -54,12 +53,6 @@ const { battery, fetchBattery } = useBattery()
 const { storage, fetchStorage } = useStorage()
 const { location, fetchLocation } = useLocation()
 const { modules: sensorModules, loading: sensorsLoading, fetchModules } = useSensors()
-const {
-  status: safeSurfaceStatus,
-  loading: safeSurfaceLoading,
-  error: safeSurfaceError,
-  fetchSafeSurfaceStatus,
-} = useSafeSurfaceStatus()
 const {
   status: diveStatus,
   mission: diveMission,
@@ -172,7 +165,6 @@ onMounted(() => {
   fetchConfigurations()
   fetchDiveStatus()
   fetchDiveMission()
-  fetchSafeSurfaceStatus()
   refreshCurrentUtcTime()
   pollInterval = setInterval(() => {
     fetchStatus()
@@ -342,7 +334,6 @@ const canStartDive = computed(() => {
     estimatedDepth.value.trim() !== '' &&
     !isNaN(parseFloat(estimatedDepth.value)) &&
     parseFloat(estimatedDepth.value) > 0
-    && safeSurfaceStatus.value?.ready === true
   )
 })
 
@@ -426,8 +417,6 @@ const handleConfigurationChange = async () => {
 
 async function handleStartDive() {
   if (!canStartDive.value) return
-  const currentSafety = await fetchSafeSurfaceStatus()
-  if (!currentSafety?.ready) return
   const diveData: Record<string, unknown> = {
     dive_name: diveName.value.trim(),
     username: username.value.trim(),
@@ -637,43 +626,6 @@ const formatReleaseTime = (date: Date) => {
             </p>
           </div>
         </template>
-
-        <div
-          v-if="safeSurfaceLoading || safeSurfaceError || safeSurfaceStatus?.ready !== true"
-          class="rounded-lg p-4"
-          style="background-color: rgba(221, 44, 29, 0.15); border: 1px solid rgba(221, 44, 29, 0.5)"
-        >
-          <div class="flex items-start gap-3">
-            <Loader2 v-if="safeSurfaceLoading" class="w-5 h-5 animate-spin flex-shrink-0" style="color: #FF9937" />
-            <AlertTriangle v-else class="w-5 h-5 flex-shrink-0" style="color: #FF9937" />
-            <div>
-              <p class="text-white font-semibold">No usable weight release path</p>
-              <p v-if="safeSurfaceLoading" class="text-sm mt-1" style="color: #FCD869">Checking release paths, AGT firmware, and wiring…</p>
-              <p v-else-if="safeSurfaceError" class="text-sm mt-1" style="color: #FCD869">{{ safeSurfaceError }}</p>
-              <ul v-else class="text-sm mt-1 list-disc pl-5" style="color: #FCD869">
-                <li v-for="message in safeSurfaceStatus?.blockers ?? []" :key="message">{{ message }}</li>
-              </ul>
-            </div>
-          </div>
-        </div>
-
-        <div
-          v-else-if="(safeSurfaceStatus?.warnings?.length ?? 0) > 0"
-          class="rounded-lg p-4"
-          style="background-color: rgba(255, 153, 55, 0.12); border: 1px solid rgba(255, 153, 55, 0.4)"
-        >
-          <div class="flex items-start gap-3">
-            <AlertTriangle class="w-5 h-5 flex-shrink-0" style="color: #FF9937" />
-            <div>
-              <p class="text-white font-semibold">
-                Release redundancy reduced — {{ safeSurfaceStatus?.navigator_release_available ? 'Navigator' : 'AGT' }} path only
-              </p>
-              <ul class="text-sm mt-1 list-disc pl-5" style="color: #FCD869">
-                <li v-for="message in safeSurfaceStatus?.warnings ?? []" :key="message">{{ message }}</li>
-              </ul>
-            </div>
-          </div>
-        </div>
 
         <div class="flex items-end gap-3">
           <button
