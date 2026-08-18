@@ -312,6 +312,46 @@ def _dir_bytes(root: Path, patterns: tuple[str, ...]) -> int:
     return total
 
 
+def _resolve_dive_dir(stamp: str | None) -> Path | None:
+    """Locate this dive's ``dive_<stamp>/`` folder across all recording roots.
+
+    The recorder writes each dive into ``<root>/dive_<stamp>/`` where ``<root>``
+    is USB-preferred (see ``ip_camera_recorder._output_dir`` and
+    ``dive_finalize._recordings_dir``): a mounted, roomy USB stick wins,
+    otherwise it falls back to internal ``DORIS_DATA_ROOT``.  Preflight must use
+    the *same* resolution or it looks internally for a folder that lives on the
+    stick and wrongly reports "no dive recording folder" (skipping the log,
+    RadCam, and media steps) even though the video step -- which resolves the
+    USB-preferred way -- built fine.
+
+    Both roots are checked, not just the preferred one, so a stick swapped or
+    pulled between recording and processing still resolves as long as the
+    segments survive somewhere.  Whichever candidate actually holds content wins
+    over a bare, freshly-created directory.
+    """
+    if not stamp:
+        return None
+
+    sub = settings.ipcam_recordings_subdir.strip("/").strip()
+    candidates: list[Path] = []
+
+    usb_base = usb_storage.get_recording_dir_if_available(sub)
+    if usb_base is not None:
+        candidates.append(Path(usb_base))
+    candidates.append(_data_root() / sub)
+
+    fallback: Path | None = None
+    for base in candidates:
+        cand = base / f"dive_{stamp}"
+        if not cand.is_dir():
+            continue
+        if any(cand.iterdir()):
+            return cand
+        if fallback is None:
+            fallback = cand
+    return fallback
+
+
 class DiveProcessingService:
     """Runs one post-dive processing job at a time."""
 
@@ -458,11 +498,7 @@ class DiveProcessingService:
         ctx["stamp"] = stamp
         ctx["bottom_mode"] = record.get("bottom_mode")
 
-        rec_root = Path(settings.ipcam_recordings_subdir)
-        if not rec_root.is_absolute():
-            rec_root = _data_root() / settings.ipcam_recordings_subdir
-        dive_dir = rec_root / f"dive_{stamp}" if stamp else None
-        ctx["dive_dir"] = dive_dir if dive_dir and dive_dir.is_dir() else None
+        ctx["dive_dir"] = _resolve_dive_dir(stamp)
 
         needed_mb = 0.0
         if ctx["dive_dir"] is not None:
