@@ -5,12 +5,13 @@ The protocol uses MAVLink ``NAMED_VALUE_FLOAT`` messages:
 * autopilot component 1 publishes ``RELAY`` as the requested release state;
 * AGT component 192 publishes ``AGT_CAP=3``, ``REL_STAT`` and ``PWR_SHDN``;
 * ``PWR_SHDN=1`` requests shutdown and ``PWR_SHDN=0`` resets the handshake.
-  BlueOS flushes recording and storage, publishes ``PWR_ACK=1``, then asks BlueOS
-  Commander to power off the host.
+  BlueOS disarms the autopilot, flushes recording and storage, publishes
+  ``PWR_ACK=1``, then asks BlueOS Commander to power off the host.
 
-Lua's repeated terminal ``STATE=4`` is the sole surface authority used by the
-AGT. BlueOS only confirms that storage is safe; release relay ownership is not
-part of that decision. STATUSTEXT is deliberately not accepted as control.
+One fresh terminal ``STATE=4`` after an observed dive is the AGT's sole surface
+authority. Lua continues publishing it during the dwell for telemetry, while
+BlueOS only confirms that storage is safe. Release relay ownership is not part
+of that decision. STATUSTEXT is deliberately not accepted as control.
 """
 
 from __future__ import annotations
@@ -43,6 +44,9 @@ STATUS_STALE_S = 5.0
 RECONNECT_DELAY_S = 2.0
 BINARY_VALUE_TOLERANCE = 0.1
 MAX_CAPABILITY_MASK = 0xFF
+MAV_MODE_FLAG_SAFETY_ARMED = 128
+DISARM_CONFIRM_TIMEOUT_S = 10.0
+DISARM_POLL_INTERVAL_S = 0.25
 
 
 def _decode_name(raw_name: object) -> str:
@@ -104,6 +108,39 @@ def _named_float_payload(name: str, value: float) -> dict:
             "value": value,
         },
     }
+
+
+def _disarm_payload() -> dict:
+    """Build the standard MAVLink command that disarms the autopilot."""
+    return {
+        "header": {"system_id": 255, "component_id": 0, "sequence": 0},
+        "message": {
+            "type": "COMMAND_LONG",
+            "target_system": 1,
+            "target_component": AUTOPILOT_COMPONENT_ID,
+            "command": {"type": "MAV_CMD_COMPONENT_ARM_DISARM"},
+            "confirmation": 0,
+            "param1": 0.0,
+            "param2": 0.0,
+            "param3": 0.0,
+            "param4": 0.0,
+            "param5": 0.0,
+            "param6": 0.0,
+            "param7": 0.0,
+        },
+    }
+
+
+def _heartbeat_armed(message: object) -> bool | None:
+    """Decode the armed flag from a mavlink2rest HEARTBEAT response."""
+    if not isinstance(message, dict) or message.get("type") != "HEARTBEAT":
+        return None
+    base_mode = message.get("base_mode")
+    if isinstance(base_mode, dict):
+        base_mode = base_mode.get("bits")
+    if not isinstance(base_mode, (int, float)):
+        return None
+    return bool(int(base_mode) & MAV_MODE_FLAG_SAFETY_ARMED)
 
 
 def _binary_value(value: object) -> bool | None:
@@ -350,9 +387,8 @@ class SafeSurfaceService:
 
     async def _bench_quiesce_sequence(self) -> None:
         """Close the dive on an AGT request without ACKing or powering off."""
-        self.state.shutdown_state = "bench_quiescing"
         try:
-            await self._flush_and_finalize()
+            await self._disarm_and_finalize()
             self.state.shutdown_state = "bench_disabled"
             logger.warning(
                 "AGT shutdown request quiesced, but bench mode withheld PWR_ACK"
@@ -364,10 +400,9 @@ class SafeSurfaceService:
             logger.exception("AGT bench-mode quiesce failed")
 
     async def _shutdown_sequence(self) -> None:
-        """Flush data, acknowledge the AGT, then request host poweroff."""
-        self.state.shutdown_state = "flushing"
+        """Disarm, flush data, acknowledge the AGT, then request host poweroff."""
         try:
-            await self._flush_and_finalize()
+            await self._disarm_and_finalize()
             if not await self._run_host_command("sync"):
                 raise RuntimeError("host sync failed")
 
@@ -383,6 +418,54 @@ class SafeSurfaceService:
             self.state.shutdown_error = str(error)
             self._shutdown_request_latched = False
             logger.exception("AGT safe shutdown failed")
+
+    async def _disarm_and_finalize(self) -> None:
+        """End armed logging only after the AGT's powered surface dwell."""
+        self.state.shutdown_state = "disarming"
+        if not await self._disarm_autopilot():
+            raise RuntimeError("autopilot disarm was not confirmed")
+        self.state.shutdown_state = "flushing"
+        await self._flush_and_finalize()
+
+    async def _disarm_autopilot(self) -> bool:
+        """Request an ordinary disarm and confirm it from HEARTBEAT."""
+        base = blueos_services.mavlink2rest
+        heartbeat_url = (
+            f"{base}/mavlink/vehicles/1/components/"
+            f"{AUTOPILOT_COMPONENT_ID}/messages/HEARTBEAT"
+        )
+        try:
+            async with httpx.AsyncClient(timeout=5.0) as client:
+                response = await client.post(
+                    f"{base}/mavlink", json=_disarm_payload()
+                )
+                response.raise_for_status()
+
+                deadline = (
+                    asyncio.get_running_loop().time() + DISARM_CONFIRM_TIMEOUT_S
+                )
+                while asyncio.get_running_loop().time() < deadline:
+                    response = await client.get(heartbeat_url)
+                    if response.status_code != 404:
+                        response.raise_for_status()
+                        armed = _heartbeat_armed(
+                            response.json().get("message", {})
+                        )
+                        if armed is False:
+                            logger.info(
+                                "Autopilot disarmed after AGT surface dwell"
+                            )
+                            return True
+                    await asyncio.sleep(DISARM_POLL_INTERVAL_S)
+        except Exception as error:
+            logger.warning("Failed to disarm autopilot: %s", error)
+            return False
+
+        logger.warning(
+            "Autopilot remained armed %.1fs after disarm request",
+            DISARM_CONFIRM_TIMEOUT_S,
+        )
+        return False
 
     def recovery_seen(self) -> bool:
         """True once Lua has reported RECOVERY on this run."""

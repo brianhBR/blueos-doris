@@ -21,13 +21,15 @@ frame parameters that do not match — starts the mission with a warning that
 release redundancy is reduced.
 
 AGT-requested host shutdown is enabled by default and is independent of which
-controller owns the release actuator. Lua's repeated terminal `STATE=4` is the
-AGT's sole surface authority; after a three-minute powered logging dwell the AGT
-sends `PWR_SHDN=1`. The backend quiesces the dive, runs `sync`, sends
-`PWR_ACK=1` from system 1/component 191, and only then asks BlueOS Commander to
-power off. Operators can persistently enable **Bench mode** on the AGT sensor
-card: BlueOS still closes the dive on `PWR_SHDN`, but withholds both `PWR_ACK`
-and host poweroff so the payload remains powered.
+controller owns the release actuator. One fresh post-dive `STATE=4` is the
+AGT's sole surface authority and starts its three-minute powered logging dwell.
+Lua remains armed and continues sending telemetry so ArduPilot keeps MCAP and
+BIN logging throughout that dwell. The backend then commands and verifies
+disarm, quiesces the dive, runs `sync`, sends `PWR_ACK=1` from system
+1/component 191, and only then asks BlueOS Commander to power off. Operators
+can persistently enable **Bench mode** on the AGT sensor card: BlueOS still
+disarms and closes the dive on `PWR_SHDN`, but withholds both `PWR_ACK` and host
+poweroff so the payload remains powered.
 
 Component 191 is `MAV_COMP_ID_ONBOARD_COMPUTER`, which BlueOS's mavlink-server
 also advertises for itself. That is deliberate, so an operator on a laptop can
@@ -100,12 +102,13 @@ shallow and perfectly steady, which is indistinguishable from floating; across
 ## Post-dive processing
 
 Reaching the surface no longer processes or immediately closes the dive. Lua
-keeps terminal `STATE=4` and telemetry publishing while the AGT holds the payload
-up for its three-minute surface-logging dwell. When `PWR_SHDN=1` arrives, the
-shutdown service quiesces in seconds: it stops any remaining camera recorder,
-records the dive stamp and bottom mode, closes the dive as completed, and marks
-it pending processing. The bottom mode is recovered from the dive's saved
-configuration snapshot because Lua no longer calls the finalize endpoint.
+stays armed and keeps terminal `STATE=4` and telemetry publishing while the AGT
+holds the payload up for its three-minute surface-logging dwell. When
+`PWR_SHDN=1` arrives, the shutdown service disarms and verifies the vehicle,
+then quiesces in seconds: it stops any remaining camera recorder, records the
+dive stamp and bottom mode, closes the dive as completed, and marks it pending
+processing. The bottom mode is recovered from the dive's saved configuration
+snapshot because Lua no longer calls the finalize endpoint.
 
 Everything expensive runs later, when an operator presses **Process Dive** on the
 Previous Dives page with the vehicle on deck:

@@ -123,7 +123,7 @@ def test_recovery_does_not_finalize_the_dive_early():
 
 
 def test_recovery_explicitly_reschedules_after_telemetry():
-    """Recovery must repeatedly satisfy the AGT's fresh STATE=4 requirement."""
+    """Recovery must keep terminal telemetry alive throughout the AGT dwell."""
     body = SCRIPT.read_text(encoding="utf-8")
     update = body.split("function update()", 1)[1]
     recovery_start = update.index("-- RECOVERY keepalive:")
@@ -146,3 +146,14 @@ def test_recovery_persists_mission_completion_only_once():
         "prm.START:set_and_save(0)"
     )
     assert recovery.count("prm.START:set_and_save(0)") == 1
+
+
+def test_recovery_stays_armed_for_agt_surface_dwell():
+    """Disarming early stops ArduPilot's MCAP/BIN logs before the dwell."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    recovery = body.split("-- RECOVERY keepalive:", 1)[1].split(
+        "-- light test:", 1
+    )[0]
+
+    assert "arming:disarm()" not in recovery
+    assert "return update, UPDATE_INTERVAL_MS" in recovery
