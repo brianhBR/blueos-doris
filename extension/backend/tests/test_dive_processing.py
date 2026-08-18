@@ -13,6 +13,7 @@ from doris.services.dive_processing import (
     StepSkipped,
     _copy_verified,
     _radcam_stamp_from_name,
+    _resolve_dive_dir,
     quiesce_dive,
 )
 from doris.services.dive_records import (
@@ -417,6 +418,79 @@ def test_verify_usb_rejects_a_file_that_never_landed(tmp_path):
     ctx = {"usb_dir": usb, "copied": [(usb / "gone.bin", 12)]}
     with pytest.raises(OSError, match="missing"):
         asyncio.run(service._step_verify_usb(_processing_session(), ctx))
+
+
+# ── dive folder resolution ────────────────────────────────────────────────
+
+
+def _make_ipcam_root(tmp_path, monkeypatch):
+    """Point the resolver at an isolated internal recordings tree."""
+    sub = module.settings.ipcam_recordings_subdir.strip("/").strip()
+    data_root = tmp_path / "data"
+    (data_root / sub).mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(module, "_data_root", lambda: data_root)
+    return data_root / sub
+
+
+def test_resolve_dive_dir_prefers_usb_where_the_recorder_wrote(tmp_path, monkeypatch):
+    """A dive recorded to a mounted stick must resolve on the stick, not internal.
+
+    This is the regression: preflight used to look only internally, so a USB
+    dive reported "no dive recording folder" and skipped the log/media steps.
+    """
+    _make_ipcam_root(tmp_path, monkeypatch)
+    sub = module.settings.ipcam_recordings_subdir.strip("/").strip()
+    usb_base = tmp_path / "usb" / sub
+    usb_dive = usb_base / "dive_20260817_231959"
+    usb_dive.mkdir(parents=True)
+    (usb_dive / "on_bottom.ts").write_bytes(b"segment")
+
+    monkeypatch.setattr(
+        module.usb_storage, "get_recording_dir_if_available", lambda _sub: str(usb_base)
+    )
+
+    assert _resolve_dive_dir("20260817_231959") == usb_dive
+
+
+def test_resolve_dive_dir_falls_back_to_internal_without_usb(tmp_path, monkeypatch):
+    ipcam_root = _make_ipcam_root(tmp_path, monkeypatch)
+    internal_dive = ipcam_root / "dive_20260817_231959"
+    internal_dive.mkdir(parents=True)
+    (internal_dive / "on_bottom.ts").write_bytes(b"segment")
+
+    monkeypatch.setattr(
+        module.usb_storage, "get_recording_dir_if_available", lambda _sub: None
+    )
+
+    assert _resolve_dive_dir("20260817_231959") == internal_dive
+
+
+def test_resolve_dive_dir_prefers_the_root_that_holds_content(tmp_path, monkeypatch):
+    """A bare USB dir (stick swapped) must not shadow segments left internally."""
+    ipcam_root = _make_ipcam_root(tmp_path, monkeypatch)
+    internal_dive = ipcam_root / "dive_20260817_231959"
+    internal_dive.mkdir(parents=True)
+    (internal_dive / "on_bottom.ts").write_bytes(b"segment")
+
+    sub = module.settings.ipcam_recordings_subdir.strip("/").strip()
+    usb_base = tmp_path / "usb" / sub
+    (usb_base / "dive_20260817_231959").mkdir(parents=True)  # empty
+
+    monkeypatch.setattr(
+        module.usb_storage, "get_recording_dir_if_available", lambda _sub: str(usb_base)
+    )
+
+    assert _resolve_dive_dir("20260817_231959") == internal_dive
+
+
+def test_resolve_dive_dir_none_when_missing_everywhere(tmp_path, monkeypatch):
+    _make_ipcam_root(tmp_path, monkeypatch)
+    monkeypatch.setattr(
+        module.usb_storage, "get_recording_dir_if_available", lambda _sub: None
+    )
+
+    assert _resolve_dive_dir("20260817_231959") is None
+    assert _resolve_dive_dir(None) is None
 
 
 # ── RadCam Spy log selection ──────────────────────────────────────────────
