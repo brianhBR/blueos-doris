@@ -983,6 +983,32 @@ function update()
 
     update_telemetry(now_ms)
 
+    -- RECOVERY keepalive: publish STATE=4 above, perform terminal actions once,
+    -- then reschedule immediately. The AGT requires consecutive fresh recovery
+    -- reports before its three-minute surface dwell can begin. Keeping this
+    -- path ahead of profile authorization and light-test dispatch also ensures
+    -- unrelated terminal-state work cannot interrupt the shutdown handshake.
+    if state == STATE_RECOVERY then
+        if RC9 then RC9:set_override(LIGHT_PWM_MIN) end
+        if not recovery_done then
+            if arming:is_armed() then
+                arming:disarm()
+            end
+            if not arming:is_armed() then
+                prm.START:set_and_save(0)
+                deactivate_relay()
+                local total = dive_start_ms > 0
+                    and (now_ms - dive_start_ms) / 1000.0 or 0
+                gcs:send_text(MAV_SEVERITY.INFO,
+                    string.format(
+                        "DIVE: mission complete (%.1fs), safe for power-off",
+                        total))
+                recovery_done = true
+            end
+        end
+        return update, UPDATE_INTERVAL_MS
+    end
+
     -- light test: when DORIS_LGT_TST > 0, override lights to that % brightness.
     -- Auto-clears after 10000 ms so lights don't stay stuck on
     -- if the "off" PARAM_SET is lost.
@@ -1625,23 +1651,6 @@ function update()
             end
         end
 
-    -- ??????????????? RECOVERY (terminal) ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-    elseif state == STATE_RECOVERY then
-        if RC9 then RC9:set_override(LIGHT_PWM_MIN) end
-        arming:disarm()
-        prm.START:set_and_save(0)
-        -- Keep terminal STATE=4 and telemetry flowing throughout the AGT's
-        -- powered surface-logging dwell. BlueOS closes the active dive only
-        -- after the AGT sends PWR_SHDN; processing remains operator-triggered.
-        if not recovery_done and not arming:is_armed() then
-            deactivate_relay()
-            local total = dive_start_ms > 0
-                and (now_ms - dive_start_ms) / 1000.0 or 0
-            gcs:send_text(MAV_SEVERITY.INFO,
-                string.format("DIVE: mission complete (%.1fs), safe for power-off",
-                    total))
-            recovery_done = true
-        end
     end
 
     return update, UPDATE_INTERVAL_MS

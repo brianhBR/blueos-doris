@@ -2,6 +2,13 @@
 
 ## bh-0.6
 
+- Recovery now uses an explicit terminal keepalive path. A pool dive recorded
+  only one `STATE=4` before ArduPilot disarmed and its MCAP recorder stopped,
+  while the AGT requires three consecutive fresh recovery reports before
+  starting the powered surface dwell. Lua now publishes telemetry first and
+  immediately reschedules every 500 ms in recovery, with disarm and
+  `DORIS_START` persistence performed once instead of on every terminal tick.
+
 - Surface shutdown now has one authority: Lua continuously publishes terminal
   `STATE=4`, the AGT keeps the payload and MCAP logging alive for three minutes,
   then `PWR_SHDN=1` tells BlueOS to quiesce, sync, ACK, and halt. Lua no longer

@@ -116,14 +116,33 @@ def test_recovery_does_not_finalize_the_dive_early():
     """BlueOS must keep the active dive open for the AGT surface dwell."""
     body = SCRIPT.read_text(encoding="utf-8")
     assert "/api/v1/dive/finalize" not in body
-    recovery = body.split("elseif state == STATE_RECOVERY then", 1)[1]
-    assert "state =" not in recovery.split("return update, UPDATE_INTERVAL_MS", 1)[0]
+    recovery = body.split("-- RECOVERY keepalive:", 1)[1].split(
+        "-- light test:", 1
+    )[0]
+    assert re.search(r"\bstate\s*=(?!=)", recovery) is None
 
 
-def test_telemetry_runs_before_terminal_recovery_dispatch():
-    """STATE=4 and DORS telemetry continue on every terminal recovery tick."""
+def test_recovery_explicitly_reschedules_after_telemetry():
+    """Recovery must repeatedly satisfy the AGT's fresh STATE=4 requirement."""
     body = SCRIPT.read_text(encoding="utf-8")
     update = body.split("function update()", 1)[1]
-    assert update.index("update_telemetry(now_ms)") < update.index(
-        "elseif state == STATE_RECOVERY then"
+    recovery_start = update.index("-- RECOVERY keepalive:")
+    recovery_end = update.index("-- light test:")
+    recovery = update[recovery_start:recovery_end]
+
+    assert update.index("update_telemetry(now_ms)") < recovery_start
+    assert "if state == STATE_RECOVERY then" in recovery
+    assert "return update, UPDATE_INTERVAL_MS" in recovery
+
+
+def test_recovery_persists_mission_completion_only_once():
+    """Do not write DORIS_START to parameter storage every 500 ms."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    recovery = body.split("-- RECOVERY keepalive:", 1)[1].split(
+        "-- light test:", 1
+    )[0]
+
+    assert recovery.index("if not recovery_done then") < recovery.index(
+        "prm.START:set_and_save(0)"
     )
+    assert recovery.count("prm.START:set_and_save(0)") == 1
