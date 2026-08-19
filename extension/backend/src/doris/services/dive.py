@@ -172,6 +172,8 @@ class DiveService:
             ("DORIS_LGT_BRT", float(config.bottom.light.brightness)),
             ("DORIS_BTM_DLY", round(btm_light_dly_s)),
             ("DORIS_CAM_DLY", round(btm_cam_dly_s)),
+            # One-push auto white balance after the bottom lights come on.
+            ("DORIS_BTM_AWB", 1.0 if config.bottom.auto_white_balance else 0.0),
             ("DORIS_PRF_ID", float(profile_id)),
             ("DORIS_UPL_DATE", upload_date),
             ("DORIS_UPL_TIME", upload_time),

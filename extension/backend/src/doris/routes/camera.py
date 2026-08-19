@@ -81,6 +81,25 @@ def register_camera_routes(app: Robyn) -> None:
             logger.warning("camera apply_settings failed: %s", e)
             return _error(str(e), _camera_error_status(e))
 
+    async def _trigger_awb_core():
+        """Fire a one-push auto white balance on the camera."""
+        try:
+            fresh = await svc.trigger_awb()
+            return _json(fresh.model_dump_json(by_alias=True))
+        except Exception as e:
+            logger.warning("camera trigger_awb failed: %s", e)
+            return _error(str(e), _camera_error_status(e))
+
+    @app.post("/api/v1/camera/awb")
+    async def trigger_awb_api(request):
+        return await _trigger_awb_core()
+
+    # Short path used by the doris.lua dive script (fire-and-forget POST from a
+    # raw socket) once the bottom lights come on.  Mirrors the /rec/* pattern.
+    @app.post("/rec/awb")
+    async def trigger_awb_lua(request):
+        return await _trigger_awb_core()
+
     @app.post("/api/v1/camera/settings/recommended")
     async def apply_recommended(request):
         try:

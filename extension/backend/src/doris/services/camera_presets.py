@@ -88,6 +88,21 @@ class CameraPresetService:
         )
         return await self.apply_bundle(bundle, camera_uuid)
 
+    async def trigger_awb(
+        self, camera_uuid: str | None = None
+    ) -> AdvancedImageSettings:
+        """Fire a one-push auto white balance on the camera.
+
+        Uses the advanced ``onceAWB`` trigger, which tells the RadCam to run a
+        single auto-white-balance convergence against the current (lit) scene
+        and then hold that balance.  Called by the Lua dive script once the
+        bottom lights come on.
+        """
+        uuid = await self._require_uuid(camera_uuid)
+        return await self.client.set_advanced(
+            uuid, AdvancedImageSettings(once_awb=1)
+        )
+
     async def snapshot_to_preset(
         self, name: str, camera_uuid: str | None = None
     ) -> CameraPreset:

@@ -95,7 +95,7 @@ local STATE_ASCENT        = 3
 local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-assert(param:add_table(73, "DORIS_", 40),
+assert(param:add_table(73, "DORIS_", 41),
        "DIVE: could not add DORIS_ param table")
 
 -- mission control
@@ -160,6 +160,11 @@ assert(param:add_param(73, 38, "TL_PST_S", 1),    "DORIS_TL_PST_S")
 assert(param:add_param(73, 39, "SRF_DPT", 1.5),  "DORIS_SRF_DPT")
 assert(param:add_param(73, 40, "SRF_SEC", 30),   "DORIS_SRF_SEC")
 
+-- One-push auto white balance on the bottom lights (0 off, 1 on).  When set,
+-- the on-bottom loop fires a single AWB command to the DORIS extension shortly
+-- after the bottom lights come on so white balance matches the lit scene.
+assert(param:add_param(73, 41, "BTM_AWB", 0),    "DORIS_BTM_AWB")
+
 
 -- Parameter handles live in one table rather than in a local apiece.
 -- ArduPilot builds Lua with MAXVARS lowered from upstream's 200 to 100
@@ -181,6 +186,7 @@ local prm = {
     LGT_ON   = Parameter("DORIS_LGT_ON"),
     LGT_OFF  = Parameter("DORIS_LGT_OFF"),
     BTM_DLY  = Parameter("DORIS_BTM_DLY"),
+    BTM_AWB  = Parameter("DORIS_BTM_AWB"),
     PRF_ID   = Parameter("DORIS_PRF_ID"),
     UPL_DATE = Parameter("DORIS_UPL_DATE"),
     UPL_TIME = Parameter("DORIS_UPL_TIME"),
@@ -334,6 +340,12 @@ local leak_detected = false
 local light_on       = true
 local light_cycle_ms = 0
 
+-- one-push auto white balance state (fires once per bottom visit, a short
+-- settle after the bottom lights first come on)
+local btm_awb_done   = false
+local btm_lgt_on_ms  = 0
+local AWB_SETTLE_MS   = 2000
+
 -- light test state (auto-clears after timeout)
 local lgt_tst_start_ms = 0
 -- 10000 = 10000 (inlined)
@@ -362,6 +374,7 @@ local cfg = {
     lgt_on_ms   = 10000,
     lgt_off_ms  = 5000,
     btm_dly_ms  = 30000,
+    btm_awb     = false,
 }
 
 -- snapshotted IP camera policy (set in snapshot_config from DORIS_* params)
@@ -634,6 +647,7 @@ local function snapshot_config()
     cfg.dsc_lgt     = prm.DSC_LGT:get() >= 1
     cfg.btm_lgt     = prm.BTM_LGT:get() >= 1
     cfg.asc_lgt     = prm.ASC_LGT:get() >= 1
+    cfg.btm_awb     = prm.BTM_AWB:get() >= 1
     cfg.lgt_pwm     = brightness_to_pwm(brt)
     cfg.btm_thr_mps = math.max(btm_thr, 0.1) / 100.0
     cfg.dpt_gat_m   = math.max(dpt_gat, 0.0)
@@ -882,6 +896,13 @@ local function ipcam_http_snapshot(host, port, phase)
     return ipcam_http_send(
         string.format("POST /rec/snapshot?phase=%s", phase or "manual"),
         host, port)
+end
+
+-- Fire a one-push auto white balance on the camera (via the DORIS extension,
+-- which forwards onceAWB to the br4kcam-manager).  Fire-and-forget like the
+-- other recorder calls.
+local function ipcam_http_awb(host, port)
+    return ipcam_http_send("POST /rec/awb", host, port)
 end
 
 local function ipcam_start(phase, seg_s)
@@ -1249,6 +1270,9 @@ function update()
                 bottom_start_ms   = now_ms
                 bottom_delay_done = cfg.btm_dly_ms <= 0
                 reset_light_cycle(now_ms)
+                -- Arm the one-push AWB for this bottom visit.
+                btm_awb_done      = false
+                btm_lgt_on_ms     = 0
                 ipcam_btm_started = false
                 -- Reset interval/timelapse timers so the on_bottom
                 -- loop below can establish its own cadence.
@@ -1346,6 +1370,10 @@ function update()
             bottom_lgt_eff = cfg.btm_lgt and (pre_active or post_active)
         end
 
+        -- ``lights_cmd`` is the enable actually handed to update_lights this
+        -- tick; captured so the one-push AWB below can anchor on the moment
+        -- the bottom lights are first commanded on.
+        local lights_cmd
         if ipcam_cfg.btm_cmod == 2
            or (ipcam_cfg.btm_cmod == 1 and ipcam_cfg.rec_en) then
             -- INTERVAL and CONTINUOUS-recording own their light timing via
@@ -1353,9 +1381,9 @@ function update()
             -- bottom settling delay (bottom_delay_done, measured from
             -- bottom detection) is replaced by the recording-start anchor
             -- so the light tracks the camera, not the detection instant.
-            update_lights(bottom_lgt_eff, now_ms)
+            lights_cmd = bottom_lgt_eff
         elseif not bottom_delay_done then
-            update_lights(false, now_ms)
+            lights_cmd = false
             if bottom_elapsed >= cfg.btm_dly_ms then
                 bottom_delay_done = true
                 reset_light_cycle(now_ms)
@@ -1364,7 +1392,23 @@ function update()
                         cfg.btm_dly_ms / 1000.0))
             end
         else
-            update_lights(bottom_lgt_eff, now_ms)
+            lights_cmd = bottom_lgt_eff
+        end
+        update_lights(lights_cmd, now_ms)
+
+        -- One-push auto white balance: once per bottom visit, a short settle
+        -- after the bottom lights are first commanded on, so the camera's AWB
+        -- converges against the lit scene rather than ambient light.  Needs
+        -- both the bottom lights enabled and the operator's AWB toggle set.
+        if cfg.btm_awb and cfg.btm_lgt and not btm_awb_done and lights_cmd then
+            if btm_lgt_on_ms == 0 then
+                btm_lgt_on_ms = now_ms
+            elseif now_ms - btm_lgt_on_ms >= AWB_SETTLE_MS then
+                ipcam_http_awb("127.0.0.1", 8095)
+                btm_awb_done = true
+                gcs:send_text(MAV_SEVERITY.INFO,
+                    "DIVE: bottom lights on, triggered auto white balance")
+            end
         end
 
         -- Bottom camera dispatcher: OFF / CONTINUOUS / VIDEO_INTERVAL / TIMELAPSE

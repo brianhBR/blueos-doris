@@ -97,6 +97,13 @@ class BottomPhase(BaseModel):
     light: LightSettings = Field(default_factory=lambda: LightSettings(enabled=True))
     light_delay: TimeValue = Field(default_factory=lambda: TimeValue(number="30", unit="seconds"))
 
+    # When enabled, the Lua dive script fires a one-push auto white balance on
+    # the RadCam shortly after the bottom lights first come on, so white
+    # balance is calibrated for the actual lit scene rather than ambient
+    # surface light.  Pushed to the autopilot as DORIS_BTM_AWB and executed via
+    # the br4kcam-manager onceAWB trigger (see routes/camera.py /rec/awb).
+    auto_white_balance: bool = False
+
 
 class ReleaseWeight(BaseModel):
     method: Literal["elapsed", "datetime"] = "elapsed"

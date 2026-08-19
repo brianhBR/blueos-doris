@@ -333,6 +333,7 @@ export interface BottomPhase {
   camera_delay: TimeValue
   light: LightSettings
   light_delay: TimeValue
+  auto_white_balance?: boolean
 }
 
 export interface ReleaseWeight {

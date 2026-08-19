@@ -110,6 +110,7 @@ const bottomLightOnUnit = ref('seconds')
 const bottomLightOffNumber = ref('5')
 const bottomLightOffUnit = ref('seconds')
 const bottomLightBrightness = ref(60)
+const bottomAutoWhiteBalance = ref(false)
 const bottomMatchCameraInterval = ref(false)
 
 // Ascent settings
@@ -283,7 +284,7 @@ watch(() => props.initialConfiguration, (val) => {
 
 watch([diveName, descentCameraOn, descentCameraType, descentCaptureFrequency,
   descentLightOn, descentLightMode, descentLightBrightness, bottomCameraOn, bottomCameraType,
-  bottomCaptureFrequency, bottomLightOn, bottomLightMode, bottomLightBrightness, ascentCameraOn, ascentCameraType,
+  bottomCaptureFrequency, bottomLightOn, bottomLightMode, bottomLightBrightness, bottomAutoWhiteBalance, ascentCameraOn, ascentCameraType,
   ascentCaptureFrequency, ascentLightOn, ascentLightMode, ascentLightBrightness,
   activateMastLight, updateFrequency, useIridium, useLoRA, releaseWeightElapsedNumber
 ], () => {
@@ -343,6 +344,7 @@ function resetToDefaults() {
   bottomLightOffNumber.value = '5'
   bottomLightOffUnit.value = 'seconds'
   bottomLightBrightness.value = 60
+  bottomAutoWhiteBalance.value = false
   bottomMatchCameraInterval.value = false
   ascentSameAsDescent.value = false
   emit('update:releaseWeightBy', 'elapsed')
@@ -435,6 +437,7 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         off_time: tv(bottomLightOffNumber.value, bottomLightOffUnit.value),
       },
       light_delay: tv(bottomLightDelayNumber.value, bottomLightDelayUnit.value),
+      auto_white_balance: bottomAutoWhiteBalance.value,
     },
     ascent: {
       same_as_descent: ascentSameAsDescent.value,
@@ -534,6 +537,7 @@ function applyConfig(cfg: DeploymentConfiguration) {
   bottomLightOnUnit.value = cfg.bottom.light.on_time.unit
   bottomLightOffNumber.value = cfg.bottom.light.off_time.number
   bottomLightOffUnit.value = cfg.bottom.light.off_time.unit
+  bottomAutoWhiteBalance.value = cfg.bottom.auto_white_balance ?? false
 
   ascentSameAsDescent.value = cfg.ascent.same_as_descent
   ascentCameraOn.value = cfg.ascent.camera.enabled
@@ -1584,6 +1588,22 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
               <input type="range" min="0" max="100" :value="bottomLightBrightness" @input="handleBrightnessChange(Number(($event.target as HTMLInputElement).value), 'bottom')" class="w-full" />
               <div class="flex justify-between text-sm mt-1" style="color: #96EEF2">
                 <span>0%</span><span>{{ bottomLightBrightness }}%</span><span>100%</span>
+              </div>
+            </div>
+
+            <div class="pt-2" style="border-top: 1px solid rgba(65, 185, 195, 0.2)">
+              <div class="flex items-center justify-between">
+                <div class="pr-4">
+                  <label class="block text-sm" style="color: #96EEF2">Auto White Balance on Lights</label>
+                  <p class="text-xs mt-1 opacity-70" style="color: #96EEF2">
+                    Runs a one-time white balance a couple seconds after the bottom lights turn on, so colors are calibrated for the lit scene.
+                  </p>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer flex-shrink-0">
+                  <input type="checkbox" v-model="bottomAutoWhiteBalance" class="sr-only peer" />
+                  <div class="w-11 h-6 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all" :style="{ backgroundColor: bottomAutoWhiteBalance ? '#41B9C3' : 'rgba(65, 185, 195, 0.3)' }"></div>
+                  <span class="ml-3 text-sm" style="color: #96EEF2">{{ bottomAutoWhiteBalance ? 'On' : 'Off' }}</span>
+                </label>
               </div>
             </div>
           </div>
