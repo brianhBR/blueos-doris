@@ -1,4 +1,10 @@
-"""Camera service."""
+"""Camera service.
+
+Live camera *settings* (resolution, exposure, white balance, etc.) are now
+handled via the br4kcam-manager proxy in :mod:`.br4kcam` and the preset
+service in :mod:`.camera_presets`.  This service retains the lightweight
+camera/stream discovery and MAVLink light-control helpers used elsewhere.
+"""
 
 import logging
 
@@ -8,24 +14,8 @@ from .base import BlueOSClient
 logger = logging.getLogger(__name__)
 
 
-class CameraSettings:
-    """Camera configuration."""
-
-    def __init__(
-        self,
-        resolution: str = "4K",
-        frame_rate: int = 30,
-        focus: str = "auto",
-        brightness: int = 75,
-    ):
-        self.resolution = resolution
-        self.frame_rate = frame_rate
-        self.focus = focus
-        self.brightness = brightness
-
-
 class CameraService:
-    """Service for managing camera and lighting."""
+    """Service for managing camera discovery, streams, and lighting."""
 
     def __init__(self):
         self.camera_manager = BlueOSClient(blueos_services.camera_manager)
@@ -39,39 +29,6 @@ class CameraService:
             return cameras
         except Exception:
             return []
-
-    async def get_camera_settings(self, camera_id: str = "default") -> CameraSettings:
-        """Get camera settings."""
-        try:
-            settings = await self.camera_manager.get(f"/cameras/{camera_id}/settings")
-            return CameraSettings(
-                resolution=settings.get("resolution", "4K"),
-                frame_rate=settings.get("frame_rate", 30),
-                focus=settings.get("focus", "auto"),
-                brightness=settings.get("brightness", 75),
-            )
-        except Exception:
-            return CameraSettings()
-
-    async def set_camera_settings(
-        self, camera_id: str = "default", settings: CameraSettings = None
-    ) -> bool:
-        """Update camera settings."""
-        if settings is None:
-            return False
-        try:
-            await self.camera_manager.put(
-                f"/cameras/{camera_id}/settings",
-                json={
-                    "resolution": settings.resolution,
-                    "frame_rate": settings.frame_rate,
-                    "focus": settings.focus,
-                    "brightness": settings.brightness,
-                },
-            )
-            return True
-        except Exception:
-            return False
 
     async def start_recording(self, camera_id: str = "default") -> bool:
         """Start video recording."""

@@ -58,12 +58,15 @@ class CameraSettings(BaseModel):
     timelapse_light_pre: TimeValue = Field(default_factory=lambda: TimeValue(number="2", unit="seconds"))
     timelapse_light_post: TimeValue = Field(default_factory=lambda: TimeValue(number="1", unit="seconds"))
 
+    # Image/video *quality* settings now live in the global camera preset
+    # (models/camera.py), applied to the RadCam via the br4kcam-manager proxy.
+    # The fields below are retained only for backward-compatibility when
+    # loading older saved configurations; they are not applied to hardware.
+    # ``focus`` and the file-format fields were removed entirely (fixed-focus
+    # camera; container/format is a recorder concern) -- legacy values for
+    # them are ignored on load (Pydantic ignores unknown keys).
     resolution: str = "4K"
-    image_type: str = "High-Rez JPG"
-    file_format: str = "JPEG"
-    video_file_format: str = ".MP4"
     frame_rate: int = 30
-    focus: str = "auto"
     iso: str = "auto"
     white_balance: str = "auto"
     exposure: str = "0"

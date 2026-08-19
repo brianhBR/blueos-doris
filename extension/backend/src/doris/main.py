@@ -15,6 +15,7 @@ from .routes import (
     register_artemis_routes,
     register_attitude_routes,
     register_blueos_routes,
+    register_camera_routes,
     register_configuration_routes,
     register_dive_routes,
     register_frame_routes,
@@ -29,6 +30,7 @@ from .routes import (
 )
 from .services import ip_camera_recorder
 from .services.agt_serial import reconcile_agt_serial
+from .services.camera_presets import apply_active_preset_best_effort
 from .services.dive_records import find_latest_active_dive_record
 from .services.external_storage import start_external_storage_setup
 from .services.frame import FrameService
@@ -130,6 +132,7 @@ def create_app() -> Robyn:
     register_mission_routes(app)
     register_media_routes(app)
     register_configuration_routes(app)
+    register_camera_routes(app)
     register_dive_routes(app)
     register_frame_routes(app)
     register_arming_routes(app)
@@ -235,6 +238,15 @@ def create_app() -> Robyn:
             asyncio.get_event_loop().run_in_executor(None, ip_camera_recorder.prewarm)
         except Exception as e:
             logger.warning("GStreamer prewarm scheduling skipped: %s", e)
+
+        # Re-apply the active camera preset once the camera/manager have had
+        # time to come up.  Best-effort and off the critical path: a missing
+        # camera or an uninstalled br4kcam-manager just logs and moves on.
+        async def _apply_active_camera_preset() -> None:
+            await asyncio.sleep(15)
+            await apply_active_preset_best_effort(logger)
+
+        asyncio.get_event_loop().create_task(_apply_active_camera_preset())
 
         logger.info("DORIS backend startup complete")
         asyncio.get_event_loop().create_task(_restart_autopilot(logger))

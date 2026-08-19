@@ -2,8 +2,13 @@
 import { ref, watch, nextTick, onMounted, onUnmounted, computed } from 'vue'
 import { Settings, Save, Copy, AlertTriangle, ChevronDown, ChevronUp, Camera as CameraIcon, Lightbulb, Database as DatabaseIcon, Battery, ArrowDown, Anchor, ArrowUp, Radio, X, Trash2 } from 'lucide-vue-next'
 import type { Screen } from '../types'
-import { useConfigurations } from '../composables/useApi'
-import type { DeploymentConfiguration } from '../composables/useApi'
+import { useConfigurations, useCameraSettings, usePresets } from '../composables/useApi'
+import type {
+  DeploymentConfiguration,
+  CameraSettingsBundle,
+  CameraBaseSettings,
+  CameraAdvancedSettings,
+} from '../composables/useApi'
 import {
   estimateDive,
   BASE_W,
@@ -66,22 +71,11 @@ const descentVideoRecordNumber = ref('10')
 const descentVideoRecordUnit = ref('seconds')
 const descentVideoPauseNumber = ref('5')
 const descentVideoPauseUnit = ref('seconds')
-const descentResolution = ref('4K')
-const descentImageType = ref('High-Rez JPG')
-const descentFileFormat = ref('JPEG')
-const descentVideoFileFormat = ref('.MP4')
-const descentFrameRate = ref(30)
 const descentCaptureFrequency = ref(10)
 const descentCaptureFrequencyUnit = ref('seconds')
-const descentFocus = ref('auto')
 const descentSleepTimerNumber = ref('')
 const descentSleepTimerUnit = ref('hours')
 const descentSleepTimerEnabled = ref(false)
-const descentAdvancedOpen = ref(false)
-const descentISO = ref('auto')
-const descentWhiteBalance = ref('auto')
-const descentExposure = ref('0')
-const descentSharpness = ref('medium')
 const descentLightOn = ref(false)
 const descentLightMode = ref<'continuous' | 'interval'>('continuous')
 const descentLightOnNumber = ref('10')
@@ -100,24 +94,13 @@ const bottomVideoRecordNumber = ref('10')
 const bottomVideoRecordUnit = ref('seconds')
 const bottomVideoPauseNumber = ref('5')
 const bottomVideoPauseUnit = ref('seconds')
-const bottomResolution = ref('4K')
-const bottomImageType = ref('High-Rez JPG')
-const bottomFileFormat = ref('JPEG')
-const bottomVideoFileFormat = ref('.MP4')
-const bottomFrameRate = ref(30)
 const bottomCaptureFrequency = ref(10)
 const bottomCaptureFrequencyUnit = ref('seconds')
 const bottomTimelapseLightPreNumber = ref('2')
 const bottomTimelapseLightPostNumber = ref('1')
-const bottomFocus = ref('auto')
 const bottomSleepTimerNumber = ref('')
 const bottomSleepTimerUnit = ref('hours')
 const bottomSleepTimerEnabled = ref(false)
-const bottomAdvancedOpen = ref(false)
-const bottomISO = ref('auto')
-const bottomWhiteBalance = ref('auto')
-const bottomExposure = ref('0')
-const bottomSharpness = ref('medium')
 const bottomLightOn = ref(true)
 const bottomLightDelayNumber = ref('30')
 const bottomLightDelayUnit = ref('seconds')
@@ -141,22 +124,11 @@ const ascentVideoRecordNumber = ref('10')
 const ascentVideoRecordUnit = ref('seconds')
 const ascentVideoPauseNumber = ref('5')
 const ascentVideoPauseUnit = ref('seconds')
-const ascentResolution = ref('4K')
-const ascentImageType = ref('High-Rez JPG')
-const ascentFileFormat = ref('JPEG')
-const ascentVideoFileFormat = ref('.MP4')
-const ascentFrameRate = ref(30)
 const ascentCaptureFrequency = ref(10)
 const ascentCaptureFrequencyUnit = ref('seconds')
-const ascentFocus = ref('auto')
 const ascentSleepTimerNumber = ref('')
 const ascentSleepTimerUnit = ref('hours')
 const ascentSleepTimerEnabled = ref(false)
-const ascentAdvancedOpen = ref(false)
-const ascentISO = ref('auto')
-const ascentWhiteBalance = ref('auto')
-const ascentExposure = ref('0')
-const ascentSharpness = ref('medium')
 const ascentLightOn = ref(false)
 const ascentLightMode = ref<'continuous' | 'interval'>('continuous')
 const ascentLightOnNumber = ref('10')
@@ -309,10 +281,10 @@ watch(() => props.initialConfiguration, (val) => {
   if (val) selectedConfiguration.value = val
 })
 
-watch([diveName, descentCameraOn, descentCameraType, descentResolution, descentCaptureFrequency,
-  descentLightOn, descentLightMode, descentLightBrightness, bottomCameraOn, bottomCameraType, bottomResolution,
+watch([diveName, descentCameraOn, descentCameraType, descentCaptureFrequency,
+  descentLightOn, descentLightMode, descentLightBrightness, bottomCameraOn, bottomCameraType,
   bottomCaptureFrequency, bottomLightOn, bottomLightMode, bottomLightBrightness, ascentCameraOn, ascentCameraType,
-  ascentResolution, ascentCaptureFrequency, ascentLightOn, ascentLightMode, ascentLightBrightness,
+  ascentCaptureFrequency, ascentLightOn, ascentLightMode, ascentLightBrightness,
   activateMastLight, updateFrequency, useIridium, useLoRA, releaseWeightElapsedNumber
 ], () => {
   if (suppressUnsavedTracking) return
@@ -334,22 +306,11 @@ function resetToDefaults() {
   descentVideoRecordUnit.value = 'seconds'
   descentVideoPauseNumber.value = '5'
   descentVideoPauseUnit.value = 'seconds'
-  descentResolution.value = '4K'
-  descentImageType.value = 'High-Rez JPG'
-  descentFileFormat.value = 'JPEG'
-  descentVideoFileFormat.value = '.MP4'
-  descentFrameRate.value = 30
   descentCaptureFrequency.value = 10
   descentCaptureFrequencyUnit.value = 'seconds'
-  descentFocus.value = 'auto'
   descentSleepTimerEnabled.value = false
   descentSleepTimerNumber.value = ''
   descentSleepTimerUnit.value = 'hours'
-  descentAdvancedOpen.value = false
-  descentISO.value = 'auto'
-  descentWhiteBalance.value = 'auto'
-  descentExposure.value = '0'
-  descentSharpness.value = 'medium'
   descentLightOn.value = false
   descentLightMode.value = 'continuous'
   descentLightOnNumber.value = '10'
@@ -366,24 +327,13 @@ function resetToDefaults() {
   bottomVideoRecordUnit.value = 'seconds'
   bottomVideoPauseNumber.value = '5'
   bottomVideoPauseUnit.value = 'seconds'
-  bottomResolution.value = '4K'
-  bottomImageType.value = 'High-Rez JPG'
-  bottomFileFormat.value = 'JPEG'
-  bottomVideoFileFormat.value = '.MP4'
-  bottomFrameRate.value = 30
   bottomCaptureFrequency.value = 10
   bottomCaptureFrequencyUnit.value = 'seconds'
   bottomTimelapseLightPreNumber.value = '2'
   bottomTimelapseLightPostNumber.value = '1'
-  bottomFocus.value = 'auto'
   bottomSleepTimerEnabled.value = false
   bottomSleepTimerNumber.value = ''
   bottomSleepTimerUnit.value = 'hours'
-  bottomAdvancedOpen.value = false
-  bottomISO.value = 'auto'
-  bottomWhiteBalance.value = 'auto'
-  bottomExposure.value = '0'
-  bottomSharpness.value = 'medium'
   bottomLightOn.value = true
   bottomLightDelayNumber.value = '30'
   bottomLightDelayUnit.value = 'seconds'
@@ -406,22 +356,11 @@ function resetToDefaults() {
   ascentVideoRecordUnit.value = 'seconds'
   ascentVideoPauseNumber.value = '5'
   ascentVideoPauseUnit.value = 'seconds'
-  ascentResolution.value = '4K'
-  ascentImageType.value = 'High-Rez JPG'
-  ascentFileFormat.value = 'JPEG'
-  ascentVideoFileFormat.value = '.MP4'
-  ascentFrameRate.value = 30
   ascentCaptureFrequency.value = 10
   ascentCaptureFrequencyUnit.value = 'seconds'
-  ascentFocus.value = 'auto'
   ascentSleepTimerEnabled.value = false
   ascentSleepTimerNumber.value = ''
   ascentSleepTimerUnit.value = 'hours'
-  ascentAdvancedOpen.value = false
-  ascentISO.value = 'auto'
-  ascentWhiteBalance.value = 'auto'
-  ascentExposure.value = '0'
-  ascentSharpness.value = 'medium'
   ascentLightOn.value = false
   ascentLightMode.value = 'continuous'
   ascentLightOnNumber.value = '10'
@@ -461,16 +400,6 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         capture_frequency_unit: descentCaptureFrequencyUnit.value as 'seconds' | 'minutes' | 'hours',
         video_record: tv(descentVideoRecordNumber.value, descentVideoRecordUnit.value),
         video_pause: tv(descentVideoPauseNumber.value, descentVideoPauseUnit.value),
-        resolution: descentResolution.value,
-        image_type: descentImageType.value,
-        file_format: descentFileFormat.value,
-        video_file_format: descentVideoFileFormat.value,
-        frame_rate: safePositiveInt(descentFrameRate.value, 30),
-        focus: descentFocus.value,
-        iso: descentISO.value,
-        white_balance: descentWhiteBalance.value,
-        exposure: descentExposure.value,
-        sharpness: descentSharpness.value,
         sleep_timer_enabled: descentSleepTimerEnabled.value,
         sleep_timer: tv(descentSleepTimerNumber.value, descentSleepTimerUnit.value),
       },
@@ -493,16 +422,6 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         video_pause: tv(bottomVideoPauseNumber.value, bottomVideoPauseUnit.value),
         timelapse_light_pre: tv(bottomTimelapseLightPreNumber.value, 'seconds'),
         timelapse_light_post: tv(bottomTimelapseLightPostNumber.value, 'seconds'),
-        resolution: bottomResolution.value,
-        image_type: bottomImageType.value,
-        file_format: bottomFileFormat.value,
-        video_file_format: bottomVideoFileFormat.value,
-        frame_rate: safePositiveInt(bottomFrameRate.value, 30),
-        focus: bottomFocus.value,
-        iso: bottomISO.value,
-        white_balance: bottomWhiteBalance.value,
-        exposure: bottomExposure.value,
-        sharpness: bottomSharpness.value,
         sleep_timer_enabled: bottomSleepTimerEnabled.value,
         sleep_timer: tv(bottomSleepTimerNumber.value, bottomSleepTimerUnit.value),
       },
@@ -526,16 +445,6 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         capture_frequency_unit: ascentCaptureFrequencyUnit.value as 'seconds' | 'minutes' | 'hours',
         video_record: tv(ascentVideoRecordNumber.value, ascentVideoRecordUnit.value),
         video_pause: tv(ascentVideoPauseNumber.value, ascentVideoPauseUnit.value),
-        resolution: ascentResolution.value,
-        image_type: ascentImageType.value,
-        file_format: ascentFileFormat.value,
-        video_file_format: ascentVideoFileFormat.value,
-        frame_rate: safePositiveInt(ascentFrameRate.value, 30),
-        focus: ascentFocus.value,
-        iso: ascentISO.value,
-        white_balance: ascentWhiteBalance.value,
-        exposure: ascentExposure.value,
-        sharpness: ascentSharpness.value,
         sleep_timer_enabled: ascentSleepTimerEnabled.value,
         sleep_timer: tv(ascentSleepTimerNumber.value, ascentSleepTimerUnit.value),
       },
@@ -585,16 +494,6 @@ function applyConfig(cfg: DeploymentConfiguration) {
   descentVideoRecordUnit.value = cfg.descent.camera.video_record.unit
   descentVideoPauseNumber.value = cfg.descent.camera.video_pause.number
   descentVideoPauseUnit.value = cfg.descent.camera.video_pause.unit
-  descentResolution.value = cfg.descent.camera.resolution
-  descentImageType.value = cfg.descent.camera.image_type
-  descentFileFormat.value = cfg.descent.camera.file_format
-  descentVideoFileFormat.value = cfg.descent.camera.video_file_format
-  descentFrameRate.value = cfg.descent.camera.frame_rate
-  descentFocus.value = cfg.descent.camera.focus
-  descentISO.value = cfg.descent.camera.iso
-  descentWhiteBalance.value = cfg.descent.camera.white_balance
-  descentExposure.value = cfg.descent.camera.exposure
-  descentSharpness.value = cfg.descent.camera.sharpness
   descentSleepTimerEnabled.value = cfg.descent.camera.sleep_timer_enabled
   descentSleepTimerNumber.value = cfg.descent.camera.sleep_timer.number
   descentSleepTimerUnit.value = cfg.descent.camera.sleep_timer.unit
@@ -622,16 +521,6 @@ function applyConfig(cfg: DeploymentConfiguration) {
   // populates cleanly and the user can immediately tune them.
   bottomTimelapseLightPreNumber.value = cfg.bottom.camera.timelapse_light_pre?.number ?? '2'
   bottomTimelapseLightPostNumber.value = cfg.bottom.camera.timelapse_light_post?.number ?? '1'
-  bottomResolution.value = cfg.bottom.camera.resolution
-  bottomImageType.value = cfg.bottom.camera.image_type
-  bottomFileFormat.value = cfg.bottom.camera.file_format
-  bottomVideoFileFormat.value = cfg.bottom.camera.video_file_format
-  bottomFrameRate.value = cfg.bottom.camera.frame_rate
-  bottomFocus.value = cfg.bottom.camera.focus
-  bottomISO.value = cfg.bottom.camera.iso
-  bottomWhiteBalance.value = cfg.bottom.camera.white_balance
-  bottomExposure.value = cfg.bottom.camera.exposure
-  bottomSharpness.value = cfg.bottom.camera.sharpness
   bottomSleepTimerEnabled.value = cfg.bottom.camera.sleep_timer_enabled
   bottomSleepTimerNumber.value = cfg.bottom.camera.sleep_timer.number
   bottomSleepTimerUnit.value = cfg.bottom.camera.sleep_timer.unit
@@ -659,16 +548,6 @@ function applyConfig(cfg: DeploymentConfiguration) {
   ascentVideoRecordUnit.value = cfg.ascent.camera.video_record.unit
   ascentVideoPauseNumber.value = cfg.ascent.camera.video_pause.number
   ascentVideoPauseUnit.value = cfg.ascent.camera.video_pause.unit
-  ascentResolution.value = cfg.ascent.camera.resolution
-  ascentImageType.value = cfg.ascent.camera.image_type
-  ascentFileFormat.value = cfg.ascent.camera.file_format
-  ascentVideoFileFormat.value = cfg.ascent.camera.video_file_format
-  ascentFrameRate.value = cfg.ascent.camera.frame_rate
-  ascentFocus.value = cfg.ascent.camera.focus
-  ascentISO.value = cfg.ascent.camera.iso
-  ascentWhiteBalance.value = cfg.ascent.camera.white_balance
-  ascentExposure.value = cfg.ascent.camera.exposure
-  ascentSharpness.value = cfg.ascent.camera.sharpness
   ascentSleepTimerEnabled.value = cfg.ascent.camera.sleep_timer_enabled
   ascentSleepTimerNumber.value = cfg.ascent.camera.sleep_timer.number
   ascentSleepTimerUnit.value = cfg.ascent.camera.sleep_timer.unit
@@ -879,9 +758,187 @@ function handleBeforeUnload(e: BeforeUnloadEvent) {
   }
 }
 
+// ── Global camera settings + preset manager ─────────────────────────
+//
+// One global RadCam profile (image/video quality) applied via the
+// br4kcam-manager proxy — not per dive phase. The Advanced panel exposes
+// the full base/advanced setting surface for experimentation; presets can
+// be saved, snapshotted, downloaded, imported, and marked "active" (the
+// active preset is auto-applied at DORIS startup and at dive start).
+
+const {
+  settings: liveCameraSettings,
+  loading: cameraLoading,
+  applying: cameraApplying,
+  error: cameraError,
+  fetchSettings: fetchCameraSettings,
+  applySettings,
+  applyRecommended,
+  restartCamera,
+} = useCameraSettings()
+
+const {
+  presets,
+  activePreset,
+  error: presetError,
+  fetchPresets,
+  savePreset,
+  snapshotPreset,
+  deletePreset,
+  applyPreset,
+  downloadPreset,
+  importPreset,
+  fetchActivePreset,
+  setActivePreset,
+} = usePresets()
+
+const cameraAdvancedOpen = ref(false)
+const cameraStatus = ref('')
+const newPresetName = ref('')
+const importInput = ref<HTMLInputElement | null>(null)
+
+// Editable copies of the live settings (composable refs are readonly).
+const videoForm = ref<Record<string, number | undefined>>({})
+const baseForm = ref<CameraBaseSettings>({})
+const advancedForm = ref<CameraAdvancedSettings>({})
+
+const CODEC_OPTIONS = [
+  { value: 1, label: 'H.264' },
+  { value: 5, label: 'H.265 (HEVC)' },
+]
+
+const resolutionOptions = computed(() => {
+  const list = liveCameraSettings.value?.video.pixel_list ?? []
+  return list.map(r => ({ value: `${r.width}x${r.height}`, label: `${r.width} × ${r.height}` }))
+})
+
+const selectedResolution = computed({
+  get: () => {
+    const w = videoForm.value.pic_width
+    const h = videoForm.value.pic_height
+    return w && h ? `${w}x${h}` : ''
+  },
+  set: (val: string) => {
+    const [w, h] = val.split('x').map(Number)
+    videoForm.value.pic_width = w
+    videoForm.value.pic_height = h
+  },
+})
+
+const baseKeys = computed(() => Object.keys(baseForm.value).sort())
+const advancedKeys = computed(() => Object.keys(advancedForm.value).sort())
+
+function syncCameraForms() {
+  const s = liveCameraSettings.value
+  if (!s) return
+  videoForm.value = { ...s.video, pixel_list: undefined } as Record<string, number | undefined>
+  // Drop read-only keys from the editable video form.
+  delete videoForm.value.pixel_list
+  delete videoForm.value.max_framerate
+  baseForm.value = { ...s.base }
+  advancedForm.value = { ...s.advanced }
+}
+
+function cleanNums(obj: Record<string, unknown>): Record<string, number> {
+  const out: Record<string, number> = {}
+  for (const [k, v] of Object.entries(obj)) {
+    const n = Number(v)
+    if (v !== undefined && v !== null && v !== '' && Number.isFinite(n)) out[k] = n
+  }
+  return out
+}
+
+function buildCameraBundle(): Partial<CameraSettingsBundle> {
+  return {
+    video: cleanNums(videoForm.value),
+    base: cleanNums(baseForm.value),
+    advanced: cleanNums(advancedForm.value),
+  }
+}
+
+async function loadCameraSettings() {
+  const s = await fetchCameraSettings()
+  if (s) syncCameraForms()
+}
+
+async function applyGlobalCameraSettings() {
+  cameraStatus.value = ''
+  const fresh = await applySettings(buildCameraBundle())
+  if (fresh) {
+    syncCameraForms()
+    cameraStatus.value = 'Camera settings applied.'
+  }
+}
+
+async function applyRecommendedSettings() {
+  cameraStatus.value = ''
+  if (await applyRecommended()) {
+    syncCameraForms()
+    cameraStatus.value = 'Recommended settings applied.'
+  }
+}
+
+async function restartCameraNow() {
+  cameraStatus.value = ''
+  if (await restartCamera()) cameraStatus.value = 'Camera restart requested.'
+}
+
+async function saveCurrentAsPreset() {
+  const name = newPresetName.value.trim()
+  if (!name) return
+  const saved = await savePreset({ name, ...buildCameraBundle() } as never)
+  if (saved) {
+    cameraStatus.value = `Preset "${name}" saved.`
+    newPresetName.value = ''
+  }
+}
+
+async function snapshotCurrentCamera() {
+  const name = newPresetName.value.trim()
+  if (!name) return
+  const saved = await snapshotPreset(name)
+  if (saved) {
+    cameraStatus.value = `Snapshot saved as "${name}".`
+    newPresetName.value = ''
+  }
+}
+
+async function applyPresetByName(name: string) {
+  cameraStatus.value = ''
+  const fresh = await applyPreset(name)
+  if (fresh) {
+    await loadCameraSettings()
+    cameraStatus.value = `Preset "${name}" applied.`
+  }
+}
+
+async function deletePresetByName(name: string) {
+  if (await deletePreset(name)) cameraStatus.value = `Preset "${name}" deleted.`
+}
+
+async function onActivePresetChange(name: string) {
+  await setActivePreset(name || null)
+}
+
+function triggerPresetImport() {
+  importInput.value?.click()
+}
+
+async function onPresetFileSelected(event: Event) {
+  const input = event.target as HTMLInputElement
+  const file = input.files?.[0]
+  if (!file) return
+  const saved = await importPreset(file)
+  if (saved) cameraStatus.value = `Preset "${saved.name}" imported.`
+  input.value = ''
+}
+
 onMounted(() => {
   window.addEventListener('beforeunload', handleBeforeUnload)
   fetchConfigurations()
+  void loadCameraSettings()
+  void fetchPresets()
+  void fetchActivePreset()
 })
 
 onUnmounted(() => {
@@ -936,6 +993,184 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
             <Trash2 class="w-5 h-5" style="color: #FF6B5E" />
           </button>
         </div>
+      </div>
+
+      <!-- ==================== CAMERA SETTINGS (GLOBAL) ==================== -->
+      <div class="mb-6 p-6 rounded-lg" :style="phaseStyle">
+        <h2 class="text-white text-xl mb-2 flex items-center gap-2">
+          <CameraIcon class="w-5 h-5" style="color: #96EEF2" />
+          Camera Settings
+        </h2>
+        <p class="text-sm mb-4" style="color: rgba(150, 238, 242, 0.7)">
+          One global image/video quality profile applied to the RadCam through the 4K Cam Manager. The active preset is re-applied automatically at startup and at the beginning of each dive.
+        </p>
+
+        <!-- Manager unreachable / loading states -->
+        <div v-if="cameraLoading && !liveCameraSettings" class="text-sm" style="color: #96EEF2">
+          Reading camera settings…
+        </div>
+        <div
+          v-else-if="!liveCameraSettings"
+          class="p-4 rounded-lg text-sm"
+          style="background-color: rgba(221, 44, 29, 0.15); border: 1px solid rgba(221, 44, 29, 0.4); color: #FFB4AC"
+        >
+          <div class="flex items-start gap-2">
+            <AlertTriangle class="w-5 h-5 flex-shrink-0" style="color: #FF6B5E" />
+            <div>
+              <p class="mb-1">Couldn't reach the 4K Cam Manager{{ cameraError ? ': ' + cameraError : '' }}.</p>
+              <p class="mb-2" style="color: rgba(150, 238, 242, 0.7)">
+                Make sure the br4kcam-manager extension is installed and set <code>DORIS_BR4KCAM_URL</code> to its reachable base URL. Presets can still be edited below.
+              </p>
+              <button @click="loadCameraSettings" class="px-3 py-1.5 rounded-lg text-white text-sm" style="background-color: rgba(65, 185, 195, 0.3); border: 1px solid rgba(65, 185, 195, 0.5)">Retry</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Quality controls -->
+        <div v-if="liveCameraSettings" class="space-y-4">
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+            <div v-if="resolutionOptions.length">
+              <label class="block mb-2 text-sm" style="color: #96EEF2">Resolution</label>
+              <select v-model="selectedResolution" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle">
+                <option v-for="opt in resolutionOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+              </select>
+            </div>
+            <div>
+              <label class="block mb-2 text-sm" style="color: #96EEF2">Frame Rate (fps)</label>
+              <input type="number" min="1" v-model.number="videoForm.frame_rate" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" />
+            </div>
+            <div>
+              <label class="block mb-2 text-sm" style="color: #96EEF2">Bitrate (kbps)</label>
+              <input type="number" min="1" v-model.number="videoForm.bitrate" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" />
+            </div>
+            <div>
+              <label class="block mb-2 text-sm" style="color: #96EEF2">Codec</label>
+              <select v-model.number="videoForm.encode_type" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle">
+                <option v-for="opt in CODEC_OPTIONS" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+              </select>
+            </div>
+            <div>
+              <label class="block mb-2 text-sm" style="color: #96EEF2">Rate Control</label>
+              <select v-model.number="videoForm.rc_mode" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle">
+                <option :value="0">VBR (variable)</option><option :value="1">CBR (constant)</option>
+              </select>
+            </div>
+            <div>
+              <label class="block mb-2 text-sm" style="color: #96EEF2">Keyframe interval (GOP)</label>
+              <input type="number" min="1" v-model.number="videoForm.gop" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" />
+            </div>
+          </div>
+
+          <div class="flex flex-wrap gap-3">
+            <button @click="applyGlobalCameraSettings" :disabled="cameraApplying" class="px-4 py-2 text-white rounded-lg transition-all hover:opacity-90 disabled:opacity-50" style="background: linear-gradient(135deg, #41B9C3 0%, #96EEF2 100%)">
+              {{ cameraApplying ? 'Applying…' : 'Apply to Camera' }}
+            </button>
+            <button @click="applyRecommendedSettings" :disabled="cameraApplying" class="px-4 py-2 text-white rounded-lg disabled:opacity-50" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4)">
+              Apply Recommended
+            </button>
+            <button @click="restartCameraNow" class="px-4 py-2 text-white rounded-lg" style="background-color: rgba(221, 44, 29, 0.2); border: 1px solid rgba(221, 44, 29, 0.5)">
+              Restart Camera
+            </button>
+          </div>
+
+          <!-- Advanced (experimental) -->
+          <button @click="cameraAdvancedOpen = !cameraAdvancedOpen" class="flex items-center gap-2 px-4 py-2 mt-2 rounded-lg transition-all hover:opacity-80" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4); color: #96EEF2">
+            <ChevronUp v-if="cameraAdvancedOpen" class="w-5 h-5" />
+            <ChevronDown v-else class="w-5 h-5" />
+            <span class="font-medium">Advanced (experimental)</span>
+          </button>
+          <div v-if="cameraAdvancedOpen" class="p-4 rounded-lg space-y-4" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
+            <p class="text-xs" style="color: rgba(150, 238, 242, 0.6)">
+              Every setting reported by the camera, using its native field names. Values are raw integers — see the 4K Cam Manager docs for ranges. Leave a field blank to omit it from the update.
+            </p>
+            <div>
+              <h4 class="text-sm mb-2" style="color: #96EEF2">Base image</h4>
+              <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+                <div v-for="key in baseKeys" :key="'base-' + key">
+                  <label class="block mb-1 text-xs break-all" style="color: rgba(150, 238, 242, 0.8)">{{ key }}</label>
+                  <input type="number" v-model.number="baseForm[key]" class="w-full px-3 py-1.5 text-white rounded-lg focus:outline-none text-sm" :style="inputStyle" />
+                </div>
+              </div>
+            </div>
+            <div>
+              <h4 class="text-sm mb-2" style="color: #96EEF2">Advanced image</h4>
+              <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
+                <div v-for="key in advancedKeys" :key="'adv-' + key">
+                  <label class="block mb-1 text-xs break-all" style="color: rgba(150, 238, 242, 0.8)">{{ key }}</label>
+                  <input type="number" v-model.number="advancedForm[key]" class="w-full px-3 py-1.5 text-white rounded-lg focus:outline-none text-sm" :style="inputStyle" />
+                </div>
+              </div>
+            </div>
+            <button @click="applyGlobalCameraSettings" :disabled="cameraApplying" class="px-4 py-2 text-white rounded-lg disabled:opacity-50" style="background: linear-gradient(135deg, #41B9C3 0%, #96EEF2 100%)">
+              {{ cameraApplying ? 'Applying…' : 'Apply All Settings' }}
+            </button>
+          </div>
+        </div>
+
+        <!-- Preset manager -->
+        <div class="mt-6 pt-4" style="border-top: 1px solid rgba(65, 185, 195, 0.2)">
+          <h3 class="text-white flex items-center gap-2 mb-3" style="font-weight: 500">
+            <Save class="w-4 h-4" style="color: #41B9C3" />
+            Presets
+          </h3>
+
+          <div class="grid grid-cols-1 md:grid-cols-2 gap-4 mb-4">
+            <div>
+              <label class="block mb-2 text-sm" style="color: #96EEF2">Active preset (auto-applied at startup &amp; dive start)</label>
+              <select
+                :value="activePreset?.name ?? ''"
+                @change="onActivePresetChange(($event.target as HTMLSelectElement).value)"
+                class="w-full px-4 py-2 text-white rounded-lg focus:outline-none"
+                :style="inputStyle"
+              >
+                <option value="">None</option>
+                <option v-for="p in presets" :key="p.name" :value="p.name">{{ p.name }}</option>
+              </select>
+            </div>
+            <div>
+              <label class="block mb-2 text-sm" style="color: #96EEF2">New preset name</label>
+              <div class="flex gap-2">
+                <input v-model="newPresetName" placeholder="e.g. Reef daylight" class="flex-1 px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" />
+              </div>
+            </div>
+          </div>
+
+          <div class="flex flex-wrap gap-3 mb-4">
+            <button @click="saveCurrentAsPreset" :disabled="!newPresetName.trim()" class="px-4 py-2 text-white rounded-lg disabled:opacity-50" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4)">
+              Save Current Form
+            </button>
+            <button @click="snapshotCurrentCamera" :disabled="!newPresetName.trim() || !liveCameraSettings" class="px-4 py-2 text-white rounded-lg disabled:opacity-50" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4)">
+              Snapshot Camera
+            </button>
+            <button @click="triggerPresetImport" class="px-4 py-2 text-white rounded-lg" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4)">
+              Import…
+            </button>
+            <input ref="importInput" type="file" accept="application/json,.json" class="hidden" @change="onPresetFileSelected" />
+          </div>
+
+          <div v-if="presets.length" class="space-y-2">
+            <div
+              v-for="p in presets"
+              :key="p.name"
+              class="flex items-center justify-between px-4 py-2 rounded-lg"
+              style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)"
+            >
+              <span class="text-white text-sm">
+                {{ p.name }}
+                <span v-if="activePreset?.name === p.name" class="ml-2 text-xs px-2 py-0.5 rounded" style="background-color: rgba(65, 185, 195, 0.3); color: #96EEF2">active</span>
+              </span>
+              <div class="flex gap-2">
+                <button @click="applyPresetByName(p.name)" :disabled="!liveCameraSettings" class="px-3 py-1 text-white rounded text-sm disabled:opacity-50" style="background-color: rgba(65, 185, 195, 0.25)">Apply</button>
+                <button @click="downloadPreset(p.name)" class="px-3 py-1 text-white rounded text-sm" style="background-color: rgba(65, 185, 195, 0.15)">Download</button>
+                <button @click="deletePresetByName(p.name)" class="px-3 py-1 rounded text-sm" style="background-color: rgba(221, 44, 29, 0.2); color: #FF6B5E">Delete</button>
+              </div>
+            </div>
+          </div>
+          <p v-else class="text-sm" style="color: rgba(150, 238, 242, 0.6)">No presets saved yet.</p>
+        </div>
+
+        <p v-if="cameraStatus" class="mt-3 text-sm" style="color: #96EEF2">{{ cameraStatus }}</p>
+        <p v-if="presetError" class="mt-1 text-sm" style="color: #FF6B5E">{{ presetError }}</p>
       </div>
 
       <!-- ==================== DESCENT SECTION ==================== -->
@@ -1059,74 +1294,6 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
               </label>
             </div>
 
-            <!-- Camera Settings Toggle -->
-            <button @click="descentAdvancedOpen = !descentAdvancedOpen" class="flex items-center gap-2 px-4 py-2 mt-2 rounded-lg transition-all hover:opacity-80" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4); color: #96EEF2">
-              <ChevronUp v-if="descentAdvancedOpen" class="w-5 h-5" />
-              <ChevronDown v-else class="w-5 h-5" />
-              <span class="font-medium">Camera Settings</span>
-            </button>
-
-            <div v-if="descentAdvancedOpen" class="p-4 rounded-lg space-y-4 opacity-50 pointer-events-none" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
-              <template v-if="descentCameraType !== 'timelapse'">
-                <div>
-                  <label class="block mb-2 text-sm" style="color: #96EEF2">Resolution</label>
-                  <select disabled v-model="descentResolution" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                    <option value="4K">4K</option><option value="2.7K">2.7K</option><option value="1080p">1080p</option><option value="720p">720p</option>
-                  </select>
-                </div>
-                <div>
-                  <label class="block mb-2 text-sm" style="color: #96EEF2">Frame Rate</label>
-                  <select disabled v-model.number="descentFrameRate" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                    <option :value="24">24 fps</option><option :value="30">30 fps</option><option :value="60">60 fps</option>
-                  </select>
-                </div>
-                <div>
-                  <label class="block mb-2 text-sm" style="color: #96EEF2">File Format</label>
-                  <select disabled v-model="descentVideoFileFormat" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                    <option value=".MP4">.MP4</option><option value=".MOV">.MOV</option><option value=".AVI">.AVI</option>
-                  </select>
-                </div>
-              </template>
-              <div>
-                <label class="block mb-2 text-sm" style="color: #96EEF2">Focus</label>
-                <select disabled v-model="descentFocus" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                  <option value="auto">Auto</option><option value="manual">Manual</option>
-                </select>
-              </div>
-              <div>
-                <label class="block mb-2 text-sm" style="color: #96EEF2">ISO</label>
-                <select disabled v-model="descentISO" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                  <option value="auto">Auto</option><option value="100">100</option><option value="200">200</option><option value="400">400</option><option value="800">800</option><option value="1600">1600</option><option value="3200">3200</option>
-                </select>
-              </div>
-              <div>
-                <label class="block mb-2 text-sm" style="color: #96EEF2">White Balance</label>
-                <select disabled v-model="descentWhiteBalance" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                  <option value="auto">Auto</option><option value="underwater">Underwater</option><option value="3000k">3000K</option><option value="5500k">5500K</option><option value="6500k">6500K</option>
-                </select>
-              </div>
-              <div>
-                <label class="block mb-2 text-sm" style="color: #96EEF2">Exposure Compensation</label>
-                <select disabled v-model="descentExposure" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                  <option value="-2">-2.0</option><option value="-1">-1.0</option><option value="0">0.0</option><option value="+1">+1.0</option><option value="+2">+2.0</option>
-                </select>
-              </div>
-              <div>
-                <label class="block mb-2 text-sm" style="color: #96EEF2">Sharpness</label>
-                <select disabled v-model="descentSharpness" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                  <option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option>
-                </select>
-              </div>
-              <div v-if="descentCameraType === 'timelapse'">
-                <label class="block mb-2 text-sm" style="color: #96EEF2">File Format</label>
-                <select disabled v-model="descentFileFormat" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                  <option value="JPEG">JPEG</option><option value="TIFF">TIFF</option>
-                </select>
-              </div>
-              <button disabled class="px-4 py-2 text-white rounded-lg cursor-not-allowed" style="background: linear-gradient(135deg, #41B9C3 0%, #96EEF2 100%)">
-                Reset to Default Settings
-              </button>
-            </div>
           </div>
         </div>
 
@@ -1334,70 +1501,6 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
               </label>
             </div>
 
-            <button @click="bottomAdvancedOpen = !bottomAdvancedOpen" class="flex items-center gap-2 px-4 py-2 mt-2 rounded-lg transition-all hover:opacity-80" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4); color: #96EEF2">
-              <ChevronUp v-if="bottomAdvancedOpen" class="w-5 h-5" /><ChevronDown v-else class="w-5 h-5" />
-              <span class="font-medium">Camera Settings</span>
-            </button>
-
-            <div v-if="bottomAdvancedOpen" class="p-4 rounded-lg space-y-4 opacity-50 pointer-events-none" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
-              <template v-if="bottomCameraType !== 'timelapse'">
-                <div>
-                  <label class="block mb-2 text-sm" style="color: #96EEF2">Resolution</label>
-                  <select disabled v-model="bottomResolution" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                    <option value="4K">4K</option><option value="2.7K">2.7K</option><option value="1080p">1080p</option><option value="720p">720p</option>
-                  </select>
-                </div>
-                <div>
-                  <label class="block mb-2 text-sm" style="color: #96EEF2">Frame Rate</label>
-                  <select disabled v-model.number="bottomFrameRate" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                    <option :value="24">24 fps</option><option :value="30">30 fps</option><option :value="60">60 fps</option>
-                  </select>
-                </div>
-                <div>
-                  <label class="block mb-2 text-sm" style="color: #96EEF2">File Format</label>
-                  <select disabled v-model="bottomVideoFileFormat" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                    <option value=".MP4">.MP4</option><option value=".MOV">.MOV</option><option value=".AVI">.AVI</option>
-                  </select>
-                </div>
-              </template>
-              <div>
-                <label class="block mb-2 text-sm" style="color: #96EEF2">Focus</label>
-                <select disabled v-model="bottomFocus" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                  <option value="auto">Auto</option><option value="manual">Manual</option>
-                </select>
-              </div>
-              <div>
-                <label class="block mb-2 text-sm" style="color: #96EEF2">ISO</label>
-                <select disabled v-model="bottomISO" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                  <option value="auto">Auto</option><option value="100">100</option><option value="200">200</option><option value="400">400</option><option value="800">800</option><option value="1600">1600</option><option value="3200">3200</option>
-                </select>
-              </div>
-              <div>
-                <label class="block mb-2 text-sm" style="color: #96EEF2">White Balance</label>
-                <select disabled v-model="bottomWhiteBalance" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                  <option value="auto">Auto</option><option value="underwater">Underwater</option><option value="3000k">3000K</option><option value="5500k">5500K</option><option value="6500k">6500K</option>
-                </select>
-              </div>
-              <div>
-                <label class="block mb-2 text-sm" style="color: #96EEF2">Exposure Compensation</label>
-                <select disabled v-model="bottomExposure" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                  <option value="-2">-2.0</option><option value="-1">-1.0</option><option value="0">0.0</option><option value="+1">+1.0</option><option value="+2">+2.0</option>
-                </select>
-              </div>
-              <div>
-                <label class="block mb-2 text-sm" style="color: #96EEF2">Sharpness</label>
-                <select disabled v-model="bottomSharpness" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                  <option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option>
-                </select>
-              </div>
-              <div v-if="bottomCameraType === 'timelapse'">
-                <label class="block mb-2 text-sm" style="color: #96EEF2">File Format</label>
-                <select disabled v-model="bottomFileFormat" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                  <option value="JPEG">JPEG</option><option value="TIFF">TIFF</option>
-                </select>
-              </div>
-              <button disabled class="px-4 py-2 text-white rounded-lg cursor-not-allowed" style="background: linear-gradient(135deg, #41B9C3 0%, #96EEF2 100%)">Reset to Default Settings</button>
-            </div>
           </div>
         </div>
 
@@ -1645,70 +1748,6 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                 </label>
               </div>
 
-              <button @click="ascentAdvancedOpen = !ascentAdvancedOpen" class="flex items-center gap-2 px-4 py-2 mt-2 rounded-lg transition-all hover:opacity-80" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4); color: #96EEF2">
-                <ChevronUp v-if="ascentAdvancedOpen" class="w-5 h-5" /><ChevronDown v-else class="w-5 h-5" />
-                <span class="font-medium">Camera Settings</span>
-              </button>
-
-              <div v-if="ascentAdvancedOpen" class="p-4 rounded-lg space-y-4 opacity-50 pointer-events-none" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
-                <template v-if="ascentCameraType !== 'timelapse'">
-                  <div>
-                    <label class="block mb-2 text-sm" style="color: #96EEF2">Resolution</label>
-                    <select disabled v-model="ascentResolution" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                      <option value="4K">4K</option><option value="2.7K">2.7K</option><option value="1080p">1080p</option><option value="720p">720p</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label class="block mb-2 text-sm" style="color: #96EEF2">Frame Rate</label>
-                    <select disabled v-model.number="ascentFrameRate" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                      <option :value="24">24 fps</option><option :value="30">30 fps</option><option :value="60">60 fps</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label class="block mb-2 text-sm" style="color: #96EEF2">File Format</label>
-                    <select disabled v-model="ascentVideoFileFormat" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                      <option value=".MP4">.MP4</option><option value=".MOV">.MOV</option><option value=".AVI">.AVI</option>
-                    </select>
-                  </div>
-                </template>
-                <div>
-                  <label class="block mb-2 text-sm" style="color: #96EEF2">Focus</label>
-                  <select disabled v-model="ascentFocus" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                    <option value="auto">Auto</option><option value="manual">Manual</option>
-                  </select>
-                </div>
-                <div>
-                  <label class="block mb-2 text-sm" style="color: #96EEF2">ISO</label>
-                  <select disabled v-model="ascentISO" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                    <option value="auto">Auto</option><option value="100">100</option><option value="200">200</option><option value="400">400</option><option value="800">800</option><option value="1600">1600</option><option value="3200">3200</option>
-                  </select>
-                </div>
-                <div>
-                  <label class="block mb-2 text-sm" style="color: #96EEF2">White Balance</label>
-                  <select disabled v-model="ascentWhiteBalance" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                    <option value="auto">Auto</option><option value="underwater">Underwater</option><option value="3000k">3000K</option><option value="5500k">5500K</option><option value="6500k">6500K</option>
-                  </select>
-                </div>
-                <div>
-                  <label class="block mb-2 text-sm" style="color: #96EEF2">Exposure Compensation</label>
-                  <select disabled v-model="ascentExposure" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                    <option value="-2">-2.0</option><option value="-1">-1.0</option><option value="0">0.0</option><option value="+1">+1.0</option><option value="+2">+2.0</option>
-                  </select>
-                </div>
-                <div>
-                  <label class="block mb-2 text-sm" style="color: #96EEF2">Sharpness</label>
-                  <select disabled v-model="ascentSharpness" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                    <option value="low">Low</option><option value="medium">Medium</option><option value="high">High</option>
-                  </select>
-                </div>
-                <div v-if="ascentCameraType === 'timelapse'">
-                  <label class="block mb-2 text-sm" style="color: #96EEF2">File Format</label>
-                  <select disabled v-model="ascentFileFormat" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none cursor-not-allowed" :style="inputStyle">
-                    <option value="JPEG">JPEG</option><option value="TIFF">TIFF</option>
-                  </select>
-                </div>
-                <button disabled class="px-4 py-2 text-white rounded-lg cursor-not-allowed" style="background: linear-gradient(135deg, #41B9C3 0%, #96EEF2 100%)">Reset to Default Settings</button>
-              </div>
             </div>
           </div>
 
