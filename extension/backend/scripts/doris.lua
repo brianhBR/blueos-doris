@@ -46,6 +46,20 @@
    Battery failsafe actions are also disabled; the script monitors
    voltage directly via DORIS_MIN_VOLT.
 
+   Stuck-on-bottom protection: the release relay is energized for up to
+   DORIS_BRN_MIN seconds (the "max release time").  If that full burn
+   window elapses in ASCENT and the vehicle is still not rising -- no
+   sustained upward velocity and less than DORIS_STK_RISE metres gained
+   above the deepest point -- the drop-weight release has failed or the
+   lander is stuck.  Continuing to energize the relay only drains the
+   battery, so the script cuts the relay and breaks straight to RECOVERY
+   (STATE=4), taking the exact same terminal path as a normal surfacing.
+   A fresh terminal STATE=4 is the AGT's surface authority, so the AGT
+   runs its shutdown handshake (PWR_SHDN -> BlueOS disarm/finalize ->
+   PWR_ACK -> host poweroff) and powers the Pi off.  That is the whole
+   point: hand the stuck vehicle to the normal low-power shutdown flow so
+   the AGT conserves the battery instead of holding the relay on.
+
    RECOVERY is a terminal state: outputs are safe, but the autopilot remains
    armed so MCAP and BIN logging continue through the AGT's surface dwell.
    BlueOS disarms when the AGT requests shutdown.
@@ -95,7 +109,7 @@ local STATE_ASCENT        = 3
 local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-assert(param:add_table(73, "DORIS_", 40),
+assert(param:add_table(73, "DORIS_", 41),
        "DIVE: could not add DORIS_ param table")
 
 -- mission control
@@ -159,6 +173,11 @@ assert(param:add_param(73, 38, "TL_PST_S", 1),    "DORIS_TL_PST_S")
 -- depth every sample must stay under, SRF_SEC how long it must hold.
 assert(param:add_param(73, 39, "SRF_DPT", 1.5),  "DORIS_SRF_DPT")
 assert(param:add_param(73, 40, "SRF_SEC", 30),   "DORIS_SRF_SEC")
+-- Stuck-on-bottom guard: minimum rise (m) above the deepest recorded depth
+-- required to count as "ascending" once the DORIS_BRN_MIN burn has elapsed.
+-- Below this after the full burn -> release failed / stuck -> RECOVERY (AGT
+-- shutdown).
+assert(param:add_param(73, 41, "STK_RISE", 2.0), "DORIS_STK_RISE")
 
 
 -- Parameter handles live in one table rather than in a local apiece.
@@ -196,6 +215,7 @@ local prm = {
     ASC_AVG  = Parameter("DORIS_ASC_AVG"),
     SRF_DPT  = Parameter("DORIS_SRF_DPT"),
     SRF_SEC  = Parameter("DORIS_SRF_SEC"),
+    STK_RISE = Parameter("DORIS_STK_RISE"),
 }
 
 -- GPS self-heal: reboot up to 2 times if the GPS driver never receives
@@ -1579,6 +1599,17 @@ function update()
         -- confirms sustained ascent over DORIS_ASC_AVG seconds (default 120s).
         -- This replaces the old depth-based check which was vulnerable to
         -- single-sample baro glitches that caused premature relay deactivation.
+        --
+        -- DORIS_BRN_MIN is also the max release time: once the full burn has
+        -- elapsed the release has either worked (sustained ascent -> relay off
+        -- below) or it has not.  If it has not -- no sustained upward velocity
+        -- and the vehicle has not risen DORIS_STK_RISE m above its deepest
+        -- depth -- the drop-weight never freed us (mechanical failure or stuck
+        -- on the bottom).  Holding the relay on past that only burns battery,
+        -- so cut the relay and break to RECOVERY (STATE=4) on the same terminal
+        -- path as a normal surfacing; publishing STATE=4 is the AGT's surface
+        -- authority, so its shutdown handshake powers the Pi off and conserves
+        -- the battery.
         if relay_active then
             local vel = ahrs:get_velocity_NED()
             if vel then
@@ -1590,12 +1621,35 @@ function update()
             if burn_elapsed >= brn_min_ms then
                 local avg = get_ring_avg(ar)
                 local thr = (prm.ASC_THR:get() or 10) / 100.0
-                if avg and ar.count >= ar.size and avg >= thr then
-                    gcs:send_text(MAV_SEVERITY.INFO,
-                        string.format(
-                            "DIVE: sustained ascent %.3f m/s > %.3f thr (%ds window), relay off",
-                            avg, thr, ar.size * UPDATE_INTERVAL_MS / 1000))
-                    deactivate_relay()
+                if avg and ar.count >= ar.size then
+                    if avg >= thr then
+                        gcs:send_text(MAV_SEVERITY.INFO,
+                            string.format(
+                                "DIVE: sustained ascent %.3f m/s > %.3f thr (%ds window), relay off",
+                                avg, thr, ar.size * UPDATE_INTERVAL_MS / 1000))
+                        deactivate_relay()
+                    else
+                        -- Max release time elapsed with no sustained ascent.
+                        -- telem.max_depth is the deepest point reached, so
+                        -- (max_depth - current depth) is how far we have risen
+                        -- off the bottom; near zero means the release failed.
+                        -- Break to RECOVERY (STATE=4) exactly like a normal
+                        -- surfacing: the AGT treats a fresh STATE=4 as surface
+                        -- authority and runs its shutdown handshake, powering
+                        -- the Pi off to conserve the battery.
+                        local rise_min = prm.STK_RISE:get() or 2.0
+                        local risen = telem.max_depth - (get_depth_m() or telem.max_depth)
+                        if risen < rise_min then
+                            gcs:send_text(MAV_SEVERITY.CRITICAL,
+                                string.format(
+                                    "DIVE: STUCK on bottom - no ascent (%.3f m/s, risen %.1fm < %.1fm) after %ds burn. Relay OFF, entering RECOVERY for AGT shutdown",
+                                    avg, risen, rise_min, math.floor(brn_min_ms / 1000)))
+                            deactivate_relay()
+                            ipcam_stop()
+                            state = STATE_RECOVERY
+                            return update, UPDATE_INTERVAL_MS
+                        end
+                    end
                 end
             end
         end
