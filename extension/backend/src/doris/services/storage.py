@@ -25,6 +25,7 @@ from ..models.configuration import (
 from ..models.dive_history import DiveHistoryEntry
 from ..models.media import MediaFile, MediaMission, MediaType, SyncStatus
 
+from .binlog import slug_for_dive
 from .usb_storage import iter_media_files_on_usb, iter_media_scan_roots
 
 logger = logging.getLogger(__name__)
@@ -176,6 +177,15 @@ def _best_start_time(data: dict, file: Path) -> datetime | None:
     return None
 
 
+def _dive_display_name(data: dict, dive_file: Path) -> str:
+    """Human label for a dive record (shared by window + BIN-log linking)."""
+    name = str(data.get("dive_name") or "").strip()
+    if name:
+        return name
+    cfg = str(data.get("configuration") or "").strip()
+    return cfg or dive_file.stem.replace("_", " ").title()
+
+
 def _load_dive_windows(root: Path) -> list[_DiveWindow]:
     """Build time windows from dives/dive_*.json for matching recorder files."""
     ddir = root / "dives"
@@ -211,10 +221,7 @@ def _load_dive_windows(root: Path) -> list[_DiveWindow]:
             else:
                 ended = now + timedelta(days=3650)
 
-        name = str(data.get("dive_name") or "").strip()
-        if not name:
-            cfg = str(data.get("configuration") or "").strip()
-            name = cfg or f.stem.replace("_", " ").title()
+        name = _dive_display_name(data, f)
 
         windows.append(
             _DiveWindow(stem=f.stem, start=start, end=ended, display_name=name)
@@ -236,6 +243,81 @@ def _match_dive_window(windows: list[_DiveWindow], t: datetime) -> _DiveWindow |
         return None
     candidates.sort(key=lambda w: w.start, reverse=True)
     return candidates[0]
+
+
+# Archived ArduPilot BIN logs are named ``<dive-slug>_<orig_num>.BIN`` by
+# services.binlog._dest_filename (e.g. ``8_17_pool_2_00000113.BIN``).
+_ARCHIVED_BIN_RE = re.compile(r"^(?P<slug>.+)_(?P<num>\d+)\.bin$", re.IGNORECASE)
+
+
+@dataclass(frozen=True)
+class _BinLogIndex:
+    """Deterministic filename -> dive-name link for archived BIN logs.
+
+    ArduPilot BIN logs frequently carry a bogus mtime (the flight-controller
+    RTC is often unset), so timestamp-based dive matching fails and the files
+    show up as unlinked "System" data.  The archive step (services.binlog)
+    records the exact files it copied in each dive's ``bin_log_files`` and
+    names them ``<dive-slug>_<num>.BIN``, so the dive can be recovered from
+    the filename alone -- no clock required.
+    """
+
+    by_name: dict[str, str]
+    by_slug: dict[str, str]
+
+    def lookup(self, filename: str) -> str | None:
+        """Return the dive display name for a BIN filename, or None."""
+        hit = self.by_name.get(filename)
+        if hit:
+            return hit
+        m = _ARCHIVED_BIN_RE.match(filename)
+        if m:
+            return self.by_slug.get(m.group("slug").lower())
+        return None
+
+
+def _load_bin_log_index(root: Path) -> _BinLogIndex:
+    """Build a :class:`_BinLogIndex` from dives/dive_*.json records."""
+    ddir = root / "dives"
+    by_name: dict[str, str] = {}
+    by_slug: dict[str, str] = {}
+    if not ddir.is_dir():
+        return _BinLogIndex(by_name, by_slug)
+
+    for f in sorted(ddir.glob("dive_*.json")):
+        try:
+            data = json.loads(f.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        display = _dive_display_name(data, f)
+        # Primary: exact filenames the archiver actually wrote.
+        for entry in data.get("bin_log_files") or []:
+            base = Path(str(entry)).name
+            if base:
+                by_name[base] = display
+        # Fallback: reconstruct the slug the archiver would have used, so
+        # logs still link even if ``bin_log_files`` is missing/stale.
+        slug = slug_for_dive(data, f).lower()
+        if slug:
+            by_slug.setdefault(slug, display)
+
+    return _BinLogIndex(by_name, by_slug)
+
+
+def _bin_log_dive_name(
+    filename: str, content_kind: MediaType, bin_index: _BinLogIndex | None
+) -> str | None:
+    """Clock-free dive link for archived ArduPilot BIN logs.
+
+    Preferred over timestamp matching because BIN logs routinely carry a
+    bogus mtime; returns None for non-BIN files so they fall back to the
+    normal dive-window matching.
+    """
+    if bin_index is None or content_kind != MediaType.DATA:
+        return None
+    if not filename.lower().endswith(".bin"):
+        return None
+    return bin_index.lookup(filename)
 
 
 def _aggregate_media_paths(
@@ -600,17 +682,19 @@ def _usb_file_to_media(
     dive_windows: list[_DiveWindow],
     mount_key: str,
     rel_under_mount: Path,
+    bin_index: _BinLogIndex | None = None,
 ) -> MediaFile:
     """Build a :class:`MediaFile` for a path on an external USB root."""
     stat = full_path.stat()
     eff = _effective_created_at(full_path, stat.st_mtime)
     eff_utc = eff if eff.tzinfo else eff.replace(tzinfo=timezone.utc)
     content_kind = _detect_media_type(full_path.name)
-    dive_name: str | None = None
+    dive_name = _bin_log_dive_name(full_path.name, content_kind, bin_index)
     media_type = content_kind
-    wn = _match_dive_window(dive_windows, eff_utc)
-    if wn:
-        dive_name = wn.display_name
+    if dive_name is None:
+        wn = _match_dive_window(dive_windows, eff_utc)
+        if wn:
+            dive_name = wn.display_name
     if dive_name is None and content_kind == MediaType.DATA:
         media_type = MediaType.SYSTEM
     fid = f"{USB_MEDIA_PREFIX}{mount_key}:{rel_under_mount.as_posix()}"
@@ -627,7 +711,10 @@ def _usb_file_to_media(
 
 
 def _file_to_media(
-    path: Path, root: Path, dive_windows: list[_DiveWindow]
+    path: Path,
+    root: Path,
+    dive_windows: list[_DiveWindow],
+    bin_index: _BinLogIndex | None = None,
 ) -> MediaFile:
     """Convert a filesystem path to a MediaFile model."""
     stat = path.stat()
@@ -689,14 +776,17 @@ def _file_to_media(
             download_url=f"/api/v1/media/download/{rel}",
         )
 
+    bin_dive = _bin_log_dive_name(path.name, content_kind, bin_index)
     if top == RECORDER_DIR:
         wn = _match_dive_window(dive_windows, eff_utc)
-        dive_name = wn.display_name if wn else None
+        dive_name = bin_dive or (wn.display_name if wn else None)
         if dive_name is None and content_kind == MediaType.DATA:
             media_type = MediaType.SYSTEM
     else:
         wn = _match_dive_window(dive_windows, eff_utc)
-        if wn:
+        if bin_dive:
+            dive_name = bin_dive
+        elif wn:
             dive_name = wn.display_name
         elif len(parts) > 1:
             dive_name = parts[0]
@@ -768,19 +858,31 @@ class StorageService:
         if not self.media_root.exists() and not self.media_root.is_symlink():
             self.media_root.mkdir(parents=True, exist_ok=True)
         self._dive_windows_cache: list[_DiveWindow] | None = None
+        self._bin_index_cache: _BinLogIndex | None = None
         self._dives_dir_mtime: float | None = None
 
-    def _get_dive_windows(self) -> list[_DiveWindow]:
+    def _refresh_dive_caches(self) -> None:
         ddir = self.root / "dives"
         mtime = ddir.stat().st_mtime if ddir.is_dir() else 0.0
         if (
             self._dive_windows_cache is not None
+            and self._bin_index_cache is not None
             and self._dives_dir_mtime == mtime
         ):
-            return self._dive_windows_cache
+            return
         self._dive_windows_cache = _load_dive_windows(self.root)
+        self._bin_index_cache = _load_bin_log_index(self.root)
         self._dives_dir_mtime = mtime
+
+    def _get_dive_windows(self) -> list[_DiveWindow]:
+        self._refresh_dive_caches()
+        assert self._dive_windows_cache is not None
         return self._dive_windows_cache
+
+    def _get_bin_log_index(self) -> _BinLogIndex:
+        self._refresh_dive_caches()
+        assert self._bin_index_cache is not None
+        return self._bin_index_cache
 
     async def get_media_files(
         self,
@@ -792,6 +894,7 @@ class StorageService:
         """List media files from the recorder tree and from mounted USB volumes."""
         try:
             dive_windows = self._get_dive_windows()
+            bin_index = self._get_bin_log_index()
             files: list[MediaFile] = []
 
             def _append_if_matches(mf: MediaFile) -> None:
@@ -815,7 +918,7 @@ class StorageService:
                             continue
                         rel = path.resolve().relative_to(base_r)
                         mf = _usb_file_to_media(
-                            path, self.root, dive_windows, mount_key, rel
+                            path, self.root, dive_windows, mount_key, rel, bin_index
                         )
                         _append_if_matches(mf)
                     except (FileNotFoundError, PermissionError, ValueError):
@@ -840,7 +943,9 @@ class StorageService:
                         ext = path.suffix.lstrip(".").lower()
                         if ext not in ALL_EXTENSIONS:
                             continue
-                        mf = _file_to_media(path, self.root, dive_windows)
+                        mf = _file_to_media(
+                            path, self.root, dive_windows, bin_index
+                        )
                         _append_if_matches(mf)
                     except (FileNotFoundError, PermissionError):
                         continue
@@ -858,7 +963,9 @@ class StorageService:
                             ext = path.suffix.lstrip(".").lower()
                             if ext not in ALL_EXTENSIONS:
                                 continue
-                            mf = _file_to_media(path, self.root, dive_windows)
+                            mf = _file_to_media(
+                                path, self.root, dive_windows, bin_index
+                            )
                             _append_if_matches(mf)
                         except (FileNotFoundError, PermissionError):
                             continue
@@ -878,7 +985,12 @@ class StorageService:
                                 continue
                             rel = path.resolve().relative_to(base_r)
                             mf = _usb_file_to_media(
-                                path, self.root, dive_windows, mount_key, rel
+                                path,
+                                self.root,
+                                dive_windows,
+                                mount_key,
+                                rel,
+                                bin_index,
                             )
                             _append_if_matches(mf)
                         except (FileNotFoundError, PermissionError, ValueError):
@@ -1009,6 +1121,7 @@ class StorageService:
         ok = delete_dive_record_file(self.root, dive_id)
         if ok:
             self._dive_windows_cache = None
+            self._bin_index_cache = None
             self._dives_dir_mtime = None
         return ok
 
