@@ -30,8 +30,15 @@ BARO_PROBE_EXT   256
 # Mission endurance: ~10 hours
 BATT_MONITOR     4
 BATT_CAPACITY    20000
-BATT_LOW_VOLT    14.0
-BATT_CRT_VOLT    13.0
+# Three-tier voltage protection (resting/sag-compensated volts).  The DORIS
+# Lua reads these directly; ArduPilot's own failsafe actions stay disabled.
+#   ARM  - pre-arm floor; mission will not start below it
+#   LOW  - in-mission warning only (no action)
+#   CRT  - critical; release the weight after BATT_LOW_TIMER seconds below it
+BATT_ARM_VOLT    14.5
+BATT_LOW_VOLT    14.2
+BATT_CRT_VOLT    14.0
+BATT_LOW_TIMER   10
 BATT_FS_LOW_ACT  0
 BATT_FS_CRT_ACT  0
 

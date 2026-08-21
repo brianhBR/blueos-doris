@@ -65,9 +65,12 @@ FS_PRESS_ENABLE  0
 BATT_FS_LOW_ACT  0
 BATT_FS_CRT_ACT  0
 # With the +4V SIM_BATT_VOLTAGE compensation above, reported voltage
-# matches real hardware.  Use production thresholds from doris.parm.
-BATT_LOW_VOLT    14.0
-BATT_CRT_VOLT    13.0
+# matches real hardware.  Use production thresholds from doris.parm:
+# ARM (pre-arm floor) / LOW (warning) / CRT (release after BATT_LOW_TIMER s).
+BATT_ARM_VOLT    14.5
+BATT_LOW_VOLT    14.2
+BATT_CRT_VOLT    14.0
+BATT_LOW_TIMER   10
 # Disable all pre-arm checks for SITL (SITL voltages and sensors are
 # unreliable for a thrusterless vehicle).
 ARMING_CHECK     0
