@@ -1195,10 +1195,15 @@ function update()
                 gps_ok = true
             end
             local batt_ok = arm_volt <= 0 or arm_v >= arm_volt
+            -- Low-voltage cutoff must be armed before a mission can start.
+            -- The in-mission critical release (check_failsafes) only fires when
+            -- BATT_CRT_VOLT > 0; leaving it at 0 silently disables the sole
+            -- software low-voltage protection, so refuse to arm until it is set.
+            local crt_ok = (param:get("BATT_CRT_VOLT") or 0) > 0
             local leak_ok = not check_leak()
             local profile_ok, profile_reason = validate_profile()
 
-            if gps_ok and batt_ok and leak_ok and profile_ok then
+            if gps_ok and batt_ok and crt_ok and leak_ok and profile_ok then
                 prearm_passed = true
                 gps_reboot_attempted = true
                 prm.GPS_RBT:set_and_save(0)
@@ -1228,6 +1233,9 @@ function update()
                     if not batt_ok then
                         reasons[#reasons + 1] = string.format("BATT(%.1fV<%.1fV)",
                             arm_v, arm_volt)
+                    end
+                    if not crt_ok then
+                        reasons[#reasons + 1] = "LVCO-OFF(set BATT_CRT_VOLT>0)"
                     end
                     if not leak_ok then reasons[#reasons + 1] = "LEAK" end
                     if not profile_ok then
