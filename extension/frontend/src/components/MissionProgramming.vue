@@ -19,6 +19,7 @@ import {
   type CameraType,
   type LightMode,
 } from '../lib/powerModel'
+import { cameraFieldMeta, CAMERA_SECTIONS, CAMERA_SECTION_KEYS } from '../lib/cameraSettingsSchema'
 
 const POWER = { BASE_W, CAMERA_RECORDING_W, BATTERY_CAPACITY_WH, ASCENT_BURN_MINUTES }
 
@@ -83,6 +84,7 @@ const descentLightOnUnit = ref('seconds')
 const descentLightOffNumber = ref('5')
 const descentLightOffUnit = ref('seconds')
 const descentLightBrightness = ref(60)
+const descentAutoWhiteBalance = ref(false)
 const descentMatchCameraInterval = ref(false)
 
 // On Bottom settings
@@ -137,6 +139,7 @@ const ascentLightOnUnit = ref('seconds')
 const ascentLightOffNumber = ref('5')
 const ascentLightOffUnit = ref('seconds')
 const ascentLightBrightness = ref(60)
+const ascentAutoWhiteBalance = ref(false)
 const ascentMatchCameraInterval = ref(false)
 
 // Recovery settings
@@ -283,9 +286,9 @@ watch(() => props.initialConfiguration, (val) => {
 })
 
 watch([diveName, descentCameraOn, descentCameraType, descentCaptureFrequency,
-  descentLightOn, descentLightMode, descentLightBrightness, bottomCameraOn, bottomCameraType,
+  descentLightOn, descentLightMode, descentLightBrightness, descentAutoWhiteBalance, bottomCameraOn, bottomCameraType,
   bottomCaptureFrequency, bottomLightOn, bottomLightMode, bottomLightBrightness, bottomAutoWhiteBalance, ascentCameraOn, ascentCameraType,
-  ascentCaptureFrequency, ascentLightOn, ascentLightMode, ascentLightBrightness,
+  ascentCaptureFrequency, ascentLightOn, ascentLightMode, ascentLightBrightness, ascentAutoWhiteBalance,
   activateMastLight, updateFrequency, useIridium, useLoRA, releaseWeightElapsedNumber
 ], () => {
   if (suppressUnsavedTracking) return
@@ -319,6 +322,7 @@ function resetToDefaults() {
   descentLightOffNumber.value = '5'
   descentLightOffUnit.value = 'seconds'
   descentLightBrightness.value = 60
+  descentAutoWhiteBalance.value = false
   descentMatchCameraInterval.value = false
   bottomCameraOn.value = true
   bottomCameraDelayNumber.value = '30'
@@ -370,6 +374,7 @@ function resetToDefaults() {
   ascentLightOffNumber.value = '5'
   ascentLightOffUnit.value = 'seconds'
   ascentLightBrightness.value = 60
+  ascentAutoWhiteBalance.value = false
   ascentMatchCameraInterval.value = false
   activateMastLight.value = false
   updateFrequency.value = '5min'
@@ -413,6 +418,7 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         on_time: tv(descentLightOnNumber.value, descentLightOnUnit.value),
         off_time: tv(descentLightOffNumber.value, descentLightOffUnit.value),
       },
+      auto_white_balance: descentAutoWhiteBalance.value,
     },
     bottom: {
       camera: {
@@ -465,6 +471,7 @@ function buildConfigPayload(name: string): DeploymentConfiguration {
         release_date: releaseWeightDate.value,
         release_time: releaseWeightTime.value,
       },
+      auto_white_balance: ascentAutoWhiteBalance.value,
     },
     recovery: {
       activate_mast_light: activateMastLight.value,
@@ -508,6 +515,7 @@ function applyConfig(cfg: DeploymentConfiguration) {
   descentLightOnUnit.value = cfg.descent.light.on_time.unit
   descentLightOffNumber.value = cfg.descent.light.off_time.number
   descentLightOffUnit.value = cfg.descent.light.off_time.unit
+  descentAutoWhiteBalance.value = cfg.descent.auto_white_balance ?? false
 
   bottomCameraOn.value = cfg.bottom.camera.enabled
   bottomCameraDelayNumber.value = cfg.bottom.camera_delay.number
@@ -563,6 +571,7 @@ function applyConfig(cfg: DeploymentConfiguration) {
   ascentLightOnUnit.value = cfg.ascent.light.on_time.unit
   ascentLightOffNumber.value = cfg.ascent.light.off_time.number
   ascentLightOffUnit.value = cfg.ascent.light.off_time.unit
+  ascentAutoWhiteBalance.value = cfg.ascent.auto_white_balance ?? false
   releaseWeightElapsedNumber.value = cfg.ascent.release_weight.elapsed.number
   releaseWeightElapsedUnit.value = cfg.ascent.release_weight.elapsed.unit
   releaseWeightDate.value = cfg.ascent.release_weight.release_date
@@ -767,7 +776,7 @@ function handleBeforeUnload(e: BeforeUnloadEvent) {
 // One global RadCam profile (image/video quality) applied via the
 // br4kcam-manager proxy — not per dive phase. The Advanced panel exposes
 // the full base/advanced setting surface for experimentation; presets can
-// be saved, snapshotted, downloaded, imported, and marked "active" (the
+// be saved, downloaded, imported, and marked "active" (the
 // active preset is auto-applied at DORIS startup and at dive start).
 
 const {
@@ -778,7 +787,6 @@ const {
   fetchSettings: fetchCameraSettings,
   applySettings,
   applyRecommended,
-  restartCamera,
 } = useCameraSettings()
 
 const {
@@ -787,7 +795,6 @@ const {
   error: presetError,
   fetchPresets,
   savePreset,
-  snapshotPreset,
   deletePreset,
   applyPreset,
   downloadPreset,
@@ -811,6 +818,24 @@ const CODEC_OPTIONS = [
   { value: 5, label: 'H.265 (HEVC)' },
 ]
 
+// Settings DORIS provides hardware defaults for on this vehicle — Day/Night &
+// IR-Cut (H), Light/IR LED (I), Aperture/Iris (J) and Scene Mode (M). They are
+// hidden from the editor only because there's no dedicated control for them
+// yet; their values are still kept in the form data and stored JSON. The
+// backend fills these defaults in only when a preset/apply omits them, so an
+// advanced user can override any of them by editing a preset's JSON directly.
+const DORIS_FIXED_CAMERA_KEYS = new Set<string>([
+  // H. Day/Night & IR-Cut
+  'color_black', 'infr_detect_mode', 'sens_day_to_night', 'sens_night_to_day',
+  'infr_day_h', 'infr_day_m', 'infr_night_h', 'infr_night_m', 'ircut_level', 'ldr_level',
+  // I. Light / IR LED Control
+  'led_control_mode', 'lamp_type', 'led_control_avail', 'ir_level', 'led_level', 'led_control',
+  // J. Aperture / Iris
+  'auto_iris', 'irisLevel',
+  // M. Scene Mode
+  'scene_mode', 'sceneMode',
+])
+
 const resolutionOptions = computed(() => {
   const list = liveCameraSettings.value?.video.pixel_list ?? []
   return list.map(r => ({ value: `${r.width}x${r.height}`, label: `${r.width} × ${r.height}` }))
@@ -829,8 +854,75 @@ const selectedResolution = computed({
   },
 })
 
-const baseKeys = computed(() => Object.keys(baseForm.value).sort())
-const advancedKeys = computed(() => Object.keys(advancedForm.value).sort())
+// Reset/trigger keys aren't meaningful as editable fields.
+const CAMERA_TRIGGER_KEYS = new Set<string>(['set_default', 'onceAWB'])
+
+function isEditableCameraKey(k: string): boolean {
+  return !DORIS_FIXED_CAMERA_KEYS.has(k) && !CAMERA_TRIGGER_KEYS.has(k)
+}
+
+type CameraGroup = 'base' | 'advanced' | 'video'
+interface CameraFieldRow { key: string; group: CameraGroup; meta: ReturnType<typeof cameraFieldMeta> }
+
+function cameraFormFor(group: CameraGroup): Record<string, number | undefined> {
+  if (group === 'base') return baseForm.value
+  if (group === 'advanced') return advancedForm.value
+  return videoForm.value
+}
+function cameraFieldValue(f: CameraFieldRow): number | undefined {
+  return cameraFormFor(f.group)[f.key]
+}
+function setCameraField(f: CameraFieldRow, raw: string) {
+  const target = cameraFormFor(f.group)
+  const n = raw === '' ? NaN : Number(raw)
+  target[f.key] = Number.isNaN(n) ? undefined : n
+}
+
+// A few commonly-tuned image settings are promoted out of the Advanced editor
+// and shown in the main quality panel: Auto White Balance, AE Strategy and
+// Video Standard.  They're excluded from cameraSections below so they don't
+// appear twice.
+const PROMOTED_CAMERA_FIELDS: { key: string; group: CameraGroup }[] = [
+  { key: 'auto_awb', group: 'base' },
+  { key: 'AE_strategy_mode', group: 'base' },
+  { key: 'power_freq', group: 'advanced' },
+]
+const PROMOTED_CAMERA_KEYS = new Set(
+  PROMOTED_CAMERA_FIELDS.map(f => `${f.group}:${f.key}`),
+)
+const promotedCameraFields = computed<CameraFieldRow[]>(() =>
+  PROMOTED_CAMERA_FIELDS
+    .filter(f => f.key in cameraFormFor(f.group))
+    .map(f => ({ key: f.key, group: f.group, meta: cameraFieldMeta(f.key, f.group) })),
+)
+
+// Group related controls into logical sections (all gain together, WB together,
+// etc.) rather than a flat alphabetical list. Hidden/pinned/trigger keys are
+// excluded; any editable key not covered by a section falls into "Other" so the
+// camera's full surface stays reachable. DORIS-pinned keys are still kept in the
+// form data (they round-trip into presets), just not shown here.
+const cameraSections = computed<{ title: string; fields: CameraFieldRow[] }[]>(() => {
+  const sections = CAMERA_SECTIONS.map(sec => ({
+    title: sec.title,
+    fields: sec.fields
+      .filter(f =>
+        isEditableCameraKey(f.key)
+        && !PROMOTED_CAMERA_KEYS.has(`${f.group}:${f.key}`)
+        && f.key in cameraFormFor(f.group))
+      .map(f => ({ key: f.key, group: f.group, meta: cameraFieldMeta(f.key, f.group) })),
+  })).filter(s => s.fields.length > 0)
+
+  const others: CameraFieldRow[] = [
+    ...Object.keys(baseForm.value)
+      .filter(k => isEditableCameraKey(k) && !CAMERA_SECTION_KEYS.has(`base:${k}`))
+      .map(k => ({ key: k, group: 'base' as CameraGroup, meta: cameraFieldMeta(k, 'base') })),
+    ...Object.keys(advancedForm.value)
+      .filter(k => isEditableCameraKey(k) && !CAMERA_SECTION_KEYS.has(`advanced:${k}`))
+      .map(k => ({ key: k, group: 'advanced' as CameraGroup, meta: cameraFieldMeta(k, 'advanced') })),
+  ]
+  if (others.length) sections.push({ title: 'Other', fields: others })
+  return sections
+})
 
 function syncCameraForms() {
   const s = liveCameraSettings.value
@@ -841,6 +933,9 @@ function syncCameraForms() {
   delete videoForm.value.max_framerate
   baseForm.value = { ...s.base }
   advancedForm.value = { ...s.advanced }
+  // Note: DORIS-pinned keys (H/I/J/M) are kept in the form data so they persist
+  // in presets and the stored JSON; they're only hidden from the rendered
+  // editor (see baseKeys/advancedKeys) and re-asserted server-side on apply.
 }
 
 function cleanNums(obj: Record<string, unknown>): Record<string, number> {
@@ -882,27 +977,12 @@ async function applyRecommendedSettings() {
   }
 }
 
-async function restartCameraNow() {
-  cameraStatus.value = ''
-  if (await restartCamera()) cameraStatus.value = 'Camera restart requested.'
-}
-
 async function saveCurrentAsPreset() {
   const name = newPresetName.value.trim()
   if (!name) return
   const saved = await savePreset({ name, ...buildCameraBundle() } as never)
   if (saved) {
     cameraStatus.value = `Preset "${name}" saved.`
-    newPresetName.value = ''
-  }
-}
-
-async function snapshotCurrentCamera() {
-  const name = newPresetName.value.trim()
-  if (!name) return
-  const saved = await snapshotPreset(name)
-  if (saved) {
-    cameraStatus.value = `Snapshot saved as "${name}".`
     newPresetName.value = ''
   }
 }
@@ -1059,9 +1139,12 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                 <option :value="0">VBR (variable)</option><option :value="1">CBR (constant)</option>
               </select>
             </div>
-            <div>
-              <label class="block mb-2 text-sm" style="color: #96EEF2">Keyframe interval (GOP)</label>
-              <input type="number" min="1" v-model.number="videoForm.gop" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" />
+            <div v-for="f in promotedCameraFields" :key="f.group + '-' + f.key">
+              <label class="block mb-2 text-sm" :title="f.meta.help || f.key" style="color: #96EEF2">{{ f.meta.label }}</label>
+              <select v-if="f.meta.kind === 'select'" :value="cameraFieldValue(f)" @change="setCameraField(f, ($event.target as HTMLSelectElement).value)" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle">
+                <option v-for="o in f.meta.options" :key="o.value" :value="o.value">{{ o.label }}</option>
+              </select>
+              <input v-else type="number" :value="cameraFieldValue(f)" @input="setCameraField(f, ($event.target as HTMLInputElement).value)" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" />
             </div>
           </div>
 
@@ -1069,11 +1152,11 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
             <button @click="applyGlobalCameraSettings" :disabled="cameraApplying" class="px-4 py-2 text-white rounded-lg transition-all hover:opacity-90 disabled:opacity-50" style="background: linear-gradient(135deg, #41B9C3 0%, #96EEF2 100%)">
               {{ cameraApplying ? 'Applying…' : 'Apply to Camera' }}
             </button>
+            <button @click="loadCameraSettings" :disabled="cameraLoading || cameraApplying" class="px-4 py-2 text-white rounded-lg disabled:opacity-50" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4)">
+              {{ cameraLoading ? 'Reading…' : 'Query Current Settings' }}
+            </button>
             <button @click="applyRecommendedSettings" :disabled="cameraApplying" class="px-4 py-2 text-white rounded-lg disabled:opacity-50" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4)">
               Apply Recommended
-            </button>
-            <button @click="restartCameraNow" class="px-4 py-2 text-white rounded-lg" style="background-color: rgba(221, 44, 29, 0.2); border: 1px solid rgba(221, 44, 29, 0.5)">
-              Restart Camera
             </button>
           </div>
 
@@ -1085,23 +1168,21 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
           </button>
           <div v-if="cameraAdvancedOpen" class="p-4 rounded-lg space-y-4" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
             <p class="text-xs" style="color: rgba(150, 238, 242, 0.6)">
-              Every setting reported by the camera, using its native field names. Values are raw integers — see the 4K Cam Manager docs for ranges. Leave a field blank to omit it from the update.
+              The full image setting surface reported by the camera. Day/Night &amp; IR-Cut, LED, Iris and Scene Mode use DORIS hardware defaults and aren't shown here — they're still stored, and can be overridden by editing a preset's JSON directly.
             </p>
-            <div>
-              <h4 class="text-sm mb-2" style="color: #96EEF2">Base image</h4>
-              <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
-                <div v-for="key in baseKeys" :key="'base-' + key">
-                  <label class="block mb-1 text-xs break-all" style="color: rgba(150, 238, 242, 0.8)">{{ key }}</label>
-                  <input type="number" v-model.number="baseForm[key]" class="w-full px-3 py-1.5 text-white rounded-lg focus:outline-none text-sm" :style="inputStyle" />
-                </div>
-              </div>
-            </div>
-            <div>
-              <h4 class="text-sm mb-2" style="color: #96EEF2">Advanced image</h4>
-              <div class="grid grid-cols-2 md:grid-cols-3 gap-3">
-                <div v-for="key in advancedKeys" :key="'adv-' + key">
-                  <label class="block mb-1 text-xs break-all" style="color: rgba(150, 238, 242, 0.8)">{{ key }}</label>
-                  <input type="number" v-model.number="advancedForm[key]" class="w-full px-3 py-1.5 text-white rounded-lg focus:outline-none text-sm" :style="inputStyle" />
+            <div v-for="section in cameraSections" :key="section.title">
+              <h4 class="text-sm mb-2" style="color: #96EEF2">{{ section.title }}</h4>
+              <div class="grid grid-cols-2 md:grid-cols-3 gap-4">
+                <div v-for="f in section.fields" :key="f.group + '-' + f.key">
+                  <label class="block mb-1 text-xs" :title="f.meta.help || f.key" style="color: rgba(150, 238, 242, 0.8)">{{ f.meta.label }}</label>
+                  <select v-if="f.meta.kind === 'select'" :value="cameraFieldValue(f)" @change="setCameraField(f, ($event.target as HTMLSelectElement).value)" class="w-full px-3 py-1.5 text-white rounded-lg focus:outline-none text-sm" :style="inputStyle">
+                    <option v-for="o in f.meta.options" :key="o.value" :value="o.value">{{ o.label }}</option>
+                  </select>
+                  <div v-else-if="f.meta.kind === 'slider'" class="flex items-center gap-2">
+                    <input type="range" :min="f.meta.min" :max="f.meta.max" :step="f.meta.step || 1" :value="cameraFieldValue(f)" @input="setCameraField(f, ($event.target as HTMLInputElement).value)" class="flex-1" style="accent-color: #41B9C3" />
+                    <input type="number" :min="f.meta.min" :max="f.meta.max" :value="cameraFieldValue(f)" @input="setCameraField(f, ($event.target as HTMLInputElement).value)" class="w-16 px-2 py-1 text-white rounded text-sm text-right" :style="inputStyle" />
+                  </div>
+                  <input v-else type="number" :value="cameraFieldValue(f)" @input="setCameraField(f, ($event.target as HTMLInputElement).value)" class="w-full px-3 py-1.5 text-white rounded-lg focus:outline-none text-sm" :style="inputStyle" />
                 </div>
               </div>
             </div>
@@ -1140,11 +1221,8 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
           </div>
 
           <div class="flex flex-wrap gap-3 mb-4">
-            <button @click="saveCurrentAsPreset" :disabled="!newPresetName.trim()" class="px-4 py-2 text-white rounded-lg disabled:opacity-50" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4)">
-              Save Current Form
-            </button>
-            <button @click="snapshotCurrentCamera" :disabled="!newPresetName.trim() || !liveCameraSettings" class="px-4 py-2 text-white rounded-lg disabled:opacity-50" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4)">
-              Snapshot Camera
+            <button @click="saveCurrentAsPreset" :disabled="!newPresetName.trim()" class="px-4 py-2 text-white rounded-lg disabled:opacity-50" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4)" title="Save the fields shown above as a preset. Use “Query Current Settings” first to pull the camera's current values in.">
+              Save Preset
             </button>
             <button @click="triggerPresetImport" class="px-4 py-2 text-white rounded-lg" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4)">
               Import…
@@ -1287,6 +1365,23 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                     </div>
                   </div>
                 </div>
+              </div>
+            </div>
+
+            <!-- One-shot white balance -->
+            <div class="pt-2" style="border-top: 1px solid rgba(65, 185, 195, 0.2)">
+              <div class="flex items-center justify-between">
+                <div class="pr-4">
+                  <label class="block text-sm" style="color: #96EEF2">Auto White Balance on Lights</label>
+                  <p class="text-xs mt-1 opacity-70" style="color: #96EEF2">
+                    Fires a one-time white balance a couple seconds after the descent lights turn on, so colors are calibrated for the lit scene. Requires the descent light to be enabled.
+                  </p>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer flex-shrink-0">
+                  <input type="checkbox" v-model="descentAutoWhiteBalance" class="sr-only peer" />
+                  <div class="w-11 h-6 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all" :style="{ backgroundColor: descentAutoWhiteBalance ? '#41B9C3' : 'rgba(65, 185, 195, 0.3)' }"></div>
+                  <span class="ml-3 text-sm" style="color: #96EEF2">{{ descentAutoWhiteBalance ? 'On' : 'Off' }}</span>
+                </label>
               </div>
             </div>
 
@@ -1497,6 +1592,23 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
               </div>
             </div>
 
+            <!-- One-shot white balance -->
+            <div class="pt-2" style="border-top: 1px solid rgba(65, 185, 195, 0.2)">
+              <div class="flex items-center justify-between">
+                <div class="pr-4">
+                  <label class="block text-sm" style="color: #96EEF2">Auto White Balance on Lights</label>
+                  <p class="text-xs mt-1 opacity-70" style="color: #96EEF2">
+                    Fires a one-time white balance a couple seconds after the bottom lights turn on, so colors are calibrated for the lit scene. Requires the bottom light to be enabled.
+                  </p>
+                </div>
+                <label class="relative inline-flex items-center cursor-pointer flex-shrink-0">
+                  <input type="checkbox" v-model="bottomAutoWhiteBalance" class="sr-only peer" />
+                  <div class="w-11 h-6 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all" :style="{ backgroundColor: bottomAutoWhiteBalance ? '#41B9C3' : 'rgba(65, 185, 195, 0.3)' }"></div>
+                  <span class="ml-3 text-sm" style="color: #96EEF2">{{ bottomAutoWhiteBalance ? 'On' : 'Off' }}</span>
+                </label>
+              </div>
+            </div>
+
             <!-- Sleep Timer (disabled) -->
             <div class="mt-4 opacity-40">
               <label class="flex items-center gap-2 mb-2 text-sm cursor-not-allowed" style="color: #96EEF2">
@@ -1588,22 +1700,6 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
               <input type="range" min="0" max="100" :value="bottomLightBrightness" @input="handleBrightnessChange(Number(($event.target as HTMLInputElement).value), 'bottom')" class="w-full" />
               <div class="flex justify-between text-sm mt-1" style="color: #96EEF2">
                 <span>0%</span><span>{{ bottomLightBrightness }}%</span><span>100%</span>
-              </div>
-            </div>
-
-            <div class="pt-2" style="border-top: 1px solid rgba(65, 185, 195, 0.2)">
-              <div class="flex items-center justify-between">
-                <div class="pr-4">
-                  <label class="block text-sm" style="color: #96EEF2">Auto White Balance on Lights</label>
-                  <p class="text-xs mt-1 opacity-70" style="color: #96EEF2">
-                    Runs a one-time white balance a couple seconds after the bottom lights turn on, so colors are calibrated for the lit scene.
-                  </p>
-                </div>
-                <label class="relative inline-flex items-center cursor-pointer flex-shrink-0">
-                  <input type="checkbox" v-model="bottomAutoWhiteBalance" class="sr-only peer" />
-                  <div class="w-11 h-6 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all" :style="{ backgroundColor: bottomAutoWhiteBalance ? '#41B9C3' : 'rgba(65, 185, 195, 0.3)' }"></div>
-                  <span class="ml-3 text-sm" style="color: #96EEF2">{{ bottomAutoWhiteBalance ? 'On' : 'Off' }}</span>
-                </label>
               </div>
             </div>
           </div>
@@ -1749,6 +1845,23 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                       <option value="seconds">seconds</option><option value="minutes">minutes</option><option value="hours">hours</option>
                     </select>
                   </div>
+                </div>
+              </div>
+
+              <!-- One-shot white balance -->
+              <div class="pt-2" style="border-top: 1px solid rgba(65, 185, 195, 0.2)">
+                <div class="flex items-center justify-between">
+                  <div class="pr-4">
+                    <label class="block text-sm" style="color: #96EEF2">Auto White Balance on Lights</label>
+                    <p class="text-xs mt-1 opacity-70" style="color: #96EEF2">
+                      Fires a one-time white balance a couple seconds after the ascent lights turn on, so colors are calibrated for the lit scene. Requires the ascent light to be enabled.
+                    </p>
+                  </div>
+                  <label class="relative inline-flex items-center cursor-pointer flex-shrink-0">
+                    <input type="checkbox" v-model="ascentAutoWhiteBalance" class="sr-only peer" />
+                    <div class="w-11 h-6 rounded-full peer peer-checked:after:translate-x-full after:content-[''] after:absolute after:top-0.5 after:left-[2px] after:bg-white after:rounded-full after:h-5 after:w-5 after:transition-all" :style="{ backgroundColor: ascentAutoWhiteBalance ? '#41B9C3' : 'rgba(65, 185, 195, 0.3)' }"></div>
+                    <span class="ml-3 text-sm" style="color: #96EEF2">{{ ascentAutoWhiteBalance ? 'On' : 'Off' }}</span>
+                  </label>
                 </div>
               </div>
 

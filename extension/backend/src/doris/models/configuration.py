@@ -90,6 +90,11 @@ class DescentPhase(BaseModel):
     camera: CameraSettings = Field(default_factory=CameraSettings)
     light: LightSettings = Field(default_factory=LightSettings)
 
+    # One-push auto white balance a couple seconds after the descent lights
+    # first come on (see BottomPhase.auto_white_balance).  Pushed as
+    # DORIS_DSC_AWB and executed via the br4kcam-manager onceAWB trigger.
+    auto_white_balance: bool = False
+
 
 class BottomPhase(BaseModel):
     camera: CameraSettings = Field(default_factory=lambda: CameraSettings(enabled=True))
@@ -117,6 +122,11 @@ class AscentPhase(BaseModel):
     camera: CameraSettings = Field(default_factory=CameraSettings)
     light: LightSettings = Field(default_factory=LightSettings)
     release_weight: ReleaseWeight = Field(default_factory=ReleaseWeight)
+
+    # One-push auto white balance a couple seconds after the ascent lights
+    # first come on (see BottomPhase.auto_white_balance).  Pushed as
+    # DORIS_ASC_AWB and executed via the br4kcam-manager onceAWB trigger.
+    auto_white_balance: bool = False
 
 
 class RecoverySettings(BaseModel):

@@ -10,6 +10,8 @@ persistence (:class:`.storage.StorageService`):
 """
 
 import logging
+from datetime import datetime, timezone
+from pathlib import Path
 
 from ..models.camera import (
     AdvancedImageSettings,
@@ -24,6 +26,42 @@ from .storage import StorageService
 logger = logging.getLogger(__name__)
 
 
+# ── DORIS hardware defaults ──────────────────────────────────────────
+#
+# A handful of settings are dictated by this vehicle's hardware.  DORIS supplies
+# sensible defaults for them, but treats those defaults as *fallbacks*: they
+# fill in only the keys a preset/apply didn't specify, so an advanced user can
+# still override any of them by including the key in a preset or hand-edited
+# JSON.  With no active preset they are applied as a baseline at startup and
+# dive start (see :func:`apply_active_preset_best_effort`).  They are hidden
+# from the experimentation UI simply because there is no control for them yet.
+#
+#   H. Day/Night & IR-Cut : color_black=0 -> colour/day, IR-cut filter engaged.
+#   I. Light / IR LED      : led_control=2 -> illuminator disabled (no LEDs).
+#   J. Aperture / Iris     : auto_iris=1  -> iris disabled; fixed-aperture lens.
+#   M. Scene Mode          : scene_mode=0 (advanced, IPC) and sceneMode=0 (base)
+#                            -> plain general video capture.
+DORIS_BASE_DEFAULTS = BaseImageSettings(scene_mode=0)
+DORIS_ADVANCED_DEFAULTS = AdvancedImageSettings(
+    color_black=0,
+    led_control=2,
+    auto_iris=1,
+    scene_mode=0,
+)
+
+
+def _fill_missing_defaults(model, defaults):
+    """Return a copy of ``model`` with ``defaults`` filling only unset fields.
+
+    Values already present in ``model`` win, so a preset or hand-edited JSON
+    that specifies one of these keys is honored; the defaults just supply the
+    keys the caller left out.
+    """
+    data = defaults.model_dump(exclude_none=True)
+    data.update(model.model_dump(exclude_none=True))
+    return type(model)(**data)
+
+
 class NoCameraError(Br4kcamError):
     """Raised when no camera is known to the manager."""
 
@@ -31,8 +69,8 @@ class NoCameraError(Br4kcamError):
 class CameraPresetService:
     """Applies/reads/persists RadCam settings and presets."""
 
-    def __init__(self) -> None:
-        self.client = Br4kcamClient()
+    def __init__(self, timeout: float = 15.0) -> None:
+        self.client = Br4kcamClient(timeout=timeout)
         self.storage = StorageService()
 
     async def close(self) -> None:
@@ -60,8 +98,12 @@ class CameraPresetService:
         uuid = await self._require_uuid(camera_uuid)
 
         video = bundle.video
-        base = bundle.base
-        advanced = bundle.advanced
+        # Fill in DORIS's hardware defaults for any of these settings the caller
+        # didn't specify, so a preset that omits them still gets a sane value.
+        # An explicit value in the bundle/preset/JSON is preserved, so an
+        # advanced user can override them by editing the JSON directly.
+        base = _fill_missing_defaults(bundle.base, DORIS_BASE_DEFAULTS)
+        advanced = _fill_missing_defaults(bundle.advanced, DORIS_ADVANCED_DEFAULTS)
 
         if video.model_dump(exclude_none=True, exclude={"channel"}):
             video = await self.client.set_video(uuid, video)
@@ -87,6 +129,24 @@ class CameraPresetService:
             advanced=advanced or AdvancedImageSettings(),
         )
         return await self.apply_bundle(bundle, camera_uuid)
+
+    async def apply_baseline_defaults(
+        self, camera_uuid: str | None = None
+    ) -> CameraSettingsBundle:
+        """Apply DORIS's hardware defaults as a baseline.
+
+        Used at startup and dive start when no preset is active, so the camera
+        still lands in a sane default state.  When a preset *is* active its
+        values take precedence (see :func:`apply_active_preset_best_effort`).
+        """
+        uuid = await self._require_uuid(camera_uuid)
+        base = await self.client.set_base(
+            uuid, DORIS_BASE_DEFAULTS.model_copy(deep=True)
+        )
+        advanced = await self.client.set_advanced(
+            uuid, DORIS_ADVANCED_DEFAULTS.model_copy(deep=True)
+        )
+        return CameraSettingsBundle(video=VideoSettings(), base=base, advanced=advanced)
 
     async def trigger_awb(
         self, camera_uuid: str | None = None
@@ -142,6 +202,65 @@ class CameraPresetService:
         return active.name
 
 
+async def record_camera_sample(
+    phase: str,
+    *,
+    dives_dir: Path,
+    dive_file: Path | None = None,
+    include_error_sample: bool = True,
+    timeout: float = 6.0,
+    logger_: logging.Logger = logger,
+) -> None:
+    """Snapshot the live camera settings into a dive record (best-effort).
+
+    Reads the full video/base/advanced bundle from the br4kcam-manager and
+    appends it under ``camera_settings_samples`` on the target dive record so
+    the footage can be interpreted after the dive (the settings themselves are
+    not carried in the video stream).
+
+    Never raises: a missing camera or unreachable manager just logs.  When
+    ``include_error_sample`` is set, an unreachable camera still records a small
+    ``{"error": ...}`` marker so post-analysis can tell the camera was offline
+    at that phase; ``recovery`` passes ``False`` because the payload may already
+    be powering down and a failure there is expected, not noteworthy.
+    """
+    sample: dict = {
+        "phase": phase,
+        "sampled_at": datetime.now(timezone.utc).isoformat(),
+    }
+    service = CameraPresetService(timeout=timeout)
+    try:
+        uuid = await service.client.get_primary_camera_uuid()
+        if not uuid:
+            raise NoCameraError("No camera found via br4kcam-manager")
+        bundle = await service.read_live(uuid)
+        sample["camera_uuid"] = uuid
+        sample["video"] = bundle.video.model_dump(by_alias=True, exclude_none=True)
+        sample["base"] = bundle.base.model_dump(by_alias=True, exclude_none=True)
+        sample["advanced"] = bundle.advanced.model_dump(by_alias=True, exclude_none=True)
+    except Exception as e:  # noqa: BLE001 - best-effort, never propagate
+        if not include_error_sample:
+            logger_.info("Camera sample (%s) skipped: %s", phase, e)
+            return
+        sample["error"] = str(e)
+        logger_.warning("Camera sample (%s) failed: %s", phase, e)
+    finally:
+        await service.close()
+
+    try:
+        from .dive_records import append_camera_sample_to_dive
+
+        written = append_camera_sample_to_dive(dives_dir, sample, dive_file=dive_file)
+        if written is not None:
+            logger_.info("Camera sample (%s) recorded to %s", phase, written.name)
+        else:
+            logger_.info(
+                "Camera sample (%s): no active dive record to attach", phase
+            )
+    except Exception as e:  # noqa: BLE001
+        logger_.warning("Camera sample (%s) append failed: %s", phase, e)
+
+
 async def apply_active_preset_best_effort(logger_: logging.Logger) -> None:
     """Best-effort apply of the active preset (startup / dive start).
 
@@ -152,10 +271,16 @@ async def apply_active_preset_best_effort(logger_: logging.Logger) -> None:
     try:
         applied = await service.apply_active()
         if applied:
+            # The preset is authoritative; apply_bundle already filled any
+            # H/I/J/M keys it omitted with DORIS's defaults.
             logger_.info("Applied active camera preset: %s", applied)
+        else:
+            # No active preset: land the camera in DORIS's baseline defaults.
+            await service.apply_baseline_defaults()
+            logger_.info("Applied baseline camera defaults (no active preset)")
     except Br4kcamError as e:
-        logger_.info("Active camera preset not applied: %s", e)
+        logger_.info("Active camera preset / defaults not applied: %s", e)
     except Exception as e:  # noqa: BLE001
-        logger_.warning("Active camera preset apply failed: %s", e)
+        logger_.warning("Active camera preset / defaults failed: %s", e)
     finally:
         await service.close()

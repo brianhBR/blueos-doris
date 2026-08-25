@@ -275,6 +275,29 @@ async function stopIpcamRecording() {
   }
 }
 
+// ── Camera restart ──────────────────────────────────────────────────
+// Restarts the camera via the DORIS backend (which power-cycles / re-inits
+// the RadCam through the br4kcam-manager).  Moved here from the
+// Configuration tab so all live camera hardware controls live together.
+const cameraRestartBusy = ref(false)
+const cameraRestartMsg = ref('')
+
+async function restartCameraNow() {
+  if (cameraRestartBusy.value) return
+  cameraRestartBusy.value = true
+  cameraRestartMsg.value = ''
+  try {
+    const resp = await fetch('/api/v1/camera/restart', { method: 'POST' })
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`)
+    cameraRestartMsg.value = 'Camera restart requested.'
+  } catch (e) {
+    cameraRestartMsg.value = e instanceof Error ? e.message : 'Restart failed'
+  } finally {
+    cameraRestartBusy.value = false
+    setTimeout(() => { cameraRestartMsg.value = '' }, 5000)
+  }
+}
+
 // ── Tracker GPS data ────────────────────────────────────────────────
 interface TrackerGPS {
   fix_type: number
@@ -1160,6 +1183,25 @@ const getStatusColor = (moduleStatus: string) => {
                   </button>
                 </div>
                 <p v-if="ipcamRecordError" class="text-xs" style="color: #f87171">{{ ipcamRecordError }}</p>
+              </div>
+
+              <div class="rounded-lg p-3 space-y-2" style="background-color: rgba(14, 36, 70, 0.6); border: 1px solid rgba(65, 185, 195, 0.25)">
+                <span class="text-xs font-medium" style="color: #96EEF2">Camera hardware</span>
+                <p class="text-xs leading-relaxed" style="color: rgba(150, 238, 242, 0.65)">
+                  Re-initialises the RadCam through the 4K Cam Manager. Use if the stream stalls or the camera stops responding.
+                </p>
+                <button
+                  type="button"
+                  :disabled="cameraRestartBusy"
+                  class="w-full flex items-center justify-center gap-2 px-3 py-2 rounded-lg text-sm transition-all disabled:opacity-50 disabled:cursor-not-allowed"
+                  style="background-color: rgba(221, 44, 29, 0.15); color: #fca5a5; border: 1px solid rgba(221, 44, 29, 0.45)"
+                  @click.stop="restartCameraNow()"
+                >
+                  <Loader2 v-if="cameraRestartBusy" class="w-4 h-4 animate-spin" />
+                  <RefreshCw v-else class="w-4 h-4" />
+                  Restart Camera
+                </button>
+                <p v-if="cameraRestartMsg" class="text-xs" style="color: rgba(150, 238, 242, 0.7)">{{ cameraRestartMsg }}</p>
               </div>
             </div>
 

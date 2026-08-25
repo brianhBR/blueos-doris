@@ -326,6 +326,7 @@ export interface LightSettings {
 export interface DescentPhase {
   camera: CameraSettings
   light: LightSettings
+  auto_white_balance?: boolean
 }
 
 export interface BottomPhase {
@@ -348,6 +349,7 @@ export interface AscentPhase {
   camera: CameraSettings
   light: LightSettings
   release_weight: ReleaseWeight
+  auto_white_balance?: boolean
 }
 
 export interface RecoverySettings {
@@ -1387,6 +1389,55 @@ export function useConfigurations() {
 
 // ── Camera settings + preset composables ────────────────────────────
 
+// Dev-only mock so the camera UI can be previewed with `vite dev` when no
+// vehicle/camera is reachable. It is used ONLY under import.meta.env.DEV and
+// ONLY as a fallback when the real request fails, so it never affects
+// production or a dev session proxied to a real camera. Remove/ignore for
+// on-vehicle testing.
+const DEV_MOCK_CAMERA_SETTINGS: CameraSettingsBundle = {
+  video: {
+    channel: 0,
+    encode_profile: 2,
+    encode_type: 5,
+    pixel_list: [
+      { width: 3840, height: 2160 },
+      { width: 2560, height: 1440 },
+      { width: 1920, height: 1080 },
+    ],
+    pic_width: 1920,
+    pic_height: 1080,
+    rc_mode: 0,
+    bitrate: 6144,
+    max_framerate: 30,
+    frame_rate: 25,
+    gop: 50,
+  },
+  base: {
+    hue: 128, brightness: 140, sharpness: 128, contrast: 132, saturation: 150, gamma: 128,
+    blc_level: 0, max_exposure: 100, auto_exposureEx: 0, AE_strategy_mode: 0, exposure_time: 100,
+    auto_awb: 0, awb_red: 128, awb_green: 128, awb_blue: 128, awb_auto_mode: 0,
+    awb_style_red: 128, awb_style_green: 128, awb_style_blue: 128,
+    auto_gain_mode: 0, auto_DGain_max: 200, auto_AGain_max: 200, max_sys_gain: 200,
+    manual_AGain_enable: 0, manual_AGain: 128, manual_DGain_enable: 0, manual_DGain: 128,
+    antiFog: 0, frameTurbo_pro: 0, rotate: 0,
+    // DORIS-managed (hidden in the editor):
+    sceneMode: 0,
+  },
+  advanced: {
+    mirror: 1, flip: 1, power_freq: 1, lens_correction: 0,
+    wdr_level: 0, wdr_sensor: 0, wdr_level_sensor: 0, hlc_enable: 0,
+    noiseReduction: 1, _2DNR_level: 1,
+    anti_flicker: 1, low_farme_rate: 0,
+    // DORIS-managed (hidden in the editor):
+    color_black: 0, led_control: 2, auto_iris: 1, scene_mode: 0,
+  },
+}
+
+const DEV_MOCK_PRESETS: CameraPresetSummary[] = [
+  { name: 'Reef daylight', camera_model: 'radcam', created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+  { name: 'Deep low-light', camera_model: 'radcam', created_at: new Date().toISOString(), updated_at: new Date().toISOString() },
+]
+
 /**
  * Live RadCam settings via the br4kcam-manager proxy. Reads/writes the
  * full video + base + advanced setting surface (experimental).
@@ -1404,6 +1455,11 @@ export function useCameraSettings() {
       settings.value = await fetchApi<CameraSettingsBundle>('/camera/settings')
       return settings.value
     } catch (e) {
+      if (import.meta.env.DEV) {
+        settings.value = structuredClone(DEV_MOCK_CAMERA_SETTINGS)
+        error.value = null
+        return settings.value
+      }
       error.value = e instanceof Error ? e.message : 'Failed to read camera settings'
       return null
     } finally {
@@ -1482,6 +1538,11 @@ export function usePresets() {
     try {
       presets.value = await fetchApi<CameraPresetSummary[]>('/camera/presets')
     } catch (e) {
+      if (import.meta.env.DEV) {
+        presets.value = DEV_MOCK_PRESETS
+        error.value = null
+        return
+      }
       error.value = e instanceof Error ? e.message : 'Failed to fetch presets'
     } finally {
       loading.value = false
@@ -1588,6 +1649,10 @@ export function usePresets() {
     try {
       activePreset.value = await fetchApi<ActivePreset>('/camera/active-preset')
     } catch (e) {
+      if (import.meta.env.DEV) {
+        activePreset.value = { name: 'Reef daylight', updated_at: new Date().toISOString() }
+        return
+      }
       error.value = e instanceof Error ? e.message : 'Failed to fetch active preset'
     }
   }

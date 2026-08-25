@@ -177,6 +177,23 @@ async def quiesce_dive(
     dives_dir = data_root / "dives"
     mission_state_path = data_root / "mission_state.json"
 
+    # Snapshot the camera's final settings while the payload is still powered
+    # (the AGT waits on this before cutting power).  Done before the dive record
+    # is closed so it attaches to the still-active record.  Short timeout and
+    # best-effort: the camera may already be powering down, and this must never
+    # stall the AGT handshake.
+    try:
+        from .camera_presets import record_camera_sample
+
+        await record_camera_sample(
+            "recovery",
+            dives_dir=dives_dir,
+            include_error_sample=False,
+            timeout=3.0,
+        )
+    except Exception as e:
+        logger.warning("Quiesce: camera recovery sample failed: %s", e)
+
     # Closing the dive record matters more than stopping the recorder: the AGT
     # will not acknowledge until this returns, so a recorder problem must not
     # take the rest of the quiesce down with it.

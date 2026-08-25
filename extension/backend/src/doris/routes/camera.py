@@ -85,10 +85,23 @@ def register_camera_routes(app: Robyn) -> None:
         """Fire a one-push auto white balance on the camera."""
         try:
             fresh = await svc.trigger_awb()
-            return _json(fresh.model_dump_json(by_alias=True))
         except Exception as e:
             logger.warning("camera trigger_awb failed: %s", e)
             return _error(str(e), _camera_error_status(e))
+
+        # The AWB just recalibrated white balance against the lit bottom scene,
+        # so record the effective settings into the active dive record.  Camera
+        # settings are not carried in the video stream; this snapshot is what
+        # lets post-analysis know how the footage was actually captured.
+        try:
+            from ..services.camera_presets import record_camera_sample
+            from ..services.storage import DATA_ROOT
+
+            await record_camera_sample("bottom_awb", dives_dir=DATA_ROOT / "dives")
+        except Exception as e:
+            logger.warning("camera bottom_awb sample failed: %s", e)
+
+        return _json(fresh.model_dump_json(by_alias=True))
 
     @app.post("/api/v1/camera/awb")
     async def trigger_awb_api(request):

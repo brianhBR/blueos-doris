@@ -63,6 +63,40 @@ RECORDER_DIR = "recorder"
 USB_MEDIA_PREFIX = "usb:"
 
 
+_LEGACY_PRESETS_MIGRATED = False
+
+
+def _migrate_legacy_camera_presets(root: Path, new_dir: Path) -> None:
+    """Copy presets from the old ephemeral location into the bind-mounted dir.
+
+    One-shot per process and best-effort: earlier builds wrote presets to
+    ``DATA_ROOT/camera_presets`` (lost on extension update).  On first access we
+    lift any of those files (including the ``_active.json`` pointer) into the
+    persistent ``userdata`` location, without clobbering files already there.
+    """
+    global _LEGACY_PRESETS_MIGRATED
+    if _LEGACY_PRESETS_MIGRATED:
+        return
+    _LEGACY_PRESETS_MIGRATED = True
+    legacy = root / "camera_presets"
+    try:
+        if legacy.resolve() == new_dir.resolve() or not legacy.is_dir():
+            return
+        moved = 0
+        for f in legacy.glob("*.json"):
+            target = new_dir / f.name
+            if not target.exists():
+                target.write_text(f.read_text())
+                moved += 1
+        if moved:
+            logger.info(
+                "Migrated %d legacy camera preset file(s) %s -> %s",
+                moved, legacy, new_dir,
+            )
+    except Exception as e:
+        logger.warning("Camera preset migration skipped: %s", e)
+
+
 def media_download_id_from_abs_path(path: Path, data_root: Path) -> str:
     """Stable id for ``/api/v1/media/download`` (internal or USB)."""
     pr = path.resolve()
@@ -1120,15 +1154,19 @@ class StorageService:
     # ── Camera preset management ────────────────────────────────
     #
     # Presets are stored one JSON file per preset under
-    # ``DATA_ROOT/camera_presets/<slug>.json`` (survives reboot).  The
-    # active-preset pointer lives in ``_active.json`` in the same dir;
-    # underscore-prefixed files are skipped by the listing so the pointer
-    # is never mistaken for a preset.
+    # ``DATA_ROOT/userdata/camera_presets/<slug>.json``.  ``userdata`` is the
+    # BlueOS bind mount (host ``/usr/blueos/userdata``), so presets survive not
+    # just reboots but also extension updates/reinstalls -- unlike the old
+    # ``DATA_ROOT/camera_presets`` location, which lived in the container's
+    # ephemeral layer.  The active-preset pointer lives in ``_active.json`` in
+    # the same dir; underscore-prefixed files are skipped by the listing so the
+    # pointer is never mistaken for a preset.
 
     @property
     def _presets_dir(self) -> Path:
-        d = self.root / "camera_presets"
+        d = self.root / "userdata" / "camera_presets"
         d.mkdir(parents=True, exist_ok=True)
+        _migrate_legacy_camera_presets(self.root, d)
         return d
 
     @property
