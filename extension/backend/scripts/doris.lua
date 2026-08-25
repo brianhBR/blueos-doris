@@ -34,17 +34,38 @@
    Bottom lights can be delayed (DORIS_BTM_DLY seconds) to allow
    settling before activating.
 
-   In-mission failsafe monitoring runs every cycle during active
-   states (MISSION_START through ASCENT).  Leak detection, low
-   battery, and max-depth violations trigger an immediate weight
-   release and transition to RECOVERY.
+   In-mission failsafe monitoring runs every cycle during the active
+   descent states (MISSION_START, DESCENT, ON_BOTTOM).  Leak, critical
+   battery, and max-depth violations trigger a weight release and
+   transition to ASCENT.
+
+   Battery protection uses three tiers keyed on ArduPilot's native BATT_*
+   parameters, compared against the sag-compensated resting voltage:
+     * BATT_ARM_VOLT  - pre-arm floor; the mission will not start below it.
+     * BATT_LOW_VOLT  - in-mission warning only (GCS + telemetry), no action.
+     * BATT_CRT_VOLT  - critical; once the resting voltage holds below it for
+                        BATT_LOW_TIMER seconds the weight is released.
+   ArduPilot's own battery failsafe actions stay disabled (BATT_FS_*_ACT=0)
+   because none suit a thrusterless lander; the script is the actuator.
 
    ArduPilot's built-in failsafes (EKF, GCS, pilot input, crash
    check) are disabled at boot because GPS/GCS/pilot are unavailable
    underwater.  Leak, pressure, and temperature failsafes are set
    to warn-only so the script can decide the appropriate response.
-   Battery failsafe actions are also disabled; the script monitors
-   voltage directly via DORIS_MIN_VOLT.
+
+   Stuck-on-bottom protection: the release relay is energized for up to
+   DORIS_BRN_MIN seconds (the "max release time").  If that full burn
+   window elapses in ASCENT and the vehicle is still not rising -- no
+   sustained upward velocity and less than DORIS_STK_RISE metres gained
+   above the deepest point -- the drop-weight release has failed or the
+   lander is stuck.  Continuing to energize the relay only drains the
+   battery, so the script cuts the relay and breaks straight to RECOVERY
+   (STATE=4), taking the exact same terminal path as a normal surfacing.
+   A fresh terminal STATE=4 is the AGT's surface authority, so the AGT
+   runs its shutdown handshake (PWR_SHDN -> BlueOS disarm/finalize ->
+   PWR_ACK -> host poweroff) and powers the Pi off.  That is the whole
+   point: hand the stuck vehicle to the normal low-power shutdown flow so
+   the AGT conserves the battery instead of holding the relay on.
 
    RECOVERY is a terminal state: outputs are safe, but the autopilot remains
    armed so MCAP and BIN logging continue through the AGT's surface dwell.
@@ -95,7 +116,7 @@ local STATE_ASCENT        = 3
 local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-assert(param:add_table(73, "DORIS_", 40),
+assert(param:add_table(73, "DORIS_", 41),
        "DIVE: could not add DORIS_ param table")
 
 -- mission control
@@ -117,7 +138,8 @@ assert(param:add_param(73, 14, "BTM_DLY", 30), "DORIS_BTM_DLY")
 assert(param:add_param(73, 15, "PRF_ID",   0),    "DORIS_PRF_ID")
 assert(param:add_param(73, 16, "UPL_DATE", 0),    "DORIS_UPL_DATE")
 assert(param:add_param(73, 17, "UPL_TIME", 0),    "DORIS_UPL_TIME")
-assert(param:add_param(73, 18, "MIN_VOLT", 14.0), "DORIS_MIN_VOLT")
+-- Slot 18 retired: battery thresholds now use ArduPilot's native BATT_ARM_VOLT
+-- / BATT_LOW_VOLT / BATT_CRT_VOLT (+ BATT_LOW_TIMER) instead of DORIS_MIN_VOLT.
 -- Navigator relay channel for the mirrored release output; -1 disables it.
 assert(param:add_param(73, 19, "RELAY_CH", 0),    "DORIS_RELAY_CH")
 assert(param:add_param(73, 20, "INJ_LEAK", 0),    "DORIS_INJ_LEAK")
@@ -159,6 +181,11 @@ assert(param:add_param(73, 38, "TL_PST_S", 1),    "DORIS_TL_PST_S")
 -- depth every sample must stay under, SRF_SEC how long it must hold.
 assert(param:add_param(73, 39, "SRF_DPT", 1.5),  "DORIS_SRF_DPT")
 assert(param:add_param(73, 40, "SRF_SEC", 30),   "DORIS_SRF_SEC")
+-- Stuck-on-bottom guard: minimum rise (m) above the deepest recorded depth
+-- required to count as "ascending" once the DORIS_BRN_MIN burn has elapsed.
+-- Below this after the full burn -> release failed / stuck -> RECOVERY (AGT
+-- shutdown).
+assert(param:add_param(73, 41, "STK_RISE", 2.0), "DORIS_STK_RISE")
 
 
 -- Parameter handles live in one table rather than in a local apiece.
@@ -184,7 +211,6 @@ local prm = {
     PRF_ID   = Parameter("DORIS_PRF_ID"),
     UPL_DATE = Parameter("DORIS_UPL_DATE"),
     UPL_TIME = Parameter("DORIS_UPL_TIME"),
-    MIN_VOLT = Parameter("DORIS_MIN_VOLT"),
     RELAY_CH = Parameter("DORIS_RELAY_CH"),
     INJ_LEAK = Parameter("DORIS_INJ_LEAK"),
     MAX_DPTH = Parameter("DORIS_MAX_DPTH"),
@@ -196,6 +222,7 @@ local prm = {
     ASC_AVG  = Parameter("DORIS_ASC_AVG"),
     SRF_DPT  = Parameter("DORIS_SRF_DPT"),
     SRF_SEC  = Parameter("DORIS_SRF_SEC"),
+    STK_RISE = Parameter("DORIS_STK_RISE"),
 }
 
 -- GPS self-heal: reboot up to 2 times if the GPS driver never receives
@@ -241,7 +268,10 @@ param:set_and_save("FS_TERRAIN_ENAB", 0) -- not using terrain data
 param:set_and_save("FS_LEAK_ENABLE", 1)  -- warn only; script handles response
 param:set_and_save("FS_PRESS_ENABLE", 1) -- warn only; script treats as leak
 param:set_and_save("FS_TEMP_ENABLE", 1)  -- warn only; logged for telemetry
-param:set_and_save("BATT_FS_LOW_ACT", 0) -- script monitors voltage directly
+-- Battery: keep ArduPilot's own failsafe actions off (no lander-appropriate
+-- action exists); the script reads BATT_ARM_VOLT / BATT_LOW_VOLT /
+-- BATT_CRT_VOLT (+ BATT_LOW_TIMER) itself and releases the weight.
+param:set_and_save("BATT_FS_LOW_ACT", 0)
 param:set_and_save("BATT_FS_CRT_ACT", 0)
 
 -- Lights: ensure servo output 13 passes through RC input channel 9.
@@ -329,6 +359,13 @@ local relay_active       = false
 
 -- in-mission failsafe state
 local leak_detected = false
+
+-- Battery failsafe tracking (native ArduPilot BATT_* thresholds).
+--   crit_since_ms: when the resting voltage first fell below BATT_CRT_VOLT;
+--                  release only fires once it holds for BATT_LOW_TIMER seconds.
+--   warned:        latched true after the one-shot BATT_LOW_VOLT warning, so
+--                  the advisory does not repeat every cycle.
+local batt_fs = { crit_since_ms = 0, warned = false }
 
 -- light interval state
 local light_on       = true
@@ -559,11 +596,6 @@ local function validate_profile()
         return false, "BTM_TIM must be > 0"
     end
 
-    local min_v = prm.MIN_VOLT:get() or 0
-    if min_v < 10.0 or min_v > 25.0 then
-        return false, string.format("MIN_VOLT %.1f out of range 10-25", min_v)
-    end
-
     local brt = prm.LGT_BRT:get() or 0
     if brt < 0 or brt > 100 then
         return false, string.format("LGT_BRT %.0f out of range 0-100", brt)
@@ -583,7 +615,24 @@ local function update_profile_auth(auth_id)
     end
 end
 
-local function check_failsafes()
+-- Sag-compensated pack voltage for the failsafe/arming tiers.  Voltage droops
+-- under load (lights, relay inrush), so comparing raw voltage risks a false
+-- release on a transient sag; the resting estimate is what BATT_FS_VOLTSRC=1
+-- would use.  Falls back to the loaded voltage if the estimate is unavailable.
+-- Returns nil when there is no plausible reading (<= 1 V), so callers can tell
+-- "battery genuinely low" apart from "no monitor / bogus 0 V".
+local function batt_fs_voltage()
+    local v = battery:voltage_resting_estimate(0)
+    if not v or v <= 1.0 then
+        v = battery:voltage(0)
+    end
+    if not v or v <= 1.0 then
+        return nil
+    end
+    return v
+end
+
+local function check_failsafes(now_ms)
     if state == STATE_CONFIG or state == STATE_ASCENT or state == STATE_RECOVERY then
         return false
     end
@@ -596,13 +645,51 @@ local function check_failsafes()
         return true
     end
 
-    local min_volt = prm.MIN_VOLT:get() or 14.0
-    if batt_voltage > 1.0 and batt_voltage < min_volt then
-        gcs:send_text(MAV_SEVERITY.CRITICAL,
-            string.format("DIVE: FAILSAFE low battery %.1fV < %.1fV, releasing weight",
-                batt_voltage, min_volt))
-        activate_relay()
-        return true
+    -- Battery tiers use ArduPilot's native BATT_* thresholds against the
+    -- sag-compensated resting voltage.  BATT_LOW_VOLT is advisory only; only
+    -- BATT_CRT_VOLT, held for BATT_LOW_TIMER seconds, releases the weight.
+    local v = batt_fs_voltage()
+    if v then
+        local low_volt = param:get("BATT_LOW_VOLT") or 0
+        if low_volt > 0 then
+            if v < low_volt and not batt_fs.warned then
+                batt_fs.warned = true
+                gcs:send_text(MAV_SEVERITY.WARNING,
+                    string.format("DIVE: WARNING low battery %.2fV < %.2fV",
+                        v, low_volt))
+            elseif v >= low_volt + 0.2 and batt_fs.warned then
+                batt_fs.warned = false
+            end
+        end
+
+        local crt_volt = param:get("BATT_CRT_VOLT") or 0
+        if crt_volt > 0 and v < crt_volt then
+            if batt_fs.crit_since_ms == 0 then
+                batt_fs.crit_since_ms = now_ms
+                gcs:send_text(MAV_SEVERITY.CRITICAL,
+                    string.format(
+                        "DIVE: critical battery %.2fV < %.2fV, confirming for %ds",
+                        v, crt_volt,
+                        math.floor(param:get("BATT_LOW_TIMER") or 10)))
+            else
+                local timer_ms = (param:get("BATT_LOW_TIMER") or 10) * 1000
+                if now_ms - batt_fs.crit_since_ms >= timer_ms then
+                    gcs:send_text(MAV_SEVERITY.CRITICAL,
+                        string.format(
+                            "DIVE: FAILSAFE low battery %.2fV < %.2fV for %ds, releasing weight",
+                            v, crt_volt, math.floor(timer_ms / 1000)))
+                    activate_relay()
+                    return true
+                end
+            end
+        elseif batt_fs.crit_since_ms ~= 0 then
+            -- Recovered above the critical threshold before the debounce
+            -- elapsed (or a transient sag): reset the confirmation timer.
+            gcs:send_text(MAV_SEVERITY.INFO,
+                string.format("DIVE: battery recovered %.2fV, critical timer reset",
+                    v))
+            batt_fs.crit_since_ms = 0
+        end
     end
 
     local max_depth = prm.MAX_DPTH:get() or 6100
@@ -776,6 +863,8 @@ local function update_telemetry(now_ms)
     gcs:send_named_float('BATT_PCT', telem.batt_pct)
     gcs:send_named_float('MSN_TIME', mission_time_s)
     gcs:send_named_float('RELAY',    relay_active and 1 or 0)
+    -- Battery warning tier (BATT_LOW_VOLT): 1 while the advisory is latched.
+    gcs:send_named_float('BATT_WARN', batt_fs.warned and 1 or 0)
     local ar_avg = get_ring_avg(ar) or 0
     gcs:send_named_float('ASC_VEL',  ar_avg)
 
@@ -1095,17 +1184,26 @@ function update()
 
         if prm.START:get() >= 1 then
             -- Surface pre-arm checks
-            local min_volt = prm.MIN_VOLT:get() or 14.0
+            -- Arming voltage tier: native BATT_ARM_VOLT against the
+            -- sag-compensated resting voltage.  0 (ArduPilot default) disables
+            -- the gate, so treat non-positive as "no arm-voltage requirement".
+            local arm_volt = param:get("BATT_ARM_VOLT") or 0
+            local arm_v = batt_fs_voltage() or 0
             local gps_ok = false
             local gps_stat = gps:status(0)
             if gps_stat and gps_stat >= 3 then
                 gps_ok = true
             end
-            local batt_ok = batt_voltage >= min_volt
+            local batt_ok = arm_volt <= 0 or arm_v >= arm_volt
+            -- Low-voltage cutoff must be armed before a mission can start.
+            -- The in-mission critical release (check_failsafes) only fires when
+            -- BATT_CRT_VOLT > 0; leaving it at 0 silently disables the sole
+            -- software low-voltage protection, so refuse to arm until it is set.
+            local crt_ok = (param:get("BATT_CRT_VOLT") or 0) > 0
             local leak_ok = not check_leak()
             local profile_ok, profile_reason = validate_profile()
 
-            if gps_ok and batt_ok and leak_ok and profile_ok then
+            if gps_ok and batt_ok and crt_ok and leak_ok and profile_ok then
                 prearm_passed = true
                 gps_reboot_attempted = true
                 prm.GPS_RBT:set_and_save(0)
@@ -1114,7 +1212,7 @@ function update()
                 local prf_id = prm.PRF_ID:get() or 0
                 gcs:send_text(MAV_SEVERITY.INFO,
                     string.format("DIVE: Pre-arm PASSED (GPS %d sats, %.1fV, profile #%d, Pref=%.0fPa)",
-                        num_sats, batt_voltage, prf_id, surface_pressure))
+                        num_sats, arm_v, prf_id, surface_pressure))
                 snapshot_config()
                 vehicle:set_mode(19)
                 armed_once          = false
@@ -1134,7 +1232,10 @@ function update()
                     if not gps_ok then reasons[#reasons + 1] = "GPS" end
                     if not batt_ok then
                         reasons[#reasons + 1] = string.format("BATT(%.1fV<%.1fV)",
-                            batt_voltage, min_volt)
+                            arm_v, arm_volt)
+                    end
+                    if not crt_ok then
+                        reasons[#reasons + 1] = "LVCO-OFF(set BATT_CRT_VOLT>0)"
                     end
                     if not leak_ok then reasons[#reasons + 1] = "LEAK" end
                     if not profile_ok then
@@ -1150,7 +1251,7 @@ function update()
 
     -- ??????????????? MISSION_START (arm + depth gate) ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
     elseif state == STATE_MISSION_START then
-        if check_failsafes() then
+        if check_failsafes(now_ms) then
             ascent_start_ms = now_ms
             init_ascent_rings()
             reset_light_cycle(now_ms)
@@ -1209,7 +1310,7 @@ function update()
 
     -- ??????????????? DESCENT ???????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
     elseif state == STATE_DESCENT then
-        if check_failsafes() then
+        if check_failsafes(now_ms) then
             ascent_start_ms = now_ms
             init_ascent_rings()
             reset_light_cycle(now_ms)
@@ -1282,7 +1383,7 @@ function update()
 
     -- ??????????????? ON_BOTTOM ?????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
     elseif state == STATE_ON_BOTTOM then
-        if check_failsafes() then
+        if check_failsafes(now_ms) then
             ascent_start_ms = now_ms
             init_ascent_rings()
             reset_light_cycle(now_ms)
@@ -1579,6 +1680,17 @@ function update()
         -- confirms sustained ascent over DORIS_ASC_AVG seconds (default 120s).
         -- This replaces the old depth-based check which was vulnerable to
         -- single-sample baro glitches that caused premature relay deactivation.
+        --
+        -- DORIS_BRN_MIN is also the max release time: once the full burn has
+        -- elapsed the release has either worked (sustained ascent -> relay off
+        -- below) or it has not.  If it has not -- no sustained upward velocity
+        -- and the vehicle has not risen DORIS_STK_RISE m above its deepest
+        -- depth -- the drop-weight never freed us (mechanical failure or stuck
+        -- on the bottom).  Holding the relay on past that only burns battery,
+        -- so cut the relay and break to RECOVERY (STATE=4) on the same terminal
+        -- path as a normal surfacing; publishing STATE=4 is the AGT's surface
+        -- authority, so its shutdown handshake powers the Pi off and conserves
+        -- the battery.
         if relay_active then
             local vel = ahrs:get_velocity_NED()
             if vel then
@@ -1590,12 +1702,35 @@ function update()
             if burn_elapsed >= brn_min_ms then
                 local avg = get_ring_avg(ar)
                 local thr = (prm.ASC_THR:get() or 10) / 100.0
-                if avg and ar.count >= ar.size and avg >= thr then
-                    gcs:send_text(MAV_SEVERITY.INFO,
-                        string.format(
-                            "DIVE: sustained ascent %.3f m/s > %.3f thr (%ds window), relay off",
-                            avg, thr, ar.size * UPDATE_INTERVAL_MS / 1000))
-                    deactivate_relay()
+                if avg and ar.count >= ar.size then
+                    if avg >= thr then
+                        gcs:send_text(MAV_SEVERITY.INFO,
+                            string.format(
+                                "DIVE: sustained ascent %.3f m/s > %.3f thr (%ds window), relay off",
+                                avg, thr, ar.size * UPDATE_INTERVAL_MS / 1000))
+                        deactivate_relay()
+                    else
+                        -- Max release time elapsed with no sustained ascent.
+                        -- telem.max_depth is the deepest point reached, so
+                        -- (max_depth - current depth) is how far we have risen
+                        -- off the bottom; near zero means the release failed.
+                        -- Break to RECOVERY (STATE=4) exactly like a normal
+                        -- surfacing: the AGT treats a fresh STATE=4 as surface
+                        -- authority and runs its shutdown handshake, powering
+                        -- the Pi off to conserve the battery.
+                        local rise_min = prm.STK_RISE:get() or 2.0
+                        local risen = telem.max_depth - (get_depth_m() or telem.max_depth)
+                        if risen < rise_min then
+                            gcs:send_text(MAV_SEVERITY.CRITICAL,
+                                string.format(
+                                    "DIVE: STUCK on bottom - no ascent (%.3f m/s, risen %.1fm < %.1fm) after %ds burn. Relay OFF, entering RECOVERY for AGT shutdown",
+                                    avg, risen, rise_min, math.floor(brn_min_ms / 1000)))
+                            deactivate_relay()
+                            ipcam_stop()
+                            state = STATE_RECOVERY
+                            return update, UPDATE_INTERVAL_MS
+                        end
+                    end
                 end
             end
         end
