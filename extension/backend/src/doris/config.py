@@ -42,6 +42,19 @@ class Settings(BaseSettings):
     nmea_injector_port: int = 2748
     recorder_extractor_port: int = 9150
 
+    # RadCam manager ("4K Cam Manager") extension. It listens on 8080 inside
+    # its own container and BlueOS publishes it on a *random* host port, so a
+    # direct host.docker.internal:<port> is not stable. Instead reach it via
+    # the blueos-core nginx reverse proxy, which exposes every extension at a
+    # fixed path on port 80 and rewrites the upstream port on each restart:
+    #     http://host.docker.internal/extensionv2/<slug>/...
+    # The slug is the extension name with non-alphanumerics stripped
+    # (identifier ``bluerobotics.radcam-manager`` -> ``radcammanager``). Update
+    # ``br4kcam_extension_slug`` (or set DORIS_BR4KCAM_URL outright) if the
+    # extension is renamed.
+    br4kcam_extension_slug: str = os.environ.get("DORIS_BR4KCAM_SLUG", "radcammanager")
+    br4kcam_url: str = os.environ.get("DORIS_BR4KCAM_URL", "")
+
     # IP camera recorder (RTSP -> segmented MPEG-TS via gst-launch; URL is hardcoded in service)
     ipcam_recordings_subdir: str = "userdata/ipcam_recordings"
     ipcam_segment_seconds_default: int = 1800
@@ -152,6 +165,20 @@ class BlueOSServices:
     @property
     def radcam_spy(self) -> str:
         return self._url(settings.radcam_spy_port)
+
+    @property
+    def br4kcam(self) -> str:
+        """Base URL of the RadCam manager extension REST API.
+
+        Prefers the explicit DORIS_BR4KCAM_URL override; otherwise routes
+        through the blueos-core nginx extension proxy at
+        ``<blueos_address>/extensionv2/<slug>`` (port 80), which is stable
+        across manager restarts.
+        """
+        if settings.br4kcam_url:
+            return settings.br4kcam_url.rstrip("/")
+        base = settings.blueos_address.rstrip("/")
+        return f"{base}/extensionv2/{settings.br4kcam_extension_slug}"
 
 
 blueos_services = BlueOSServices()

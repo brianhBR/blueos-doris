@@ -4,6 +4,7 @@ from .arming import register_arming_routes
 from .artemis import register_artemis_routes
 from .attitude import register_attitude_routes
 from .blueos import register_blueos_routes
+from .camera import register_camera_routes
 from .configurations import register_configuration_routes
 from .dive import register_dive_routes
 from .frame import register_frame_routes
@@ -21,6 +22,7 @@ __all__ = [
     "register_artemis_routes",
     "register_attitude_routes",
     "register_blueos_routes",
+    "register_camera_routes",
     "register_system_routes",
     "register_log_routes",
     "register_network_routes",

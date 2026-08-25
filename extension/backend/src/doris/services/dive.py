@@ -172,6 +172,8 @@ class DiveService:
             ("DORIS_LGT_BRT", float(config.bottom.light.brightness)),
             ("DORIS_BTM_DLY", round(btm_light_dly_s)),
             ("DORIS_CAM_DLY", round(btm_cam_dly_s)),
+            # One-push auto white balance after the bottom lights come on.
+            ("DORIS_BTM_AWB", 1.0 if config.bottom.auto_white_balance else 0.0),
             ("DORIS_PRF_ID", float(profile_id)),
             ("DORIS_UPL_DATE", upload_date),
             ("DORIS_UPL_TIME", upload_time),
@@ -237,6 +239,15 @@ class DiveService:
             if not params_ok:
                 logger.warning("Some config params failed to set, proceeding anyway")
             await asyncio.sleep(0.2)
+
+        # Re-apply the active camera preset so the RadCam starts each dive in a
+        # deterministic state.  Best-effort: never blocks or aborts the dive.
+        try:
+            from .camera_presets import apply_active_preset_best_effort
+
+            await apply_active_preset_best_effort(logger)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Active camera preset apply at dive start skipped: %s", e)
 
         ok = await self._set_param(PARAM_NAME, 1.0)
         if ok:

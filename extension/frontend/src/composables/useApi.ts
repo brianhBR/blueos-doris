@@ -300,16 +300,16 @@ export interface CameraSettings {
   // the load path falls back to (2 s pre, 1 s post) defaults.
   timelapse_light_pre?: TimeValue
   timelapse_light_post?: TimeValue
-  resolution: string
-  image_type: string
-  file_format: string
-  video_file_format: string
-  frame_rate: number
-  focus: string
-  iso: string
-  white_balance: string
-  exposure: string
-  sharpness: string
+  // Image/video *quality* now lives in the global camera preset
+  // (see CameraPreset / usePresets). These per-phase fields are retained
+  // only for backward-compat with older saved configurations and are not
+  // applied to hardware. focus and file-format fields were removed.
+  resolution?: string
+  frame_rate?: number
+  iso?: string
+  white_balance?: string
+  exposure?: string
+  sharpness?: string
   sleep_timer_enabled: boolean
   sleep_timer: TimeValue
 }
@@ -333,6 +333,7 @@ export interface BottomPhase {
   camera_delay: TimeValue
   light: LightSettings
   light_delay: TimeValue
+  auto_white_balance?: boolean
 }
 
 export interface ReleaseWeight {
@@ -374,6 +375,65 @@ export interface ConfigurationSummary {
   updated_at: string
 }
 
+// ── Camera settings + preset types ──────────────────────────────────
+//
+// Field names mirror the camera's native protocol keys (as forwarded by
+// the br4kcam-manager), so a preset re-applies verbatim. Every field is
+// optional: reads return whatever the camera reports, writes send only
+// the keys you set. base/advanced are intentionally open maps so the
+// experimental Advanced panel can expose the full setting surface.
+
+export interface VideoResolution {
+  width: number
+  height: number
+}
+
+export interface CameraVideoSettings {
+  channel?: number
+  encode_profile?: number
+  /** 1 = H.264, 5 = H.265 */
+  encode_type?: number
+  /** Supported resolutions (read-only). */
+  pixel_list?: VideoResolution[]
+  pic_width?: number
+  pic_height?: number
+  /** 0 = VBR, 1 = CBR */
+  rc_mode?: number
+  bitrate?: number
+  /** Read-only. */
+  max_framerate?: number
+  frame_rate?: number
+  gop?: number
+}
+
+export type CameraBaseSettings = Record<string, number | undefined>
+export type CameraAdvancedSettings = Record<string, number | undefined>
+
+export interface CameraSettingsBundle {
+  video: CameraVideoSettings
+  base: CameraBaseSettings
+  advanced: CameraAdvancedSettings
+}
+
+export interface CameraPreset extends CameraSettingsBundle {
+  name: string
+  camera_model?: string
+  created_at?: string
+  updated_at?: string
+}
+
+export interface CameraPresetSummary {
+  name: string
+  camera_model: string
+  created_at: string
+  updated_at: string
+}
+
+export interface ActivePreset {
+  name: string | null
+  updated_at: string
+}
+
 // ── HTTP helpers ────────────────────────────────────────────────────
 
 async function fetchApi<T>(endpoint: string, params?: Record<string, string>): Promise<T> {
@@ -403,6 +463,25 @@ async function postApi<T>(endpoint: string, body?: unknown): Promise<T> {
   } finally {
     clearTimeout(timeout)
   }
+  if (!response.ok) {
+    let detail = `${response.status} ${response.statusText}`
+    try {
+      const errBody = await response.json() as { error?: string }
+      if (errBody?.error) detail = errBody.error
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new Error(`API error: ${detail}`)
+  }
+  return response.json()
+}
+
+async function putApi<T>(endpoint: string, body?: unknown): Promise<T> {
+  const response = await fetch(`${API_BASE}${endpoint}`, {
+    method: 'PUT',
+    headers: body ? { 'Content-Type': 'application/json' } : {},
+    body: body ? JSON.stringify(body) : undefined,
+  })
   if (!response.ok) {
     let detail = `${response.status} ${response.statusText}`
     try {
@@ -1303,6 +1382,242 @@ export function useConfigurations() {
     saveConfiguration,
     deleteConfiguration,
     clearError,
+  }
+}
+
+// ── Camera settings + preset composables ────────────────────────────
+
+/**
+ * Live RadCam settings via the br4kcam-manager proxy. Reads/writes the
+ * full video + base + advanced setting surface (experimental).
+ */
+export function useCameraSettings() {
+  const settings = ref<CameraSettingsBundle | null>(null)
+  const loading = ref(false)
+  const applying = ref(false)
+  const error = ref<string | null>(null)
+
+  async function fetchSettings(): Promise<CameraSettingsBundle | null> {
+    loading.value = true
+    error.value = null
+    try {
+      settings.value = await fetchApi<CameraSettingsBundle>('/camera/settings')
+      return settings.value
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to read camera settings'
+      return null
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function applySettings(
+    bundle: Partial<CameraSettingsBundle>,
+  ): Promise<CameraSettingsBundle | null> {
+    applying.value = true
+    error.value = null
+    try {
+      const fresh = await postApi<CameraSettingsBundle>('/camera/settings', bundle)
+      settings.value = fresh
+      return fresh
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to apply camera settings'
+      return null
+    } finally {
+      applying.value = false
+    }
+  }
+
+  async function applyRecommended(): Promise<boolean> {
+    applying.value = true
+    error.value = null
+    try {
+      await postApi('/camera/settings/recommended')
+      await fetchSettings()
+      return true
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to apply recommended settings'
+      return false
+    } finally {
+      applying.value = false
+    }
+  }
+
+  async function restartCamera(): Promise<boolean> {
+    try {
+      await postApi('/camera/restart')
+      return true
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to restart camera'
+      return false
+    }
+  }
+
+  return {
+    settings: readonly(settings),
+    loading: readonly(loading),
+    applying: readonly(applying),
+    error: readonly(error),
+    fetchSettings,
+    applySettings,
+    applyRecommended,
+    restartCamera,
+  }
+}
+
+/**
+ * Camera preset library: named, downloadable/importable setting bundles
+ * persisted on the vehicle, plus the "active" preset auto-applied at
+ * startup and dive start.
+ */
+export function usePresets() {
+  const presets = ref<CameraPresetSummary[]>([])
+  const activePreset = ref<ActivePreset | null>(null)
+  const loading = ref(false)
+  const error = ref<string | null>(null)
+
+  async function fetchPresets() {
+    loading.value = true
+    error.value = null
+    try {
+      presets.value = await fetchApi<CameraPresetSummary[]>('/camera/presets')
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to fetch presets'
+    } finally {
+      loading.value = false
+    }
+  }
+
+  async function getPreset(name: string): Promise<CameraPreset | null> {
+    try {
+      return await fetchApi<CameraPreset>(`/camera/presets/${encodeURIComponent(name)}`)
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to load preset'
+      return null
+    }
+  }
+
+  async function savePreset(preset: CameraPreset): Promise<CameraPreset | null> {
+    try {
+      const saved = await postApi<CameraPreset>('/camera/presets', preset)
+      await fetchPresets()
+      return saved
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to save preset'
+      return null
+    }
+  }
+
+  /** Create a preset from the camera's current live settings. */
+  async function snapshotPreset(name: string): Promise<CameraPreset | null> {
+    try {
+      const saved = await postApi<CameraPreset>('/camera/presets', { name, snapshot: true })
+      await fetchPresets()
+      return saved
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to snapshot camera'
+      return null
+    }
+  }
+
+  async function updatePreset(
+    name: string,
+    bundle: Partial<CameraSettingsBundle>,
+  ): Promise<CameraPreset | null> {
+    try {
+      const saved = await putApi<CameraPreset>(
+        `/camera/presets/${encodeURIComponent(name)}`,
+        bundle,
+      )
+      await fetchPresets()
+      return saved
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to update preset'
+      return null
+    }
+  }
+
+  async function deletePreset(name: string): Promise<boolean> {
+    try {
+      await deleteApi(`/camera/presets/${encodeURIComponent(name)}`)
+      presets.value = presets.value.filter(p => p.name !== name)
+      return true
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to delete preset'
+      return false
+    }
+  }
+
+  async function applyPreset(name: string): Promise<CameraSettingsBundle | null> {
+    try {
+      return await postApi<CameraSettingsBundle>(
+        `/camera/presets/${encodeURIComponent(name)}/apply`,
+      )
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to apply preset'
+      return null
+    }
+  }
+
+  /** Trigger a browser download of the preset JSON file. */
+  function downloadPreset(name: string) {
+    const url = `${API_BASE}/camera/presets/${encodeURIComponent(name)}/download`
+    const a = document.createElement('a')
+    a.href = url
+    a.download = ''
+    document.body.appendChild(a)
+    a.click()
+    a.remove()
+  }
+
+  /** Import a preset from a user-selected JSON file. */
+  async function importPreset(file: File): Promise<CameraPreset | null> {
+    try {
+      const text = await file.text()
+      const parsed = JSON.parse(text)
+      const saved = await postApi<CameraPreset>('/camera/presets/import', parsed)
+      await fetchPresets()
+      return saved
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to import preset'
+      return null
+    }
+  }
+
+  async function fetchActivePreset() {
+    try {
+      activePreset.value = await fetchApi<ActivePreset>('/camera/active-preset')
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to fetch active preset'
+    }
+  }
+
+  async function setActivePreset(name: string | null): Promise<boolean> {
+    try {
+      activePreset.value = await putApi<ActivePreset>('/camera/active-preset', { name })
+      return true
+    } catch (e) {
+      error.value = e instanceof Error ? e.message : 'Failed to set active preset'
+      return false
+    }
+  }
+
+  return {
+    presets: readonly(presets),
+    activePreset: readonly(activePreset),
+    loading: readonly(loading),
+    error: readonly(error),
+    fetchPresets,
+    getPreset,
+    savePreset,
+    snapshotPreset,
+    updatePreset,
+    deletePreset,
+    applyPreset,
+    downloadPreset,
+    importPreset,
+    fetchActivePreset,
+    setActivePreset,
   }
 }
 
