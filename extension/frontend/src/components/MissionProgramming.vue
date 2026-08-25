@@ -1374,7 +1374,7 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                 <div class="pr-4">
                   <label class="block text-sm" style="color: #96EEF2">Auto White Balance on Lights</label>
                   <p class="text-xs mt-1 opacity-70" style="color: #96EEF2">
-                    Fires a one-time white balance a couple seconds after the descent lights turn on, so colors are calibrated for the lit scene. Requires the descent light to be enabled.
+                    Fires a one-time white balance a couple seconds after the descent lights turn on, so colors are calibrated for the lit scene. If the descent light is off, it runs immediately when descent begins.
                   </p>
                 </div>
                 <label class="relative inline-flex items-center cursor-pointer flex-shrink-0">
@@ -1598,7 +1598,7 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                 <div class="pr-4">
                   <label class="block text-sm" style="color: #96EEF2">Auto White Balance on Lights</label>
                   <p class="text-xs mt-1 opacity-70" style="color: #96EEF2">
-                    Fires a one-time white balance a couple seconds after the bottom lights turn on, so colors are calibrated for the lit scene. Requires the bottom light to be enabled.
+                    Fires a one-time white balance a couple seconds after the bottom lights turn on, so colors are calibrated for the lit scene. If the bottom light is off, it runs immediately when the vehicle reaches the bottom.
                   </p>
                 </div>
                 <label class="relative inline-flex items-center cursor-pointer flex-shrink-0">
@@ -1854,7 +1854,7 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                   <div class="pr-4">
                     <label class="block text-sm" style="color: #96EEF2">Auto White Balance on Lights</label>
                     <p class="text-xs mt-1 opacity-70" style="color: #96EEF2">
-                      Fires a one-time white balance a couple seconds after the ascent lights turn on, so colors are calibrated for the lit scene. Requires the ascent light to be enabled.
+                      Fires a one-time white balance a couple seconds after the ascent lights turn on, so colors are calibrated for the lit scene. If the ascent light is off, it runs immediately when ascent begins.
                     </p>
                   </div>
                   <label class="relative inline-flex items-center cursor-pointer flex-shrink-0">

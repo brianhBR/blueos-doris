@@ -917,13 +917,21 @@ local function ipcam_http_awb(host, port)
     return ipcam_http_send("POST /rec/awb", host, port)
 end
 
--- One-push AWB for descent/ascent: fire a single AWB command AWB_SETTLE_MS
--- after this phase's lights are actually on, so white balance converges
--- against the lit scene.  ``anchor_ms`` records when the lights were first
--- seen on; returns the updated (done, anchor_ms) so the caller can persist
--- the one-shot state across ticks.
-local function phase_awb_tick(awb_en, lights_on, done, anchor_ms, now_ms, phase_name)
-    if awb_en and lights_on and not done then
+-- One-push AWB for a dive phase, fired once.  When this phase's lights are
+-- enabled, wait AWB_SETTLE_MS after they are actually on so white balance
+-- converges against the lit scene.  When the lights are disabled there is
+-- nothing to wait for, so calibrate immediately against ambient light.
+-- ``anchor_ms`` records when the lights were first seen on; returns the
+-- updated (done, anchor_ms) so the caller can persist the one-shot state.
+local function phase_awb_tick(awb_en, lights_enabled, lights_on, done, anchor_ms, now_ms, phase_name)
+    if not awb_en or done then return done, anchor_ms end
+    if not lights_enabled then
+        ipcam_http_awb("127.0.0.1", 8095)
+        done = true
+        gcs:send_text(MAV_SEVERITY.INFO,
+            string.format("DIVE: %s AWB (no lights), triggered auto white balance",
+                phase_name))
+    elseif lights_on then
         if anchor_ms == 0 then
             anchor_ms = now_ms
         elseif now_ms - anchor_ms >= AWB_SETTLE_MS then
@@ -1289,9 +1297,10 @@ function update()
 
         update_lights(cfg.dsc_lgt, now_ms)
 
-        -- One-push AWB a short settle after the descent lights come on.
+        -- One-push AWB: a short settle after the descent lights come on, or
+        -- immediately if descent lights are disabled.
         dsc_awb_done, dsc_lgt_on_ms = phase_awb_tick(
-            cfg.dsc_awb, cfg.dsc_lgt and light_on,
+            cfg.dsc_awb, cfg.dsc_lgt, light_on,
             dsc_awb_done, dsc_lgt_on_ms, now_ms, "descent")
 
         local elapsed = now_ms - dive_start_ms
@@ -1443,20 +1452,14 @@ function update()
         end
         update_lights(lights_cmd, now_ms)
 
-        -- One-push auto white balance: once per bottom visit, a short settle
-        -- after the bottom lights are first commanded on, so the camera's AWB
-        -- converges against the lit scene rather than ambient light.  Needs
-        -- both the bottom lights enabled and the operator's AWB toggle set.
-        if cfg.btm_awb and cfg.btm_lgt and not btm_awb_done and lights_cmd then
-            if btm_lgt_on_ms == 0 then
-                btm_lgt_on_ms = now_ms
-            elseif now_ms - btm_lgt_on_ms >= AWB_SETTLE_MS then
-                ipcam_http_awb("127.0.0.1", 8095)
-                btm_awb_done = true
-                gcs:send_text(MAV_SEVERITY.INFO,
-                    "DIVE: bottom lights on, triggered auto white balance")
-            end
-        end
+        -- One-push auto white balance: once per bottom visit.  With bottom
+        -- lights enabled it waits a short settle after they are first
+        -- commanded on so the camera's AWB converges against the lit scene;
+        -- with bottom lights disabled there is nothing to wait for, so it
+        -- calibrates immediately against ambient light.
+        btm_awb_done, btm_lgt_on_ms = phase_awb_tick(
+            cfg.btm_awb, cfg.btm_lgt, lights_cmd,
+            btm_awb_done, btm_lgt_on_ms, now_ms, "bottom")
 
         -- Bottom camera dispatcher: OFF / CONTINUOUS / VIDEO_INTERVAL / TIMELAPSE
         if ipcam_cfg.btm_cmod == 0 then
@@ -1665,9 +1668,10 @@ function update()
 
         update_lights(cfg.asc_lgt, now_ms)
 
-        -- One-push AWB a short settle after the ascent lights come on.
+        -- One-push AWB: a short settle after the ascent lights come on, or
+        -- immediately if ascent lights are disabled.
         asc_awb_done, asc_lgt_on_ms = phase_awb_tick(
-            cfg.asc_awb, cfg.asc_lgt and light_on,
+            cfg.asc_awb, cfg.asc_lgt, light_on,
             asc_awb_done, asc_lgt_on_ms, now_ms, "ascent")
 
         -- Relay stays on for at least DORIS_BRN_MIN seconds (default 2 hrs).
