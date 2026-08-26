@@ -50,12 +50,12 @@ const shutterOpts = (extra: number[] = []): CameraFieldOption[] =>
   [...SHUTTER, ...extra].map(v => ({ value: v, label: `1/${v} s` }))
 
 export const CAMERA_BASE_SCHEMA: Record<string, CameraFieldMeta> = {
-  // Tone & colour
-  hue: range('Hue', 'Colour tint / shift.'),
+  // Tone & color
+  hue: range('Hue', 'Color tint / shift.'),
   brightness: range('Brightness', 'Overall image lightness.'),
   sharpness: range('Sharpness', 'Edge enhancement / apparent detail.'),
   contrast: range('Contrast', 'Difference between light and dark areas.'),
-  saturation: range('Saturation', 'Colour intensity.'),
+  saturation: range('Saturation', 'Color intensity.'),
   gamma: range('Gamma', 'Midtone response / tone-curve shape.'),
   // Exposure
   blc_level: range('Backlight Compensation', 'Brightens a subject lit from behind.'),
@@ -63,7 +63,7 @@ export const CAMERA_BASE_SCHEMA: Record<string, CameraFieldMeta> = {
   auto_exposureEx: options('Auto Exposure Mode', [
     { value: 0, label: 'Auto' }, { value: 1, label: 'Manual' },
   ]),
-  AE_strategy_mode: options('AE Strategy', [
+  AE_strategy_mode: options('Exposure Strategy', [
     { value: 0, label: 'Highlight priority' }, { value: 1, label: 'Lowlight priority' },
   ], 'Metering priority in auto exposure.'),
   exposure_time: options('Manual Exposure Time', shutterOpts([10000, 34464]),
@@ -124,7 +124,7 @@ export const CAMERA_ADVANCED_SCHEMA: Record<string, CameraFieldMeta> = {
     { value: 0, label: 'Low' }, { value: 1, label: 'Middle' }, { value: 2, label: 'High' },
   ], 'Spatial (single-frame) noise reduction.'),
   // Shutter & flicker
-  low_farme_rate: enableCloseZero('Slow Shutter', 'Enable slow shutter for low-light scenes.'),
+  low_farme_rate: enableCloseZero('Slow Shutter Mode', 'Enable slow shutter for low-light scenes.'),
   anti_flicker: options('Anti-Flicker', [
     { value: 0, label: 'Off' }, { value: 1, label: 'Auto' }, { value: 2, label: '50 Hz' }, { value: 3, label: '60 Hz' },
   ], 'Reduces flicker under artificial light.'),
@@ -177,7 +177,7 @@ const V = (key: string): CameraSectionField => ({ key, group: 'video' })
 
 export const CAMERA_SECTIONS: CameraSectionDef[] = [
   {
-    title: 'Image Tone & Colour',
+    title: 'Image Tone & Color',
     fields: [B('brightness'), B('contrast'), B('saturation'), B('sharpness'), B('hue'), B('gamma')],
   },
   {

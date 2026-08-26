@@ -20,6 +20,7 @@ import {
   type LightMode,
 } from '../lib/powerModel'
 import { cameraFieldMeta, CAMERA_SECTIONS, CAMERA_SECTION_KEYS } from '../lib/cameraSettingsSchema'
+import { estimateDataUsage, formatBytes, STILL_BYTES_PER_PIXEL } from '../lib/dataModel'
 
 const POWER = { BASE_W, CAMERA_RECORDING_W, BATTERY_CAPACITY_WH, ASCENT_BURN_MINUTES }
 
@@ -41,6 +42,8 @@ const estimatedDepth = ref('')
 const warnings = ref<string[]>([])
 const showBatteryPlanning = ref(false)
 const showBatteryBreakdown = ref(false)
+const showDataPlanning = ref(false)
+const showDataBreakdown = ref(false)
 const showSaveModal = ref(false)
 const configurationName = ref('')
 const showDeleteModal = ref(false)
@@ -225,6 +228,27 @@ const batteryData = computed(() => {
     batteryUsagePercent: estimate.usagePercent,
     diveDuration: estimate.totalHours,
     estimate,
+  }
+})
+
+// Estimated on-board storage for the planned dive, driven by the global video
+// bitrate/resolution and the per-phase camera mode (see lib/dataModel.ts).
+const dataUsage = computed(() => {
+  const bitrateKbps = Number(videoForm.value.bitrate) || 0
+  const estimate = estimateDataUsage({
+    depthM: parseFloat(estimatedDepth.value) || 0,
+    bottomTimeHours: bottomTimeHours.value,
+    descent: descentPhase.value,
+    bottom: bottomPhase.value,
+    ascent: ascentPhase.value,
+    bitrateKbps,
+    stillWidth: Number(videoForm.value.pic_width) || undefined,
+    stillHeight: Number(videoForm.value.pic_height) || undefined,
+  })
+  return {
+    estimate,
+    totalLabel: formatBytes(estimate.totalBytes),
+    bitrateMbps: bitrateKbps / 1024,
   }
 })
 
@@ -841,6 +865,34 @@ const resolutionOptions = computed(() => {
   return list.map(r => ({ value: `${r.width}x${r.height}`, label: `${r.width} × ${r.height}` }))
 })
 
+// Standard frame rates offered in the dropdown, capped to whatever the camera
+// reports as max_framerate at the current resolution.  The camera's current
+// value is always included so an out-of-list setting is never silently lost.
+const FRAME_RATE_CHOICES = [5, 10, 15, 24, 25, 30, 50, 60]
+const frameRateOptions = computed(() => {
+  const max = liveCameraSettings.value?.video.max_framerate ?? 30
+  const current = videoForm.value.frame_rate
+  const values = new Set(FRAME_RATE_CHOICES.filter(v => v <= max))
+  if (typeof current === 'number' && current > 0) values.add(current)
+  return [...values].sort((a, b) => a - b).map(v => ({ value: v, label: `${v} fps` }))
+})
+
+// Bitrate presets in kbps (the camera's unit; 1 Mbps = 1024 kbps here, matching
+// the recommended-bitrate sheet). Spans the sheet's Low/Medium/High tiers
+// (4/8/16 Mbps @ 4K) up through the ~50 Mbps we actually run at 4K. The
+// camera's current value is always kept so an out-of-list setting isn't lost.
+const BITRATE_CHOICES_KBPS = [2048, 4096, 8192, 16384, 24576, 32768, 51200, 65536]
+function bitrateLabel(kbps: number): string {
+  const mbps = kbps / 1024
+  return `${Number.isInteger(mbps) ? mbps : mbps.toFixed(1)} Mbps`
+}
+const bitrateOptions = computed(() => {
+  const current = videoForm.value.bitrate
+  const values = new Set(BITRATE_CHOICES_KBPS)
+  if (typeof current === 'number' && current > 0) values.add(current)
+  return [...values].sort((a, b) => a - b).map(v => ({ value: v, label: bitrateLabel(v) }))
+})
+
 const selectedResolution = computed({
   get: () => {
     const w = videoForm.value.pic_width
@@ -879,8 +931,8 @@ function setCameraField(f: CameraFieldRow, raw: string) {
 }
 
 // A few commonly-tuned image settings are promoted out of the Advanced editor
-// and shown in the main quality panel: Auto White Balance, AE Strategy and
-// Video Standard.  They're excluded from cameraSections below so they don't
+// and shown in the main quality panel: Auto White Balance, Exposure Strategy
+// and Video Standard.  They're excluded from cameraSections below so they don't
 // appear twice.
 const PROMOTED_CAMERA_FIELDS: { key: string; group: CameraGroup }[] = [
   { key: 'auto_awb', group: 'base' },
@@ -973,7 +1025,7 @@ async function applyRecommendedSettings() {
   cameraStatus.value = ''
   if (await applyRecommended()) {
     syncCameraForms()
-    cameraStatus.value = 'Recommended settings applied.'
+    cameraStatus.value = 'Default settings applied.'
   }
 }
 
@@ -1120,12 +1172,16 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
               </select>
             </div>
             <div>
-              <label class="block mb-2 text-sm" style="color: #96EEF2">Frame Rate (fps)</label>
-              <input type="number" min="1" v-model.number="videoForm.frame_rate" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" />
+              <label class="block mb-2 text-sm" style="color: #96EEF2">Frame Rate</label>
+              <select v-model.number="videoForm.frame_rate" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle">
+                <option v-for="opt in frameRateOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+              </select>
             </div>
             <div>
-              <label class="block mb-2 text-sm" style="color: #96EEF2">Bitrate (kbps)</label>
-              <input type="number" min="1" v-model.number="videoForm.bitrate" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle" />
+              <label class="block mb-2 text-sm" style="color: #96EEF2">Bitrate</label>
+              <select v-model.number="videoForm.bitrate" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle">
+                <option v-for="opt in bitrateOptions" :key="opt.value" :value="opt.value">{{ opt.label }}</option>
+              </select>
             </div>
             <div>
               <label class="block mb-2 text-sm" style="color: #96EEF2">Codec</label>
@@ -1134,9 +1190,9 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
               </select>
             </div>
             <div>
-              <label class="block mb-2 text-sm" style="color: #96EEF2">Rate Control</label>
+              <label class="block mb-2 text-sm" :title="'VBR lets the bitrate rise and fall with scene complexity; CBR holds it fixed for predictable file sizes.'" style="color: #96EEF2">Bitrate Mode</label>
               <select v-model.number="videoForm.rc_mode" class="w-full px-4 py-2 text-white rounded-lg focus:outline-none" :style="inputStyle">
-                <option :value="0">VBR (variable)</option><option :value="1">CBR (constant)</option>
+                <option :value="0">Variable (VBR)</option><option :value="1">Constant (CBR)</option>
               </select>
             </div>
             <div v-for="f in promotedCameraFields" :key="f.group + '-' + f.key">
@@ -1156,7 +1212,7 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
               {{ cameraLoading ? 'Reading…' : 'Query Current Settings' }}
             </button>
             <button @click="applyRecommendedSettings" :disabled="cameraApplying" class="px-4 py-2 text-white rounded-lg disabled:opacity-50" style="background-color: rgba(65, 185, 195, 0.2); border: 1px solid rgba(65, 185, 195, 0.4)">
-              Apply Recommended
+              Apply Default
             </button>
           </div>
 
@@ -2114,6 +2170,108 @@ const phaseStyle = "background-color: rgba(14, 36, 70, 0.3); border: 1px solid r
                 <p class="mb-2" style="color: #DD2C1D">Battery Warning:</p>
                 <p class="text-sm" style="color: #FF9937">Dive configuration may exceed battery capacity. Consider changing settings to reduce power consumption or dive duration.</p>
               </div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Data Usage Planning -->
+      <div class="mt-6">
+        <button @click="showDataPlanning = !showDataPlanning" class="w-full flex items-center justify-between p-4 rounded-lg transition-all" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.3)">
+          <div class="flex items-center gap-3">
+            <DatabaseIcon class="w-6 h-6" style="color: #41B9C3" />
+            <span class="text-white text-xl">Data Usage</span>
+            <span class="text-sm px-2 py-0.5 rounded" style="color: #96EEF2; background-color: rgba(65, 185, 195, 0.15)">~{{ dataUsage.totalLabel }}</span>
+          </div>
+          <ChevronUp v-if="showDataPlanning" class="w-6 h-6" style="color: #96EEF2" />
+          <ChevronDown v-else class="w-6 h-6" style="color: #96EEF2" />
+        </button>
+
+        <div v-if="showDataPlanning" class="mt-4 p-6 rounded-lg" :style="phaseStyle">
+          <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-6">
+            <div class="p-4 rounded-lg" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
+              <div class="flex items-center justify-between mb-2">
+                <span style="color: #96EEF2">Estimated Data</span>
+                <span class="text-white text-xl">{{ dataUsage.totalLabel }}</span>
+              </div>
+            </div>
+            <div class="p-4 rounded-lg" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
+              <div class="flex items-center justify-between mb-2">
+                <span style="color: #96EEF2">Video Bitrate</span>
+                <span class="text-white text-xl">{{ dataUsage.bitrateMbps.toFixed(dataUsage.bitrateMbps < 10 ? 1 : 0) }} Mbps</span>
+              </div>
+            </div>
+            <div class="p-4 rounded-lg" style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)">
+              <div class="flex items-center justify-between mb-2">
+                <span style="color: #96EEF2">Dive Duration</span>
+                <span class="text-white text-xl">{{ dataUsage.estimate.totalHours.toFixed(1) }}h</span>
+              </div>
+            </div>
+          </div>
+
+          <p class="text-xs mb-3" style="color: rgba(150, 238, 242, 0.6)">
+            Set the estimated dive depth in Battery Planning above to include descent/ascent recording time.
+            Video storage scales with the global bitrate and each phase's recording duty; timelapse uses the still count.
+          </p>
+
+          <button
+            type="button"
+            @click="showDataBreakdown = !showDataBreakdown"
+            class="flex items-center gap-1 text-xs"
+            style="color: #96EEF2"
+          >
+            <ChevronDown v-if="!showDataBreakdown" class="w-4 h-4" />
+            <ChevronUp v-else class="w-4 h-4" />
+            {{ showDataBreakdown ? 'Hide' : 'Show' }} per-phase breakdown
+          </button>
+
+          <div v-if="showDataBreakdown" class="mt-3 text-xs" style="color: #96EEF2">
+            <p class="mb-2" style="color: rgba(150, 238, 242, 0.75)">
+              Video bytes = bitrate × recording time (codec-independent at a fixed bitrate).
+              Timelapse ≈ still count × ~{{ STILL_BYTES_PER_PIXEL }} bytes/pixel at the capture resolution.
+              Durations: descent = depth ÷ 1 m/s, bottom = release-weight time, ascent = {{ POWER.ASCENT_BURN_MINUTES }} min burn + depth ÷ 1 m/s.
+            </p>
+            <div class="overflow-x-auto">
+              <table class="w-full text-left" style="border-collapse: collapse">
+                <thead>
+                  <tr style="color: rgba(150, 238, 242, 0.9)">
+                    <th class="py-1 pr-3">Phase</th>
+                    <th class="py-1 pr-3">Dur (h)</th>
+                    <th class="py-1 pr-3">Mode</th>
+                    <th class="py-1 pr-3">Recorded</th>
+                    <th class="py-1">Data</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <tr
+                    v-for="phase in dataUsage.estimate.phases"
+                    :key="phase.name"
+                    style="border-top: 1px solid rgba(65, 185, 195, 0.2)"
+                  >
+                    <td class="py-1 pr-3 text-white">{{ phase.name }}</td>
+                    <td class="py-1 pr-3">{{ phase.hours.toFixed(2) }}</td>
+                    <td class="py-1 pr-3">
+                      <span v-if="phase.mode === 'off'" style="color: rgba(150, 238, 242, 0.5)">camera off</span>
+                      <span v-else-if="phase.mode === 'timelapse'">timelapse</span>
+                      <span v-else-if="phase.mode === 'video-interval'">interval video</span>
+                      <span v-else>continuous</span>
+                    </td>
+                    <td class="py-1 pr-3">
+                      <span v-if="phase.mode === 'timelapse'">{{ phase.stillCount }} stills</span>
+                      <span v-else-if="phase.mode !== 'off'">{{ (phase.recordSeconds / 60).toFixed(0) }} min</span>
+                      <span v-else style="color: rgba(150, 238, 242, 0.5)">—</span>
+                    </td>
+                    <td class="py-1 text-white">{{ formatBytes(phase.bytes) }}</td>
+                  </tr>
+                  <tr style="border-top: 1px solid rgba(65, 185, 195, 0.4)">
+                    <td class="py-1 pr-3 text-white">Total</td>
+                    <td class="py-1 pr-3 text-white">{{ dataUsage.estimate.totalHours.toFixed(2) }}</td>
+                    <td class="py-1 pr-3"></td>
+                    <td class="py-1 pr-3"></td>
+                    <td class="py-1 text-white">{{ dataUsage.totalLabel }}</td>
+                  </tr>
+                </tbody>
+              </table>
             </div>
           </div>
         </div>
