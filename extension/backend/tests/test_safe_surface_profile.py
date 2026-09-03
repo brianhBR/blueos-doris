@@ -34,8 +34,25 @@ def test_lua_mirrors_the_release_to_both_controllers():
 
 def test_lua_requests_agt_release_even_when_navigator_output_is_disabled():
     lua = (BACKEND_ROOT / "scripts" / "doris.lua").read_text()
-    body = lua.split("local function activate_relay()", 1)[1].split("\nend", 1)[0]
-    assert body.index("relay_active = true") < body.index("navigator_relay_channel()")
+    body = lua.split("local function set_release_outputs(on)", 1)[1].split("\nend", 1)[0]
+    assert body.index("relay_active = on") < body.index("navigator_relay_channel()")
+    # Every caller has to go through that helper or it guarantees nothing.
+    for caller in ("activate_relay", "deactivate_relay", "update_release_test"):
+        body = lua.split(f"local function {caller}(", 1)[1].split("\nend", 1)[0]
+        assert "set_release_outputs(" in body
+        assert "relay:on(" not in body and "relay:off(" not in body
+
+
+def test_lua_release_test_cannot_fire_during_a_dive():
+    """The on-deck test must be inert once the mission owns the release."""
+    lua = (BACKEND_ROOT / "scripts" / "doris.lua").read_text()
+    body = lua.split("local function update_release_test(now_ms)", 1)[1]
+    body = body.split("\nend", 1)[0]
+    assert "state == STATE_CONFIG" in body
+    # And a real release clears the test's claim, so the test's own timeout
+    # can never switch off a weight drop the mission asked for.
+    activate = lua.split("local function activate_relay()", 1)[1].split("\nend", 1)[0]
+    assert "rls_tst_start_ms = 0" in activate
 
 
 async def test_changed_frame_version_reapplies_existing_install(monkeypatch, tmp_path):

@@ -116,7 +116,7 @@ local STATE_ASCENT        = 3
 local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-assert(param:add_table(73, "DORIS_", 41),
+assert(param:add_table(73, "DORIS_", 42),
        "DIVE: could not add DORIS_ param table")
 
 -- mission control
@@ -186,6 +186,9 @@ assert(param:add_param(73, 40, "SRF_SEC", 30),   "DORIS_SRF_SEC")
 -- Below this after the full burn -> release failed / stuck -> RECOVERY (AGT
 -- shutdown).
 assert(param:add_param(73, 41, "STK_RISE", 2.0), "DORIS_STK_RISE")
+-- On-deck release test.  Held above zero by the operator's browser; the
+-- release output follows it while the vehicle is still in CONFIG.
+assert(param:add_param(73, 42, "RLS_TST", 0),    "DORIS_RLS_TST")
 
 
 -- Parameter handles live in one table rather than in a local apiece.
@@ -223,6 +226,7 @@ local prm = {
     SRF_DPT  = Parameter("DORIS_SRF_DPT"),
     SRF_SEC  = Parameter("DORIS_SRF_SEC"),
     STK_RISE = Parameter("DORIS_STK_RISE"),
+    RLS_TST  = Parameter("DORIS_RLS_TST"),
 }
 
 -- GPS self-heal: reboot up to 2 times if the GPS driver never receives
@@ -374,6 +378,9 @@ local light_cycle_ms = 0
 -- light test state (auto-clears after timeout)
 local lgt_tst_start_ms = 0
 -- 10000 = 10000 (inlined)
+
+-- release test state (auto-clears after the same 10000 ms timeout)
+local rls_tst_start_ms = 0
 
 -- telemetry tracking (updated every cycle by update_sensors)
 -- packed into a table to stay under Lua's 200-local-variable limit
@@ -544,12 +551,23 @@ local function relay_target_text(ch)
     return "AGT"
 end
 
-local function activate_relay()
-    relay_active = true
+-- Drives both mirrored outputs and returns the Navigator channel, if any.
+-- The AGT follows relay_active through the RELAY named float published by
+-- update_telemetry, so the two stay in step whichever one is wired.
+local function set_release_outputs(on)
+    relay_active = on
     local ch = navigator_relay_channel()
     if ch then
-        relay:on(ch)
+        if on then relay:on(ch) else relay:off(ch) end
     end
+    return ch
+end
+
+local function activate_relay()
+    local ch = set_release_outputs(true)
+    -- A real release outranks a test: drop the test's claim on the output so
+    -- update_release_test cannot switch off a release the mission asked for.
+    rls_tst_start_ms = 0
     if is_sitl then
         -- ~2 kg net positive buoyancy for ascent after weight drop in SITL
         param:set_and_save("SIM_BUOYANCY", 19.6)
@@ -562,14 +580,44 @@ end
 
 local function deactivate_relay()
     if not relay_active then return end
-    relay_active = false
-    local ch = navigator_relay_channel()
-    if ch then
-        relay:off(ch)
-    end
+    local ch = set_release_outputs(false)
+    rls_tst_start_ms = 0
     gcs:send_text(MAV_SEVERITY.INFO,
         string.format("DIVE: Release OFF at %.1fm (%s)",
             get_depth_m() or 0, relay_target_text(ch)))
+end
+
+-- On-deck release test.  DORIS_RLS_TST energises the galvanic-release output
+-- the same way DORIS_LGT_TST drives the lights: the operator's browser holds
+-- the parameter above zero and the output follows it.  Two things keep it
+-- from becoming an accidental weight drop.  It is honoured only in CONFIG,
+-- so it cannot fire once a dive is under way, and it lets go 10 s after the
+-- last assertion, so a lost "off" PARAM_SET or a browser that goes away
+-- cannot leave the anode/cathode pair energised.
+local function update_release_test(now_ms)
+    local requested = (prm.RLS_TST:get() or 0) > 0 and state == STATE_CONFIG
+
+    if requested and rls_tst_start_ms == 0 then
+        rls_tst_start_ms = now_ms
+        local ch = set_release_outputs(true)
+        gcs:send_text(MAV_SEVERITY.WARNING,
+            string.format("DIVE: Release TEST ON (%s)", relay_target_text(ch)))
+        return
+    end
+
+    if requested and now_ms - rls_tst_start_ms <= 10000 then
+        return
+    end
+
+    if rls_tst_start_ms ~= 0 then
+        local ch = set_release_outputs(false)
+        rls_tst_start_ms = 0
+        gcs:send_text(MAV_SEVERITY.INFO,
+            string.format("DIVE: Release TEST OFF (%s)", relay_target_text(ch)))
+    end
+    if (prm.RLS_TST:get() or 0) > 0 then
+        prm.RLS_TST:set(0)
+    end
 end
 
 local function check_leak()
@@ -1071,6 +1119,10 @@ function update()
     if v then batt_voltage = v end
 
     update_telemetry(now_ms)
+
+    -- Ahead of every early return below, so the test's timeout still expires
+    -- while a light test or a mission branch owns the rest of the cycle.
+    update_release_test(now_ms)
 
     -- RECOVERY keepalive: stay armed so ArduPilot keeps MCAP/BIN logging while
     -- publishing STATE=4 throughout the AGT's three-minute surface dwell.

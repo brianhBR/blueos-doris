@@ -18,6 +18,7 @@ import {
   mdiCogOutline,
   mdiChip,
   mdiBugOutline,
+  mdiWeight,
 } from '@mdi/js'
 import { useSensors } from '../composables/useApi'
 import type { SensorModule as ApiSensorModule } from '../composables/useApi'
@@ -716,6 +717,62 @@ function lightTestOff() {
   }
 }
 
+// ── Weight release test button ──────────────────────────────────────
+// Same hold-to-test shape as the light: the backend sets DORIS_RLS_TST and
+// doris.lua energises the release output (Navigator relay on SERVO14, mirrored
+// to the AGT) only while that parameter stays asserted, and only before a dive
+// has started.  Lua lets go on its own ~10s after the last request, so the
+// keepalive below is what keeps the release held rather than what arms it.
+const releaseTestActive = ref(false)
+const releaseTestError = ref('')
+let releaseKeepAlive: number | undefined
+
+async function setReleaseTest(active: boolean): Promise<boolean> {
+  try {
+    const resp = await fetch('/api/v1/release/test', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ active }),
+    })
+    const data = await resp.json()
+    if (!data.success) {
+      const msg = data.error || `Release test failed (HTTP ${resp.status})`
+      console.warn('[DORIS] Release test error:', msg)
+      releaseTestError.value = msg
+      return false
+    }
+    releaseTestError.value = ''
+    return true
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : 'Network error'
+    console.warn('[DORIS] Release test fetch failed:', msg)
+    releaseTestError.value = msg
+    return false
+  }
+}
+
+async function releaseTestOn() {
+  if (releaseTestActive.value) return
+  releaseTestActive.value = true
+  releaseTestError.value = ''
+  const ok = await setReleaseTest(true)
+  if (!ok || !releaseTestActive.value) {
+    releaseTestActive.value = false
+    return
+  }
+  releaseKeepAlive = setInterval(() => setReleaseTest(true), 1500) as unknown as number
+}
+
+function releaseTestOff() {
+  const wasActive = releaseTestActive.value
+  releaseTestActive.value = false
+  if (releaseKeepAlive) { clearInterval(releaseKeepAlive); releaseKeepAlive = undefined }
+  if (wasActive) {
+    setReleaseTest(false)
+    setTimeout(() => setReleaseTest(false), 300)
+  }
+}
+
 // ── Barometer surface calibration ────────────────────────────────────
 type BaroCalState = 'idle' | 'calibrating' | 'done' | 'error'
 const baroCalState = ref<BaroCalState>('idle')
@@ -797,6 +854,9 @@ onUnmounted(() => {
   if (ipcamStatusInterval) clearInterval(ipcamStatusInterval)
   if (trackerInterval) clearInterval(trackerInterval)
   if (lightKeepAlive) clearInterval(lightKeepAlive)
+  // Leaving the page must not leave the release energised; Lua's timeout is
+  // the backstop, this makes it immediate.
+  releaseTestOff()
   stopIridiumPolling()
   stopDebugPolling()
   if (snapshotUrl.value) URL.revokeObjectURL(snapshotUrl.value)
@@ -1528,6 +1588,54 @@ const getStatusColor = (moduleStatus: string) => {
             </div>
           </div>
         </div>
+      </div>
+
+      <!-- Weight release test -->
+      <div
+        class="mt-4 rounded-lg p-4"
+        style="background-color: rgba(14, 36, 70, 0.5); border: 1px solid rgba(65, 185, 195, 0.2)"
+      >
+        <div class="flex items-center gap-3 mb-2">
+          <svg class="w-6 h-6" viewBox="0 0 24 24" style="color: #96EEF2">
+            <path :d="mdiWeight" fill="currentColor" />
+          </svg>
+          <h3 class="text-white">Weight Release (SERVO14)</h3>
+        </div>
+        <p class="text-xs leading-relaxed mb-3" style="color: rgba(150, 238, 242, 0.65)">
+          Hold to put voltage across the galvanic release anode and cathode so it can be
+          checked on the bench. The dive script ignores this once a mission has started and
+          drops the output about 10 seconds after the button is released.
+        </p>
+        <button
+          class="w-full flex items-center justify-center gap-2 px-4 py-2.5 rounded-lg text-sm transition-all select-none"
+          :style="{
+            backgroundColor: releaseTestError
+              ? 'rgba(239, 68, 68, 0.2)'
+              : releaseTestActive
+                ? 'rgba(221, 44, 29, 0.3)'
+                : 'rgba(14, 36, 70, 0.5)',
+            border: releaseTestError
+              ? '1px solid rgba(239, 68, 68, 0.6)'
+              : releaseTestActive
+                ? '1px solid #DD2C1D'
+                : '1px solid rgba(221, 44, 29, 0.45)',
+            color: releaseTestError ? '#F87171' : releaseTestActive ? '#FCA5A5' : '#96EEF2',
+          }"
+          @mousedown.prevent="releaseTestOn"
+          @mouseup.prevent="releaseTestOff"
+          @mouseleave="releaseTestOff"
+          @touchstart.prevent="releaseTestOn"
+          @touchend.prevent="releaseTestOff"
+          @touchcancel="releaseTestOff"
+        >
+          <svg class="w-4 h-4" viewBox="0 0 24 24" fill="currentColor">
+            <path :d="mdiWeight" />
+          </svg>
+          {{ releaseTestActive ? 'Release ENERGISED' : 'Hold to Test Release' }}
+        </button>
+        <p v-if="releaseTestError" class="mt-1.5 text-xs" style="color: #F87171">
+          {{ releaseTestError }}
+        </p>
       </div>
     </div>
   </div>

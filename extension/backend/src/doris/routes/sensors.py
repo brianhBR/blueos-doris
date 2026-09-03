@@ -7,6 +7,7 @@ from robyn import Response, Robyn
 from ..models.sensors import SensorConfig
 from ..services.barometer import BarometerService
 from ..services.camera import CameraService
+from ..services.release import release_service
 from ..services.sensors import SensorService
 from ..services.tracker import tracker_service
 
@@ -116,6 +117,33 @@ def register_sensor_routes(app: Robyn) -> None:
                 headers={"Content-Type": "application/json"},
             )
 
+
+    @app.post("/api/v1/release/test")
+    async def set_release_test(request):
+        """Hold the weight release energised for the momentary test button.
+
+        Lua drops the output ~10 s after the last request, so the caller has
+        to keep re-asserting ``active`` for as long as it wants the test.
+        """
+        try:
+            data = json.loads(request.body) if request.body else {}
+            active = bool(data.get("active", False))
+            result = await release_service.set_release_test(active)
+            ok = result.get("ok", False)
+            payload = {"success": ok, "active": active}
+            if not ok and result.get("error"):
+                payload["error"] = result["error"]
+            return Response(
+                status_code=200 if ok else 502,
+                description=json.dumps(payload),
+                headers={"Content-Type": "application/json"},
+            )
+        except Exception as e:
+            return Response(
+                status_code=500,
+                description=json.dumps({"error": str(e)}),
+                headers={"Content-Type": "application/json"},
+            )
 
     @app.post("/api/v1/sensors/barometer/calibrate")
     async def calibrate_barometer(request):
