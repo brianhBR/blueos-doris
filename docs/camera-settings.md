@@ -17,7 +17,7 @@ Notes:
 - Fields marked [read-only] are reported by the camera but cannot be set.
 - Some settings are only honored when a related setting has a particular value; those dependencies are noted under Values.
 - Not every setting is meant for end users; the full list is exposed now for experimentation and will be trimmed to a practical subset later.
-- **DORIS defaults:** the settings in sections **H (Day/Night & IR-Cut)**, **I (Light / IR LED)**, **J (Aperture / Iris)** and **M (Scene Mode)** have hardware-appropriate defaults supplied by DORIS. These are *fill-if-missing* defaults, not hard overrides: DORIS fills them in only when a preset/apply doesn't specify them, and applies them as a baseline at startup / dive start when no preset is active. An advanced user can still override any of them by including the key in a preset or hand-edited JSON — the explicit value is honored. They are simply hidden from the experimentation panel because there's no dedicated control for them yet (their values are still stored). The default values are: `color_black=0` (colour/day, IR-cut filter engaged, never night mode), `led_control=2` (illuminator disabled — no camera-controlled LEDs), `auto_iris=1` (iris disabled — fixed-aperture lens), `scene_mode=0` and `sceneMode=0` (plain general video capture).
+- **DORIS defaults:** the settings in sections **H (Day/Night & IR-Cut)**, **I (Light / IR LED)**, **J (Aperture / Iris)** and **M (Scene Mode)** have hardware-appropriate defaults supplied by DORIS. These are *fill-if-missing* defaults, not hard overrides: DORIS fills them in only when a preset/apply doesn't specify them, and applies them as a baseline at startup / dive start when no preset is active. An advanced user can still override any of them by including the key in a preset or hand-edited JSON — the explicit value is honored. They are simply hidden from the experimentation panel because there's no dedicated control for them yet (their values are still stored). The default values are: `color_black=0` (color/day, IR-cut filter engaged, never night mode), `led_control=2` (illuminator disabled — no camera-controlled LEDs), `auto_iris=1` (iris disabled — fixed-aperture lens), `scene_mode=0` and `sceneMode=0` (plain general video capture).
 
 ---
 
@@ -35,7 +35,7 @@ Notes:
    *Values:* integer pixels from pixel_list (e.g. 2560, 1920)
 6. **Picture Height** (`pic_height`) — Encoded frame height; must match a height offered in pixel_list.  
    *Values:* integer pixels from pixel_list (e.g. 1440, 1080)
-7. **Rate Control Mode** (`rc_mode`) — VBR is quality-priority; CBR gives predictable bandwidth/file size.  
+7. **Bitrate Mode** (`rc_mode`) — VBR (Variable) is quality-priority; CBR (Constant) gives predictable bandwidth/file size.  
    *Values:* 0 VBR, 1 CBR (enum)
 8. **Bitrate** (`bitrate`) — Target bitrate; higher = better quality and larger files.  
    *Values:* integer, kbps (e.g. 6144)
@@ -73,7 +73,7 @@ Notes:
    *Values:* enum: 12, 25, 30, 50, 60, 100, 200, 400, 800, 1000, 2000, 4000, 8000
 20. **Auto Exposure Mode** (`auto_exposureEx`) — Auto or manual exposure.  
    *Values:* 0 Auto, 1 Manual (enum)
-21. **AE Strategy** (`AE_strategy_mode`) — Metering priority in auto exposure.  
+21. **Exposure Strategy** (`AE_strategy_mode`) — Metering priority in auto exposure.  
    *Values:* 0 Highlight priority, 1 Lowlight priority (enum)
 22. **Manual Exposure Time** (`exposure_time`) — Fixed shutter time as the x in T = 1/x seconds; used only in manual exposure.  
    *Values:* enum: 12, 25, 30, 50, 60, 100, 200, 400, 800, 1000, 2000, 4000, 8000, 10000, 34464
@@ -154,7 +154,7 @@ Notes:
 
 ## H. Day / Night & IR-Cut
 
-> **DORIS default:** `color_black=0` (colour/day; IR-cut filter engaged; never night mode) unless a preset/JSON overrides it. The remaining entries in this section only matter in auto/night modes.
+> **DORIS default:** `color_black=0` (color/day; IR-cut filter engaged; never night mode) unless a preset/JSON overrides it. The remaining entries in this section only matter in auto/night modes.
 
 49. **Color / Black Mode** (`color_black`) — Force color, or auto-switch to black-and-white at night.  
    *Values:* 0 Color, 1 Auto (enum)
@@ -211,7 +211,7 @@ Notes:
 
 ## K. Shutter & Flicker
 
-67. **Slow Shutter** (`low_farme_rate`) — Enable slow shutter for low-light scenes (the camera spells this key low_farme_rate).  
+67. **Slow Shutter Mode** (`low_farme_rate`) — Enable slow shutter for low-light scenes (the camera spells this key low_farme_rate).  
    *Values:* 0 Close (disabled), 1 Open (enabled) (enum)
 68. **Anti-Flicker** (`anti_flicker`) — Reduces flicker under artificial light.  
    *Values:* 0 Close (disabled), 1 Auto, 2 50 Hz, 3 60 Hz (enum)
@@ -253,5 +253,5 @@ Notes:
 
 ## Related DORIS automation
 
-- **Auto White Balance on Lights** (On Bottom phase) — When enabled, the dive script fires the one-push AWB (onceAWB, #31) a couple seconds after the bottom lights first turn on, so white balance is calibrated for the lit scene rather than ambient surface light.
+- **Auto White Balance on Lights** (Descent, On Bottom and Ascent phases) — Each phase has its own toggle in the Camera section. When enabled, the dive script fires the one-push AWB (onceAWB, #31) a couple seconds after that phase's lights first turn on, so white balance is calibrated for the lit scene rather than ambient surface light. If the phase's lights are disabled, the AWB fires immediately when the phase begins.
 - **Presets** — Any combination of the settings above can be saved to a named preset. The active preset is auto-applied at DORIS startup and at dive start, and presets can be downloaded/imported as JSON using these same native keys.
