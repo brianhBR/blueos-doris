@@ -48,11 +48,13 @@ class Settings(BaseSettings):
     # the blueos-core nginx reverse proxy, which exposes every extension at a
     # fixed path on port 80 and rewrites the upstream port on each restart:
     #     http://host.docker.internal/extensionv2/<slug>/...
-    # The slug is the extension name with non-alphanumerics stripped
-    # (identifier ``bluerobotics.radcam-manager`` -> ``radcammanager``). Update
-    # ``br4kcam_extension_slug`` (or set DORIS_BR4KCAM_URL outright) if the
-    # extension is renamed.
-    br4kcam_extension_slug: str = os.environ.get("DORIS_BR4KCAM_SLUG", "radcammanager")
+    # The slug is the extension name with non-alphanumerics stripped. Blue
+    # Robotics ships this as the "4K Cam Manager" extension, whose BlueOS
+    # slug is ``4kcammanager`` (verified on-vehicle:
+    # ``http://host.docker.internal/extensionv2/4kcammanager/v1/camera/list``).
+    # Update ``br4kcam_extension_slug`` (or set DORIS_BR4KCAM_URL outright) if
+    # the extension is renamed or a fork uses a different slug.
+    br4kcam_extension_slug: str = os.environ.get("DORIS_BR4KCAM_SLUG", "4kcammanager")
     br4kcam_url: str = os.environ.get("DORIS_BR4KCAM_URL", "")
 
     # IP camera recorder (RTSP -> segmented MPEG-TS via gst-launch; URL is hardcoded in service)
