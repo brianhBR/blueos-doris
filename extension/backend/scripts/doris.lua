@@ -116,7 +116,7 @@ local STATE_ASCENT        = 3
 local STATE_RECOVERY      = 4
 
 -- ?????????? DORIS parameter table ??????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
-assert(param:add_table(73, "DORIS_", 41),
+assert(param:add_table(73, "DORIS_", 44),
        "DIVE: could not add DORIS_ param table")
 
 -- mission control
@@ -187,6 +187,13 @@ assert(param:add_param(73, 40, "SRF_SEC", 30),   "DORIS_SRF_SEC")
 -- shutdown).
 assert(param:add_param(73, 41, "STK_RISE", 2.0), "DORIS_STK_RISE")
 
+-- One-push auto white balance on the phase lights (0 off, 1 on).  When set,
+-- that phase's loop fires a single AWB command to the DORIS extension shortly
+-- after its lights come on so white balance matches the lit scene.
+assert(param:add_param(73, 42, "BTM_AWB", 0),    "DORIS_BTM_AWB")
+assert(param:add_param(73, 43, "DSC_AWB", 0),    "DORIS_DSC_AWB")
+assert(param:add_param(73, 44, "ASC_AWB", 0),    "DORIS_ASC_AWB")
+
 
 -- Parameter handles live in one table rather than in a local apiece.
 -- ArduPilot builds Lua with MAXVARS lowered from upstream's 200 to 100
@@ -208,6 +215,9 @@ local prm = {
     LGT_ON   = Parameter("DORIS_LGT_ON"),
     LGT_OFF  = Parameter("DORIS_LGT_OFF"),
     BTM_DLY  = Parameter("DORIS_BTM_DLY"),
+    BTM_AWB  = Parameter("DORIS_BTM_AWB"),
+    DSC_AWB  = Parameter("DORIS_DSC_AWB"),
+    ASC_AWB  = Parameter("DORIS_ASC_AWB"),
     PRF_ID   = Parameter("DORIS_PRF_ID"),
     UPL_DATE = Parameter("DORIS_UPL_DATE"),
     UPL_TIME = Parameter("DORIS_UPL_TIME"),
@@ -371,6 +381,16 @@ local batt_fs = { crit_since_ms = 0, warned = false }
 local light_on       = true
 local light_cycle_ms = 0
 
+-- one-push auto white balance state (fires once per phase, a short settle
+-- after that phase's lights first come on)
+local btm_awb_done   = false
+local btm_lgt_on_ms  = 0
+local dsc_awb_done   = false
+local dsc_lgt_on_ms  = 0
+local asc_awb_done   = false
+local asc_lgt_on_ms  = 0
+local AWB_SETTLE_MS   = 2000
+
 -- light test state (auto-clears after timeout)
 local lgt_tst_start_ms = 0
 -- 10000 = 10000 (inlined)
@@ -399,6 +419,9 @@ local cfg = {
     lgt_on_ms   = 10000,
     lgt_off_ms  = 5000,
     btm_dly_ms  = 30000,
+    dsc_awb     = false,
+    btm_awb     = false,
+    asc_awb     = false,
 }
 
 -- snapshotted IP camera policy (set in snapshot_config from DORIS_* params)
@@ -721,6 +744,9 @@ local function snapshot_config()
     cfg.dsc_lgt     = prm.DSC_LGT:get() >= 1
     cfg.btm_lgt     = prm.BTM_LGT:get() >= 1
     cfg.asc_lgt     = prm.ASC_LGT:get() >= 1
+    cfg.dsc_awb     = prm.DSC_AWB:get() >= 1
+    cfg.btm_awb     = prm.BTM_AWB:get() >= 1
+    cfg.asc_awb     = prm.ASC_AWB:get() >= 1
     cfg.lgt_pwm     = brightness_to_pwm(brt)
     cfg.btm_thr_mps = math.max(btm_thr, 0.1) / 100.0
     cfg.dpt_gat_m   = math.max(dpt_gat, 0.0)
@@ -973,6 +999,41 @@ local function ipcam_http_snapshot(host, port, phase)
         host, port)
 end
 
+-- Fire a one-push auto white balance on the camera (via the DORIS extension,
+-- which forwards onceAWB to the br4kcam-manager).  Fire-and-forget like the
+-- other recorder calls.
+local function ipcam_http_awb(host, port)
+    return ipcam_http_send("POST /rec/awb", host, port)
+end
+
+-- One-push AWB for a dive phase, fired once.  When this phase's lights are
+-- enabled, wait AWB_SETTLE_MS after they are actually on so white balance
+-- converges against the lit scene.  When the lights are disabled there is
+-- nothing to wait for, so calibrate immediately against ambient light.
+-- ``anchor_ms`` records when the lights were first seen on; returns the
+-- updated (done, anchor_ms) so the caller can persist the one-shot state.
+local function phase_awb_tick(awb_en, lights_enabled, lights_on, done, anchor_ms, now_ms, phase_name)
+    if not awb_en or done then return done, anchor_ms end
+    if not lights_enabled then
+        ipcam_http_awb("127.0.0.1", 8095)
+        done = true
+        gcs:send_text(MAV_SEVERITY.INFO,
+            string.format("DIVE: %s AWB (no lights), triggered auto white balance",
+                phase_name))
+    elseif lights_on then
+        if anchor_ms == 0 then
+            anchor_ms = now_ms
+        elseif now_ms - anchor_ms >= AWB_SETTLE_MS then
+            ipcam_http_awb("127.0.0.1", 8095)
+            done = true
+            gcs:send_text(MAV_SEVERITY.INFO,
+                string.format("DIVE: %s lights on, triggered auto white balance",
+                    phase_name))
+        end
+    end
+    return done, anchor_ms
+end
+
 local function ipcam_start(phase, seg_s)
     if ipcam_recording then return end
     if not ipcam_cfg.rec_en then return end
@@ -1217,6 +1278,13 @@ function update()
                 vehicle:set_mode(19)
                 armed_once          = false
                 recovery_done       = false
+                -- Re-arm the per-phase one-push AWB one-shots for this dive.
+                dsc_awb_done        = false
+                dsc_lgt_on_ms       = 0
+                btm_awb_done        = false
+                btm_lgt_on_ms       = 0
+                asc_awb_done        = false
+                asc_lgt_on_ms       = 0
                 arm_start_ms        = now_ms
                 telem.max_depth     = 0.0
                 telem.min_temp      = 999.0
@@ -1303,6 +1371,9 @@ function update()
                     -- finalize chunks it into 5-min MP4s like the
                     -- bottom phase, instead of one long file (#33).
                     ipcam_begin_phase(ipcam_cfg.dsc_rec, "descent", 300)
+                    -- Arm the one-push AWB for the descent phase.
+                    dsc_awb_done  = false
+                    dsc_lgt_on_ms = 0
                     state = STATE_DESCENT
                 end
             end
@@ -1327,6 +1398,12 @@ function update()
 
         update_lights(cfg.dsc_lgt, now_ms)
 
+        -- One-push AWB: a short settle after the descent lights come on, or
+        -- immediately if descent lights are disabled.
+        dsc_awb_done, dsc_lgt_on_ms = phase_awb_tick(
+            cfg.dsc_awb, cfg.dsc_lgt, light_on,
+            dsc_awb_done, dsc_lgt_on_ms, now_ms, "descent")
+
         local elapsed = now_ms - dive_start_ms
         local vel = ahrs:get_velocity_NED()
         if vel then
@@ -1350,6 +1427,9 @@ function update()
                 bottom_start_ms   = now_ms
                 bottom_delay_done = cfg.btm_dly_ms <= 0
                 reset_light_cycle(now_ms)
+                -- Arm the one-push AWB for this bottom visit.
+                btm_awb_done      = false
+                btm_lgt_on_ms     = 0
                 ipcam_btm_started = false
                 -- Reset interval/timelapse timers so the on_bottom
                 -- loop below can establish its own cadence.
@@ -1447,6 +1527,10 @@ function update()
             bottom_lgt_eff = cfg.btm_lgt and (pre_active or post_active)
         end
 
+        -- ``lights_cmd`` is the enable actually handed to update_lights this
+        -- tick; captured so the one-push AWB below can anchor on the moment
+        -- the bottom lights are first commanded on.
+        local lights_cmd
         if ipcam_cfg.btm_cmod == 2
            or (ipcam_cfg.btm_cmod == 1 and ipcam_cfg.rec_en) then
             -- INTERVAL and CONTINUOUS-recording own their light timing via
@@ -1454,9 +1538,9 @@ function update()
             -- bottom settling delay (bottom_delay_done, measured from
             -- bottom detection) is replaced by the recording-start anchor
             -- so the light tracks the camera, not the detection instant.
-            update_lights(bottom_lgt_eff, now_ms)
+            lights_cmd = bottom_lgt_eff
         elseif not bottom_delay_done then
-            update_lights(false, now_ms)
+            lights_cmd = false
             if bottom_elapsed >= cfg.btm_dly_ms then
                 bottom_delay_done = true
                 reset_light_cycle(now_ms)
@@ -1465,8 +1549,18 @@ function update()
                         cfg.btm_dly_ms / 1000.0))
             end
         else
-            update_lights(bottom_lgt_eff, now_ms)
+            lights_cmd = bottom_lgt_eff
         end
+        update_lights(lights_cmd, now_ms)
+
+        -- One-push auto white balance: once per bottom visit.  With bottom
+        -- lights enabled it waits a short settle after they are first
+        -- commanded on so the camera's AWB converges against the lit scene;
+        -- with bottom lights disabled there is nothing to wait for, so it
+        -- calibrates immediately against ambient light.
+        btm_awb_done, btm_lgt_on_ms = phase_awb_tick(
+            cfg.btm_awb, cfg.btm_lgt, lights_cmd,
+            btm_awb_done, btm_lgt_on_ms, now_ms, "bottom")
 
         -- Bottom camera dispatcher: OFF / CONTINUOUS / VIDEO_INTERVAL / TIMELAPSE
         if ipcam_cfg.btm_cmod == 0 then
@@ -1674,6 +1768,12 @@ function update()
         end
 
         update_lights(cfg.asc_lgt, now_ms)
+
+        -- One-push AWB: a short settle after the ascent lights come on, or
+        -- immediately if ascent lights are disabled.
+        asc_awb_done, asc_lgt_on_ms = phase_awb_tick(
+            cfg.asc_awb, cfg.asc_lgt, light_on,
+            asc_awb_done, asc_lgt_on_ms, now_ms, "ascent")
 
         -- Relay stays on for at least DORIS_BRN_MIN seconds (default 2 hrs).
         -- After that, deactivate only when EKF-filtered vertical velocity

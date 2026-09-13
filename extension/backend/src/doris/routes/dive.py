@@ -337,6 +337,19 @@ def register_dive_routes(app: Robyn) -> None:
             "dive_file": dive_file.name,
         })
 
+        # Snapshot the camera's starting settings into this dive record.  Camera
+        # settings are not embedded in the video stream, so we sample them from
+        # the br4kcam-manager for post-dive analysis.  Fire-and-forget so a slow
+        # or unreachable camera never delays the dive-start response.
+        try:
+            from ..services.camera_presets import record_camera_sample
+
+            asyncio.create_task(
+                record_camera_sample("start", dives_dir=DIVES_DIR, dive_file=dive_file)
+            )
+        except Exception as e:
+            logger.warning("Failed to schedule camera start sample: %s", e)
+
         msg = f"DORIS_START set to 1 (dive: {dive_file.name})"
         return json.dumps({
             "success": True,

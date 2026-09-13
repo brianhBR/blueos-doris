@@ -75,6 +75,60 @@ def set_mission_terminal_status(mission_state_path: Path, new_status: str) -> No
         logger.warning("Failed to set mission status %s: %s", new_status, e)
 
 
+def _latest_active_dive_file(dives_dir: Path) -> Path | None:
+    """Return the path of the highest-numbered dive record still 'active'."""
+    if not dives_dir.is_dir():
+        return None
+    candidates: list[tuple[int, Path]] = []
+    for f in dives_dir.iterdir():
+        m = _DIVE_FILE_RE.match(f.name)
+        if m:
+            candidates.append((int(m.group(1)), f))
+    candidates.sort(reverse=True)
+    for _, dive_file in candidates:
+        try:
+            record = json.loads(dive_file.read_text())
+        except Exception as e:
+            logger.warning("Error reading %s: %s", dive_file.name, e)
+            continue
+        if record.get("status") == "active":
+            return dive_file
+    return None
+
+
+def append_camera_sample_to_dive(
+    dives_dir: Path, sample: dict, *, dive_file: Path | None = None
+) -> Path | None:
+    """Append a camera-settings snapshot to a dive record.
+
+    Camera ISP/encoder settings are not carried in the video stream, so DORIS
+    samples them from the br4kcam-manager at key moments (dive start, on-bottom
+    after AWB, recovery) and stores each snapshot under
+    ``camera_settings_samples`` so the footage can be interpreted after the
+    fact.
+
+    Appends to ``dive_file`` when given, otherwise to the most recent active
+    dive record.  Returns the file written, or ``None`` when there is no target
+    (e.g. an AWB fired outside any dive).  Best-effort: swallows read errors and
+    returns ``None`` rather than raising into a dive-critical code path.
+    """
+    target = dive_file if dive_file is not None else _latest_active_dive_file(dives_dir)
+    if target is None or not target.exists():
+        return None
+    try:
+        record = json.loads(target.read_text())
+    except Exception as e:
+        logger.warning("append_camera_sample: unreadable %s: %s", target.name, e)
+        return None
+    samples = record.get("camera_settings_samples")
+    if not isinstance(samples, list):
+        samples = []
+    samples.append(sample)
+    record["camera_settings_samples"] = samples
+    write_json_atomic(target, record)
+    return target
+
+
 def find_latest_active_dive_record(dives_dir: Path) -> dict | None:
     """Return the highest-numbered dive record still marked 'active'.
 

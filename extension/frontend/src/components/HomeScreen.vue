@@ -16,6 +16,7 @@ import {
 import { mdiCompassOutline } from '@mdi/js'
 import {
   useBattery,
+  useCameraSettings,
   useConfigurations,
   useDiveControl,
   useLocation,
@@ -37,6 +38,7 @@ import {
   BATTERY_PACK_AH,
   TYPICAL_DIVE_LOAD_W,
 } from '../lib/powerModel'
+import { estimateDataUsage } from '../lib/dataModel'
 
 const props = defineProps<{
   isConnected: boolean
@@ -52,6 +54,7 @@ const emit = defineEmits<{
 const { status: systemStatus, fetchStatus } = useSystemStatus()
 const { battery, fetchBattery } = useBattery()
 const { storage, fetchStorage } = useStorage()
+const { settings: cameraSettings, fetchSettings: fetchCameraSettings } = useCameraSettings()
 const { location, fetchLocation } = useLocation()
 const { modules: sensorModules, loading: sensorsLoading, fetchModules } = useSensors()
 const {
@@ -173,6 +176,7 @@ onMounted(() => {
   fetchDiveStatus()
   fetchDiveMission()
   fetchSafeSurfaceStatus()
+  fetchCameraSettings()
   refreshCurrentUtcTime()
   pollInterval = setInterval(() => {
     fetchStatus()
@@ -256,10 +260,24 @@ const diveFeasibility = computed(() => {
   const batteryRemainingPercent = estimate.remainingPercent
   const batteryOk = batteryRemainingPercent >= 20
 
-  const storagePerHour = 8
-  const estimatedStorageNeeded = totalDiveTimeHours * storagePerHour
-  const storageAvailable = 100 - storageUsed.value
-  const storageRemaining = storageAvailable - estimatedStorageNeeded
+  // Storage estimate driven by the live camera bitrate + per-phase recording
+  // mode (see lib/dataModel.ts), so it agrees with the Configuration tab's
+  // Data Usage panel.  Falls back to a nominal bitrate if the camera settings
+  // haven't been read yet (e.g. camera offline at the dock).
+  const DEFAULT_BITRATE_KBPS = 20480 // ~20 Mbps
+  const bitrateKbps = Number(cameraSettings.value?.video?.bitrate) || DEFAULT_BITRATE_KBPS
+  const dataEstimate = estimateDataUsage({
+    depthM: depth,
+    bottomTimeHours,
+    descent: phaseConfigFromSettings(cfg?.descent?.light, cfg?.descent?.camera),
+    bottom: phaseConfigFromSettings(cfg?.bottom?.light, cfg?.bottom?.camera),
+    ascent: phaseConfigFromSettings(cfg?.ascent?.light, cfg?.ascent?.camera),
+    bitrateKbps,
+    stillWidth: Number(cameraSettings.value?.video?.pic_width) || undefined,
+    stillHeight: Number(cameraSettings.value?.video?.pic_height) || undefined,
+  })
+  const estimatedStorageNeeded = dataEstimate.totalBytes / (1024 * 1024 * 1024)
+  const storageRemaining = storageAvailableGb.value - estimatedStorageNeeded
   const storageOk = storageRemaining >= 10
 
   let surfaceTimeUTC: Date | null = null

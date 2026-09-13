@@ -58,12 +58,15 @@ class CameraSettings(BaseModel):
     timelapse_light_pre: TimeValue = Field(default_factory=lambda: TimeValue(number="2", unit="seconds"))
     timelapse_light_post: TimeValue = Field(default_factory=lambda: TimeValue(number="1", unit="seconds"))
 
+    # Image/video *quality* settings now live in the global camera preset
+    # (models/camera.py), applied to the RadCam via the br4kcam-manager proxy.
+    # The fields below are retained only for backward-compatibility when
+    # loading older saved configurations; they are not applied to hardware.
+    # ``focus`` and the file-format fields were removed entirely (fixed-focus
+    # camera; container/format is a recorder concern) -- legacy values for
+    # them are ignored on load (Pydantic ignores unknown keys).
     resolution: str = "4K"
-    image_type: str = "High-Rez JPG"
-    file_format: str = "JPEG"
-    video_file_format: str = ".MP4"
     frame_rate: int = 30
-    focus: str = "auto"
     iso: str = "auto"
     white_balance: str = "auto"
     exposure: str = "0"
@@ -87,12 +90,24 @@ class DescentPhase(BaseModel):
     camera: CameraSettings = Field(default_factory=CameraSettings)
     light: LightSettings = Field(default_factory=LightSettings)
 
+    # One-push auto white balance a couple seconds after the descent lights
+    # first come on (see BottomPhase.auto_white_balance).  Pushed as
+    # DORIS_DSC_AWB and executed via the br4kcam-manager onceAWB trigger.
+    auto_white_balance: bool = False
+
 
 class BottomPhase(BaseModel):
     camera: CameraSettings = Field(default_factory=lambda: CameraSettings(enabled=True))
     camera_delay: TimeValue = Field(default_factory=lambda: TimeValue(number="30", unit="seconds"))
     light: LightSettings = Field(default_factory=lambda: LightSettings(enabled=True))
     light_delay: TimeValue = Field(default_factory=lambda: TimeValue(number="30", unit="seconds"))
+
+    # When enabled, the Lua dive script fires a one-push auto white balance on
+    # the RadCam shortly after the bottom lights first come on, so white
+    # balance is calibrated for the actual lit scene rather than ambient
+    # surface light.  Pushed to the autopilot as DORIS_BTM_AWB and executed via
+    # the br4kcam-manager onceAWB trigger (see routes/camera.py /rec/awb).
+    auto_white_balance: bool = False
 
 
 class ReleaseWeight(BaseModel):
@@ -107,6 +122,11 @@ class AscentPhase(BaseModel):
     camera: CameraSettings = Field(default_factory=CameraSettings)
     light: LightSettings = Field(default_factory=LightSettings)
     release_weight: ReleaseWeight = Field(default_factory=ReleaseWeight)
+
+    # One-push auto white balance a couple seconds after the ascent lights
+    # first come on (see BottomPhase.auto_white_balance).  Pushed as
+    # DORIS_ASC_AWB and executed via the br4kcam-manager onceAWB trigger.
+    auto_white_balance: bool = False
 
 
 class RecoverySettings(BaseModel):

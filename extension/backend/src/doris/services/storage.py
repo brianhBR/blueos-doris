@@ -18,6 +18,11 @@ from pathlib import Path
 from urllib.parse import quote
 
 from ..config import settings
+from ..models.camera import (
+    ActivePreset,
+    CameraPreset,
+    CameraPresetSummary,
+)
 from ..models.configuration import (
     ConfigurationSummary,
     DeploymentConfiguration,
@@ -57,6 +62,40 @@ RECORDER_DIR = "recorder"
 
 # External USB files use this prefix on ``MediaFile.id`` / download ``path=``.
 USB_MEDIA_PREFIX = "usb:"
+
+
+_LEGACY_PRESETS_MIGRATED = False
+
+
+def _migrate_legacy_camera_presets(root: Path, new_dir: Path) -> None:
+    """Copy presets from the old ephemeral location into the bind-mounted dir.
+
+    One-shot per process and best-effort: earlier builds wrote presets to
+    ``DATA_ROOT/camera_presets`` (lost on extension update).  On first access we
+    lift any of those files (including the ``_active.json`` pointer) into the
+    persistent ``userdata`` location, without clobbering files already there.
+    """
+    global _LEGACY_PRESETS_MIGRATED
+    if _LEGACY_PRESETS_MIGRATED:
+        return
+    _LEGACY_PRESETS_MIGRATED = True
+    legacy = root / "camera_presets"
+    try:
+        if legacy.resolve() == new_dir.resolve() or not legacy.is_dir():
+            return
+        moved = 0
+        for f in legacy.glob("*.json"):
+            target = new_dir / f.name
+            if not target.exists():
+                target.write_text(f.read_text())
+                moved += 1
+        if moved:
+            logger.info(
+                "Migrated %d legacy camera preset file(s) %s -> %s",
+                moved, legacy, new_dir,
+            )
+    except Exception as e:
+        logger.warning("Camera preset migration skipped: %s", e)
 
 
 def media_download_id_from_abs_path(path: Path, data_root: Path) -> str:
@@ -1224,6 +1263,98 @@ class StorageService:
         path.unlink()
         logger.info(f"Configuration deleted: {name}")
         return True
+
+    # ── Camera preset management ────────────────────────────────
+    #
+    # Presets are stored one JSON file per preset under
+    # ``DATA_ROOT/userdata/camera_presets/<slug>.json``.  ``userdata`` is the
+    # BlueOS bind mount (host ``/usr/blueos/userdata``), so presets survive not
+    # just reboots but also extension updates/reinstalls -- unlike the old
+    # ``DATA_ROOT/camera_presets`` location, which lived in the container's
+    # ephemeral layer.  The active-preset pointer lives in ``_active.json`` in
+    # the same dir; underscore-prefixed files are skipped by the listing so the
+    # pointer is never mistaken for a preset.
+
+    @property
+    def _presets_dir(self) -> Path:
+        d = self.root / "userdata" / "camera_presets"
+        d.mkdir(parents=True, exist_ok=True)
+        _migrate_legacy_camera_presets(self.root, d)
+        return d
+
+    @property
+    def _active_preset_path(self) -> Path:
+        return self._presets_dir / "_active.json"
+
+    async def save_camera_preset(self, preset: CameraPreset) -> CameraPreset:
+        """Persist a camera preset as JSON (camera-native keys via by_alias)."""
+        preset.updated_at = datetime.now(timezone.utc)
+        path = self._presets_dir / f"{self._slug(preset.name)}.json"
+        path.write_text(preset.model_dump_json(indent=2, by_alias=True))
+        logger.info(f"Camera preset saved: {preset.name} -> {path}")
+        return preset
+
+    async def load_camera_preset(self, name: str) -> CameraPreset | None:
+        """Load a camera preset by name."""
+        path = self._presets_dir / f"{self._slug(name)}.json"
+        if not path.is_file():
+            return None
+        try:
+            return CameraPreset.model_validate_json(path.read_text())
+        except Exception as e:
+            logger.warning(f"Failed to parse camera preset '{name}': {e}")
+            return None
+
+    async def list_camera_presets(self) -> list[CameraPresetSummary]:
+        """Return a summary list of all saved camera presets."""
+        summaries: list[CameraPresetSummary] = []
+        for path in sorted(self._presets_dir.glob("*.json")):
+            if path.name.startswith("_"):
+                continue
+            try:
+                data = json.loads(path.read_text())
+                now = datetime.now(timezone.utc).isoformat()
+                summaries.append(
+                    CameraPresetSummary(
+                        name=data["name"],
+                        camera_model=data.get("camera_model", "radcam"),
+                        created_at=data.get("created_at", now),
+                        updated_at=data.get("updated_at", now),
+                    )
+                )
+            except Exception as e:
+                logger.warning(f"Skipping invalid preset file {path.name}: {e}")
+        return summaries
+
+    async def delete_camera_preset(self, name: str) -> bool:
+        """Delete a camera preset by name; clears the active pointer if it matched."""
+        path = self._presets_dir / f"{self._slug(name)}.json"
+        if not path.is_file():
+            return False
+        path.unlink()
+        active = await self.get_active_preset()
+        if active.name and self._slug(active.name) == self._slug(name):
+            await self.set_active_preset(None)
+        logger.info(f"Camera preset deleted: {name}")
+        return True
+
+    async def get_active_preset(self) -> ActivePreset:
+        """Read the active-preset pointer (name may be ``None``)."""
+        path = self._active_preset_path
+        if not path.is_file():
+            return ActivePreset(name=None)
+        try:
+            return ActivePreset.model_validate_json(path.read_text())
+        except Exception as e:
+            logger.warning(f"Failed to parse active preset pointer: {e}")
+            return ActivePreset(name=None)
+
+    async def set_active_preset(self, name: str | None) -> ActivePreset:
+        """Set (or clear when ``None``) the active-preset pointer."""
+        active = ActivePreset(name=name, updated_at=datetime.now(timezone.utc))
+        self._active_preset_path.write_text(active.model_dump_json(indent=2))
+        logger.info(f"Active camera preset set to: {name!r}")
+        return active
 
     async def close(self) -> None:
         """Nothing to close for filesystem access."""
