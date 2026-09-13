@@ -32,6 +32,16 @@ const { status: migrationStatus, isActive: migrationActive, isError: migrationEr
 
 const { status: armingStatus, fetchArmingStatus } = useArmingStatus()
 const showArmingBanner = computed(() => armingStatus.value?.waiting_to_arm === true)
+const isArmed = computed(() => armingStatus.value?.armed === true)
+
+// Once a mission is loaded the banner mirrors the AGT status lights: it turns
+// green the moment DORIS is armed (mission loaded + armed = ready), otherwise it
+// stays red to flag that the vehicle is loaded but not yet armed.
+const activeBannerStyle = computed(() =>
+  isArmed.value
+    ? { backgroundColor: '#00D4AA', color: '#0E2446', fontFamily: 'Montserrat, sans-serif' }
+    : { backgroundColor: '#DD2C1D', color: '#FFFFFF', fontFamily: 'Montserrat, sans-serif' },
+)
 // Strip the redundant "PreArm:"/"Arm:" prefix since the banner heading
 // already says pre-arm checks are failing.
 const armingReasons = computed(() =>
@@ -205,8 +215,8 @@ const setConnected = (connected: boolean) => {
 
     <div
       v-if="isDiveActive"
-      class="w-full py-3 px-4 text-white text-center font-semibold"
-      style="background-color: #DD2C1D; font-family: Montserrat, sans-serif"
+      class="w-full py-3 px-4 text-center font-semibold"
+      :style="activeBannerStyle"
     >
       Active Dive<span v-if="activeConfigName"> — {{ activeConfigName }}</span>
     </div>

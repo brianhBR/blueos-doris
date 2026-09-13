@@ -136,8 +136,14 @@ class SystemService:
             if not message:
                 raise ValueError("Empty BATTERY_STATUS message")
 
-            voltages = message.get("voltages", [0])
-            voltage = voltages[0] / 1000.0 if voltages and voltages[0] > 0 else None
+            # BATTERY_STATUS.voltages[] is in mV. MAVLink uses 0xFFFF (65535)
+            # as the "voltage unknown" sentinel and 0xFFFE (65534) as ">65.534V";
+            # both appear briefly at boot before the battery monitor initializes.
+            # The old guard only rejected <= 0, so a 65535 sentinel became a bogus
+            # 65.5V reading (and clamped SOC to 100%). Treat >= 65534 as no-data.
+            voltages = message.get("voltages", [])
+            raw_mv = voltages[0] if voltages else 0
+            voltage = raw_mv / 1000.0 if 0 < raw_mv < 65534 else None
             current = message.get("current_battery", 0) / 100.0
 
             # Always derive SOC from the measured pack voltage. ArduPilot's
