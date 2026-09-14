@@ -1102,20 +1102,26 @@ async def test_ensure_usb_max_current_reports_failure_when_append_fails(
 async def test_setup_hotspot_radio_runs_usb_current_before_early_return(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    # The udev/NM write failure path returns early; the USB budget must
-    # already have been staged by then, since it is unrelated to the
-    # hotspot config that failed.
+    # The udev/NM write failure path returns early; the USB budget and
+    # RTC charging must already have been staged by then, since they are
+    # unrelated to the hotspot config that failed.
     async def failing_write(path: str, content: str) -> bool:
         return False
 
     usb_calls: list[bool] = []
+    rtc_calls: list[bool] = []
 
     async def fake_usb() -> bool:
         usb_calls.append(True)
         return True
 
+    async def fake_rtc() -> bool:
+        rtc_calls.append(True)
+        return True
+
     monkeypatch.setattr(hotspot_radio, "_write_host_file", failing_write)
     monkeypatch.setattr(hotspot_radio, "_ensure_usb_max_current", fake_usb)
+    monkeypatch.setattr(hotspot_radio, "_ensure_rtc_bbat_charging", fake_rtc)
     monkeypatch.setattr(hotspot_radio, "_run_host_command", _RunHostCommandRecorder())
 
     await hotspot_radio.setup_hotspot_radio()
@@ -1124,3 +1130,155 @@ async def test_setup_hotspot_radio_runs_usb_current_before_early_return(
         "_ensure_usb_max_current must run before the early return on "
         "hotspot-config write failure"
     )
+    assert rtc_calls == [True], (
+        "_ensure_rtc_bbat_charging must run before the early return on "
+        "hotspot-config write failure"
+    )
+
+
+# ---------------------------------------------------------------------
+# _ensure_rtc_bbat_charging: enables Pi 5 RTC backup-battery charging
+# and surgically fixes the rtc=bbat_vchg typo that disables /dev/rtc0.
+# Same append-only contract as the USB budget helper.
+# ---------------------------------------------------------------------
+
+
+async def test_ensure_rtc_bbat_appends_never_rewrites(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)   # board model
+    patched_command.respond(True, "")          # charging_voltage inactive
+    patched_command.respond(True, "")          # no typo
+    patched_command.respond(True, "")          # not declared
+    patched_command.respond(True, "")          # backup
+    patched_command.respond(True, "")          # append
+    patched_command.respond(True, "1")         # post-append count
+
+    assert await hotspot_radio._ensure_rtc_bbat_charging() is True
+
+    appends = [c for c in patched_command.calls if "tee -a" in c]
+    assert len(appends) == 1, patched_command.calls
+    assert hotspot_radio.RTC_BBAT_SETTING in appends[0]
+
+    joined = " ".join(patched_command.calls)
+    assert "tee -a" in joined
+    for forbidden in ("tee /boot", f"> {hotspot_radio.BOOT_CONFIG_PATH}", "base64 -d"):
+        assert forbidden not in joined, (
+            f"{forbidden!r} would rewrite {hotspot_radio.BOOT_CONFIG_PATH}"
+        )
+
+
+async def test_ensure_rtc_bbat_emits_explicit_all_section(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)
+    patched_command.respond(True, "")
+    patched_command.respond(True, "")
+    patched_command.respond(True, "")
+    patched_command.respond(True, "")
+    patched_command.respond(True, "")
+    patched_command.respond(True, "1")
+
+    await hotspot_radio._ensure_rtc_bbat_charging()
+
+    append = next(c for c in patched_command.calls if "tee -a" in c)
+    assert "[all]" in append
+    assert append.index("[all]") < append.index(hotspot_radio.RTC_BBAT_SETTING)
+
+
+async def test_ensure_rtc_bbat_block_is_printf_safe() -> None:
+    for line in hotspot_radio.RTC_BBAT_BLOCK_LINES:
+        assert "'" not in line, f"single quote breaks the printf: {line!r}"
+        assert "%" not in line, f"percent is a printf format specifier: {line!r}"
+
+
+async def test_ensure_rtc_bbat_skips_non_pi5(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, "Raspberry Pi 4 Model B Rev 1.4")
+
+    assert await hotspot_radio._ensure_rtc_bbat_charging() is False
+    assert _mutating_calls(patched_command.calls) == [], patched_command.calls
+
+
+async def test_ensure_rtc_bbat_short_circuits_when_already_active(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)
+    patched_command.respond(True, "3000000")
+
+    assert await hotspot_radio._ensure_rtc_bbat_charging() is True
+    assert _mutating_calls(patched_command.calls) == [], patched_command.calls
+
+
+async def test_ensure_rtc_bbat_leaves_existing_declaration_alone(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)
+    patched_command.respond(True, "0")
+    patched_command.respond(True, "")  # no typo
+    patched_command.respond(True, "74:dtparam=rtc_bbat_vchg=3000000")
+
+    assert await hotspot_radio._ensure_rtc_bbat_charging() is True
+    assert not any("tee -a" in c for c in patched_command.calls)
+    assert not any("sed -i" in c for c in patched_command.calls)
+
+
+async def test_ensure_rtc_bbat_respects_explicit_opt_out(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)
+    patched_command.respond(True, "0")
+    patched_command.respond(True, "")
+    patched_command.respond(True, "42:dtparam=rtc_bbat_vchg=0")
+
+    assert await hotspot_radio._ensure_rtc_bbat_charging() is True
+    assert not any("tee -a" in c for c in patched_command.calls)
+    assert not any("sed -i" in c for c in patched_command.calls)
+
+
+async def test_ensure_rtc_bbat_fixes_typo_in_place(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)
+    patched_command.respond(True, "")  # inactive
+    patched_command.respond(True, "74:dtparam=rtc=bbat_vchg=3000000")  # typo
+    patched_command.respond(True, "")  # backup
+    patched_command.respond(True, "")  # sed
+    patched_command.respond(True, "")  # typo gone
+    patched_command.respond(True, "74:dtparam=rtc_bbat_vchg=3000000")  # fixed
+
+    assert await hotspot_radio._ensure_rtc_bbat_charging() is True
+
+    seds = [c for c in patched_command.calls if "sed -i" in c]
+    assert len(seds) == 1, patched_command.calls
+    assert "dtparam=rtc=bbat_vchg=" in seds[0]
+    assert "dtparam=rtc_bbat_vchg=" in seds[0]
+    assert not any("tee -a" in c for c in patched_command.calls), (
+        "typo fix must not also append a second charging line"
+    )
+
+
+async def test_ensure_rtc_bbat_aborts_typo_fix_when_backup_fails(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)
+    patched_command.respond(True, "")
+    patched_command.respond(True, "74:dtparam=rtc=bbat_vchg=3000000")
+    patched_command.respond(False, "cp: cannot create regular file")
+
+    assert await hotspot_radio._ensure_rtc_bbat_charging() is False
+    assert not any("sed -i" in c for c in patched_command.calls)
+
+
+async def test_ensure_rtc_bbat_aborts_when_backup_fails(
+    patched_command: _RunHostCommandRecorder,
+) -> None:
+    patched_command.respond(True, PI5_MODEL)
+    patched_command.respond(True, "")
+    patched_command.respond(True, "")
+    patched_command.respond(True, "")
+    patched_command.respond(False, "cp: cannot create regular file")
+
+    assert await hotspot_radio._ensure_rtc_bbat_charging() is False
+    assert not any("tee -a" in c for c in patched_command.calls)

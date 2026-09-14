@@ -165,6 +165,26 @@ the logs cannot attribute the trip to an individual device.
 It is deliberately append-only and never rewrites ``config.txt`` - see
 that function for why.
 
+Part 4: enable Pi 5 RTC backup-battery charging
+-----------------------------------------------
+The Pi 5 has an onboard RTC in the PMIC and a J5 battery connector for
+the official ML2020 cell. Charging is **off by default**; enabling it
+requires::
+
+    dtparam=rtc_bbat_vchg=3000000
+
+in ``/boot/firmware/config.txt``. Without a working RTC the system
+clock falls back to 1970 across hard power cuts (BlueOS has no reliable
+``fake-hwclock``), which corrupts log / MCAP timestamps until GPS or
+browser time sync catches up.
+
+:func:`_ensure_rtc_bbat_charging` stages that setting the same
+append-only way as the USB budget. It also surgically corrects the
+common typo ``dtparam=rtc=bbat_vchg=...`` (equals instead of underscore
+after ``rtc``): that form overwrites the ``rpi_rtc`` device-tree
+``status`` with garbage, so the kernel never binds ``/dev/rtc0`` even
+though ``vcgencmd pmic_read_adc BATT_V`` still shows the cell.
+
 Boot order
 ----------
   1. Kernel + USB enumeration -> ``rtl88x2bu`` loads -> udev rule renames
@@ -379,6 +399,23 @@ USB_MAX_CURRENT_BLOCK_LINES = (
     "# leaves no headroom: the rail trips over-current under load, drops the",
     "# dongle off the bus, and takes the hotspot down with it.",
     USB_MAX_CURRENT_SETTING,
+)
+
+# Pi 5 RTC backup-battery charging. See "Part 4" in the module docstring.
+# 3000000 uV = 3.0 V constant-voltage setpoint for the official ML2020.
+BOOT_CONFIG_RTC_BACKUP_PATH = "/boot/firmware/config.txt.doris-rtc-bbat.bak"
+RTC_BBAT_SETTING = "dtparam=rtc_bbat_vchg=3000000"
+# Typo that sets rpi_rtc status=bbat_vchg=... and disables /dev/rtc0.
+RTC_BBAT_TYPO_GREP = "^[[:space:]]*dtparam=rtc=bbat_vchg="
+
+RTC_BBAT_BLOCK_LINES = (
+    "",
+    "[all]",
+    "# Managed by DORIS extension (services/hotspot_radio.py).",
+    "# Enable charging for the Pi 5 onboard RTC backup battery (official",
+    "# ML2020 on J5). Charging is off by default; without it the RTC still",
+    "# runs while powered but does not keep time across hard power cuts.",
+    RTC_BBAT_SETTING,
 )
 
 
@@ -1113,26 +1150,180 @@ async def _ensure_usb_max_current() -> bool:
     return True
 
 
+async def _ensure_rtc_bbat_charging() -> bool:
+    """Stage ``dtparam=rtc_bbat_vchg=3000000`` for the Pi 5 RTC battery.
+
+    Enables the PMIC charger for the official ML2020 backup cell so wall
+    time survives hard power cuts. See "Part 4" in the module docstring.
+
+    Returns ``True`` when the setting is active or staged, ``False``
+    when we skipped or could not apply it. Nothing else is gated on the
+    result.
+
+    **Only takes effect on the next reboot.** Same append-only rules as
+    :func:`_ensure_usb_max_current`: never rewrite ``config.txt`` through
+    Commander. The one exception is a surgical ``sed`` that rewrites the
+    known-broken typo ``dtparam=rtc=bbat_vchg=...`` in place - that form
+    disables the RTC driver entirely, so leaving it alone is worse than
+    a one-line fix, and we never send the file contents through the
+    Commander ``repr()`` transport.
+
+    Guards, in order: skip non-Pi-5; short-circuit if sysfs already
+    reports the 3.0 V charge setpoint; fix the typo if present; leave
+    any existing ``dtparam=rtc_bbat_vchg`` declaration alone (including
+    an explicit opt-out); refuse to append if the one-time backup cannot
+    be taken.
+    """
+    ok, model = await _run_host_command(
+        "cat /proc/device-tree/model 2>/dev/null | tr -d '\\0'"
+    )
+    if not ok or "Raspberry Pi 5" not in model:
+        logger.info(
+            "RTC battery charging: board reports %r, not a Pi 5 - skipping",
+            model.strip() or "unknown",
+        )
+        return False
+
+    ok, active = await _run_host_command(
+        "cat /sys/devices/platform/soc/soc:rpi_rtc/rtc/rtc0/charging_voltage "
+        "2>/dev/null || true"
+    )
+    if ok and active.strip() == "3000000":
+        logger.info("Pi 5 RTC backup-battery charging already active at 3.0 V")
+        return True
+
+    ok, typo = await _run_host_command(
+        f"grep -n '{RTC_BBAT_TYPO_GREP}' {BOOT_CONFIG_PATH} 2>/dev/null; true"
+    )
+    if ok and typo.strip():
+        ok, _ = await _run_host_command(
+            f"test -f {BOOT_CONFIG_RTC_BACKUP_PATH} ||"
+            f" sudo cp -p {BOOT_CONFIG_PATH} {BOOT_CONFIG_RTC_BACKUP_PATH}"
+        )
+        if not ok:
+            logger.warning(
+                "Could not back up %s; refusing to fix RTC typo in boot config",
+                BOOT_CONFIG_PATH,
+            )
+            return False
+        # In-place one-line fix only - never rewrite the whole file.
+        ok, _ = await _run_host_command(
+            f"sudo sed -i 's/^[[:space:]]*dtparam=rtc=bbat_vchg=/"
+            f"dtparam=rtc_bbat_vchg=/' {BOOT_CONFIG_PATH}"
+        )
+        if not ok:
+            logger.warning(
+                "Failed to correct RTC typo in %s (backup at %s)",
+                BOOT_CONFIG_PATH,
+                BOOT_CONFIG_RTC_BACKUP_PATH,
+            )
+            return False
+        ok, still_typo = await _run_host_command(
+            f"grep -n '{RTC_BBAT_TYPO_GREP}' {BOOT_CONFIG_PATH} 2>/dev/null; true"
+        )
+        ok2, fixed = await _run_host_command(
+            f"grep -n '^[[:space:]]*{RTC_BBAT_SETTING}$' {BOOT_CONFIG_PATH}"
+            " 2>/dev/null; true"
+        )
+        if (ok and still_typo.strip()) or not (ok2 and fixed.strip()):
+            logger.warning(
+                "RTC typo fix of %s did not land cleanly (still_typo=%r fixed=%r); "
+                "backup at %s",
+                BOOT_CONFIG_PATH,
+                still_typo.strip(),
+                fixed.strip(),
+                BOOT_CONFIG_RTC_BACKUP_PATH,
+            )
+            return False
+        logger.info(
+            "Corrected RTC typo to %s in %s; reboot to activate (backup at %s)",
+            RTC_BBAT_SETTING,
+            BOOT_CONFIG_PATH,
+            BOOT_CONFIG_RTC_BACKUP_PATH,
+        )
+        return True
+
+    ok, declared = await _run_host_command(
+        f"grep -n '^[[:space:]]*dtparam=rtc_bbat_vchg=' {BOOT_CONFIG_PATH}"
+        " 2>/dev/null; true"
+    )
+    if ok and declared.strip():
+        logger.info(
+            "RTC battery charging already declared in %s (%s); reboot to activate",
+            BOOT_CONFIG_PATH,
+            "; ".join(declared.split()),
+        )
+        return True
+
+    ok, _ = await _run_host_command(
+        f"test -f {BOOT_CONFIG_RTC_BACKUP_PATH} ||"
+        f" sudo cp -p {BOOT_CONFIG_PATH} {BOOT_CONFIG_RTC_BACKUP_PATH}"
+    )
+    if not ok:
+        logger.warning(
+            "Could not back up %s; refusing to modify the boot config",
+            BOOT_CONFIG_PATH,
+        )
+        return False
+
+    block = "\\n".join(RTC_BBAT_BLOCK_LINES) + "\\n"
+    ok, _ = await _run_host_command(
+        f"printf '{block}' | sudo tee -a {BOOT_CONFIG_PATH} >/dev/null"
+    )
+    if not ok:
+        logger.warning(
+            "Failed to append %s to %s (backup at %s)",
+            RTC_BBAT_SETTING,
+            BOOT_CONFIG_PATH,
+            BOOT_CONFIG_RTC_BACKUP_PATH,
+        )
+        return False
+
+    ok, count = await _run_host_command(
+        f"grep -c '^{RTC_BBAT_SETTING}$' {BOOT_CONFIG_PATH} 2>/dev/null; true"
+    )
+    if not ok or count.strip() != "1":
+        logger.warning(
+            "Post-append check of %s expected exactly one %r line but counted "
+            "%r; the boot config may now be inconsistent. Backup is at %s.",
+            BOOT_CONFIG_PATH,
+            RTC_BBAT_SETTING,
+            count.strip(),
+            BOOT_CONFIG_RTC_BACKUP_PATH,
+        )
+        return False
+
+    logger.info(
+        "Enabled Pi 5 RTC backup-battery charging in %s; reboot to activate "
+        "(backup at %s)",
+        BOOT_CONFIG_PATH,
+        BOOT_CONFIG_RTC_BACKUP_PATH,
+    )
+    return True
+
+
 async def setup_hotspot_radio() -> None:
     """Install the host-side config that pins ``uap0`` to the USB Realtek
     *and* makes the AP come up on 2.4 GHz HT20 with the full set of HT
     capabilities the radio supports.
 
     Also raises the Pi 5 USB current budget so the dongle cannot be
-    dropped off the bus by an over-current trip; see
-    :func:`_ensure_usb_max_current`.
+    dropped off the bus by an over-current trip, and enables charging
+    for the Pi 5 onboard RTC backup battery; see
+    :func:`_ensure_usb_max_current` and :func:`_ensure_rtc_bbat_charging`.
 
     Idempotent: writes are skipped where existing host content already
-    matches. The udev rename, the bind-mounted wifi override and the USB
-    current budget all only take full effect on the next reboot, so this
-    function never restarts services or kicks the running hotspot - it
-    just stages everything for the next boot. The running AP keeps
-    working at default settings in the meantime.
+    matches. The udev rename, the bind-mounted wifi override, the USB
+    current budget and the RTC charging setpoint all only take full
+    effect on the next reboot, so this function never restarts services
+    or kicks the running hotspot - it just stages everything for the
+    next boot. The running AP keeps working at default settings in the
+    meantime.
     """
-    # Runs first and unconditionally: it is independent of the hotspot
-    # config below, and the early return on write failure must not skip
-    # it.
+    # Runs first and unconditionally: independent of the hotspot config
+    # below, and the early return on write failure must not skip them.
     await _ensure_usb_max_current()
+    await _ensure_rtc_bbat_charging()
 
     rule_ok = await _write_host_file(UDEV_RULE_PATH, UDEV_RULE_CONTENT)
     nm_ok = await _write_host_file(NM_CONF_PATH, NM_CONF_CONTENT)
