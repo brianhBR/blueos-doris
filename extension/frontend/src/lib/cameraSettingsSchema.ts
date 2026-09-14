@@ -59,7 +59,10 @@ export const CAMERA_BASE_SCHEMA: Record<string, CameraFieldMeta> = {
   gamma: range('Gamma', 'Midtone response / tone-curve shape.'),
   // Exposure
   blc_level: range('Backlight Compensation', 'Brightens a subject lit from behind.'),
-  max_exposure: options('Max Exposure', shutterOpts(), 'Longest exposure the auto-exposure loop may use.'),
+  // max_exposure caps the longest exposure the auto-exposure loop may use,
+  // which is the *slowest* shutter it may drop to -- i.e. a floor on shutter
+  // speed.  Labelled "Min Shutter Speed" so a higher 1/x keeps motion sharp.
+  max_exposure: options('Min Shutter Speed', shutterOpts(), 'Fastest floor for auto-exposure: the shutter will not drop below this, so higher values (e.g. 1/100) keep moving subjects sharp.'),
   auto_exposureEx: options('Auto Exposure Mode', [
     { value: 0, label: 'Auto' }, { value: 1, label: 'Manual' },
   ]),
