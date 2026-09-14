@@ -27,6 +27,16 @@ class ConnectionStatus(BaseModel):
     signal_strength: int | None = None
 
 
+class NetworkInterface(BaseModel):
+    """A physical/logical network interface on the vehicle host."""
+
+    name: str
+    mac: str | None = None
+    ip_addresses: list[str] = []
+    is_up: bool = False
+    role: str | None = None  # "hotspot", "wifi", "ethernet", "usb"
+
+
 class NetworkInfo(BaseModel):
     """Complete network information."""
 
@@ -35,6 +45,7 @@ class NetworkInfo(BaseModel):
     is_scanning: bool = False
     serial_number: str | None = None
     hotspot_ssid: str | None = None
+    interfaces: list[NetworkInterface] = []
 
 
 class NetworkCredentials(BaseModel):

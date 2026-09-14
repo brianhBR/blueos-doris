@@ -130,12 +130,21 @@ export interface ConnectionStatus {
   signal_strength: number | null
 }
 
+export interface NetworkInterface {
+  name: string
+  mac: string | null
+  ip_addresses: string[]
+  is_up: boolean
+  role: 'hotspot' | 'wifi' | 'ethernet' | 'usb' | 'other' | null
+}
+
 export interface NetworkFullInfo {
   connection: ConnectionStatus
   available_networks: WifiNetwork[]
   is_scanning: boolean
   serial_number: string | null
   hotspot_ssid: string | null
+  interfaces: NetworkInterface[]
 }
 
 /**
@@ -663,6 +672,7 @@ export function useWifiNetworks() {
   const connectionStatus = ref<ConnectionStatus | null>(null)
   const serialNumber = ref<string | null>(null)
   const hotspotSsid = ref<string | null>(null)
+  const interfaces = ref<NetworkInterface[]>([])
   const wlanState = ref<WlanState | null>(null)
   const loading = ref(false)
   const scanning = ref(false)
@@ -678,6 +688,7 @@ export function useWifiNetworks() {
       connectionStatus.value = info.connection
       serialNumber.value = info.serial_number
       hotspotSsid.value = info.hotspot_ssid
+      interfaces.value = info.interfaces ?? []
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Failed to fetch networks'
     } finally {
@@ -803,6 +814,7 @@ export function useWifiNetworks() {
     connectionStatus: readonly(connectionStatus),
     serialNumber: readonly(serialNumber),
     hotspotSsid: readonly(hotspotSsid),
+    interfaces: readonly(interfaces),
     wlanState: readonly(wlanState),
     loading: readonly(loading),
     scanning: readonly(scanning),

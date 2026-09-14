@@ -12,6 +12,7 @@ const {
   connectionStatus: apiConnectionStatus,
   serialNumber: apiSerialNumber,
   hotspotSsid: apiHotspotSsid,
+  interfaces: apiInterfaces,
   wlanState,
   scanning,
   switching,
@@ -24,6 +25,27 @@ const {
 
 const dorisMACAddress = computed(() => apiConnectionStatus.value?.mac_address ?? '—')
 const dorisHotspotName = computed(() => apiHotspotSsid.value ?? 'DORIS')
+
+const ROLE_LABELS: Record<string, string> = {
+  hotspot: 'Hotspot radio',
+  wifi: 'WiFi',
+  ethernet: 'Ethernet',
+  usb: 'USB tether',
+  other: '',
+}
+
+// Only interfaces that are actually up are worth showing — a down
+// interface has no IP and just pads the table with dashes.
+const displayInterfaces = computed(() =>
+  apiInterfaces.value
+    .filter(i => i.is_up)
+    .map(i => ({
+      name: i.name,
+      label: ROLE_LABELS[i.role ?? 'other'] ?? '',
+      mac: i.mac ?? '—',
+      ips: i.ip_addresses.length > 0 ? i.ip_addresses.join(', ') : '—',
+    })),
+)
 
 const showAdvanced = ref(true)
 const selectedNetwork = ref<DisplayNetwork | null>(null)
@@ -293,18 +315,43 @@ const formatTimestamp = (iso: string): string => {
             <span class="text-sm font-mono text-white">{{ apiSerialNumber ?? '—' }}</span>
           </div>
           <div class="flex items-center justify-between">
-            <span class="text-sm" style="color: #96EEF2">MAC Address:</span>
-            <span class="text-sm font-mono text-white">{{ dorisMACAddress }}</span>
-          </div>
-          <div class="flex items-center justify-between">
             <span class="text-sm" style="color: #96EEF2">Hotspot Name:</span>
             <span class="text-sm font-mono text-white">{{ dorisHotspotName }}</span>
           </div>
+          <div class="flex items-center justify-between">
+            <span class="text-sm" style="color: #96EEF2">Hotspot Radio MAC:</span>
+            <span class="text-sm font-mono text-white">{{ dorisMACAddress }}</span>
+          </div>
         </div>
+
         <div class="mt-3 pt-3" style="border-top: 1px solid rgba(65, 185, 195, 0.2)">
-          <p class="text-xs" style="color: #96EEF2">
-            <strong>Note:</strong> Use the MAC address above when adding DORIS to high-security networks or MAC filtering systems.
-          </p>
+          <h4 class="text-white mb-2 text-sm font-semibold">Network Interfaces</h4>
+          <div v-if="displayInterfaces.length === 0" class="text-sm" style="color: #96EEF2">
+            No active interfaces reported.
+          </div>
+          <table v-else class="w-full text-xs">
+            <thead>
+              <tr style="color: #96EEF2">
+                <th class="text-left font-normal pb-1">Interface</th>
+                <th class="text-left font-normal pb-1">IP Address</th>
+                <th class="text-left font-normal pb-1">MAC Address</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr
+                v-for="iface in displayInterfaces"
+                :key="iface.name"
+                style="border-top: 1px solid rgba(65, 185, 195, 0.15)"
+              >
+                <td class="py-1 pr-2 align-top">
+                  <span class="font-mono text-white">{{ iface.name }}</span>
+                  <span v-if="iface.label" class="block" style="color: #96EEF2">{{ iface.label }}</span>
+                </td>
+                <td class="py-1 pr-2 align-top font-mono text-white break-all">{{ iface.ips }}</td>
+                <td class="py-1 align-top font-mono text-white break-all">{{ iface.mac }}</td>
+              </tr>
+            </tbody>
+          </table>
         </div>
       </div>
 
