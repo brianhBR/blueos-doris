@@ -20,20 +20,36 @@ exit until the caller explicitly stops recording.
 
 Pipeline (per instance):
 
-    rtspsrc location=URL protocols=tcp is-live=true latency=2000
+    rtspsrc name=src location=URL protocols=tcp is-live=true latency=2000
             retry=5 timeout=5000000 do-retransmission=false
-        ! rtph264depay
-        ! h264parse config-interval=-1
-        ! video/x-h264,stream-format=byte-stream,alignment=au
+        ! <rtph264depay|rtph265depay>
+        ! <h264parse|h265parse> name=vparse config-interval=-1
+        ! video/x-<h264|h265>,stream-format=byte-stream,alignment=au
         ! splitmuxsink name=muxsink max-size-time=NS
                        muxer-factory=mpegtsmux send-keyframe-requests=true
                        async-finalize=true
 
-The camera signals SPS/PPS only via the SDP and never re-emits them
-in-band, so without ``config-interval=-1`` only the first segment after
-each rtspsrc connect is decodable.  ``alignment=au`` then groups
-SPS+PPS+IDR into a single buffer so splitmuxsink can never split
-between the parameter sets and their keyframe.
+The depayloader/parser pair is chosen at runtime rather than baked into
+the pipeline description: ``rtspsrc`` exposes its pads only after the
+RTSP DESCRIBE completes, and :meth:`RecordingSession._on_rtsp_pad_added`
+reads ``encoding-name`` off the new pad's ``application/x-rtp`` caps to
+build the matching branch (see :data:`_VIDEO_CHAINS`).  The RadCam's
+codec is operator-configurable -- ``encode_type`` 1 is H.264 and 5 is
+H.265 -- and a hardcoded H.264 branch silently recorded nothing for a
+whole dive when the camera was switched to HEVC: ``rtspsrc`` could not
+link its H265 pad to ``rtph264depay`` and failed with a generic
+"Internal data stream error" on a ~2 s restart loop.  An encoding we
+have no branch for is now reported explicitly as
+``unsupported_codec:<NAME>`` instead.
+
+Audio pads are deliberately left unlinked; the camera offers a PCMU
+track that we never record.
+
+The camera signals SPS/PPS (and VPS, on H.265) only via the SDP and
+never re-emits them in-band, so without ``config-interval=-1`` only the
+first segment after each rtspsrc connect is decodable.  ``alignment=au``
+then groups the parameter sets and their IDR into a single buffer so
+splitmuxsink can never split between them.
 
 ``splitmuxsink`` produces multiple
 ``radcam_<stamp>_<phase>_cyc<CC>_part<NN>_%05d_t<open>.ts`` segments
@@ -324,28 +340,67 @@ def _dive_dir(root: Path, stamp: str) -> Path:
     return d
 
 
-def _build_pipeline_description(rtsp_url: str, segment_s: int) -> str:
-    """GStreamer pipeline description matching the legacy gst-launch args.
+# RTP ``encoding-name`` -> (depayloader, parser, output media type).
+# Keyed by the value rtspsrc reports on its ``application/x-rtp`` pad
+# caps, uppercased.  Both parsers accept ``config-interval`` and both
+# media types are in mpegtsmux's sink template with
+# ``alignment={au,nal}``, so the rest of the branch is identical.
+_VIDEO_CHAINS: dict[str, tuple[str, str, str]] = {
+    "H264": ("rtph264depay", "h264parse", "video/x-h264"),
+    "H265": ("rtph265depay", "h265parse", "video/x-h265"),
+}
 
-    The muxer is named ``muxsink`` so we can fetch it after parsing and
-    attach the ``format-location`` signal handler + emit ``split-now``
-    for zero-gap phase rotation in the next commit.
+# Name given to the parser element so the frame-counting buffer probe
+# can find it regardless of which codec branch was built.
+_PARSE_ELEMENT_NAME = "vparse"
+
+
+def _build_pipeline_description(rtsp_url: str, segment_s: int) -> str:
+    """Source and sink only; the codec branch is added on ``pad-added``.
+
+    ``rtspsrc`` and ``splitmuxsink`` are declared as two unlinked
+    elements (no ``!`` between them) because the depayloader/parser that
+    goes in between depends on the codec the camera advertises, which
+    isn't known until the RTSP DESCRIBE lands.  Keeping them in a
+    ``parse_launch`` description means the property values are still
+    parsed with gst-launch semantics (notably ``protocols=tcp``, a
+    ``GstRTSPLowerTrans`` flags value that is awkward to set from
+    Python).
+
+    The muxer is named ``muxsink`` so we can fetch it after parsing to
+    attach the ``format-location`` signal handler and emit ``split-now``
+    for zero-gap phase rotation.
     """
     seg_ns = max(1, segment_s) * 1_000_000_000
     return (
-        f"rtspsrc location={rtsp_url} protocols=tcp is-live=true latency=2000 "
-        f"retry=5 timeout=5000000 do-retransmission=false "
-        f"! rtph264depay "
-        f"! h264parse name=h264parse config-interval=-1 "
-        f"! video/x-h264,stream-format=byte-stream,alignment=au "
-        f"! splitmuxsink name=muxsink max-size-time={seg_ns} "
+        f"rtspsrc name=src location={rtsp_url} protocols=tcp is-live=true "
+        f"latency=2000 retry=5 timeout=5000000 do-retransmission=false "
+        f"splitmuxsink name=muxsink max-size-time={seg_ns} "
         f"muxer-factory=mpegtsmux send-keyframe-requests=true "
         f"async-finalize=true"
     )
 
 
+def _rtp_pad_info(pad) -> tuple[str | None, str | None]:
+    """Return ``(media, encoding_name)`` from an rtspsrc pad's RTP caps.
+
+    New rtspsrc pads carry
+    ``application/x-rtp, media=(string)video, encoding-name=(string)H265``.
+    Falls back to the pad's allowed caps when it has not negotiated yet,
+    and returns ``(None, None)`` if nothing usable is available.
+    """
+    try:
+        caps = pad.get_current_caps() or pad.query_caps(None)
+        if caps is None or caps.get_size() == 0:
+            return None, None
+        s = caps.get_structure(0)
+        return s.get_string("media"), s.get_string("encoding-name")
+    except Exception:
+        return None, None
+
+
 def _caps_to_dict(caps) -> dict | None:
-    """Flatten the negotiated H.264 caps into a small JSON-able dict.
+    """Flatten the negotiated video caps into a small JSON-able dict.
 
     Returns ``None`` if caps are absent/empty.  Best-effort: any GI
     quirk just drops the offending field rather than raising into the
@@ -472,6 +527,13 @@ class RecordingSession:
         self._stream_log = stream_log
         self.frame_count = 0
         self.stream_caps: dict | None = None
+        # RTP encoding-name of the linked video branch ("H264"/"H265"),
+        # and the reason the branch could not be built (unsupported
+        # codec, or a link failure) for the current pipeline instance.
+        # Both are set from the streaming thread in _on_rtsp_pad_added.
+        self.stream_codec: str | None = None
+        self._video_linked = False
+        self._codec_error: str | None = None
         self.last_pattern: str | None = None
         self.last_exit: dict | None = None
         self.rotation_count = 0
@@ -508,14 +570,14 @@ class RecordingSession:
         if sl is not None:
             sl.emit(event, part=self._current_part, cyc=self.cycle_seq, **fields)
 
-    def _on_h264_buffer(self, _pad, _info):
-        """Buffer probe on h264parse src; runs on the streaming thread.
+    def _on_video_buffer(self, _pad, _info):
+        """Buffer probe on the parser's src pad; runs on the streaming thread.
 
         Cheap on the steady-state path (just a counter bump).  On the
         very first buffer it latches the precise first-frame time and the
-        negotiated caps (resolution / framerate / H.264 profile+level)
-        which are otherwise never recorded, and emits a ``first_frame``
-        event carrying the connect latency.
+        negotiated caps (media type / resolution / framerate / profile +
+        level) which are otherwise never recorded, and emits a
+        ``first_frame`` event carrying the connect latency.
         """
         self.frame_count += 1
         if self.first_frame_at is None:
@@ -670,6 +732,110 @@ class RecordingSession:
             "segment_seconds": self._segment_s,
         }
 
+    def _on_rtsp_pad_added(self, _src, pad) -> None:
+        """Build and link the codec branch for a new rtspsrc pad.
+
+        Runs on a GStreamer streaming thread once the RTSP DESCRIBE has
+        resolved the stream's codec.  Ignores the camera's audio track
+        and records ``_codec_error`` for anything we have no branch for,
+        which :meth:`_run_one` turns into an explicit pipeline exit
+        reason instead of letting the pipeline sit in PLAYING forever
+        with nothing routed to the muxer.
+        """
+        media, encoding = _rtp_pad_info(pad)
+        if media is not None and media != "video":
+            logger.debug("RECORD ignoring %s rtsp pad (media=%s)", encoding, media)
+            return
+        if self._video_linked:
+            logger.debug("RECORD ignoring extra video pad (encoding=%s)", encoding)
+            return
+
+        enc = (encoding or "").upper()
+        chain = _VIDEO_CHAINS.get(enc)
+        if chain is None:
+            self._codec_error = enc or "unknown"
+            logger.error(
+                "RECORD part=%d camera advertises unsupported video codec %r "
+                "(supported: %s) -- no frames can be recorded until the "
+                "camera's encode_type is changed",
+                self._current_part, enc or "unknown",
+                ", ".join(sorted(_VIDEO_CHAINS)),
+            )
+            self._emit("codec_unsupported", encoding=enc or "unknown")
+            return
+
+        depay_name, parse_name, media_type = chain
+        pipeline = self._pipeline
+        muxsink = self._muxsink
+        if pipeline is None or muxsink is None:
+            return
+
+        try:
+            depay = Gst.ElementFactory.make(depay_name, None)
+            parse = Gst.ElementFactory.make(parse_name, _PARSE_ELEMENT_NAME)
+            capsfilter = Gst.ElementFactory.make("capsfilter", None)
+            if depay is None or parse is None or capsfilter is None:
+                raise RuntimeError(
+                    f"could not create {depay_name}/{parse_name}/capsfilter"
+                )
+
+            # The camera only ever sends parameter sets in the SDP, so
+            # re-inject them ahead of every keyframe (config-interval=-1)
+            # and keep each access unit whole so splitmuxsink cannot cut
+            # between the parameter sets and their IDR.
+            parse.set_property("config-interval", -1)
+            capsfilter.set_property(
+                "caps",
+                Gst.Caps.from_string(
+                    f"{media_type},stream-format=byte-stream,alignment=au"
+                ),
+            )
+
+            for el in (depay, parse, capsfilter):
+                pipeline.add(el)
+            if not depay.link(parse) or not parse.link(capsfilter):
+                raise RuntimeError(f"failed to link {depay_name} -> {parse_name}")
+
+            videopad = muxsink.request_pad_simple("video")
+            if videopad is None:
+                raise RuntimeError("splitmuxsink has no 'video' request pad")
+            if capsfilter.get_static_pad("src").link(videopad) is not Gst.PadLinkReturn.OK:
+                raise RuntimeError("failed to link capsfilter -> splitmuxsink")
+
+            for el in (depay, parse, capsfilter):
+                el.sync_state_with_parent()
+
+            if pad.link(depay.get_static_pad("sink")) is not Gst.PadLinkReturn.OK:
+                raise RuntimeError(f"failed to link rtspsrc -> {depay_name}")
+
+            # Counts frames and captures first-frame timing + negotiated
+            # caps for the stream log.  Best-effort: losing the probe
+            # costs instrumentation, not recording.
+            try:
+                srcpad = parse.get_static_pad("src")
+                if srcpad is not None:
+                    srcpad.add_probe(
+                        Gst.PadProbeType.BUFFER, self._on_video_buffer,
+                    )
+            except Exception:
+                logger.debug(
+                    "RECORD failed to attach video buffer probe", exc_info=True,
+                )
+
+            self._video_linked = True
+            self.stream_codec = enc
+            logger.info(
+                "RECORD part=%d linked %s branch (%s -> %s)",
+                self._current_part, enc, depay_name, parse_name,
+            )
+            self._emit("codec_linked", encoding=enc, depayloader=depay_name)
+        except Exception as e:
+            self._codec_error = f"{enc}:link_failed"
+            logger.exception(
+                "RECORD part=%d failed to build %s branch: %s",
+                self._current_part, enc, e,
+            )
+
     def _build_pipeline(self) -> "Gst.Pipeline":
         desc = _build_pipeline_description(self._rtsp_url, self._segment_s)
         pipeline = Gst.parse_launch(desc)
@@ -678,18 +844,17 @@ class RecordingSession:
         muxsink = pipeline.get_by_name("muxsink")
         if muxsink is None:
             raise RuntimeError("splitmuxsink 'muxsink' not found in pipeline")
+        src = pipeline.get_by_name("src")
+        if src is None:
+            raise RuntimeError("rtspsrc 'src' not found in pipeline")
         muxsink.connect("format-location", self._on_format_location)
+        # _on_rtsp_pad_added reads both of these off the session, so they
+        # must be set before rtspsrc can start emitting pads.
+        self._pipeline = pipeline
         self._muxsink = muxsink
-        # Buffer probe on h264parse's src pad: counts frames and captures
-        # first-frame timing + negotiated caps for the stream log.  Best-
-        # effort -- a missing element or pad must never fail the build.
-        try:
-            h264 = pipeline.get_by_name("h264parse")
-            srcpad = h264.get_static_pad("src") if h264 is not None else None
-            if srcpad is not None:
-                srcpad.add_probe(Gst.PadProbeType.BUFFER, self._on_h264_buffer)
-        except Exception:
-            logger.debug("RECORD failed to attach h264 buffer probe", exc_info=True)
+        self._video_linked = False
+        self._codec_error = None
+        src.connect("pad-added", self._on_rtsp_pad_added)
         return pipeline
 
     async def _run_one(self) -> tuple[str, float]:
@@ -721,7 +886,6 @@ class RecordingSession:
             logger.exception("RECORD pipeline build failed")
             return "build_failed", asyncio.get_event_loop().time() - t0
 
-        self._pipeline = pipeline
         bus = pipeline.get_bus()
 
         ret = pipeline.set_state(Gst.State.PLAYING)
@@ -758,6 +922,13 @@ class RecordingSession:
                             self._current_part,
                         )
                         exit_reason = "unexpected_eos"
+                    break
+                # A codec we can't depayload leaves rtspsrc happily in
+                # PLAYING with nothing routed to the muxer, so there is
+                # no bus ERROR to catch.  Surface it as the exit reason
+                # instead of silently recording zero frames.
+                if self._codec_error is not None:
+                    exit_reason = f"unsupported_codec:{self._codec_error}"
                     break
                 await asyncio.sleep(0.1)
 
@@ -1056,13 +1227,16 @@ async def stop_recording() -> dict:
                 "session_stop", cyc=sess.cycle_seq,
                 restarts=sess.restart_count, rotations=sess.rotation_count,
                 first_frame_latency_s=ff_latency, frames=sess.frame_count,
-                caps=sess.stream_caps, last_exit=sess.last_exit,
+                caps=sess.stream_caps, codec=sess.stream_codec,
+                last_exit=sess.last_exit,
             )
         logger.info(
             "RECORD stop completed; restarts=%d rotations=%d "
-            "first_frame_latency_s=%s frames=%d last_exit=%s next_part_offset=%d",
+            "first_frame_latency_s=%s frames=%d codec=%s last_exit=%s "
+            "next_part_offset=%d",
             sess.restart_count, sess.rotation_count, ff_latency,
-            sess.frame_count, sess.last_exit, _session_part_offset,
+            sess.frame_count, sess.stream_codec, sess.last_exit,
+            _session_part_offset,
         )
         return {
             "success": True,
@@ -1071,6 +1245,7 @@ async def stop_recording() -> dict:
             "restarts": sess.restart_count,
             "rotations": sess.rotation_count,
             "first_frame_latency_s": ff_latency,
+            "stream_codec": sess.stream_codec,
             "phases": list(sess._last_phases),
             "last_exit": sess.last_exit,
         }
@@ -1265,12 +1440,14 @@ async def recording_status() -> dict:
     ff_latency = sess.first_frame_latency_s() if sess is not None else None
     frame_count = sess.frame_count if sess is not None else 0
     stream_caps = sess.stream_caps if sess is not None else None
+    stream_codec = sess.stream_codec if sess is not None else None
     return {
         "recording": alive,
         "frames_flowing": frames_flowing,
         "first_frame_latency_s": ff_latency,
         "frame_count": frame_count,
         "stream_caps": stream_caps,
+        "stream_codec": stream_codec,
         "base_stamp": base_stamp,
         "output_pattern": pattern,
         "phase": phase,
