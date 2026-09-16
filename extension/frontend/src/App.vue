@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { ref, computed, onMounted, onUnmounted } from 'vue'
+import { ref, computed, watch, onMounted, onUnmounted } from 'vue'
 import { HardDrive, Loader2, AlertTriangle, Clock, CircleCheck, CircleX, Usb, X } from 'lucide-vue-next'
 import type { Screen, DiveData } from './types'
 import { useDiveControl, useDiveProcessing, useNotifications, useStorageMigration, useArmingStatus } from './composables/useApi'
@@ -32,11 +32,17 @@ const { status: migrationStatus, isActive: migrationActive, isError: migrationEr
 
 const { status: armingStatus, fetchArmingStatus } = useArmingStatus()
 const showArmingBanner = computed(() => armingStatus.value?.waiting_to_arm === true)
-const isArmed = computed(() => armingStatus.value?.armed === true)
 
-// Once a mission is loaded the banner mirrors the AGT status lights: it turns
-// green the moment DORIS is armed (mission loaded + armed = ready), otherwise it
-// stays red to flag that the vehicle is loaded but not yet armed.
+// Red until a confirmed autopilot HEARTBEAT says armed.  Transient
+// mavlink2rest misses report armed=false/armed_known=false; ignore those
+// so the banner cannot flash green/red on a 5 s poll.
+const isArmed = ref(false)
+watch(armingStatus, (s) => {
+  if (s?.armed_known === true) {
+    isArmed.value = s.armed === true
+  }
+})
+
 const activeBannerStyle = computed(() =>
   isArmed.value
     ? { backgroundColor: '#00D4AA', color: '#0E2446', fontFamily: 'Montserrat, sans-serif' }

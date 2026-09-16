@@ -14,6 +14,32 @@ def test_base_mode_bits_parsing() -> None:
     assert arming._base_mode_bits("x") is None
 
 
+def test_decode_heartbeat_armed_accepts_missing_type() -> None:
+    armed, known = arming._decode_heartbeat_armed({
+        "message": {"base_mode": {"bits": 209}},
+    })
+    assert (armed, known) == (True, True)
+
+    disarmed, known = arming._decode_heartbeat_armed({
+        "message": {"type": "HEARTBEAT", "base_mode": {"bits": 81}},
+    })
+    assert (disarmed, known) == (False, True)
+
+
+def test_decode_heartbeat_armed_rejects_gcs_and_wrong_type() -> None:
+    assert arming._decode_heartbeat_armed({
+        "message": {
+            "type": "HEARTBEAT",
+            "mavtype": {"type": "MAV_TYPE_GCS"},
+            "base_mode": {"bits": 209},
+        },
+    }) == (False, False)
+    assert arming._decode_heartbeat_armed({
+        "message": {"type": "STATUSTEXT", "base_mode": {"bits": 209}},
+    }) == (False, False)
+    assert arming._decode_heartbeat_armed({"message": {}}) == (False, False)
+
+
 def test_is_prearm_text() -> None:
     assert arming._is_prearm_text("PreArm: GPS horizontal error")
     assert arming._is_prearm_text("prearm: 3D fix required")
@@ -100,6 +126,47 @@ async def test_unknown_armed_state_suppresses_banner() -> None:
     # We can't confirm the vehicle is disarmed, so don't claim "waiting".
     assert status["armed_known"] is False
     assert status["waiting_to_arm"] is False
+    assert status["armed"] is False
+
+
+async def test_unknown_preserves_last_confirmed_armed() -> None:
+    """A dropped HEARTBEAT must not report disarmed after a confirmed arm."""
+    service = ArmingService()
+    await _no_network(service)
+    reads = iter([(True, True), (False, False)])
+
+    async def fake_read_armed():
+        return next(reads)
+
+    service._read_armed = fake_read_armed  # type: ignore[assignment]
+
+    armed = await service.get_status()
+    assert armed["armed"] is True
+    assert armed["armed_known"] is True
+
+    dropped = await service.get_status()
+    assert dropped["armed"] is True
+    assert dropped["armed_known"] is False
+    assert dropped["waiting_to_arm"] is False
+
+
+async def test_unknown_preserves_last_confirmed_disarmed() -> None:
+    service = ArmingService()
+    await _no_network(service)
+    reads = iter([(False, True), (False, False)])
+
+    async def fake_read_armed():
+        return next(reads)
+
+    service._read_armed = fake_read_armed  # type: ignore[assignment]
+
+    disarmed = await service.get_status()
+    assert disarmed["armed"] is False
+    assert disarmed["armed_known"] is True
+
+    dropped = await service.get_status()
+    assert dropped["armed"] is False
+    assert dropped["armed_known"] is False
 
 
 async def test_stale_reasons_are_pruned() -> None:

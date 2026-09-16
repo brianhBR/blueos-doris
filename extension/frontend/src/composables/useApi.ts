@@ -1826,7 +1826,16 @@ export function useArmingStatus() {
 
   async function fetchArmingStatus() {
     try {
-      status.value = await fetchApi<ArmingStatus>('/vehicle/arming')
+      const next = await fetchApi<ArmingStatus>('/vehicle/arming')
+      const prev = status.value
+      if (!next.armed_known && prev != null) {
+        // Hold the last confirmed armed bit so a dropped HEARTBEAT
+        // cannot flip the top banner red, then green on the next poll.
+        status.value = { ...next, armed: prev.armed }
+      } else {
+        status.value = next
+      }
+      error.value = null
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Failed to fetch arming status'
     }
