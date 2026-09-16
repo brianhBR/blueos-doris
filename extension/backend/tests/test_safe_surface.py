@@ -179,6 +179,25 @@ def test_wrong_source_cannot_change_shutdown_state():
     assert service._shutdown_task is None
 
 
+def test_power_stage_confirmation_requires_valid_agt_message():
+    service = SafeSurfaceService()
+    service.process_named_value(
+        1, 191, "PWR_STAGE", module.POWER_STAGE_ACKNOWLEDGED
+    )
+    service.process_named_value(1, 192, "PWR_STAGE", 4.0)
+    assert service.state.power_shutdown_stage is None
+    assert service._power_acknowledged.is_set() is False
+
+    service.process_named_value(
+        1, 192, "PWR_STAGE", module.POWER_STAGE_ACKNOWLEDGED
+    )
+    assert (
+        service.state.power_shutdown_stage
+        == module.POWER_STAGE_ACKNOWLEDGED
+    )
+    assert service._power_acknowledged.is_set() is True
+
+
 def test_capability_and_firmware_are_both_required():
     service = SafeSurfaceService()
     service.process_named_value(1, 192, "AGT_CAP", 3.0)
@@ -215,13 +234,20 @@ def test_heartbeat_armed_decodes_mavlink2rest_base_mode():
     assert _heartbeat_armed({"type": "STATUSTEXT"}) is None
 
 
-def test_shutdown_requires_verified_firmware(monkeypatch):
+async def test_shutdown_does_not_depend_on_runtime_firmware_check(monkeypatch):
     monkeypatch.setattr(module, "automatic_payload_shutdown_enabled", lambda: True)
     service = SafeSurfaceService()
+    started = asyncio.Event()
+
+    async def sequence():
+        started.set()
+
+    monkeypatch.setattr(service, "_shutdown_sequence", sequence)
     service.process_named_value(1, 192, "AGT_CAP", 3.0)
     service.process_named_value(1, 192, "PWR_SHDN", 1.0)
-    assert service._shutdown_task is None
-    assert service.state.shutdown_error == "AGT firmware compatibility is not verified"
+    await started.wait()
+    assert service._shutdown_task is not None
+    assert service.state.shutdown_error is None
 
 
 def test_shutdown_requires_fresh_capability(monkeypatch):
@@ -229,7 +255,6 @@ def test_shutdown_requires_fresh_capability(monkeypatch):
     monkeypatch.setattr(module.time, "monotonic", lambda: 100.0)
     service = SafeSurfaceService()
     service.process_named_value(1, 192, "AGT_CAP", 3.0)
-    service.status({"compatible": True})
 
     monkeypatch.setattr(module.time, "monotonic", lambda: 106.0)
     service.process_named_value(1, 192, "PWR_SHDN", 1.0)
@@ -242,7 +267,6 @@ async def test_repeated_shutdown_request_spawns_one_task(monkeypatch):
     monkeypatch.setattr(module, "automatic_payload_shutdown_enabled", lambda: True)
     service = SafeSurfaceService()
     service.process_named_value(1, 192, "AGT_CAP", 3.0)
-    service.status({"compatible": True})
     started = []
     release = asyncio.Event()
 
@@ -309,7 +333,6 @@ async def test_failed_shutdown_allows_retry(monkeypatch):
         retries.append(True)
 
     monkeypatch.setattr(service, "_shutdown_sequence", retry)
-    service.state.firmware_compatible = True
     service.process_named_value(
         1, 192, "AGT_CAP", float(module.REQUIRED_CAPABILITIES)
     )
@@ -411,6 +434,9 @@ async def test_ack_precedes_poweroff(monkeypatch):
 
     async def send_ack(name, value):
         events.append(f"{name}={value:g}")
+        service.process_named_value(
+            1, 192, "PWR_STAGE", module.POWER_STAGE_ACKNOWLEDGED
+        )
         return True
 
     monkeypatch.setattr(service, "_disarm_and_finalize", disarm_and_finalize)
@@ -426,6 +452,55 @@ async def test_ack_precedes_poweroff(monkeypatch):
         "PWR_ACK=1",
         "sudo systemctl poweroff",
     ]
+
+async def test_ack_repeats_until_agt_confirms(monkeypatch):
+    service = SafeSurfaceService()
+    attempts = 0
+
+    async def send_ack(name, value):
+        nonlocal attempts
+        assert (name, value) == ("PWR_ACK", 1.0)
+        attempts += 1
+        if attempts == 3:
+            service.process_named_value(
+                1, 192, "PWR_STAGE", module.POWER_STAGE_ACKNOWLEDGED
+            )
+        return True
+
+    monkeypatch.setattr(module, "POWER_ACK_RETRY_INTERVAL_S", 0.001)
+    monkeypatch.setattr(service, "_send_named_float", send_ack)
+
+    assert await service._confirm_power_acknowledgement() is True
+    assert attempts == 3
+
+
+async def test_unconfirmed_ack_withholds_poweroff(monkeypatch):
+    service = SafeSurfaceService()
+    commands = []
+
+    async def disarm_and_finalize():
+        return None
+
+    async def command(command):
+        commands.append(command)
+        return True
+
+    async def send_ack(name, value):
+        return True
+
+    monkeypatch.setattr(module, "POWER_ACK_CONFIRM_TIMEOUT_S", 0.003)
+    monkeypatch.setattr(module, "POWER_ACK_RETRY_INTERVAL_S", 0.001)
+    monkeypatch.setattr(service, "_disarm_and_finalize", disarm_and_finalize)
+    monkeypatch.setattr(service, "_run_host_command", command)
+    monkeypatch.setattr(service, "_send_named_float", send_ack)
+
+    await service._shutdown_sequence()
+
+    assert commands == ["sync"]
+    assert service.state.shutdown_state == "error"
+    assert service.state.shutdown_error == (
+        "AGT did not confirm shutdown acknowledgement"
+    )
 
 
 async def test_unconfirmed_disarm_withholds_ack_and_poweroff(monkeypatch):
@@ -500,6 +575,9 @@ async def test_shutdown_defers_heavy_processing(monkeypatch, tmp_path):
 
     async def send_ack(name, value):
         events.append(f"{name}={value:g}")
+        service.process_named_value(
+            1, 192, "PWR_STAGE", module.POWER_STAGE_ACKNOWLEDGED
+        )
         return True
 
     async def disarm():

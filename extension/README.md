@@ -26,22 +26,21 @@ AGT's sole surface authority and starts its three-minute powered logging dwell.
 Lua remains armed and continues sending telemetry so ArduPilot keeps MCAP and
 BIN logging throughout that dwell. The backend then commands and verifies
 disarm, quiesces the dive, runs `sync`, sends `PWR_ACK=1` from system
-1/component 191, and only then asks BlueOS Commander to power off. Operators
+1/component 191 until the AGT confirms `PWR_STAGE=2`, and only then asks BlueOS
+Commander to power off. Operators
 can persistently enable **Bench mode** on the AGT sensor card: BlueOS still
 disarms and closes the dive on `PWR_SHDN`, but withholds both `PWR_ACK` and host
 poweroff so the payload remains powered.
 
 Component 191 is `MAV_COMP_ID_ONBOARD_COMPUTER`, which BlueOS's mavlink-server
-also advertises for itself. That is deliberate, so an operator on a laptop can
-supply the acknowledgement too, but it means the router has to forward a message
-whose source matches its own advertised ID. That has not been confirmed on
-hardware: if it is dropped, the AGT never sees an acknowledgement and leaves
-payload power on, which is safe but silent. Watch for the AGT's
-`POWER: BlueOS shutdown ACK` status text when bench testing the handshake.
+also advertises for itself. A successful HTTP injection only proves that the
+router accepted the message, not that the AGT received it, so BlueOS repeats
+the ACK and waits for the AGT's named-float confirmation before halting.
 
-The bh-0.6 MAVLink names are `RELAY` (Lua request), `AGT_CAP=3` (bit 0 AGT
-release ownership, bit 1 safe shutdown), `REL_STAT` (physical release state),
-`PWR_SHDN` (`1` requests shutdown and `0` resets the request), and `PWR_ACK=1`.
+The bh-0.6 MAVLink names are `RELAY` (Lua request), `AGT_CAP` (capability
+bitmask), `REL_STAT` (legacy physical release state), `PWR_SHDN` (`1` requests
+shutdown and `0` resets the request), `PWR_ACK=1`, and `PWR_STAGE` (`1` awaiting
+ACK, `2` ACK accepted, `3` payload off).
 Only capability bit 1 gates the shutdown ACK; release readiness evaluates bit 0
 separately. Names are intentionally at most ten characters for
 `NAMED_VALUE_FLOAT`.
