@@ -30,6 +30,13 @@ logger = logging.getLogger(__name__)
 # Fields the camera reports but will not accept on a set; strip before sending.
 _VIDEO_READONLY = frozenset({"pixel_list", "max_framerate"})
 _ADVANCED_READONLY = frozenset({"irisLevel"})
+# ``max_exposure`` is an enumerated shutter speed (1/12, 1/30, 1/100, ...).  The
+# camera can *report* a value it will not accept back on a set (e.g. a boot
+# value of 150), and because ``setImageAdjustment`` validates the whole payload,
+# one rejected field 422s the entire base write -- silently dropping every other
+# image setting.  Strip it from bulk base writes and apply it only through the
+# dedicated, best-effort :meth:`Br4kcamClient.set_shutter` path.
+_BASE_READONLY = frozenset({"max_exposure"})
 
 
 class Br4kcamError(RuntimeError):
@@ -127,9 +134,25 @@ class Br4kcamClient:
         self, camera_uuid: str, settings: BaseImageSettings
     ) -> BaseImageSettings:
         payload = settings.model_dump(by_alias=True, exclude_none=True)
+        for key in _BASE_READONLY:
+            payload.pop(key, None)
         if not payload:
             return await self.get_base(camera_uuid)
         raw = await self._control(camera_uuid, "setImageAdjustment", payload)
+        return BaseImageSettings.model_validate(raw if isinstance(raw, dict) else {})
+
+    async def set_shutter(
+        self, camera_uuid: str, max_exposure: int
+    ) -> BaseImageSettings:
+        """Apply just the shutter speed (enumerated ``max_exposure``).
+
+        Sent on its own so a value the camera rejects only fails the shutter
+        write, never the rest of the image-adjustment bundle.  See
+        :data:`_BASE_READONLY` for why this is kept out of :meth:`set_base`.
+        """
+        raw = await self._control(
+            camera_uuid, "setImageAdjustment", {"max_exposure": max_exposure}
+        )
         return BaseImageSettings.model_validate(raw if isinstance(raw, dict) else {})
 
     async def set_advanced(

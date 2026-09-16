@@ -105,12 +105,30 @@ class CameraPresetService:
         base = _fill_missing_defaults(bundle.base, DORIS_BASE_DEFAULTS)
         advanced = _fill_missing_defaults(bundle.advanced, DORIS_ADVANCED_DEFAULTS)
 
+        # Shutter (max_exposure) is an enumerated value handled on its own below;
+        # set_base strips it so it can't 422 the whole base write.
+        requested_shutter = base.max_exposure
+
         if video.model_dump(exclude_none=True, exclude={"channel"}):
             video = await self.client.set_video(uuid, video)
         if base.model_dump(exclude_none=True):
             base = await self.client.set_base(uuid, base)
         if advanced.model_dump(exclude_none=True):
             advanced = await self.client.set_advanced(uuid, advanced)
+
+        # Apply the shutter speed on its own, best-effort, and only when it
+        # actually changes.  The camera reports enumerated shutter values it
+        # will not accept back (e.g. a boot value of 150), so a rejection here
+        # must never abort the rest of the apply.
+        if requested_shutter is not None and requested_shutter != base.max_exposure:
+            try:
+                base = await self.client.set_shutter(uuid, requested_shutter)
+            except Br4kcamError as e:
+                logger.warning(
+                    "camera shutter (max_exposure=%s) not applied: %s",
+                    requested_shutter,
+                    e,
+                )
 
         return CameraSettingsBundle(video=video, base=base, advanced=advanced)
 
