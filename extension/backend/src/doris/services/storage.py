@@ -364,6 +364,7 @@ def _aggregate_media_paths(
 ) -> dict[str, tuple[int, int]]:
     """Count image/video files whose timestamps fall in dive windows."""
     result: dict[str, tuple[int, int]] = {w.stem: (0, 0) for w in windows}
+    seen_media: set[tuple[str, int]] = set()
     if not windows:
         return result
     for path in paths:
@@ -382,6 +383,11 @@ def _aggregate_media_paths(
         if wn is None:
             continue
         mt = _detect_media_type(path.name)
+        media_key = (path.name.lower(), st.st_size)
+        if mt in (MediaType.IMAGE, MediaType.VIDEO):
+            if media_key in seen_media:
+                continue
+            seen_media.add(media_key)
         img, vid = result[wn.stem]
         if mt == MediaType.IMAGE:
             result[wn.stem] = (img + 1, vid)
@@ -693,20 +699,22 @@ def _parse_datetime_from_filename(filename: str) -> datetime | None:
 
 
 def _effective_created_at(path: Path, mtime_ts: float) -> datetime:
-    """Use mtime when plausible; otherwise parse filename or clamp bogus mtimes.
+    """Prefer embedded capture time, then plausible mtime, then clamp.
 
     Some mounts (or flight-controller exports) report impossible mtimes (e.g. year 2073).
-    Recorder files embed the real time in the name.
+    Recorder files embed the real time in the name. Processed MP4s also get a
+    new, perfectly plausible mtime when ffmpeg runs on deck, so checking mtime
+    first incorrectly moves them outside the dive that created them.
     """
     lo, hi = _sane_bounds()
     mtime_dt = datetime.fromtimestamp(mtime_ts, tz=timezone.utc)
 
-    if lo <= mtime_dt <= hi:
-        return mtime_dt
-
     parsed = _parse_datetime_from_filename(path.name)
     if parsed is not None and lo <= parsed <= hi + timedelta(days=7):
         return parsed
+
+    if lo <= mtime_dt <= hi:
+        return mtime_dt
 
     if mtime_dt > hi:
         return hi
