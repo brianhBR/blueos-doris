@@ -157,3 +157,31 @@ def test_recovery_stays_armed_for_agt_surface_dwell():
 
     assert "arming:disarm()" not in recovery
     assert "return update, UPDATE_INTERVAL_MS" in recovery
+
+
+def test_interval_and_timelapse_gate_first_capture_on_awb():
+    """The first bottom capture must follow AWB; later cycles must not repeat it."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    bottom = body.split("elseif state == STATE_ON_BOTTOM then", 1)[1].split(
+        "elseif state == STATE_ASCENT then", 1
+    )[0]
+
+    assert "ipcam_cfg.btm_cmod == 2" in bottom
+    assert "or ipcam_cfg.btm_cmod == 3" in bottom
+    assert "and cam_delay_done" in bottom
+    assert "update_lights(lights_cmd, now_ms, awb_first_pending)" in bottom
+    assert "cfg.btm_awb, cfg.btm_lgt, lights_cmd and light_on" in bottom
+    assert "ipcam_state.awb_ready_ms = now_ms + AWB_SETTLE_MS" in bottom
+    assert bottom.count("and first_capture_ready") == 2
+
+
+def test_bottom_awb_state_resets_for_each_bottom_visit():
+    """A revisit gets one fresh calibration without repeating within its cycles."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    reset = body.split("-- Arm the one-push AWB for this bottom visit.", 1)[1].split(
+        "-- For CONTINUOUS bottom mode", 1
+    )[0]
+
+    assert "btm_awb_done      = false" in reset
+    assert "btm_lgt_on_ms     = 0" in reset
+    assert "ipcam_state.awb_ready_ms          = 0" in reset

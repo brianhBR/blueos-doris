@@ -464,6 +464,10 @@ local ipcam_btm_started      = false
 local ipcam_state = {
     cycle_start_ms  = 0,
     cycle_is_record = false,
+    -- For interval video and timelapse, hold the first capture until one-push
+    -- AWB has been triggered under the phase lighting and given time to
+    -- converge.  Later captures bypass this gate.
+    awb_ready_ms     = 0,
     -- VIDEO_INTERVAL first-frame gating.  ``cycle_started`` flips true
     -- once the duty cycle has begun for the current bottom visit (so the
     -- inaugural record window is only kicked off once).
@@ -520,13 +524,15 @@ local function reset_light_cycle(now_ms)
     light_cycle_ms = now_ms
 end
 
-local function update_lights(enabled, now_ms)
+local function update_lights(enabled, now_ms, force_on)
     if not RC9 then return end
     if not enabled then
         RC9:set_override(LIGHT_PWM_MIN)
         return
     end
-    if cfg.lgt_mod == 0 then
+    if force_on or cfg.lgt_mod == 0 then
+        light_on = true
+        light_cycle_ms = now_ms
         RC9:set_override(cfg.lgt_pwm)
         return
     end
@@ -1074,6 +1080,10 @@ local function phase_awb_tick(awb_en, lights_enabled, lights_on, done, anchor_ms
                 string.format("DIVE: %s lights on, triggered auto white balance",
                     phase_name))
         end
+    else
+        -- Require one uninterrupted settle window.  Do not carry elapsed time
+        -- across an interval-light off period.
+        anchor_ms = 0
     end
     return done, anchor_ms
 end
@@ -1488,6 +1498,7 @@ function update()
                 ipcam_state.cycle_wait_start_ms  = 0
                 ipcam_state.last_snap_ms         = 0
                 ipcam_state.next_snap_ms         = 0
+                ipcam_state.awb_ready_ms          = 0
                 -- For CONTINUOUS bottom mode with no camera delay we do
                 -- a zero-gap rotate-or-start right now so the moment
                 -- the vehicle settles, the first "on_bottom" .ts starts.
@@ -1576,8 +1587,9 @@ function update()
         end
 
         -- ``lights_cmd`` is the enable actually handed to update_lights this
-        -- tick; captured so the one-push AWB below can anchor on the moment
-        -- the bottom lights are first commanded on.
+        -- tick.  Interval/timelapse mode temporarily forces the configured
+        -- phase lighting on before the first capture: settle the illumination,
+        -- trigger one-push AWB, then allow another settle before recording.
         local lights_cmd
         if ipcam_cfg.btm_cmod == 2
            or (ipcam_cfg.btm_cmod == 1 and ipcam_cfg.rec_en) then
@@ -1599,16 +1611,37 @@ function update()
         else
             lights_cmd = bottom_lgt_eff
         end
-        update_lights(lights_cmd, now_ms)
 
-        -- One-push auto white balance: once per bottom visit.  With bottom
-        -- lights enabled it waits a short settle after they are first
-        -- commanded on so the camera's AWB converges against the lit scene;
-        -- with bottom lights disabled there is nothing to wait for, so it
-        -- calibrates immediately against ambient light.
-        btm_awb_done, btm_lgt_on_ms = phase_awb_tick(
-            cfg.btm_awb, cfg.btm_lgt, lights_cmd,
-            btm_awb_done, btm_lgt_on_ms, now_ms, "bottom")
+        local awb_capture_mode = ipcam_cfg.btm_cmod == 2
+            or ipcam_cfg.btm_cmod == 3
+        local awb_first_pending = awb_capture_mode
+            and cfg.btm_awb
+            and cam_delay_done
+            and (not btm_awb_done
+                or now_ms < ipcam_state.awb_ready_ms)
+        if awb_first_pending then
+            lights_cmd = cfg.btm_lgt
+        end
+        update_lights(lights_cmd, now_ms, awb_first_pending)
+
+        -- One-push auto white balance: once per bottom visit.  Use the actual
+        -- physical light state, not just the requested enable, so an interval
+        -- off-window can never calibrate a lit profile against darkness.
+        local awb_was_done = btm_awb_done
+        if not awb_capture_mode or cam_delay_done then
+            btm_awb_done, btm_lgt_on_ms = phase_awb_tick(
+                cfg.btm_awb, cfg.btm_lgt, lights_cmd and light_on,
+                btm_awb_done, btm_lgt_on_ms, now_ms, "bottom")
+        end
+        if awb_capture_mode and btm_awb_done and not awb_was_done then
+            -- onceAWB is sent through the extension asynchronously.  Keep the
+            -- first capture gated for one more settle interval so the request
+            -- reaches the camera and its one-push convergence completes.
+            ipcam_state.awb_ready_ms = now_ms + AWB_SETTLE_MS
+        end
+        local first_capture_ready = not awb_capture_mode
+            or not cfg.btm_awb
+            or (btm_awb_done and now_ms >= ipcam_state.awb_ready_ms)
 
         -- Bottom camera dispatcher: OFF / CONTINUOUS / VIDEO_INTERVAL / TIMELAPSE
         if ipcam_cfg.btm_cmod == 0 then
@@ -1670,7 +1703,8 @@ function update()
             -- light comes on btm_dly_ms into the record window (handled in
             -- the light block above) and goes off with the camera at the
             -- end of the window.
-            if cam_delay_done and ipcam_cfg.btm_rec_ms > 0
+            if cam_delay_done and first_capture_ready
+               and ipcam_cfg.btm_rec_ms > 0
                and ipcam_cfg.btm_pau_ms > 0 then
                 if not ipcam_state.cycle_started then
                     -- Inaugural record window for this bottom visit: kick
@@ -1756,7 +1790,8 @@ function update()
             -- which inspects ``next_snap_ms`` and ``last_snap_ms``;
             -- this branch is responsible only for scheduling.
             if ipcam_recording then ipcam_stop() end
-            if cam_delay_done and ipcam_cfg.btm_pau_ms > 0 then
+            if cam_delay_done and first_capture_ready
+               and ipcam_cfg.btm_pau_ms > 0 then
                 -- Effective period floor is pre+post so the pre and
                 -- post windows can run back-to-back without negative
                 -- idle time.  When the operator sets capture_frequency
