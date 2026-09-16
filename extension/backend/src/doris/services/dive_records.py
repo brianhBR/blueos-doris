@@ -57,6 +57,57 @@ def update_active_dive_record(dives_dir: Path, new_status: str) -> Path | None:
     return None
 
 
+def find_unstamped_dive_for_recording(
+    dives_dir: Path, recording_stamp: str
+) -> Path | None:
+    """Find a terminal dive whose time window contains a recording stamp.
+
+    UI status polling can mark a dive completed before the safe-surface
+    quiesce runs.  In that race there is no active record left to annotate,
+    although the recorder stamp still identifies the correct completed dive.
+    Only unstamped terminal records are eligible, making repeated quiesce calls
+    idempotent and preventing an old dive from being relinked.
+    """
+    try:
+        recorded_at = datetime.strptime(
+            recording_stamp, "%Y%m%d_%H%M%S"
+        ).replace(tzinfo=timezone.utc)
+    except (TypeError, ValueError):
+        return None
+    if not dives_dir.is_dir():
+        return None
+
+    candidates: list[tuple[int, Path]] = []
+    for dive_file in dives_dir.iterdir():
+        match = _DIVE_FILE_RE.match(dive_file.name)
+        if match:
+            candidates.append((int(match.group(1)), dive_file))
+    candidates.sort(reverse=True)
+
+    for _, dive_file in candidates:
+        try:
+            record = json.loads(dive_file.read_text())
+            if record.get("status") not in ("completed", "cancelled"):
+                continue
+            if record.get("dive_stamp"):
+                continue
+            started = datetime.fromisoformat(
+                str(record.get("started_at", "")).replace("Z", "+00:00")
+            )
+            ended = datetime.fromisoformat(
+                str(record.get("ended_at", "")).replace("Z", "+00:00")
+            )
+            if started.tzinfo is None:
+                started = started.replace(tzinfo=timezone.utc)
+            if ended.tzinfo is None:
+                ended = ended.replace(tzinfo=timezone.utc)
+            if started <= recorded_at <= ended:
+                return dive_file
+        except (OSError, ValueError, TypeError, json.JSONDecodeError) as e:
+            logger.warning("Error matching recording stamp to %s: %s", dive_file.name, e)
+    return None
+
+
 def set_mission_terminal_status(mission_state_path: Path, new_status: str) -> None:
     """Mark mission_state.json completed or cancelled, if not already terminal."""
     if new_status not in ("cancelled", "completed"):

@@ -33,6 +33,7 @@ import httpx
 from ..config import blueos_services, settings
 from . import binlog, dive_csv_export, usb_storage
 from .dive_records import (
+    find_unstamped_dive_for_recording,
     set_mission_terminal_status,
     update_active_dive_record,
     write_json_atomic,
@@ -176,6 +177,12 @@ async def quiesce_dive(
     data_root = _data_root()
     dives_dir = data_root / "dives"
     mission_state_path = data_root / "mission_state.json"
+    resolved_stamp = stamp or _recorder_base_stamp()
+    terminal_dive_file = (
+        find_unstamped_dive_for_recording(dives_dir, resolved_stamp)
+        if resolved_stamp
+        else None
+    )
 
     # Snapshot the camera's final settings while the payload is still powered
     # (the AGT waits on this before cutting power).  Done before the dive record
@@ -188,6 +195,7 @@ async def quiesce_dive(
         await record_camera_sample(
             "recovery",
             dives_dir=dives_dir,
+            dive_file=terminal_dive_file,
             include_error_sample=False,
             timeout=3.0,
         )
@@ -213,7 +221,8 @@ async def quiesce_dive(
     except Exception as e:
         logger.warning("Quiesce: failed to close dive record: %s", e)
 
-    resolved_stamp = stamp or _recorder_base_stamp()
+    if dive_file is None:
+        dive_file = terminal_dive_file
     if dive_file is not None:
         try:
             record = json.loads(dive_file.read_text())
@@ -369,6 +378,51 @@ def _resolve_dive_dir(stamp: str | None) -> Path | None:
     return fallback
 
 
+_RECORDING_DIR_RE = re.compile(r"^dive_(\d{8}_\d{6})$")
+
+
+def _infer_dive_stamp(record: dict) -> str | None:
+    """Recover a missing stamp from a recording folder inside the dive window."""
+    started = _parse_iso(record.get("started_at"))
+    ended = _parse_iso(record.get("ended_at"))
+    if started is None or ended is None:
+        return None
+
+    sub = settings.ipcam_recordings_subdir.strip("/").strip()
+    bases: list[Path] = []
+    usb_base = usb_storage.get_recording_dir_if_available(sub)
+    if usb_base is not None:
+        bases.append(Path(usb_base))
+    bases.append(_data_root() / sub)
+
+    matches: list[tuple[datetime, str]] = []
+    seen: set[str] = set()
+    for base in bases:
+        if not base.is_dir():
+            continue
+        for candidate in base.iterdir():
+            match = _RECORDING_DIR_RE.match(candidate.name)
+            if not match or not candidate.is_dir():
+                continue
+            stamp = match.group(1)
+            if stamp in seen:
+                continue
+            seen.add(stamp)
+            try:
+                recorded_at = datetime.strptime(
+                    stamp, "%Y%m%d_%H%M%S"
+                ).replace(tzinfo=timezone.utc)
+            except ValueError:
+                continue
+            if started <= recorded_at <= ended:
+                matches.append((recorded_at, stamp))
+
+    if not matches:
+        return None
+    matches.sort()
+    return matches[0][1]
+
+
 class DiveProcessingService:
     """Runs one post-dive processing job at a time."""
 
@@ -509,7 +563,15 @@ class DiveProcessingService:
                 "Dive is still active; stop or finalize it before processing"
             )
 
-        stamp = record.get("dive_stamp") or _recorder_base_stamp()
+        stamp = (
+            record.get("dive_stamp")
+            or _recorder_base_stamp()
+            or _infer_dive_stamp(record)
+        )
+        if stamp and not record.get("dive_stamp"):
+            record["dive_stamp"] = stamp
+            write_json_atomic(Path(session.dive_file), record)
+            self._log(session, f"Recovered dive stamp from recording folder: {stamp}")
         if not stamp:
             self._log(session, "No dive stamp on record; video steps will skip")
         ctx["stamp"] = stamp

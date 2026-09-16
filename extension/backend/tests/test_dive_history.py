@@ -8,6 +8,7 @@ the log, and the separate start/end positions.
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 
 from doris.services.storage import build_dive_history_list
@@ -69,3 +70,32 @@ def test_missing_locations_are_none(tmp_path: Path) -> None:
     entry = build_dive_history_list(tmp_path)[0]
     assert entry.start_location is None
     assert entry.end_location is None
+
+
+def test_processed_video_uses_embedded_capture_time_not_ffmpeg_mtime(
+    tmp_path: Path,
+) -> None:
+    _make_dive(tmp_path)
+    video = tmp_path / "recorder" / "20260625t181303_on_bottom.mp4"
+    video.parent.mkdir()
+    video.write_bytes(b"processed video")
+    # Processing happens after the dive; this plausible mtime must not replace
+    # the capture timestamp embedded in the filename.
+    os.utime(video, (1789510200, 1789510200))
+
+    entry = build_dive_history_list(tmp_path)[0]
+
+    assert entry.video_count == 1
+
+
+def test_processed_video_copy_is_not_counted_twice(tmp_path: Path) -> None:
+    _make_dive(tmp_path)
+    name = "20260625t181303_on_bottom.mp4"
+    for folder in ("recordings", "copied_bundle"):
+        video = tmp_path / "recorder" / folder / name
+        video.parent.mkdir(parents=True, exist_ok=True)
+        video.write_bytes(b"same processed video")
+
+    entry = build_dive_history_list(tmp_path)[0]
+
+    assert entry.video_count == 1
