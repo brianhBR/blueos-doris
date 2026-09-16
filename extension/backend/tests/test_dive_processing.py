@@ -12,6 +12,7 @@ from doris.services.dive_processing import (
     DiveProcessingService,
     StepSkipped,
     _copy_verified,
+    _infer_dive_stamp,
     _radcam_stamp_from_name,
     _resolve_dive_dir,
     quiesce_dive,
@@ -140,6 +141,33 @@ def test_quiesce_is_idempotent(tmp_path, monkeypatch):
     assert json.loads(dive_file.read_text())["ended_at"] == ended_at
 
 
+def test_quiesce_annotates_dive_already_completed_by_status_polling(
+    tmp_path, monkeypatch
+):
+    """Status polling must not win a race and discard the recorder stamp."""
+    dives = tmp_path / "dives"
+    dive_file = _write_dive(
+        dives,
+        22,
+        status="completed",
+        ended_at="2026-07-27T10:20:00+00:00",
+        processing_state="pending",
+    )
+    monkeypatch.setattr(module, "_data_root", lambda: tmp_path)
+    monkeypatch.setitem(
+        __import__("sys").modules,
+        "doris.services.ip_camera_recorder",
+        _FakeRecorder(recording=False),
+    )
+
+    result = asyncio.run(quiesce_dive(stamp="20260727_100929"))
+
+    assert result["dive_file"] == "dive_0022.json"
+    record = json.loads(dive_file.read_text())
+    assert record["dive_stamp"] == "20260727_100929"
+    assert record["status"] == "completed"
+
+
 def test_update_active_dive_record_marks_processing_pending(tmp_path):
     dives = tmp_path / "dives"
     dive_file = _write_dive(dives, 2)
@@ -163,6 +191,29 @@ def test_atomic_write_leaves_no_part_file(tmp_path):
     update_active_dive_record(dives, "completed")
     assert list(dives.glob("*.part")) == []
     assert json.loads(dive_file.read_text())["status"] == "completed"
+
+
+def test_missing_stamp_is_inferred_from_recording_folder_after_restart(
+    tmp_path, monkeypatch
+):
+    """A power cycle must not prevent processing an otherwise intact dive."""
+    sub = module.settings.ipcam_recordings_subdir.strip("/").strip()
+    recording_dir = tmp_path / sub / "dive_20260727_100929"
+    recording_dir.mkdir(parents=True)
+    (recording_dir / "segment.ts").write_bytes(b"video")
+    monkeypatch.setattr(module, "_data_root", lambda: tmp_path)
+    monkeypatch.setattr(
+        module.usb_storage, "get_recording_dir_if_available", lambda _sub: None
+    )
+
+    stamp = _infer_dive_stamp(
+        {
+            "started_at": "2026-07-27T10:00:00+00:00",
+            "ended_at": "2026-07-27T10:20:00+00:00",
+        }
+    )
+
+    assert stamp == "20260727_100929"
 
 
 # ── job runner ────────────────────────────────────────────────────────────
