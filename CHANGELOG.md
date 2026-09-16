@@ -5,9 +5,11 @@
 - Recovery remains armed until the AGT finishes its three-minute surface dwell
   and asserts `PWR_SHDN`. This keeps ArduPilot's MCAP and BIN logs open for the
   full dwell. BlueOS then commands and verifies disarm before quiescing the
-  dive, syncing storage, sending `PWR_ACK`, and requesting host poweroff; a
-  failed or unconfirmed disarm withholds the acknowledgement and leaves payload
-  power on.
+  dive and syncing storage. It repeats `PWR_ACK` until the AGT publishes
+  `PWR_STAGE=2`, then requests host poweroff; a failed or unconfirmed
+  acknowledgement leaves payload power on for another retry. AGT firmware
+  compatibility remains an early preflight warning but no longer gates a live
+  shutdown request when the AGT is publishing a fresh safe-shutdown capability.
 
 - Recovery now uses an explicit terminal keepalive path. A pool dive recorded
   only two `STATE=4` reports before ArduPilot disarmed and its MCAP recorder

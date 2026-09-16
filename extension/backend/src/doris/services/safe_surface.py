@@ -3,10 +3,11 @@
 The protocol uses MAVLink ``NAMED_VALUE_FLOAT`` messages:
 
 * autopilot component 1 publishes ``RELAY`` as the requested release state;
-* AGT component 192 publishes ``AGT_CAP=3``, ``REL_STAT`` and ``PWR_SHDN``;
+* AGT component 192 publishes ``AGT_CAP``, ``PWR_SHDN``, and ``PWR_STAGE``;
 * ``PWR_SHDN=1`` requests shutdown and ``PWR_SHDN=0`` resets the handshake.
-  BlueOS disarms the autopilot, flushes recording and storage, publishes
-  ``PWR_ACK=1``, then asks BlueOS Commander to power off the host.
+  BlueOS disarms the autopilot, flushes recording and storage, repeats
+  ``PWR_ACK=1`` until ``PWR_STAGE=2`` confirms receipt, then asks BlueOS
+  Commander to power off the host.
 
 One fresh terminal ``STATE=4`` after an observed dive is the AGT's sole surface
 authority. Lua continues publishing it during the dwell for telemetry, while
@@ -47,6 +48,10 @@ MAX_CAPABILITY_MASK = 0xFF
 MAV_MODE_FLAG_SAFETY_ARMED = 128
 DISARM_CONFIRM_TIMEOUT_S = 10.0
 DISARM_POLL_INTERVAL_S = 0.25
+POWER_ACK_CONFIRM_TIMEOUT_S = 10.0
+POWER_ACK_RETRY_INTERVAL_S = 1.0
+POWER_STAGE_ACKNOWLEDGED = 2
+POWER_STAGE_PAYLOAD_OFF = 3
 
 
 def _decode_name(raw_name: object) -> str:
@@ -218,6 +223,7 @@ class SafeSurfaceState:
     release_requested: bool | None = None
     release_actual: bool | None = None
     power_shutdown_requested: bool = False
+    power_shutdown_stage: int | None = None
     last_capability_update_monotonic: float | None = None
     last_release_actual_update_monotonic: float | None = None
     last_release_request_monotonic: float | None = None
@@ -244,6 +250,7 @@ class SafeSurfaceService:
         self._shutdown_task: asyncio.Task | None = None
         self._shutdown_request_latched = False
         self._last_logged_mismatch: bool | None = None
+        self._power_acknowledged = asyncio.Event()
 
     def start(self) -> None:
         """Start the MAVLink subscriber once."""
@@ -318,6 +325,15 @@ class SafeSurfaceService:
             if requested is None:
                 return
             self._handle_shutdown_request(requested)
+        elif name == "PWR_STAGE":
+            stage = _capability_mask(value)
+            if stage is None or stage > POWER_STAGE_PAYLOAD_OFF:
+                return
+            self.state.power_shutdown_stage = stage
+            if stage >= POWER_STAGE_ACKNOWLEDGED:
+                self._power_acknowledged.set()
+            else:
+                self._power_acknowledged.clear()
         else:
             return
 
@@ -364,9 +380,6 @@ class SafeSurfaceService:
             )
             return
         capabilities = self.state.capabilities or 0
-        if self.state.firmware_compatible is not True:
-            self.state.shutdown_error = "AGT firmware compatibility is not verified"
-            return
         capability_updated = self.state.last_capability_update_monotonic
         capability_stale = (
             capability_updated is None
@@ -407,8 +420,8 @@ class SafeSurfaceService:
                 raise RuntimeError("host sync failed")
 
             self.state.shutdown_state = "acknowledging"
-            if not await self._send_named_float("PWR_ACK", 1.0):
-                raise RuntimeError("MAVLink shutdown acknowledgement failed")
+            if not await self._confirm_power_acknowledgement():
+                raise RuntimeError("AGT did not confirm shutdown acknowledgement")
 
             self.state.shutdown_state = "poweroff_requested"
             if not await self._run_host_command("sudo systemctl poweroff"):
@@ -418,6 +431,27 @@ class SafeSurfaceService:
             self.state.shutdown_error = str(error)
             self._shutdown_request_latched = False
             logger.exception("AGT safe shutdown failed")
+
+    async def _confirm_power_acknowledgement(self) -> bool:
+        """Repeat the ACK until the AGT confirms its final-grace countdown."""
+        self._power_acknowledged.clear()
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + POWER_ACK_CONFIRM_TIMEOUT_S
+        while loop.time() < deadline:
+            await self._send_named_float("PWR_ACK", 1.0)
+            remaining = deadline - loop.time()
+            try:
+                await asyncio.wait_for(
+                    self._power_acknowledged.wait(),
+                    timeout=min(POWER_ACK_RETRY_INTERVAL_S, remaining),
+                )
+            except TimeoutError:
+                continue
+            stage = self.state.power_shutdown_stage
+            if stage is not None and stage >= POWER_STAGE_ACKNOWLEDGED:
+                logger.info("AGT confirmed shutdown acknowledgement")
+                return True
+        return False
 
     async def _disarm_and_finalize(self) -> None:
         """End armed logging only after the AGT's powered surface dwell."""
@@ -492,7 +526,6 @@ class SafeSurfaceService:
                     f"{blueos_services.mavlink2rest}/mavlink", json=payload
                 )
                 response.raise_for_status()
-            logger.info("Sent AGT shutdown acknowledgement before host poweroff")
             return True
         except Exception as error:
             logger.warning("Failed to send %s: %s", name, error)
@@ -578,6 +611,7 @@ class SafeSurfaceService:
             "shutdown_enabled": shutdown_enabled,
             "bench_mode": not shutdown_enabled,
             "power_shutdown_requested": self.state.power_shutdown_requested,
+            "power_shutdown_stage": self.state.power_shutdown_stage,
             "shutdown_state": self.state.shutdown_state,
             "shutdown_error": self.state.shutdown_error,
         }
