@@ -14,6 +14,13 @@
    checks (GPS fix, battery voltage, leak sensor, mission profile).
    Only after all checks pass does it transition to MISSION_START.
 
+   The baro zero is standard atmosphere (101325 Pa) unless the reading
+   is in the sea-level air window 90-110 kPa.  A reboot at depth must
+   not capture several hundred bar as "surface": that made relative
+   depth ~0 and skipped the CONFIG deadman.  With a realistic zero, a
+   bottom reboot looks like an unarmed splash -- depth > 2 m, emergency
+   release, ASCENT.
+
    An ArduPilot arming gate (aux auth) prevents arming without a valid
    mission profile.  If the vehicle is deployed into water while still
    in CONFIG (no mission loaded, or pre-arm not yet passed), a depth-
@@ -108,7 +115,24 @@ local ARM_RETRY_MS       = 2000
 -- status-endpoint outage can never hang a record cycle.
 local IPCAM_FIRST_FRAME_TIMEOUT_MS = 30000
 
-local surface_pressure = baro:get_pressure() or 101325
+-- Baro zero is standard atmosphere unless the reading looks like air.
+-- A reboot at depth used to adopt several hundred bar as "surface",
+-- after which get_depth_m() returned ~0 and the CONFIG deadman never
+-- fired.  90-110 kPa is sea-level weather; 2 m of seawater is already
+-- ~121 kPa and is rejected, so a bottom reboot keeps 101325 Pa and
+-- takes the same unarmed-deploy failsafe as a splash in CONFIG.
+local surface_pressure = 101325
+do
+    local p = baro:get_pressure()
+    if p and p >= 90000 and p <= 110000 then
+        surface_pressure = p
+    elseif p then
+        gcs:send_text(MAV_SEVERITY.WARNING,
+            string.format(
+                "DIVE: baro %.0f Pa is not surface air; depth zero stays 101325 Pa",
+                p))
+    end
+end
 
 -- ArduSub SITL exposes SIM_BUOYANCY; used for depth fallback and relay tests.
 local is_sitl = false
@@ -1342,30 +1366,44 @@ function update()
 
     -- ??????????????? CONFIG ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
     if state == STATE_CONFIG then
-        -- GPS self-heal: reboot if GPS has no fix after 30s (max 2 attempts)
+        -- GPS self-heal: reboot if GPS has no fix after 30s (max 2 attempts).
+        -- Skip once the baro says we are submerged: there will not be a
+        -- fix, and each reboot only delays the CONFIG deadman.
         if not gps_reboot_attempted then
             local boot_age_s = (now_ms - script_start_ms) / 1000.0
             if boot_age_s >= 30 then
-                local gps_stat = gps:status(0)
-                if not gps_stat or gps_stat < 3 then
-                    local rbt = (prm.GPS_RBT:get() or 0) + 1
-                    gcs:send_text(MAV_SEVERITY.WARNING,
-                        string.format("DIVE: No GPS fix after 30s, reboot %d/2",
-                            rbt))
-                    prm.GPS_RBT:set_and_save(rbt)
-                    vehicle:reboot(false)
-                    return update, UPDATE_INTERVAL_MS
-                else
+                local p = baro:get_pressure()
+                if p and (p < 90000 or p > 110000) then
                     gps_reboot_attempted = true
+                    gcs:send_text(MAV_SEVERITY.INFO,
+                        string.format(
+                            "DIVE: skipping GPS reboot, baro %.0f Pa is not surface",
+                            p))
+                else
+                    local gps_stat = gps:status(0)
+                    if not gps_stat or gps_stat < 3 then
+                        local rbt = (prm.GPS_RBT:get() or 0) + 1
+                        gcs:send_text(MAV_SEVERITY.WARNING,
+                            string.format("DIVE: No GPS fix after 30s, reboot %d/2",
+                                rbt))
+                        prm.GPS_RBT:set_and_save(rbt)
+                        vehicle:reboot(false)
+                        return update, UPDATE_INTERVAL_MS
+                    else
+                        gps_reboot_attempted = true
+                    end
                 end
             end
         end
 
         -- Deadman: deployed into water while still in CONFIG.  Fires
         -- regardless of DORIS_START so an unstarted vehicle (operator
-        -- never pressed "Load Mission") still drops its weight.  Goes
-        -- to ASCENT (not RECOVERY) so the relay stays on for BRN_MIN
-        -- and the vehicle is properly monitored to the surface.
+        -- never pressed "Load Mission") still drops its weight.  A
+        -- reboot at depth uses the same path: the baro zero is standard
+        -- air, so get_depth_m() is real and this trips immediately.
+        -- Goes to ASCENT (not RECOVERY) so the relay stays on for
+        -- BRN_MIN and the vehicle is properly monitored to the surface.
+        -- 2 m matches the GPS-surface latch (DORIS_WAS_DEEP).
         local cfg_depth = get_depth_m()
         if cfg_depth and cfg_depth > 2.0 and not prearm_passed then
             local start_val = prm.START:get() or 0
@@ -1408,7 +1446,17 @@ function update()
                 prearm_passed = true
                 gps_reboot_attempted = true
                 prm.GPS_RBT:set_and_save(0)
-                surface_pressure = baro:get_pressure() or surface_pressure
+                -- Same air window as boot.  Do not adopt a submerged
+                -- reading if pre-arm somehow passed with a stale GPS fix.
+                local pref = baro:get_pressure()
+                if pref and pref >= 90000 and pref <= 110000 then
+                    surface_pressure = pref
+                elseif pref then
+                    gcs:send_text(MAV_SEVERITY.WARNING,
+                        string.format(
+                            "DIVE: pre-arm baro %.0f Pa rejected, keeping Pref=%.0f Pa",
+                            pref, surface_pressure))
+                end
                 local num_sats = gps:num_sats(0) or 0
                 local prf_id = prm.PRF_ID:get() or 0
                 gcs:send_text(MAV_SEVERITY.INFO,
