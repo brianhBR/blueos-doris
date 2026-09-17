@@ -159,6 +159,27 @@ def test_recovery_stays_armed_for_agt_surface_dwell():
     assert "return update, UPDATE_INTERVAL_MS" in recovery
 
 
+def test_gps_reacquire_after_deep_enters_recovery():
+    """Rope-cut / GTR float-up must publish STATE=4 for AGT Iridium."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    assert "DORIS_WAS_DEEP" in body
+    assert "telem.gps_lost" in body
+    update = body.split("function update()", 1)[1]
+    gps_surface = update.index("GPS fix after submergence")
+    gps_reboot = update.index("No GPS fix after 30s")
+    prearm = update.index("Pre-arm waiting")
+    assert gps_surface < gps_reboot < prearm
+
+
+def test_recovery_clears_was_deep_latch():
+    """A finished dive must not keep the GPS-surface latch for the next one."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    recovery = body.split("-- RECOVERY keepalive:", 1)[1].split(
+        "-- light test:", 1
+    )[0]
+    assert "prm.WAS_DEEP:set_and_save(0)" in recovery
+
+
 def test_interval_and_timelapse_gate_first_capture_on_awb():
     """The first bottom capture must follow AWB; later cycles must not repeat it."""
     body = SCRIPT.read_text(encoding="utf-8")
