@@ -9,7 +9,11 @@ from robyn.openapi import Contact, OpenAPI, OpenAPIInfo
 
 from .config import settings
 from .services.network import get_network_service
-from .services.persistent_log import setup_persistent_logging, start_dmesg_capture
+from .services.persistent_log import (
+    setup_persistent_logging,
+    start_dmesg_capture,
+    start_power_capture,
+)
 from .routes import (
     register_arming_routes,
     register_artemis_routes,
@@ -228,6 +232,7 @@ def create_app() -> Robyn:
         timesync_service.start_background_sync()
         safe_surface_service.start()
         start_dmesg_capture()
+        start_power_capture()
 
         # Pre-warm GStreamer so the first dive recording doesn't pay the
         # one-time ~4 s Gst.init() plugin-registry scan at bottom
