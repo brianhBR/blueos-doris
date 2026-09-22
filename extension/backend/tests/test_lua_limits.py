@@ -112,6 +112,17 @@ def test_parameter_keys_match_their_parameter_names():
     assert [(k, n) for k, n in pairs if k != n] == []
 
 
+def test_battery_failsafe_uses_measured_voltage():
+    """Do not let resistance compensation hide a genuinely low pack voltage."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    helper = body.split("local function batt_fs_voltage()", 1)[1].split(
+        "local function check_failsafes", 1
+    )[0]
+
+    assert "battery:voltage(0)" in helper
+    assert "voltage_resting_estimate" not in helper
+
+
 def test_recovery_does_not_finalize_the_dive_early():
     """BlueOS must keep the active dive open for the AGT surface dwell."""
     body = SCRIPT.read_text(encoding="utf-8")
