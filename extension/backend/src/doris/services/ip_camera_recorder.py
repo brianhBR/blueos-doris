@@ -20,7 +20,7 @@ exit until the caller explicitly stops recording.
 
 Pipeline (per instance):
 
-    rtspsrc name=src location=URL protocols=tcp is-live=true latency=2000
+    rtspsrc name=src location=URL protocols=tcp is-live=true latency=200
             retry=5 timeout=5000000 do-retransmission=false
         ! <rtph264depay|rtph265depay>
         ! <h264parse|h265parse> name=vparse config-interval=-1
@@ -101,6 +101,12 @@ _RESTART_BACKOFF_S = 1.0
 _MIN_GOOD_RUNTIME_S = 3.0
 _MAX_BACKOFF_S = 5.0
 _STOP_EOS_TIMEOUT_S = 5.0
+# rtspsrc's default jitter buffer is 2000 ms, sized for a lossy link.
+# This camera is on the vehicle LAN over TCP, which already delivers
+# in order. Two seconds of buffer delayed every frame, so lights showed
+# up late in the file and clip length swung by whatever was still
+# queued at stop. 200 ms covers a brief disk stall on the Pi.
+_RTSP_LATENCY_MS = 200
 
 # Phase labels are embedded into filenames; keep them path-safe.
 # Accepted: lowercase alphanumerics + underscore, 1..32 chars.
@@ -374,7 +380,7 @@ def _build_pipeline_description(rtsp_url: str, segment_s: int) -> str:
     seg_ns = max(1, segment_s) * 1_000_000_000
     return (
         f"rtspsrc name=src location={rtsp_url} protocols=tcp is-live=true "
-        f"latency=2000 retry=5 timeout=5000000 do-retransmission=false "
+        f"latency={_RTSP_LATENCY_MS} retry=5 timeout=5000000 do-retransmission=false "
         f"splitmuxsink name=muxsink max-size-time={seg_ns} "
         f"muxer-factory=mpegtsmux send-keyframe-requests=true "
         f"async-finalize=true"
