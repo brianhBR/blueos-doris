@@ -14,6 +14,13 @@
    checks (GPS fix, battery voltage, leak sensor, mission profile).
    Only after all checks pass does it transition to MISSION_START.
 
+   The baro zero is standard atmosphere (101325 Pa) unless the reading
+   is in the sea-level air window 90-110 kPa.  A reboot at depth must
+   not capture several hundred bar as "surface": that made relative
+   depth ~0 and skipped the CONFIG deadman.  With a realistic zero, a
+   bottom reboot looks like an unarmed splash -- depth > 2 m, emergency
+   release, ASCENT.
+
    An ArduPilot arming gate (aux auth) prevents arming without a valid
    mission profile.  If the vehicle is deployed into water while still
    in CONFIG (no mission loaded, or pre-arm not yet passed), a depth-
@@ -71,6 +78,15 @@
    armed so MCAP and BIN logging continue through the AGT's surface dwell.
    BlueOS disarms when the AGT requests shutdown.
 
+   Early surfacing (rope cut, GTR, unplanned float-up) is not confined to
+   ASCENT.  After the vehicle has been deeper than 2 m, DORIS_WAS_DEEP latches
+   in EEPROM.  GPS is then required to drop (so a cached surface fix cannot
+   end the dive on the way down).  A later 3D fix while absolute pressure is
+   again shallower than 2 m jumps straight to RECOVERY from any state.
+   STATE=4 is the AGT's surface authority and the Iridium position report;
+   without it a vehicle drifting on the surface after an early release is
+   silent.
+
    Requires: ArduSub with Lua scripting enabled (SCR_ENABLE = 1)
 --]]
 
@@ -99,7 +115,24 @@ local ARM_RETRY_MS       = 2000
 -- status-endpoint outage can never hang a record cycle.
 local IPCAM_FIRST_FRAME_TIMEOUT_MS = 30000
 
-local surface_pressure = baro:get_pressure() or 101325
+-- Baro zero is standard atmosphere unless the reading looks like air.
+-- A reboot at depth used to adopt several hundred bar as "surface",
+-- after which get_depth_m() returned ~0 and the CONFIG deadman never
+-- fired.  90-110 kPa is sea-level weather; 2 m of seawater is already
+-- ~121 kPa and is rejected, so a bottom reboot keeps 101325 Pa and
+-- takes the same unarmed-deploy failsafe as a splash in CONFIG.
+local surface_pressure = 101325
+do
+    local p = baro:get_pressure()
+    if p and p >= 90000 and p <= 110000 then
+        surface_pressure = p
+    elseif p then
+        gcs:send_text(MAV_SEVERITY.WARNING,
+            string.format(
+                "DIVE: baro %.0f Pa is not surface air; depth zero stays 101325 Pa",
+                p))
+    end
+end
 
 -- ArduSub SITL exposes SIM_BUOYANCY; used for depth fallback and relay tests.
 local is_sitl = false
@@ -138,8 +171,9 @@ assert(param:add_param(73, 14, "BTM_DLY", 30), "DORIS_BTM_DLY")
 assert(param:add_param(73, 15, "PRF_ID",   0),    "DORIS_PRF_ID")
 assert(param:add_param(73, 16, "UPL_DATE", 0),    "DORIS_UPL_DATE")
 assert(param:add_param(73, 17, "UPL_TIME", 0),    "DORIS_UPL_TIME")
--- Slot 18 retired: battery thresholds now use ArduPilot's native BATT_ARM_VOLT
--- / BATT_LOW_VOLT / BATT_CRT_VOLT (+ BATT_LOW_TIMER) instead of DORIS_MIN_VOLT.
+-- Slot 18 reused: DORIS_WAS_DEEP latches that the vehicle has been below 2 m
+-- so a GPS reacquire can declare the surface after a reboot.
+assert(param:add_param(73, 18, "WAS_DEEP", 0),    "DORIS_WAS_DEEP")
 -- Navigator relay channel for the mirrored release output; -1 disables it.
 assert(param:add_param(73, 19, "RELAY_CH", 0),    "DORIS_RELAY_CH")
 assert(param:add_param(73, 20, "INJ_LEAK", 0),    "DORIS_INJ_LEAK")
@@ -224,6 +258,7 @@ local prm = {
     PRF_ID   = Parameter("DORIS_PRF_ID"),
     UPL_DATE = Parameter("DORIS_UPL_DATE"),
     UPL_TIME = Parameter("DORIS_UPL_TIME"),
+    WAS_DEEP = Parameter("DORIS_WAS_DEEP"),
     RELAY_CH = Parameter("DORIS_RELAY_CH"),
     INJ_LEAK = Parameter("DORIS_INJ_LEAK"),
     MAX_DPTH = Parameter("DORIS_MAX_DPTH"),
@@ -405,7 +440,22 @@ local telem = {
     dsc_rate = 0.0, asc_rate = 0.0, batt_pct = 0.0,
     prev_depth = 0.0, prev_depth_ms = 0, last_log_ms = 0,
     alpha = 0.3,
+    -- Set once GPS drops after DORIS_WAS_DEEP.  A later 3D fix while
+    -- absolutely shallow is the early-surface / GTR / rope-cut path.
+    gps_lost = false,
 }
+
+-- A reboot on the bottom keeps DORIS_WAS_DEEP.  GPS is already gone, so
+-- arm the reacquire latch immediately.  A reboot already at the surface
+-- (GTR while the Pi was down) then treats the first 3D fix as surfacing
+-- instead of starting a new mission.
+do
+    if (prm.WAS_DEEP:get() or 0) >= 1 then
+        telem.gps_lost = true
+        gcs:send_text(MAV_SEVERITY.INFO,
+            "DIVE: WAS_DEEP latched from EEPROM, GPS-surface armed")
+    end
+end
 
 -- snapshotted config (read once at CONFIG -> MISSION_START)
 -- packed into a table to stay under Lua's 100-local limit
@@ -1191,6 +1241,61 @@ function update()
     -- while a light test or a mission branch owns the rest of the cycle.
     update_release_test(now_ms)
 
+    -- GPS reacquire after submergence.  Must run before CONFIG's GPS-reboot
+    -- and pre-arm so an early float-up (rope cut, GTR, reboot-then-GTR)
+    -- publishes STATE=4 for the AGT / Iridium instead of starting a new dive.
+    -- Gauge depth uses standard atmosphere so a reboot that captured a
+    -- bogus relative zero cannot look "shallow" while still at depth.
+    -- GPS must have dropped after going deep so a cached fix cannot end
+    -- the dive as we cross 2 m on the way down.
+    if state ~= STATE_RECOVERY then
+        local pressure = baro:get_pressure()
+        local gauge_m = nil
+        if pressure then
+            gauge_m = (pressure - 101325.0) / (1025.0 * 9.80665)
+        end
+        local rel_m = get_depth_m()
+        local deep_now = (gauge_m and gauge_m > 2.0)
+            or (is_sitl and rel_m and rel_m > 2.0)
+        local shallow_now = (gauge_m and gauge_m <= 2.0)
+            or (is_sitl and (not gauge_m) and rel_m and rel_m <= 2.0)
+        if gauge_m and gauge_m > 2.0 then
+            deep_now = true
+            shallow_now = false
+        end
+        if deep_now then
+            if (prm.WAS_DEEP:get() or 0) < 1 then
+                prm.WAS_DEEP:set_and_save(1)
+                gcs:send_text(MAV_SEVERITY.INFO,
+                    string.format(
+                        "DIVE: passed 2m (gauge=%.1fm), GPS-surface latch set",
+                        gauge_m or rel_m or 0))
+            end
+            local gps_stat = gps:status(0)
+            if not gps_stat or gps_stat < 3 then
+                telem.gps_lost = true
+            end
+        elseif shallow_now and (prm.WAS_DEEP:get() or 0) >= 1 then
+            local gps_stat = gps:status(0)
+            if not gps_stat or gps_stat < 3 then
+                telem.gps_lost = true
+            elseif telem.gps_lost then
+                gcs:send_text(MAV_SEVERITY.NOTICE,
+                    string.format(
+                        "DIVE: GPS fix after submergence (gauge=%.1fm) -> RECOVERY",
+                        gauge_m or rel_m or 0))
+                if not arming:is_armed() then
+                    arming:arm()
+                end
+                ipcam_stop()
+                state = STATE_RECOVERY
+                prm.STATE:set(state)
+                gcs:send_named_float('STATE', state)
+                return update, UPDATE_INTERVAL_MS
+            end
+        end
+    end
+
     -- RECOVERY keepalive: stay armed so ArduPilot keeps MCAP/BIN logging while
     -- publishing STATE=4 throughout the AGT's three-minute surface dwell.
     -- PWR_SHDN tells BlueOS when the dwell is complete; BlueOS then disarms,
@@ -1199,6 +1304,7 @@ function update()
         if RC9 then RC9:set_override(LIGHT_PWM_MIN) end
         if not recovery_done then
             prm.START:set_and_save(0)
+            prm.WAS_DEEP:set_and_save(0)
             deactivate_relay()
             local total = dive_start_ms > 0
                 and (now_ms - dive_start_ms) / 1000.0 or 0
@@ -1260,30 +1366,44 @@ function update()
 
     -- ??????????????? CONFIG ????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????????
     if state == STATE_CONFIG then
-        -- GPS self-heal: reboot if GPS has no fix after 30s (max 2 attempts)
+        -- GPS self-heal: reboot if GPS has no fix after 30s (max 2 attempts).
+        -- Skip once the baro says we are submerged: there will not be a
+        -- fix, and each reboot only delays the CONFIG deadman.
         if not gps_reboot_attempted then
             local boot_age_s = (now_ms - script_start_ms) / 1000.0
             if boot_age_s >= 30 then
-                local gps_stat = gps:status(0)
-                if not gps_stat or gps_stat < 3 then
-                    local rbt = (prm.GPS_RBT:get() or 0) + 1
-                    gcs:send_text(MAV_SEVERITY.WARNING,
-                        string.format("DIVE: No GPS fix after 30s, reboot %d/2",
-                            rbt))
-                    prm.GPS_RBT:set_and_save(rbt)
-                    vehicle:reboot(false)
-                    return update, UPDATE_INTERVAL_MS
-                else
+                local p = baro:get_pressure()
+                if p and (p < 90000 or p > 110000) then
                     gps_reboot_attempted = true
+                    gcs:send_text(MAV_SEVERITY.INFO,
+                        string.format(
+                            "DIVE: skipping GPS reboot, baro %.0f Pa is not surface",
+                            p))
+                else
+                    local gps_stat = gps:status(0)
+                    if not gps_stat or gps_stat < 3 then
+                        local rbt = (prm.GPS_RBT:get() or 0) + 1
+                        gcs:send_text(MAV_SEVERITY.WARNING,
+                            string.format("DIVE: No GPS fix after 30s, reboot %d/2",
+                                rbt))
+                        prm.GPS_RBT:set_and_save(rbt)
+                        vehicle:reboot(false)
+                        return update, UPDATE_INTERVAL_MS
+                    else
+                        gps_reboot_attempted = true
+                    end
                 end
             end
         end
 
         -- Deadman: deployed into water while still in CONFIG.  Fires
         -- regardless of DORIS_START so an unstarted vehicle (operator
-        -- never pressed "Load Mission") still drops its weight.  Goes
-        -- to ASCENT (not RECOVERY) so the relay stays on for BRN_MIN
-        -- and the vehicle is properly monitored to the surface.
+        -- never pressed "Load Mission") still drops its weight.  A
+        -- reboot at depth uses the same path: the baro zero is standard
+        -- air, so get_depth_m() is real and this trips immediately.
+        -- Goes to ASCENT (not RECOVERY) so the relay stays on for
+        -- BRN_MIN and the vehicle is properly monitored to the surface.
+        -- 2 m matches the GPS-surface latch (DORIS_WAS_DEEP).
         local cfg_depth = get_depth_m()
         if cfg_depth and cfg_depth > 2.0 and not prearm_passed then
             local start_val = prm.START:get() or 0
@@ -1326,7 +1446,17 @@ function update()
                 prearm_passed = true
                 gps_reboot_attempted = true
                 prm.GPS_RBT:set_and_save(0)
-                surface_pressure = baro:get_pressure() or surface_pressure
+                -- Same air window as boot.  Do not adopt a submerged
+                -- reading if pre-arm somehow passed with a stale GPS fix.
+                local pref = baro:get_pressure()
+                if pref and pref >= 90000 and pref <= 110000 then
+                    surface_pressure = pref
+                elseif pref then
+                    gcs:send_text(MAV_SEVERITY.WARNING,
+                        string.format(
+                            "DIVE: pre-arm baro %.0f Pa rejected, keeping Pref=%.0f Pa",
+                            pref, surface_pressure))
+                end
                 local num_sats = gps:num_sats(0) or 0
                 local prf_id = prm.PRF_ID:get() or 0
                 gcs:send_text(MAV_SEVERITY.INFO,

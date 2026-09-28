@@ -159,6 +159,67 @@ def test_recovery_stays_armed_for_agt_surface_dwell():
     assert "return update, UPDATE_INTERVAL_MS" in recovery
 
 
+def test_gps_reacquire_after_deep_enters_recovery():
+    """Rope-cut / GTR float-up must publish STATE=4 for AGT Iridium."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    assert "DORIS_WAS_DEEP" in body
+    assert "telem.gps_lost" in body
+    update = body.split("function update()", 1)[1]
+    gps_surface = update.index("GPS fix after submergence")
+    gps_reboot = update.index("No GPS fix after 30s")
+    prearm = update.index("Pre-arm waiting")
+    assert gps_surface < gps_reboot < prearm
+
+
+def test_recovery_clears_was_deep_latch():
+    """A finished dive must not keep the GPS-surface latch for the next one."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    recovery = body.split("-- RECOVERY keepalive:", 1)[1].split(
+        "-- light test:", 1
+    )[0]
+    assert "prm.WAS_DEEP:set_and_save(0)" in recovery
+
+
+def test_surface_pressure_rejects_deep_water_zero():
+    """A reboot at depth must not capture bottom pressure as the baro zero."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    boot = body.split("local surface_pressure", 1)[1].split(
+        "local is_sitl", 1
+    )[0]
+    assert "101325" in boot
+    assert "p >= 90000 and p <= 110000" in boot
+    assert "baro:get_pressure() or 101325" not in boot
+    prearm = body.split("prearm_passed = true", 1)[1].split(
+        "state = STATE_MISSION_START", 1
+    )[0]
+    assert "pref >= 90000 and pref <= 110000" in prearm
+
+
+def test_gps_reboot_is_skipped_when_submerged():
+    """GPS self-heal must not keep rebooting on the bottom."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    config = body.split("if state == STATE_CONFIG then", 1)[1].split(
+        "-- Deadman:", 1
+    )[0]
+    assert "skipping GPS reboot" in config
+    assert "p < 90000 or p > 110000" in config
+    assert config.index("skipping GPS reboot") < config.index(
+        "No GPS fix after 30s"
+    )
+
+
+def test_config_deadman_releases_when_deeper_than_two_metres():
+    """Unarmed splash and bottom reboot share this CONFIG failsafe."""
+    body = SCRIPT.read_text(encoding="utf-8")
+    deadman = body.split("-- Deadman:", 1)[1].split(
+        "if prm.START:get() >= 1 then", 1
+    )[0]
+    assert "cfg_depth > 2.0" in deadman
+    assert "not prearm_passed" in deadman
+    assert "DEPLOYED in CONFIG" in deadman
+    assert "state = STATE_ASCENT" in deadman
+
+
 def test_interval_and_timelapse_gate_first_capture_on_awb():
     """The first bottom capture must follow AWB; later cycles must not repeat it."""
     body = SCRIPT.read_text(encoding="utf-8")
