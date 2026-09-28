@@ -102,6 +102,40 @@ def _base_mode_bits(base_mode) -> int | None:
     return None
 
 
+def _mavtype_name(mavtype) -> str | None:
+    if isinstance(mavtype, dict):
+        name = mavtype.get("type")
+        return name if isinstance(name, str) else None
+    if isinstance(mavtype, str):
+        return mavtype
+    return None
+
+
+def _decode_heartbeat_armed(payload: object) -> tuple[bool, bool]:
+    """Return ``(armed, known)`` from a mavlink2rest HEARTBEAT JSON body.
+
+    ``known`` is False when the payload is missing, is not a vehicle
+    heartbeat, or has no parseable ``base_mode``.  GCS heartbeats are
+    ignored so a ground-station SAFETY_ARMED bit cannot flip the banner.
+    The ``type`` field is optional: a parseable ``base_mode`` is enough,
+    so a missing type is not treated as "disarmed".
+    """
+    if not isinstance(payload, dict):
+        return False, False
+    msg = payload.get("message", payload)
+    if not isinstance(msg, dict):
+        return False, False
+    msg_type = msg.get("type")
+    if msg_type is not None and msg_type != "HEARTBEAT":
+        return False, False
+    if _mavtype_name(msg.get("mavtype")) == "MAV_TYPE_GCS":
+        return False, False
+    bits = _base_mode_bits(msg.get("base_mode"))
+    if bits is None:
+        return False, False
+    return bool(bits & ARMED_FLAG), True
+
+
 class ArmingService:
     """Tracks vehicle armed state and failing pre-arm checks."""
 
@@ -111,6 +145,9 @@ class ArmingService:
         # reason text -> {"text", "severity", "last_seen", "timestamp"}
         self._failures: dict[str, dict] = {}
         self._lock = asyncio.Lock()
+        # Last confirmed HEARTBEAT armed bit.  Held across transient
+        # mavlink2rest misses so callers do not see armed flap false.
+        self._last_armed: bool | None = None
 
     @property
     def client(self) -> httpx.AsyncClient:
@@ -133,6 +170,12 @@ class ArmingService:
         """
         self._ensure_statustext_subscriber()
         armed, armed_known = await self._read_armed()
+        if armed_known:
+            self._last_armed = armed
+        elif self._last_armed is not None:
+            # Keep the last confirmed bit.  Reporting False here is what
+            # made the top banner flash red on every dropped HEARTBEAT.
+            armed = self._last_armed
 
         async with self._lock:
             if armed:
@@ -178,13 +221,7 @@ class ArmingService:
             if resp.status_code == 404:
                 return False, False
             resp.raise_for_status()
-            msg = resp.json().get("message", {})
-            if msg.get("type") != "HEARTBEAT":
-                return False, False
-            bits = _base_mode_bits(msg.get("base_mode"))
-            if bits is None:
-                return False, False
-            return bool(bits & ARMED_FLAG), True
+            return _decode_heartbeat_armed(resp.json())
         except Exception as e:
             logger.debug("Could not read HEARTBEAT for arming state: %s", e)
             return False, False
