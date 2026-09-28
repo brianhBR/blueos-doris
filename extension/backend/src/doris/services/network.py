@@ -11,6 +11,7 @@ from ..models.network import (
     ConnectionStatus,
     NetworkCredentials,
     NetworkInfo,
+    NetworkInterface,
     WifiNetwork,
     WlanLastAttempt,
     WlanState,
@@ -52,6 +53,17 @@ V1_NM_UNMANAGED_STASH = "/tmp/doris-99-blueos-hotspot-uap0.conf.stash"
 V1_UAP0_CONNECTION_PREFIX = "doris-uap0-sta-"
 V1_DHCP_TIMEOUT_S = 30
 
+# Names the external/AP radio can appear under, most specific first.
+# On DORIS hardware udev renames the Realtek RTL88x2BU to ``uap0``; a
+# stock BlueOS install with a second adapter would show ``wlan1``. This
+# must stay in sync with _resolve_external_iface_v1(), which probes the
+# same names via /sys/class/net on v1 systems.
+EXTERNAL_IFACE_CANDIDATES = ("uap0", "wlan1", "wifi1")
+
+# Interfaces that are Docker/virtual plumbing rather than something the
+# user can plug into or point a browser at.
+VIRTUAL_IFACE_PREFIXES = ("veth", "docker", "br-", "virbr", "tun", "tap")
+
 
 class NetworkService:
     """Service for managing network connections via BlueOS WiFi Manager.
@@ -81,6 +93,18 @@ class NetworkService:
         networks = await self.scan_networks()
         hotspot_ssid = await self._get_hotspot_ssid()
         serial = await self._get_serial_number()
+        interfaces = await self.get_interfaces()
+
+        # WiFi Manager v1's /status has no signallevel field, so borrow
+        # it from the scan entry for the SSID we're associated to.
+        if connection.signal_strength is None and connection.ssid:
+            match = next(
+                (n for n in networks if n.ssid == connection.ssid), None
+            )
+            if match:
+                connection = connection.model_copy(
+                    update={"signal_strength": match.signal_strength}
+                )
 
         return NetworkInfo(
             connection=connection,
@@ -88,6 +112,7 @@ class NetworkService:
             is_scanning=False,
             serial_number=serial,
             hotspot_ssid=hotspot_ssid,
+            interfaces=interfaces,
         )
 
     async def _resolve_hotspot_interface_name(self) -> str | None:
@@ -136,15 +161,25 @@ class NetworkService:
             logger.warning("Failed to get hotspot credentials: %s", e)
             return None
 
+    async def _fetch_host_interfaces(self) -> list[dict[str, Any]]:
+        """Raw interface list for the *host* from linux2rest.
+
+        The extension runs in a bridge network namespace, so its own
+        /sys/class/net only shows a Docker veth. Everything the user
+        cares about has to come from the host via linux2rest.
+        """
+        interfaces: list[dict[str, Any]] = await self._linux2rest.get(  # type: ignore[assignment]
+            "/system/network"
+        )
+        return interfaces or []
+
     async def _get_serial_number(self) -> str:
         """Derive DORIS serial number from the last 4 hex digits of the ethernet MAC."""
         if self._cached_serial:
             return self._cached_serial
 
         try:
-            interfaces: list[dict[str, Any]] = await self._linux2rest.get(  # type: ignore[assignment]
-                "/system/network"
-            )
+            interfaces = await self._fetch_host_interfaces()
             for iface in interfaces:
                 name = iface.get("name", "")
                 if name.startswith("eth") or name.startswith("en"):
@@ -164,29 +199,80 @@ class NetworkService:
         sec = await self._resolve_hotspot_interface_name()
         if sec:
             names.append(sec)
-        for n in ("wlan1", "wifi1"):
+        for n in EXTERNAL_IFACE_CANDIDATES:
             if n not in names:
                 names.append(n)
         try:
-            interfaces: list[dict[str, Any]] = await self._linux2rest.get(  # type: ignore[assignment]
-                "/system/network"
-            )
+            interfaces = await self._fetch_host_interfaces()
             by_name = {
                 iface.get("name"): iface
                 for iface in interfaces
                 if iface.get("name")
             }
             for want in names:
-                row = by_name.get(want)
-                if not row:
-                    continue
-                mac = row.get("mac")
+                mac = (by_name.get(want) or {}).get("mac")
                 if mac:
                     self._cached_mac = mac
-                return mac
+                    return mac
         except Exception as e:
             logger.warning(f"Failed to get MAC from linux2rest: {e}")
         return self._cached_mac
+
+    async def get_interfaces(self) -> list[NetworkInterface]:
+        """Host interfaces with their MACs and IPs, for display in the UI.
+
+        Loopback and Docker/virtual plumbing are dropped — they're noise
+        to anyone trying to find the address they can reach DORIS on.
+        """
+        hotspot_iface = await self._resolve_hotspot_interface_name()
+
+        def classify(name: str) -> tuple[int, str]:
+            if name == hotspot_iface or name in EXTERNAL_IFACE_CANDIDATES:
+                return 0, "hotspot"
+            if name.startswith(("wlan", "wifi", "wl")):
+                return 1, "wifi"
+            if name.startswith(("eth", "en")):
+                return 2, "ethernet"
+            if name.startswith("usb"):
+                return 3, "usb"
+            return 4, "other"
+
+        try:
+            rows = await self._fetch_host_interfaces()
+        except Exception as e:
+            logger.warning("Failed to list host interfaces: %s", e)
+            return []
+
+        result: list[tuple[int, str, NetworkInterface]] = []
+        for row in rows:
+            name = row.get("name") or ""
+            if not name or row.get("is_loopback"):
+                continue
+            if name.startswith(VIRTUAL_IFACE_PREFIXES):
+                continue
+            rank, role = classify(name)
+            result.append(
+                (
+                    rank,
+                    name,
+                    NetworkInterface(
+                        name=name,
+                        mac=row.get("mac") or None,
+                        # linux2rest reports CIDR ("10.40.1.119/24"); the
+                        # bare address is what the user types into a browser.
+                        ip_addresses=[
+                            ip.split("/")[0]
+                            for ip in (row.get("ips") or [])
+                            if ip
+                        ],
+                        is_up=bool(row.get("is_up")),
+                        role=role,
+                    ),
+                )
+            )
+
+        result.sort(key=lambda item: (item[0], item[1]))
+        return [iface for _, _, iface in result]
 
     async def get_connection_status(self) -> ConnectionStatus:
         """Get current connection status."""
@@ -393,13 +479,37 @@ class NetworkService:
         # -- ensure the secondary is in hotspot (or dual) mode --
         await self._ensure_secondary_hotspot(iface_name)
 
+    async def _is_hotspot_enabled_v1(self) -> bool | None:
+        """Whether the global v1 hotspot is currently broadcasting.
+
+        ``GET /v1.0/hotspot`` answers with a bare JSON bool, but some
+        builds wrap it as ``{"supported": ..., "enabled": ...}``. Accept
+        both. Returns None if the state can't be determined, so callers
+        can tell "off" apart from "don't know".
+        """
+        try:
+            hs = await self._client.get_hotspot()
+        except Exception as e:
+            logger.debug("v1 hotspot: state query failed: %s", e)
+            return None
+        if isinstance(hs, bool):
+            return hs
+        if isinstance(hs, dict) and "enabled" in hs:
+            return bool(hs["enabled"])
+        logger.debug("v1 hotspot: unrecognised state payload %r", hs)
+        return None
+
     async def _configure_hotspot_v1(self, ssid: str, password: str) -> None:
-        """Rename the global BlueOS hotspot via the v1 WiFi Manager API.
+        """Point the global BlueOS hotspot at DORIS and make sure it is up.
 
         Used when v2 is unavailable. v1 has no concept of per-interface
-        hotspots, so we just retarget the single global hotspot. If the
-        SSID already matches, we skip the toggle so we don't interrupt
-        connected clients on every backend restart.
+        hotspots, so we just retarget the single global hotspot.
+
+        The SSID rename and the enable are independent: the credentials
+        usually persist across reboots, so the rename is a one-time
+        event, but the AP itself comes up disabled on every boot. Enable
+        has to run regardless of whether the rename did, or the hotspot
+        only ever works on the very first boot after provisioning.
         """
         try:
             current = await self._client.get_hotspot_credentials()
@@ -408,20 +518,17 @@ class NetworkService:
             logger.warning("v1 hotspot: failed to read current credentials: %s", e)
             current_ssid = None
 
-        if current_ssid == ssid:
-            logger.info("Hotspot SSID already %r (v1 path), nothing to do", ssid)
-            return
-
-        logger.info(
-            "Renaming hotspot via v1 API: %r -> %r (BlueOS v2 unavailable)",
-            current_ssid, ssid,
-        )
-
-        try:
-            await self._client.set_hotspot_credentials(ssid, password)
-        except Exception as e:
-            logger.warning("v1 hotspot: set_hotspot_credentials failed: %s", e)
-            return
+        renamed = False
+        if current_ssid != ssid:
+            logger.info(
+                "Renaming hotspot via v1 API: %r -> %r (BlueOS v2 unavailable)",
+                current_ssid, ssid,
+            )
+            try:
+                await self._client.set_hotspot_credentials(ssid, password)
+                renamed = True
+            except Exception as e:
+                logger.warning("v1 hotspot: set_hotspot_credentials failed: %s", e)
 
         try:
             if await self._client.get_smart_hotspot():
@@ -430,13 +537,23 @@ class NetworkService:
         except Exception as e:
             logger.debug("v1 hotspot: smart_hotspot check failed: %s", e)
 
+        enabled = await self._is_hotspot_enabled_v1()
+
+        if enabled and not renamed:
+            # Already broadcasting under the right name — leave it be so
+            # a backend restart doesn't kick connected clients off.
+            logger.info("Hotspot already up and broadcasting %r (v1 path)", ssid)
+            return
+
         try:
-            await self._client.set_hotspot(False)
-            await asyncio.sleep(3)
+            if enabled:
+                # New credentials only take effect on a restart of the AP.
+                await self._client.set_hotspot(False)
+                await asyncio.sleep(3)
             await self._client.set_hotspot(True)
-            logger.info("Hotspot restarted via v1; broadcasting %r", ssid)
+            logger.info("Hotspot enabled via v1; broadcasting %r", ssid)
         except Exception as e:
-            logger.warning("v1 hotspot: toggle failed (creds set but not applied): %s", e)
+            logger.warning("v1 hotspot: enable failed: %s", e)
 
     async def _is_hotspot_actually_running(self, iface_name: str) -> bool:
         """Check if the AP is genuinely serving, not just labelled 'hotspot'."""
@@ -535,18 +652,29 @@ class NetworkService:
                 if state.mode != "ap":
                     continue
                 iface = await self._get_secondary_interface_name()
-                if not iface:
+                if iface:
+                    hs = await self._client._v2.wifi_hotspot_status(iface)
+                    if hs.get("enabled"):
+                        continue
+                    logger.warning(
+                        "AP on %s is down, re-asserting hotspot mode", iface,
+                    )
+                    if await self._ensure_secondary_hotspot(iface):
+                        logger.info("AP on %s recovered by watchdog", iface)
+                    else:
+                        logger.warning("AP watchdog: failed to recover %s", iface)
                     continue
-                hs = await self._client._v2.wifi_hotspot_status(iface)
-                if hs.get("enabled"):
+
+                # v1: no per-interface API. Recover the global hotspot.
+                enabled = await self._is_hotspot_enabled_v1()
+                if enabled is None or enabled:
                     continue
-                logger.warning(
-                    "AP on %s is down, re-asserting hotspot mode", iface,
-                )
-                if await self._ensure_secondary_hotspot(iface):
-                    logger.info("AP on %s recovered by watchdog", iface)
-                else:
-                    logger.warning("AP watchdog: failed to recover %s", iface)
+                logger.warning("AP is down (v1), re-enabling global hotspot")
+                try:
+                    await self._client.set_hotspot(True)
+                    logger.info("AP recovered via v1 set_hotspot(True)")
+                except Exception as e:
+                    logger.warning("AP watchdog v1 recovery failed: %s", e)
             except Exception as e:
                 logger.debug("AP watchdog check error: %s", e)
 
