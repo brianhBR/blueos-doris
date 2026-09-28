@@ -47,10 +47,10 @@
    transition to ASCENT.
 
    Battery protection uses three tiers keyed on ArduPilot's native BATT_*
-   parameters, compared against the sag-compensated resting voltage:
+   parameters, compared against the directly measured pack voltage:
      * BATT_ARM_VOLT  - pre-arm floor; the mission will not start below it.
      * BATT_LOW_VOLT  - in-mission warning only (GCS + telemetry), no action.
-     * BATT_CRT_VOLT  - critical; once the resting voltage holds below it for
+     * BATT_CRT_VOLT  - critical; once the measured voltage holds below it for
                         BATT_LOW_TIMER seconds the weight is released.
    ArduPilot's own battery failsafe actions stay disabled (BATT_FS_*_ACT=0)
    because none suit a thrusterless lander; the script is the actuator.
@@ -410,7 +410,7 @@ local relay_active       = false
 local leak_detected = false
 
 -- Battery failsafe tracking (native ArduPilot BATT_* thresholds).
---   crit_since_ms: when the resting voltage first fell below BATT_CRT_VOLT;
+--   crit_since_ms: when the measured voltage first fell below BATT_CRT_VOLT;
 --                  release only fires once it holds for BATT_LOW_TIMER seconds.
 --   warned:        latched true after the one-shot BATT_LOW_VOLT warning, so
 --                  the advisory does not repeat every cycle.
@@ -738,17 +738,14 @@ local function update_profile_auth(auth_id)
     end
 end
 
--- Sag-compensated pack voltage for the failsafe/arming tiers.  Voltage droops
--- under load (lights, relay inrush), so comparing raw voltage risks a false
--- release on a transient sag; the resting estimate is what BATT_FS_VOLTSRC=1
--- would use.  Falls back to the loaded voltage if the estimate is unavailable.
+-- Directly measured pack voltage for the failsafe/arming tiers.  The
+-- BATT_LOW_TIMER debounce rejects brief load/inrush sag without relying on
+-- ArduPilot's learned internal-resistance compensation, which can materially
+-- overestimate the available voltage on this vehicle.
 -- Returns nil when there is no plausible reading (<= 1 V), so callers can tell
 -- "battery genuinely low" apart from "no monitor / bogus 0 V".
 local function batt_fs_voltage()
-    local v = battery:voltage_resting_estimate(0)
-    if not v or v <= 1.0 then
-        v = battery:voltage(0)
-    end
+    local v = battery:voltage(0)
     if not v or v <= 1.0 then
         return nil
     end
@@ -769,7 +766,7 @@ local function check_failsafes(now_ms)
     end
 
     -- Battery tiers use ArduPilot's native BATT_* thresholds against the
-    -- sag-compensated resting voltage.  BATT_LOW_VOLT is advisory only; only
+    -- directly measured pack voltage.  BATT_LOW_VOLT is advisory only; only
     -- BATT_CRT_VOLT, held for BATT_LOW_TIMER seconds, releases the weight.
     local v = batt_fs_voltage()
     if v then
@@ -1424,7 +1421,7 @@ function update()
         if prm.START:get() >= 1 then
             -- Surface pre-arm checks
             -- Arming voltage tier: native BATT_ARM_VOLT against the
-            -- sag-compensated resting voltage.  0 (ArduPilot default) disables
+            -- directly measured pack voltage.  0 (ArduPilot default) disables
             -- the gate, so treat non-positive as "no arm-voltage requirement".
             local arm_volt = param:get("BATT_ARM_VOLT") or 0
             local arm_v = batt_fs_voltage() or 0
