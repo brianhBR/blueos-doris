@@ -21,6 +21,7 @@ interface DisplayFile {
   createdMs: number
   size: string
   downloadUrl: string
+  storageLocations: readonly ('internal' | 'external')[]
 }
 
 const { files: apiFiles, loading: mediaLoading, error: mediaError, fetchFiles, deleteFile, downloadFile, downloadFiles } = useMedia()
@@ -28,8 +29,11 @@ const { storage, loading: storageLoading, error: storageError, fetchStorage } = 
 
 type SortField = 'diveName' | 'fileName' | 'date' | 'type'
 type SortDirection = 'asc' | 'desc' | null
+type StorageFilter = 'all' | 'internal' | 'external'
 
 const searchQuery = ref('')
+const storageFilter = ref<StorageFilter>('all')
+const storageFilters: StorageFilter[] = ['all', 'internal', 'external']
 const sortField = ref<SortField>('date')
 const sortDirection = ref<SortDirection>('desc')
 const selectedFiles = ref<string[]>([])
@@ -97,6 +101,9 @@ const mediaFiles = computed<DisplayFile[]>(() => {
       createdMs: createdDate.getTime(),
       size: formatFileSize(f.size_bytes),
       downloadUrl: f.download_url,
+      storageLocations: f.storage_locations ?? (
+        f.id.startsWith('usb:') ? ['external'] : ['internal']
+      ),
     }
   })
 })
@@ -166,10 +173,14 @@ const getTypeBadgeStyle = (type: string) => {
 }
 
 const filteredFiles = computed(() => {
-  return mediaFiles.value.filter(file =>
-    file.fileName.toLowerCase().includes(searchQuery.value.toLowerCase()) ||
-    file.diveName.toLowerCase().includes(searchQuery.value.toLowerCase())
-  )
+  const query = searchQuery.value.toLowerCase()
+  return mediaFiles.value.filter(file => {
+    const storageMatches = storageFilter.value === 'all'
+      || file.storageLocations.includes(storageFilter.value)
+    const searchMatches = file.fileName.toLowerCase().includes(query)
+      || file.diveName.toLowerCase().includes(query)
+    return storageMatches && searchMatches
+  })
 })
 
 const sortedFiles = computed(() => {
@@ -270,6 +281,17 @@ const confirmEraseAll = async () => {
 const handlePageChange = (page: number) => {
   if (page >= 1 && page <= totalPages.value) currentPage.value = page
 }
+
+const setStorageFilter = (filter: StorageFilter) => {
+  storageFilter.value = filter
+  currentPage.value = 1
+  selectedFiles.value = []
+}
+
+const storageLabel = (file: DisplayFile) => {
+  if (file.storageLocations.length > 1) return 'Internal + External'
+  return file.storageLocations[0] === 'external' ? 'External' : 'Internal'
+}
 </script>
 
 <template>
@@ -340,8 +362,23 @@ const handlePageChange = (page: number) => {
         </div>
       </div>
 
-      <!-- Search Bar and Batch Actions -->
+      <!-- Storage filter, search, and batch actions -->
       <div class="flex flex-col gap-3 mb-4 md:mb-6">
+        <div class="flex gap-2" role="tablist" aria-label="Storage location">
+          <button
+            v-for="filter in storageFilters"
+            :key="filter"
+            role="tab"
+            :aria-selected="storageFilter === filter"
+            class="px-4 py-2 rounded-lg text-sm transition-all capitalize"
+            :style="storageFilter === filter
+              ? 'background-color: #41B9C3; color: white'
+              : 'background-color: rgba(14, 36, 70, 0.5); color: #96EEF2; border: 1px solid rgba(65, 185, 195, 0.3)'"
+            @click="setStorageFilter(filter)"
+          >
+            {{ filter }}
+          </button>
+        </div>
         <div class="flex-1 relative">
           <Search
             class="absolute left-3 top-1/2 transform -translate-y-1/2 w-4 h-4 md:w-5 md:h-5"
@@ -439,6 +476,7 @@ const handlePageChange = (page: number) => {
                 </button>
               </th>
               <th class="text-left p-3" style="color: #96EEF2">Size</th>
+              <th class="text-left p-3" style="color: #96EEF2">Storage</th>
               <th class="text-right p-3" style="color: #96EEF2">Actions</th>
             </tr>
           </thead>
@@ -486,6 +524,14 @@ const handlePageChange = (page: number) => {
                 </span>
               </td>
               <td class="p-3" style="color: #96EEF2">{{ file.size }}</td>
+              <td class="p-3">
+                <span
+                  class="px-2 py-1 rounded text-xs"
+                  style="background-color: rgba(65, 185, 195, 0.15); color: #96EEF2"
+                >
+                  {{ storageLabel(file) }}
+                </span>
+              </td>
               <td class="p-3">
                 <div class="flex justify-end gap-2">
                   <span title="Work in progress">
@@ -615,6 +661,7 @@ const handlePageChange = (page: number) => {
                   <span style="color: #FCD869">{{ file.timePart }}</span>
                 </span>
                 <span>{{ file.size }}</span>
+                <span>{{ storageLabel(file) }}</span>
               </div>
               <div class="flex gap-2">
                 <span class="flex-1" title="Work in progress">

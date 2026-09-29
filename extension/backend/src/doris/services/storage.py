@@ -28,7 +28,13 @@ from ..models.configuration import (
     DeploymentConfiguration,
 )
 from ..models.dive_history import DiveHistoryEntry
-from ..models.media import MediaFile, MediaMission, MediaType, SyncStatus
+from ..models.media import (
+    MediaFile,
+    MediaMission,
+    MediaType,
+    StorageLocation,
+    SyncStatus,
+)
 
 from .binlog import slug_for_dive
 from .usb_storage import iter_media_files_on_usb, iter_media_scan_roots
@@ -140,6 +146,100 @@ def media_abs_path_from_download_id(file_path: str, data_root: Path) -> Path | N
     if not cand.is_relative_to(data_root.resolve()):
         return None
     return cand
+
+
+def _media_preference(media: MediaFile) -> tuple[int, str]:
+    """Prefer an organized USB archive, then another USB path, for display."""
+    normalized = media.id.replace("\\", "/").lower()
+    if normalized.startswith(USB_MEDIA_PREFIX) and "doris/dives/" in normalized:
+        return (2, media.id)
+    if normalized.startswith(USB_MEDIA_PREFIX):
+        return (1, media.id)
+    return (0, media.id)
+
+
+def _deduplicate_media_files(files: list[MediaFile], root: Path) -> list[MediaFile]:
+    """Collapse mount aliases and copied MCAPs into logical media records.
+
+    First collapse paths that resolve to the same device/inode. Then combine
+    distinct physical MCAP copies that share their timestamped recorder name,
+    size, and effective creation time. ``backing_ids`` retains one safe delete
+    target per physical file.
+    """
+    physical_groups: dict[tuple[object, ...], list[MediaFile]] = {}
+    for media in files:
+        path = media_abs_path_from_download_id(media.id, root)
+        try:
+            stat = path.stat() if path is not None else None
+        except OSError:
+            stat = None
+        key: tuple[object, ...] = (
+            ("id", media.id)
+            if stat is None
+            else ("inode", stat.st_dev, stat.st_ino)
+        )
+        physical_groups.setdefault(key, []).append(media)
+
+    physical: list[MediaFile] = []
+    for aliases in physical_groups.values():
+        representative = max(aliases, key=_media_preference)
+        # Seeing the same inode through a USB scan proves it is external; do
+        # not also label its internal bind-mount alias as a second location.
+        external = any(m.id.startswith(USB_MEDIA_PREFIX) for m in aliases)
+        location = (
+            StorageLocation.EXTERNAL if external else StorageLocation.INTERNAL
+        )
+        physical.append(
+            representative.model_copy(
+                update={
+                    "storage_locations": [location],
+                    "backing_ids": [representative.id],
+                }
+            )
+        )
+
+    logical_groups: dict[tuple[object, ...], list[MediaFile]] = {}
+    for media in physical:
+        if media.filename.lower().endswith(".mcap"):
+            key = (
+                "mcap",
+                media.filename.casefold(),
+                media.size_bytes,
+                media.created_at.isoformat(),
+            )
+        else:
+            key = ("physical", media.backing_ids[0])
+        logical_groups.setdefault(key, []).append(media)
+
+    logical: list[MediaFile] = []
+    for copies in logical_groups.values():
+        representative = max(copies, key=_media_preference)
+        backing_ids = list(
+            dict.fromkeys(
+                backing_id
+                for copy in copies
+                for backing_id in copy.backing_ids
+            )
+        )
+        locations = {
+            location
+            for copy in copies
+            for location in copy.storage_locations
+        }
+        ordered_locations = [
+            location
+            for location in (StorageLocation.INTERNAL, StorageLocation.EXTERNAL)
+            if location in locations
+        ]
+        logical.append(
+            representative.model_copy(
+                update={
+                    "storage_locations": ordered_locations,
+                    "backing_ids": backing_ids,
+                }
+            )
+        )
+    return logical
 
 
 @dataclass(frozen=True)
@@ -970,6 +1070,7 @@ class StorageService:
                         _append_if_matches(mf)
                     except (FileNotFoundError, PermissionError, ValueError):
                         continue
+                files = _deduplicate_media_files(files, self.root)
                 files.sort(key=lambda f: f.created_at, reverse=True)
                 return files[offset : offset + limit]
 
@@ -1043,6 +1144,7 @@ class StorageService:
                         except (FileNotFoundError, PermissionError, ValueError):
                             continue
 
+            files = _deduplicate_media_files(files, self.root)
             files.sort(key=lambda f: f.created_at, reverse=True)
 
             return files[offset : offset + limit]
@@ -1194,6 +1296,26 @@ class StorageService:
         except Exception as e:
             logger.warning(f"Failed to delete file '{file_path}': {e}")
             raise
+
+    async def delete_logical_file(self, file_path: str) -> bool:
+        """Delete every distinct physical copy represented by a media row."""
+        files = await self.get_media_files(limit=2**31 - 1)
+        media = next(
+            (
+                candidate
+                for candidate in files
+                if candidate.id == file_path or file_path in candidate.backing_ids
+            ),
+            None,
+        )
+        if media is None:
+            return await self.delete_file(file_path)
+
+        deleted = False
+        for backing_id in media.backing_ids:
+            if await self.delete_file(backing_id):
+                deleted = True
+        return deleted
 
     async def get_sync_status(self) -> SyncStatus:
         """Get sync status (placeholder)."""

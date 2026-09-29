@@ -268,6 +268,8 @@ export interface MediaFile {
   thumbnail_url: string | null
   download_url: string
   is_synced: boolean
+  storage_locations: readonly ('internal' | 'external')[]
+  backing_ids: readonly string[]
 }
 
 export interface MediaMission {

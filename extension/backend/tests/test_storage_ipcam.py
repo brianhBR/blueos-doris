@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from doris.models.media import MediaType
+from doris.models.media import MediaType, StorageLocation
+from doris.services import storage
 from doris.services.storage import (
     StorageService,
     media_abs_path_from_download_id,
@@ -149,3 +150,63 @@ async def test_mission_filter_finds_snapshot_in_photos(svc):
 
     assert len(files) == 1
     assert files[0].filename.endswith(".jpg")
+
+
+async def test_mcap_bind_alias_is_one_external_file(svc, tmp_path, monkeypatch):
+    filename = "recorder_20260928_203114.mcap"
+    internal = svc.media_root / filename
+    internal.write_bytes(b"telemetry")
+    usb = tmp_path / "usb"
+    external = usb / "recorder" / filename
+    external.parent.mkdir(parents=True)
+    external.write_bytes(internal.read_bytes())
+
+    monkeypatch.setattr(
+        storage, "iter_media_scan_roots", lambda: [("portable", usb)]
+    )
+    real_resolver = storage.media_abs_path_from_download_id
+
+    def resolve_alias(file_id: str, root: Path) -> Path | None:
+        if file_id.startswith("usb:portable:recorder/"):
+            return internal
+        return real_resolver(file_id, root)
+
+    monkeypatch.setattr(storage, "media_abs_path_from_download_id", resolve_alias)
+
+    files = await svc.get_media_files()
+
+    assert len(files) == 1
+    assert files[0].id.startswith("usb:portable:")
+    assert files[0].storage_locations == [StorageLocation.EXTERNAL]
+    assert files[0].backing_ids == [files[0].id]
+
+
+async def test_mcap_copies_are_one_logical_file_and_delete_together(
+    svc, tmp_path, monkeypatch
+):
+    filename = "recorder_20260928_203114.mcap"
+    internal = svc.media_root / filename
+    internal.write_bytes(b"telemetry")
+    usb = tmp_path / "usb"
+    archived = usb / "DORIS" / "dives" / "bench" / "telemetry" / filename
+    archived.parent.mkdir(parents=True)
+    archived.write_bytes(internal.read_bytes())
+
+    monkeypatch.setattr(
+        storage, "iter_media_scan_roots", lambda: [("portable", usb)]
+    )
+
+    files = await svc.get_media_files()
+
+    assert len(files) == 1
+    media = files[0]
+    assert "DORIS/dives/" in media.id
+    assert media.storage_locations == [
+        StorageLocation.INTERNAL,
+        StorageLocation.EXTERNAL,
+    ]
+    assert len(media.backing_ids) == 2
+
+    assert await svc.delete_logical_file(media.id)
+    assert not internal.exists()
+    assert not archived.exists()

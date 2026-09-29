@@ -2,7 +2,8 @@
 
 from datetime import datetime
 from enum import StrEnum
-from pydantic import BaseModel
+
+from pydantic import BaseModel, Field
 
 
 class MediaType(StrEnum):
@@ -12,6 +13,13 @@ class MediaType(StrEnum):
     VIDEO = "video"
     DATA = "data"  # sensor data files
     SYSTEM = "system"  # configs, notifications, dive records, unassigned recorder data, etc.
+
+
+class StorageLocation(StrEnum):
+    """Physical storage classes backing a logical media file."""
+
+    INTERNAL = "internal"
+    EXTERNAL = "external"
 
 
 class MediaFile(BaseModel):
@@ -29,6 +37,8 @@ class MediaFile(BaseModel):
     thumbnail_url: str | None = None
     download_url: str
     is_synced: bool = False
+    storage_locations: list[StorageLocation] = Field(default_factory=list)
+    backing_ids: list[str] = Field(default_factory=list)
 
 
 class MediaMission(BaseModel):
