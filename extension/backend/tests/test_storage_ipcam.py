@@ -210,3 +210,46 @@ async def test_mcap_copies_are_one_logical_file_and_delete_together(
     assert await svc.delete_logical_file(media.id)
     assert not internal.exists()
     assert not archived.exists()
+
+
+async def test_video_copies_show_the_dive_folder_file(svc, tmp_path, monkeypatch):
+    """A processed clip is listed once, as the copy under dives/<name>/video/."""
+    filename = "20260930t184410_on_bottom.mp4"
+    payload = b"dock-test-video"
+    usb = tmp_path / "usb"
+    raw = (
+        usb
+        / "DORIS"
+        / "userdata"
+        / "ipcam_recordings"
+        / "dive_20260930_184410"
+        / filename
+    )
+    archived = usb / "DORIS" / "dives" / "mry_0930_01" / "video" / filename
+    raw.parent.mkdir(parents=True)
+    archived.parent.mkdir(parents=True)
+    raw.write_bytes(payload)
+    archived.write_bytes(payload)
+    solo_name = "20260930t120000_on_bottom.mp4"
+    solo = usb / "DORIS" / "userdata" / "ipcam_recordings" / "dive_solo" / solo_name
+    solo.parent.mkdir(parents=True)
+    solo.write_bytes(b"not-yet-copied")
+
+    monkeypatch.setattr(
+        storage, "iter_media_scan_roots", lambda: [("portable", usb)]
+    )
+
+    files = await svc.get_media_files()
+    clips = [f for f in files if f.filename == filename]
+
+    assert len(clips) == 1
+    media = clips[0]
+    assert "DORIS/dives/mry_0930_01/video/" in media.id.replace("\\", "/")
+    assert media.storage_locations == [StorageLocation.EXTERNAL]
+    assert len(media.backing_ids) == 2
+    assert any(f.filename == solo_name for f in files)
+
+    assert await svc.delete_logical_file(media.id)
+    assert not raw.exists()
+    assert not archived.exists()
+    assert solo.exists()

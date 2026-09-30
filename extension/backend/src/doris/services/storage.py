@@ -158,13 +158,33 @@ def _media_preference(media: MediaFile) -> tuple[int, str]:
     return (0, media.id)
 
 
+def _copied_media_key(media: MediaFile) -> tuple[object, ...] | None:
+    """Identity for a file that post-dive processing copies onto the USB archive.
+
+    Camera recordings stay in ``ipcam_recordings`` and are also copied under
+    ``dives/<name>/``. Those copies share a filename, size, and capture time.
+    The displayed row is the dive-folder copy (see :func:`_media_preference`).
+    """
+    if (
+        media.filename.lower().endswith(".mcap")
+        or _detect_media_type(media.filename) in (MediaType.IMAGE, MediaType.VIDEO)
+    ):
+        return (
+            "copy",
+            media.filename.casefold(),
+            media.size_bytes,
+            media.created_at.isoformat(),
+        )
+    return None
+
+
 def _deduplicate_media_files(files: list[MediaFile], root: Path) -> list[MediaFile]:
-    """Collapse mount aliases and copied MCAPs into logical media records.
+    """Collapse mount aliases and copied media into logical records.
 
     First collapse paths that resolve to the same device/inode. Then combine
-    distinct physical MCAP copies that share their timestamped recorder name,
-    size, and effective creation time. ``backing_ids`` retains one safe delete
-    target per physical file.
+    distinct physical copies of a telemetry log, video, or still that share
+    their filename, size, and effective creation time. ``backing_ids`` retains
+    one safe delete target per physical file.
     """
     physical_groups: dict[tuple[object, ...], list[MediaFile]] = {}
     for media in files:
@@ -200,15 +220,7 @@ def _deduplicate_media_files(files: list[MediaFile], root: Path) -> list[MediaFi
 
     logical_groups: dict[tuple[object, ...], list[MediaFile]] = {}
     for media in physical:
-        if media.filename.lower().endswith(".mcap"):
-            key = (
-                "mcap",
-                media.filename.casefold(),
-                media.size_bytes,
-                media.created_at.isoformat(),
-            )
-        else:
-            key = ("physical", media.backing_ids[0])
+        key = _copied_media_key(media) or ("physical", media.backing_ids[0])
         logical_groups.setdefault(key, []).append(media)
 
     logical: list[MediaFile] = []
