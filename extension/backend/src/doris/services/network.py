@@ -18,7 +18,7 @@ from ..models.network import (
 )
 from .base import BlueOSClient
 from .blueos.network import NetworkClient
-from .hotspot_radio import _run_host_command
+from .hotspot_radio import BLUEOS_CORE_CONTAINER, _run_host_command
 from .storage import DATA_ROOT
 
 logger = logging.getLogger(__name__)
@@ -52,6 +52,21 @@ V1_NM_UNMANAGED_CONF = "/etc/NetworkManager/conf.d/99-blueos-hotspot-uap0.conf"
 V1_NM_UNMANAGED_STASH = "/tmp/doris-99-blueos-hotspot-uap0.conf.stash"
 V1_UAP0_CONNECTION_PREFIX = "doris-uap0-sta-"
 V1_DHCP_TIMEOUT_S = 30
+
+# BlueOS wifi-manager's disable_hotspot() runs ``iw dev uap0 del``
+# because it assumes uap0 is a virtual interface it created. On DORIS
+# uap0 is the renamed physical Realtek, so going through the hotspot
+# API can delete the very netdev we're about to put into STA mode, and
+# the next enable_hotspot() then re-creates uap0 as a virtual AP on the
+# onboard radio. The v1 STA path therefore stops create_ap directly
+# (inside blueos-core) and leaves wifi-manager's ``hotspot_enabled``
+# setting alone. The ``[c]``/``[h]`` brackets keep pkill/pgrep from
+# matching the shell that runs them when blueos-core shares the host
+# PID namespace. wifi-manager hard-codes ``-n uap0`` in its create_ap
+# argv and create_ap names its conf dir ``/tmp/create_ap.uap0.conf.*``.
+V1_CREATE_AP_PATTERN = "[c]reate_ap -n uap0"
+V1_CREATE_AP_CHILDREN_PATTERN = r"[c]reate_ap\.uap0\.conf"
+V1_CREATE_AP_STOP_TIMEOUT_S = 10.0
 
 # Names the external/AP radio can appear under, most specific first.
 # On DORIS hardware udev renames the Realtek RTL88x2BU to ``uap0``; a
@@ -1058,11 +1073,13 @@ class NetworkService:
 
         Sequence:
 
-          1. Stash ``unmanaged-devices=uap0`` NM conf so NM can take
-             ownership of the interface; reload NM.
-          2. Disable BlueOS hotspot (legacy v1 toggle) — this kills
-             ``create_ap`` / hostapd on the interface.
-          3. Bring the iface link down/up to clear hostapd state.
+          1. If no password was given, reuse the PSK of a saved NM
+             profile for the same SSID (e.g. one BlueOS created for
+             ``wlan0``).
+          2. Stop ``create_ap`` / hostapd on uap0 directly — see
+             :data:`V1_CREATE_AP_PATTERN` for why not the hotspot API.
+          3. Stash ``unmanaged-devices=uap0`` NM conf, reload NM and
+             mark *iface* managed so NM will drive it.
           4. Create + activate an nmcli connection profile bound to
              *iface*, autoconnect off so it never auto-rejoins on its
              own.
@@ -1076,31 +1093,36 @@ class NetworkService:
             iface, ssid, conn_name,
         )
 
-        # 1. Stash unmanaged conf and reload NM so NM is willing to drive uap0.
+        # 1. The UI sends an empty password for networks it shows as
+        # saved; without this the profile below would be created as an
+        # open network and never associate to a WPA AP.
+        if not password:
+            saved = await self._v1_saved_psk(ssid)
+            if saved:
+                logger.info("[v1] Reusing saved password for %r", ssid)
+                password = saved
+
+        # 2. Stop the AP on uap0 without deleting the interface.
+        try:
+            if await self._client.get_smart_hotspot():
+                await self._client.set_smart_hotspot(False)
+        except Exception as e:
+            logger.debug("[v1] smart_hotspot check failed: %s", e)
+        if not await self._v1_stop_create_ap():
+            await self._v1_restore_hotspot(iface, conn_name)
+            self._record_failure(ssid, "Could not stop the DORIS hotspot")
+            return
+        await _run_host_command(f"sudo ip addr flush dev {iface} 2>/dev/null; true")
+
+        # 3. Hand uap0 to NetworkManager.
         await _run_host_command(
             f"if [ -f {V1_NM_UNMANAGED_CONF} ]; then "
             f"  sudo mv {V1_NM_UNMANAGED_CONF} {V1_NM_UNMANAGED_STASH}; "
             f"fi"
         )
         await _run_host_command("sudo nmcli general reload conf")
-        await asyncio.sleep(1)
-
-        # 2. Disable BlueOS hotspot (kills create_ap on uap0).
-        try:
-            await self._client.set_hotspot(False)
-        except Exception as e:
-            logger.warning("[v1] set_hotspot(False) failed: %s", e)
-            await self._v1_restore_hotspot(iface, conn_name)
-            self._record_failure(ssid, f"Could not disable hotspot: {e}")
-            return
-
+        await _run_host_command(f"sudo nmcli device set {iface} managed yes")
         await asyncio.sleep(3)
-
-        # 3. Force the link down/up to flush hostapd state cleanly.
-        await _run_host_command(
-            f"sudo ip link set {iface} down; sleep 1; sudo ip link set {iface} up"
-        )
-        await asyncio.sleep(2)
 
         # 4. Create + activate the nmcli connection.
         # Single-quote-escape SSID/password by replacing ' with '\''
@@ -1238,6 +1260,7 @@ class NetworkService:
             f"fi"
         )
         await _run_host_command("sudo nmcli general reload conf")
+        await _run_host_command(f"sudo nmcli device set {iface} managed no 2>/dev/null; true")
         await asyncio.sleep(1)
 
         # Bounce the link to clear any nmcli-supplicant state still
@@ -1254,6 +1277,77 @@ class NetworkService:
             logger.info("[v1] BlueOS hotspot re-enabled on %s", iface)
         except Exception as e:
             logger.warning("[v1] set_hotspot(True) failed: %s", e)
+
+    async def _v1_stop_create_ap(self) -> bool:
+        """Stop wifi-manager's create_ap on uap0 and wait for it to exit.
+
+        SIGINT is create_ap's clean-exit signal (it tears down hostapd,
+        dnsmasq and its iptables rules). Any hostapd/dnsmasq still bound
+        to create_ap's conf dir after the timeout is killed outright.
+        Returns False only if create_ap itself refuses to go away.
+        """
+        exec_prefix = f"docker exec {BLUEOS_CORE_CONTAINER}"
+
+        async def is_running() -> bool:
+            ok, out = await _run_host_command(
+                f"{exec_prefix} pgrep -f '{V1_CREATE_AP_PATTERN}' >/dev/null"
+                f" && echo running; true"
+            )
+            return ok and out == "running"
+
+        await _run_host_command(
+            f"{exec_prefix} pkill -INT -f '{V1_CREATE_AP_PATTERN}'; true"
+        )
+        loop = asyncio.get_event_loop()
+        deadline = loop.time() + V1_CREATE_AP_STOP_TIMEOUT_S
+        stopped = False
+        while loop.time() < deadline:
+            if not await is_running():
+                stopped = True
+                break
+            await asyncio.sleep(1)
+        if not stopped:
+            logger.warning("[v1] create_ap still running; sending SIGKILL")
+            await _run_host_command(
+                f"{exec_prefix} pkill -KILL -f '{V1_CREATE_AP_PATTERN}'; true"
+            )
+            await asyncio.sleep(1)
+            if await is_running():
+                logger.warning("[v1] create_ap survived SIGKILL")
+                return False
+        await _run_host_command(
+            f"{exec_prefix} pkill -KILL -f '{V1_CREATE_AP_CHILDREN_PATTERN}'; true"
+        )
+        await asyncio.sleep(1)
+        logger.info("[v1] create_ap stopped on uap0")
+        return True
+
+    async def _v1_saved_psk(self, ssid: str) -> str | None:
+        """PSK from the first saved NM WiFi profile whose SSID is *ssid*.
+
+        Returns None when no such profile exists or it has no PSK.
+        """
+        ok, out = await _run_host_command(
+            "nmcli -t -f UUID,TYPE connection show 2>/dev/null"
+        )
+        if not ok:
+            return None
+        for line in out.splitlines():
+            uuid, _, conn_type = line.strip().partition(":")
+            if conn_type != "802-11-wireless":
+                continue
+            ok, saved_ssid = await _run_host_command(
+                f"nmcli -e no -g 802-11-wireless.ssid connection show {uuid}"
+            )
+            if not ok or saved_ssid != ssid:
+                continue
+            ok, psk = await _run_host_command(
+                f"sudo nmcli -s -e no -g 802-11-wireless-security.psk "
+                f"connection show {uuid}"
+            )
+            if ok and psk:
+                return psk
+        return None
 
     async def _restore_ap_after_failure(self, iface: str) -> None:
         """Best-effort: put ``iface`` back into hotspot mode. Used both
