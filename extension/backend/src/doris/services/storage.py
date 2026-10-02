@@ -835,6 +835,20 @@ def _effective_created_at(path: Path, mtime_ts: float) -> datetime:
     return mtime_dt
 
 
+def _usb_layout_role(rel_under_mount: Path) -> tuple[str | None, bool]:
+    """Return ``(dive slug, is_vehicle_system)`` for a DORIS USB path.
+
+    ``DORIS/dives/<slug>/...`` is that dive's mission bundle.
+    ``DORIS/system/...`` holds vehicle diagnostics, not a dive product.
+    """
+    parts = rel_under_mount.parts
+    if len(parts) >= 2 and parts[0].lower() == "doris" and parts[1].lower() == "system":
+        return None, True
+    if len(parts) >= 3 and parts[0].lower() == "doris" and parts[1].lower() == "dives":
+        return parts[2], False
+    return None, False
+
+
 def _usb_file_to_media(
     full_path: Path,
     data_root: Path,
@@ -848,15 +862,32 @@ def _usb_file_to_media(
     eff = _effective_created_at(full_path, stat.st_mtime)
     eff_utc = eff if eff.tzinfo else eff.replace(tzinfo=timezone.utc)
     content_kind = _detect_media_type(full_path.name)
+    bundle_slug, vehicle_system = _usb_layout_role(rel_under_mount)
+    fid = f"{USB_MEDIA_PREFIX}{mount_key}:{rel_under_mount.as_posix()}"
+    if vehicle_system:
+        return MediaFile(
+            id=fid,
+            filename=full_path.name,
+            media_type=MediaType.SYSTEM,
+            size_bytes=stat.st_size,
+            created_at=eff,
+            mission_id=f"usb:{mount_key}",
+            dive_name=None,
+            download_url=f"/api/v1/media/download?path={quote(fid, safe='')}",
+        )
     dive_name = _bin_log_dive_name(full_path.name, content_kind, bin_index)
     media_type = content_kind
     if dive_name is None:
         wn = _match_dive_window(dive_windows, eff_utc)
         if wn:
             dive_name = wn.display_name
+    if dive_name is None and bundle_slug:
+        if bin_index is not None:
+            dive_name = bin_index.by_slug.get(bundle_slug.lower())
+        if dive_name is None:
+            dive_name = bundle_slug
     if dive_name is None and content_kind == MediaType.DATA:
         media_type = MediaType.SYSTEM
-    fid = f"{USB_MEDIA_PREFIX}{mount_key}:{rel_under_mount.as_posix()}"
     return MediaFile(
         id=fid,
         filename=full_path.name,

@@ -2,8 +2,9 @@
 
 After a dive ends (completed or cancelled), parse the dive's primary
 ``.mcap`` and write the comprehensive dive-data CSV to the external USB
-drive.  This mirrors :mod:`binlog` (which archives ArduPilot ``.BIN``
-logs to USB on the same hook) and exists for two reasons:
+drive, inside that dive's folder.  This mirrors :mod:`binlog` (which
+archives ArduPilot ``.BIN`` logs into the same dive folder) and exists
+for two reasons:
 
 1. **Latency.** Parsing a multi-million-message ``.mcap`` takes tens of
    seconds on the vehicle's Raspberry Pi.  Doing it once in the
@@ -29,11 +30,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import usb_storage
-from .binlog import wait_until_quiescent
+from .binlog import slug_for_dive, wait_until_quiescent
 
 logger = logging.getLogger(__name__)
-
-USB_SUBDIR = "dive_data"
 
 
 def _data_root() -> Path:
@@ -169,7 +168,9 @@ async def export_dive_csv_to_usb(dive_file: Path) -> dict:
         _write_record(dive_file, record)
         return {"status": "error", "error": f"build: {e}"}
 
-    usb_dir = usb_storage.get_recording_dir_if_available(USB_SUBDIR)
+    slug = slug_for_dive(record, dive_file)
+    # Parsed telemetry sits next to the .mcap inside this dive's folder.
+    usb_dir = usb_storage.get_recording_dir_if_available(f"dives/{slug}/telemetry")
     if usb_dir is None:
         logger.warning("CSV export: USB unavailable; skipping write for %s", dive_id)
         _set_export_status(record, status="skipped_no_usb")

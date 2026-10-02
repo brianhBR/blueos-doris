@@ -14,6 +14,7 @@ from doris.services.dive_processing import (
     _copy_verified,
     _infer_dive_stamp,
     _radcam_stamp_from_name,
+    _release_copied_working_dir,
     _resolve_dive_dir,
     quiesce_dive,
 )
@@ -639,3 +640,41 @@ class _FakeRecorder:
 
     def clear_snapshot_state(self) -> None:
         return None
+
+
+def test_release_working_dir_only_after_copies_match(tmp_path: Path) -> None:
+    doris = tmp_path / "DORIS"
+    usb_dir = doris / "dives" / "reef"
+    work = doris / "userdata" / "ipcam_recordings" / "dive_20260101_000000"
+    (usb_dir / "video").mkdir(parents=True)
+    (work / "logs").mkdir(parents=True)
+    (work / "clip.mp4").write_bytes(b"video")
+    (usb_dir / "video" / "clip.mp4").write_bytes(b"video")
+    (work / "logs" / "doris.log").write_bytes(b"log")
+    system = doris / "system" / "logs" / "reef"
+    system.mkdir(parents=True)
+    (system / "doris.log").write_bytes(b"log")
+
+    released = _release_copied_working_dir(
+        {"dive_dir": work, "usb_dir": usb_dir, "slug": "reef"}
+    )
+
+    assert released == work.name
+    assert not work.exists()
+
+
+def test_release_leaves_internal_recordings(tmp_path: Path) -> None:
+    usb_dir = tmp_path / "DORIS" / "dives" / "reef"
+    usb_dir.mkdir(parents=True)
+    internal = tmp_path / "internal" / "dive_x"
+    internal.mkdir(parents=True)
+    (internal / "clip.mp4").write_bytes(b"video")
+    (usb_dir / "clip.mp4").write_bytes(b"video")
+
+    assert (
+        _release_copied_working_dir(
+            {"dive_dir": internal, "usb_dir": usb_dir, "slug": "reef"}
+        )
+        is None
+    )
+    assert (internal / "clip.mp4").is_file()
