@@ -28,7 +28,13 @@ from ..models.configuration import (
     DeploymentConfiguration,
 )
 from ..models.dive_history import DiveHistoryEntry
-from ..models.media import MediaFile, MediaMission, MediaType, SyncStatus
+from ..models.media import (
+    MediaFile,
+    MediaMission,
+    MediaType,
+    StorageLocation,
+    SyncStatus,
+)
 
 from .binlog import slug_for_dive
 from .usb_storage import iter_media_files_on_usb, iter_media_scan_roots
@@ -140,6 +146,112 @@ def media_abs_path_from_download_id(file_path: str, data_root: Path) -> Path | N
     if not cand.is_relative_to(data_root.resolve()):
         return None
     return cand
+
+
+def _media_preference(media: MediaFile) -> tuple[int, str]:
+    """Prefer an organized USB archive, then another USB path, for display."""
+    normalized = media.id.replace("\\", "/").lower()
+    if normalized.startswith(USB_MEDIA_PREFIX) and "doris/dives/" in normalized:
+        return (2, media.id)
+    if normalized.startswith(USB_MEDIA_PREFIX):
+        return (1, media.id)
+    return (0, media.id)
+
+
+def _copied_media_key(media: MediaFile) -> tuple[object, ...] | None:
+    """Identity for a file that post-dive processing copies onto the USB archive.
+
+    Camera recordings stay in ``ipcam_recordings`` and are also copied under
+    ``dives/<name>/``. Those copies share a filename, size, and capture time.
+    The displayed row is the dive-folder copy (see :func:`_media_preference`).
+    """
+    if (
+        media.filename.lower().endswith(".mcap")
+        or _detect_media_type(media.filename) in (MediaType.IMAGE, MediaType.VIDEO)
+    ):
+        return (
+            "copy",
+            media.filename.casefold(),
+            media.size_bytes,
+            media.created_at.isoformat(),
+        )
+    return None
+
+
+def _deduplicate_media_files(files: list[MediaFile], root: Path) -> list[MediaFile]:
+    """Collapse mount aliases and copied media into logical records.
+
+    First collapse paths that resolve to the same device/inode. Then combine
+    distinct physical copies of a telemetry log, video, or still that share
+    their filename, size, and effective creation time. ``backing_ids`` retains
+    one safe delete target per physical file.
+    """
+    physical_groups: dict[tuple[object, ...], list[MediaFile]] = {}
+    for media in files:
+        path = media_abs_path_from_download_id(media.id, root)
+        try:
+            stat = path.stat() if path is not None else None
+        except OSError:
+            stat = None
+        key: tuple[object, ...] = (
+            ("id", media.id)
+            if stat is None
+            else ("inode", stat.st_dev, stat.st_ino)
+        )
+        physical_groups.setdefault(key, []).append(media)
+
+    physical: list[MediaFile] = []
+    for aliases in physical_groups.values():
+        representative = max(aliases, key=_media_preference)
+        # Seeing the same inode through a USB scan proves it is external; do
+        # not also label its internal bind-mount alias as a second location.
+        external = any(m.id.startswith(USB_MEDIA_PREFIX) for m in aliases)
+        location = (
+            StorageLocation.EXTERNAL if external else StorageLocation.INTERNAL
+        )
+        physical.append(
+            representative.model_copy(
+                update={
+                    "storage_locations": [location],
+                    "backing_ids": [representative.id],
+                }
+            )
+        )
+
+    logical_groups: dict[tuple[object, ...], list[MediaFile]] = {}
+    for media in physical:
+        key = _copied_media_key(media) or ("physical", media.backing_ids[0])
+        logical_groups.setdefault(key, []).append(media)
+
+    logical: list[MediaFile] = []
+    for copies in logical_groups.values():
+        representative = max(copies, key=_media_preference)
+        backing_ids = list(
+            dict.fromkeys(
+                backing_id
+                for copy in copies
+                for backing_id in copy.backing_ids
+            )
+        )
+        locations = {
+            location
+            for copy in copies
+            for location in copy.storage_locations
+        }
+        ordered_locations = [
+            location
+            for location in (StorageLocation.INTERNAL, StorageLocation.EXTERNAL)
+            if location in locations
+        ]
+        logical.append(
+            representative.model_copy(
+                update={
+                    "storage_locations": ordered_locations,
+                    "backing_ids": backing_ids,
+                }
+            )
+        )
+    return logical
 
 
 @dataclass(frozen=True)
@@ -723,6 +835,20 @@ def _effective_created_at(path: Path, mtime_ts: float) -> datetime:
     return mtime_dt
 
 
+def _usb_layout_role(rel_under_mount: Path) -> tuple[str | None, bool]:
+    """Return ``(dive slug, is_vehicle_system)`` for a DORIS USB path.
+
+    ``DORIS/dives/<slug>/...`` is that dive's mission bundle.
+    ``DORIS/system/...`` holds vehicle diagnostics, not a dive product.
+    """
+    parts = rel_under_mount.parts
+    if len(parts) >= 2 and parts[0].lower() == "doris" and parts[1].lower() == "system":
+        return None, True
+    if len(parts) >= 3 and parts[0].lower() == "doris" and parts[1].lower() == "dives":
+        return parts[2], False
+    return None, False
+
+
 def _usb_file_to_media(
     full_path: Path,
     data_root: Path,
@@ -736,15 +862,32 @@ def _usb_file_to_media(
     eff = _effective_created_at(full_path, stat.st_mtime)
     eff_utc = eff if eff.tzinfo else eff.replace(tzinfo=timezone.utc)
     content_kind = _detect_media_type(full_path.name)
+    bundle_slug, vehicle_system = _usb_layout_role(rel_under_mount)
+    fid = f"{USB_MEDIA_PREFIX}{mount_key}:{rel_under_mount.as_posix()}"
+    if vehicle_system:
+        return MediaFile(
+            id=fid,
+            filename=full_path.name,
+            media_type=MediaType.SYSTEM,
+            size_bytes=stat.st_size,
+            created_at=eff,
+            mission_id=f"usb:{mount_key}",
+            dive_name=None,
+            download_url=f"/api/v1/media/download?path={quote(fid, safe='')}",
+        )
     dive_name = _bin_log_dive_name(full_path.name, content_kind, bin_index)
     media_type = content_kind
     if dive_name is None:
         wn = _match_dive_window(dive_windows, eff_utc)
         if wn:
             dive_name = wn.display_name
+    if dive_name is None and bundle_slug:
+        if bin_index is not None:
+            dive_name = bin_index.by_slug.get(bundle_slug.lower())
+        if dive_name is None:
+            dive_name = bundle_slug
     if dive_name is None and content_kind == MediaType.DATA:
         media_type = MediaType.SYSTEM
-    fid = f"{USB_MEDIA_PREFIX}{mount_key}:{rel_under_mount.as_posix()}"
     return MediaFile(
         id=fid,
         filename=full_path.name,
@@ -970,6 +1113,7 @@ class StorageService:
                         _append_if_matches(mf)
                     except (FileNotFoundError, PermissionError, ValueError):
                         continue
+                files = _deduplicate_media_files(files, self.root)
                 files.sort(key=lambda f: f.created_at, reverse=True)
                 return files[offset : offset + limit]
 
@@ -1043,6 +1187,7 @@ class StorageService:
                         except (FileNotFoundError, PermissionError, ValueError):
                             continue
 
+            files = _deduplicate_media_files(files, self.root)
             files.sort(key=lambda f: f.created_at, reverse=True)
 
             return files[offset : offset + limit]
@@ -1194,6 +1339,26 @@ class StorageService:
         except Exception as e:
             logger.warning(f"Failed to delete file '{file_path}': {e}")
             raise
+
+    async def delete_logical_file(self, file_path: str) -> bool:
+        """Delete every distinct physical copy represented by a media row."""
+        files = await self.get_media_files(limit=2**31 - 1)
+        media = next(
+            (
+                candidate
+                for candidate in files
+                if candidate.id == file_path or file_path in candidate.backing_ids
+            ),
+            None,
+        )
+        if media is None:
+            return await self.delete_file(file_path)
+
+        deleted = False
+        for backing_id in media.backing_ids:
+            if await self.delete_file(backing_id):
+                deleted = True
+        return deleted
 
     async def get_sync_status(self) -> SyncStatus:
         """Get sync status (placeholder)."""

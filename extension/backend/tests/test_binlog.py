@@ -297,10 +297,14 @@ async def test_archive_copies_to_usb_with_dive_name_slug(
         bin_log_start_num=199,
     )
 
+    def _usb(sub: str) -> str:
+        assert sub == "dives/reef_survey_1/autopilot"
+        return str(usb)
+
     monkeypatch.setattr(
         binlog.usb_storage,
         "get_recording_dir_if_available",
-        lambda _sub: str(usb),
+        _usb,
     )
     # Skip the quiescence wait inside copy
     async def _instant_quiescent(*_args, **_kwargs):
@@ -347,10 +351,14 @@ async def test_archive_uses_dive_id_when_name_blank(
         dive_id="dive_0066",
     )
 
+    def _usb(sub: str) -> str:
+        assert sub == "dives/dive_0066/autopilot"
+        return str(usb)
+
     monkeypatch.setattr(
         binlog.usb_storage,
         "get_recording_dir_if_available",
-        lambda _sub: str(usb),
+        _usb,
     )
 
     async def _instant_quiescent(*_args, **_kwargs):

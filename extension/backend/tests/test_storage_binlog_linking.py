@@ -129,3 +129,44 @@ def test_usb_bin_without_match_falls_back_to_system(tmp_path: Path):
 
     assert mf.dive_name is None
     assert mf.media_type == MediaType.SYSTEM
+
+
+def test_usb_dive_bundle_links_without_a_clock(tmp_path: Path):
+    """A file living under DORIS/dives/<slug>/ belongs to that dive."""
+    _write_dive(tmp_path, "dive_0008", "8-17-pool-2", [])
+    idx = _load_bin_log_index(tmp_path)
+
+    csv = tmp_path / "20260817t231759_8_17_pool_2_dive_data.csv"
+    csv.write_text("timestamp_utc\n")
+    os.utime(csv, (BOGUS_MTIME, BOGUS_MTIME))
+
+    mf = _usb_file_to_media(
+        csv,
+        tmp_path,
+        dive_windows=[],
+        mount_key="usb0",
+        rel_under_mount=Path(
+            "DORIS/dives/8_17_pool_2/telemetry/20260817t231759_8_17_pool_2_dive_data.csv"
+        ),
+        bin_index=idx,
+    )
+
+    assert mf.dive_name == "8-17-pool-2"
+    assert mf.media_type == MediaType.DATA
+
+
+def test_usb_system_logs_are_not_a_dive(tmp_path: Path):
+    log = tmp_path / "doris.log"
+    log.write_text("startup\n")
+
+    mf = _usb_file_to_media(
+        log,
+        tmp_path,
+        dive_windows=[],
+        mount_key="usb0",
+        rel_under_mount=Path("DORIS/system/logs/8_17_pool_2/doris.log"),
+        bin_index=None,
+    )
+
+    assert mf.dive_name is None
+    assert mf.media_type == MediaType.SYSTEM

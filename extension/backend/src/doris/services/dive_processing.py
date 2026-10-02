@@ -41,9 +41,97 @@ from .dive_records import (
 
 logger = logging.getLogger(__name__)
 
-# Per-dive bundle on the stick, alongside the existing binlogs/ and dive_data/
-# folders that the BIN archive and CSV export write into.
+# Per-dive mission bundle on the stick: ``DORIS/dives/<slug>/``.
+# Autopilot BIN logs and the telemetry CSV are written into that same
+# folder.  Vehicle diagnostics (doris.log, dmesg) go to ``DORIS/system/``.
 USB_SUBDIR = "dives"
+
+_VEHICLE_LOG_RE = re.compile(r"^(?:doris|dmesg)\.log", re.IGNORECASE)
+
+
+def _is_vehicle_log(path: Path) -> bool:
+    """True for doris/dmesg diagnostics, which are not a dive's mission data."""
+    return _VEHICLE_LOG_RE.match(path.name) is not None
+
+
+def _vehicle_log_dir(usb_dir: Path, slug: str) -> Path:
+    """``DORIS/system/logs/<slug>/`` beside the per-dive mission bundle."""
+    if usb_dir.parent.name == "dives":
+        return usb_dir.parent.parent / "system" / "logs" / slug
+    return usb_dir.parent / "system" / "logs" / slug
+
+
+def _same_size(src: Path, dest: Path) -> bool:
+    try:
+        return dest.is_file() and dest.stat().st_size == src.stat().st_size
+    except OSError:
+        return False
+
+
+def _bundle_has_file(usb_dir: Path, src: Path) -> bool:
+    """True when the dive bundle already holds a same-sized copy of ``src``."""
+    direct = (
+        usb_dir / src.name,
+        usb_dir / "video" / src.name,
+        usb_dir / "photos" / src.name,
+        usb_dir / "camera" / src.name,
+        usb_dir / "telemetry" / src.name,
+    )
+    if any(_same_size(src, dest) for dest in direct):
+        return True
+    try:
+        return any(_same_size(src, dest) for dest in usb_dir.rglob(src.name))
+    except OSError:
+        return False
+
+
+def _release_copied_working_dir(ctx: dict) -> str | None:
+    """Remove the USB recording workspace once its files live in the dive bundle.
+
+    Recording writes ``userdata/ipcam_recordings/dive_<stamp>/`` and processing
+    copies the mission files into ``dives/<slug>/``.  On the same stick that
+    leaves two copies.  Internal recordings are left in place.  The workspace
+    is removed only when every mission file has a same-sized copy in the dive
+    bundle and every vehicle log has a same-sized copy under ``system/logs``.
+    """
+    dive_dir = ctx.get("dive_dir")
+    usb_dir = ctx.get("usb_dir")
+    slug = ctx.get("slug") or ""
+    if not isinstance(dive_dir, Path) or not isinstance(usb_dir, Path):
+        return None
+    if not dive_dir.is_dir() or usb_dir.parent.name != "dives":
+        return None
+    doris_root = usb_dir.parent.parent
+    resolved = dive_dir.resolve()
+    # Already inside the mission bundle, or not on this stick at all.
+    try:
+        resolved.relative_to(usb_dir.resolve())
+        return None
+    except ValueError:
+        pass
+    try:
+        resolved.relative_to(doris_root.resolve())
+    except ValueError:
+        return None
+
+    system_dir = _vehicle_log_dir(usb_dir, slug)
+    try:
+        files = [p for p in dive_dir.rglob("*") if p.is_file()]
+    except OSError:
+        return None
+    for src in files:
+        if _is_vehicle_log(src):
+            if not _same_size(src, system_dir / src.name):
+                return None
+            continue
+        if not _bundle_has_file(usb_dir, src):
+            return None
+    try:
+        shutil.rmtree(dive_dir)
+    except OSError as e:
+        logger.warning("Could not remove recording workspace %s: %s", dive_dir, e)
+        return None
+    return dive_dir.name
 
 # Refuse to start if the stick cannot hold the dive plus this much headroom,
 # so we fail in the preflight step instead of halfway through a copy.
@@ -665,12 +753,18 @@ class DiveProcessingService:
     async def _step_logs(self, session: ProcessingSession, ctx: dict) -> str:
         from .dive_finalize import _copy_diagnostic_logs
 
-        dive_dir: Path | None = ctx.get("dive_dir")
-        if dive_dir is None:
-            raise StepSkipped("no dive recording folder")
-        result = await asyncio.to_thread(_copy_diagnostic_logs, dive_dir)
+        usb_dir: Path | None = ctx.get("usb_dir")
+        slug = ctx.get("slug") or "dive"
+        if usb_dir is not None:
+            dest = _vehicle_log_dir(usb_dir, slug)
+        else:
+            dive_dir: Path | None = ctx.get("dive_dir")
+            if dive_dir is None:
+                raise StepSkipped("no dive recording folder")
+            dest = dive_dir / "logs"
+        result = await asyncio.to_thread(_copy_diagnostic_logs, dest, dest)
         copied = result.get("copied", [])
-        return f"{len(copied)} log file(s) collected"
+        return f"{len(copied)} vehicle log file(s) in {dest}"
 
     async def _step_radcam(self, session: ProcessingSession, ctx: dict) -> str:
         dive_dir: Path | None = ctx.get("dive_dir")
@@ -862,11 +956,18 @@ class DiveProcessingService:
                 written = _copy_verified(src, usb_dir / "photos" / src.name)
                 _note_copy(ctx, usb_dir / "photos" / src.name, written)
                 photos += 1
-            for src in sorted((dive_dir / "logs").rglob("*")):
-                if src.is_file():
-                    rel = src.relative_to(dive_dir / "logs")
-                    written = _copy_verified(src, usb_dir / "logs" / rel)
-                    _note_copy(ctx, usb_dir / "logs" / rel, written)
+            stream = dive_dir / "stream_log.jsonl"
+            if stream.is_file():
+                written = _copy_verified(stream, usb_dir / "camera" / stream.name)
+                _note_copy(ctx, usb_dir / "camera" / stream.name, written)
+            logs_dir = dive_dir / "logs"
+            if logs_dir.is_dir():
+                for src in sorted(logs_dir.rglob("*")):
+                    if not src.is_file() or _is_vehicle_log(src):
+                        continue
+                    rel = src.relative_to(logs_dir)
+                    written = _copy_verified(src, usb_dir / "camera" / rel)
+                    _note_copy(ctx, usb_dir / "camera" / rel, written)
             return videos, photos
 
         videos, photos = await asyncio.to_thread(_copy_media)
@@ -924,6 +1025,12 @@ class DiveProcessingService:
             return len(copied)
 
         count = await asyncio.to_thread(_verify)
+        released = await asyncio.to_thread(_release_copied_working_dir, ctx)
+        if released:
+            return (
+                f"{count} file(s) present and non-empty; "
+                f"removed recording workspace {released}"
+            )
         return f"{count} file(s) present and non-empty"
 
     async def _step_flush(self, session: ProcessingSession, ctx: dict) -> str:

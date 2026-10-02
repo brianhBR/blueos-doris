@@ -13,7 +13,8 @@ from pathlib import Path
 
 import pytest
 
-from doris.models.media import MediaType
+from doris.models.media import MediaType, StorageLocation
+from doris.services import storage
 from doris.services.storage import (
     StorageService,
     media_abs_path_from_download_id,
@@ -149,3 +150,106 @@ async def test_mission_filter_finds_snapshot_in_photos(svc):
 
     assert len(files) == 1
     assert files[0].filename.endswith(".jpg")
+
+
+async def test_mcap_bind_alias_is_one_external_file(svc, tmp_path, monkeypatch):
+    filename = "recorder_20260928_203114.mcap"
+    internal = svc.media_root / filename
+    internal.write_bytes(b"telemetry")
+    usb = tmp_path / "usb"
+    external = usb / "recorder" / filename
+    external.parent.mkdir(parents=True)
+    external.write_bytes(internal.read_bytes())
+
+    monkeypatch.setattr(
+        storage, "iter_media_scan_roots", lambda: [("portable", usb)]
+    )
+    real_resolver = storage.media_abs_path_from_download_id
+
+    def resolve_alias(file_id: str, root: Path) -> Path | None:
+        if file_id.startswith("usb:portable:recorder/"):
+            return internal
+        return real_resolver(file_id, root)
+
+    monkeypatch.setattr(storage, "media_abs_path_from_download_id", resolve_alias)
+
+    files = await svc.get_media_files()
+
+    assert len(files) == 1
+    assert files[0].id.startswith("usb:portable:")
+    assert files[0].storage_locations == [StorageLocation.EXTERNAL]
+    assert files[0].backing_ids == [files[0].id]
+
+
+async def test_mcap_copies_are_one_logical_file_and_delete_together(
+    svc, tmp_path, monkeypatch
+):
+    filename = "recorder_20260928_203114.mcap"
+    internal = svc.media_root / filename
+    internal.write_bytes(b"telemetry")
+    usb = tmp_path / "usb"
+    archived = usb / "DORIS" / "dives" / "bench" / "telemetry" / filename
+    archived.parent.mkdir(parents=True)
+    archived.write_bytes(internal.read_bytes())
+
+    monkeypatch.setattr(
+        storage, "iter_media_scan_roots", lambda: [("portable", usb)]
+    )
+
+    files = await svc.get_media_files()
+
+    assert len(files) == 1
+    media = files[0]
+    assert "DORIS/dives/" in media.id
+    assert media.storage_locations == [
+        StorageLocation.INTERNAL,
+        StorageLocation.EXTERNAL,
+    ]
+    assert len(media.backing_ids) == 2
+
+    assert await svc.delete_logical_file(media.id)
+    assert not internal.exists()
+    assert not archived.exists()
+
+
+async def test_video_copies_show_the_dive_folder_file(svc, tmp_path, monkeypatch):
+    """A processed clip is listed once, as the copy under dives/<name>/video/."""
+    filename = "20260930t184410_on_bottom.mp4"
+    payload = b"dock-test-video"
+    usb = tmp_path / "usb"
+    raw = (
+        usb
+        / "DORIS"
+        / "userdata"
+        / "ipcam_recordings"
+        / "dive_20260930_184410"
+        / filename
+    )
+    archived = usb / "DORIS" / "dives" / "mry_0930_01" / "video" / filename
+    raw.parent.mkdir(parents=True)
+    archived.parent.mkdir(parents=True)
+    raw.write_bytes(payload)
+    archived.write_bytes(payload)
+    solo_name = "20260930t120000_on_bottom.mp4"
+    solo = usb / "DORIS" / "userdata" / "ipcam_recordings" / "dive_solo" / solo_name
+    solo.parent.mkdir(parents=True)
+    solo.write_bytes(b"not-yet-copied")
+
+    monkeypatch.setattr(
+        storage, "iter_media_scan_roots", lambda: [("portable", usb)]
+    )
+
+    files = await svc.get_media_files()
+    clips = [f for f in files if f.filename == filename]
+
+    assert len(clips) == 1
+    media = clips[0]
+    assert "DORIS/dives/mry_0930_01/video/" in media.id.replace("\\", "/")
+    assert media.storage_locations == [StorageLocation.EXTERNAL]
+    assert len(media.backing_ids) == 2
+    assert any(f.filename == solo_name for f in files)
+
+    assert await svc.delete_logical_file(media.id)
+    assert not raw.exists()
+    assert not archived.exists()
+    assert solo.exists()

@@ -219,7 +219,7 @@ def register_media_routes(app: Robyn) -> None:
                     description=json.dumps({"error": "Missing 'path' parameter"}),
                     headers={"Content-Type": "application/json"},
                 )
-            success = await storage_service.delete_file(file_path)
+            success = await storage_service.delete_logical_file(file_path)
             return json.dumps({"success": success})
         except Exception as e:
             return Response(

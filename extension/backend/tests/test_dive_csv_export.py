@@ -103,9 +103,11 @@ def test_export_writes_csv_to_usb(tmp_path: Path, monkeypatch) -> None:
     usb = tmp_path / "usb" / "dive_data"
     usb.mkdir(parents=True)
     _patch_common(monkeypatch, tmp_path, mcap)
-    monkeypatch.setattr(
-        dce.usb_storage, "get_recording_dir_if_available", lambda sub: str(usb)
-    )
+    def _usb(sub: str) -> str:
+        assert sub == "dives/reef_survey/telemetry"
+        return str(usb)
+
+    monkeypatch.setattr(dce.usb_storage, "get_recording_dir_if_available", _usb)
 
     result = asyncio.run(dce.export_dive_csv_to_usb(dive_file))
 
@@ -156,9 +158,11 @@ def test_export_without_mcap_still_writes_header(tmp_path: Path, monkeypatch) ->
     usb = tmp_path / "usb" / "dive_data"
     usb.mkdir(parents=True)
     _patch_common(monkeypatch, tmp_path, None)
-    monkeypatch.setattr(
-        dce.usb_storage, "get_recording_dir_if_available", lambda sub: str(usb)
-    )
+    def _usb(sub: str) -> str:
+        assert sub == "dives/reef_survey/telemetry"
+        return str(usb)
+
+    monkeypatch.setattr(dce.usb_storage, "get_recording_dir_if_available", _usb)
 
     result = asyncio.run(dce.export_dive_csv_to_usb(dive_file))
 

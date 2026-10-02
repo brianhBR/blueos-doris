@@ -1,8 +1,9 @@
 """ArduPilot BIN log archiver.
 
 After a dive ends (completed or cancelled), copy the matching ArduPilot
-``.BIN`` log(s) from the firmware logs directory to the external USB
-drive under a dive-named filename, so they show up in the DORIS Data tab.
+``.BIN`` log(s) from the firmware logs directory into that dive's folder
+on the external USB (``DORIS/dives/<slug>/autopilot/``), under a
+dive-named filename, so they show up in the DORIS Data tab.
 
 ArduPilot writes a new ``00000NNN.BIN`` file every arm/disarm cycle and
 keeps the latest log number in ``LASTLOG.TXT``.  The Dockerfile bind-mounts
@@ -47,7 +48,6 @@ logger = logging.getLogger(__name__)
 
 BINLOG_DIR = Path(os.environ.get("DORIS_BINLOG_DIR", "/tmp/storage/firmware/logs"))
 LASTLOG_NAME = "LASTLOG.TXT"
-USB_SUBDIR = "binlogs"
 
 _BIN_RE = re.compile(r"^(\d+)\.BIN$", re.IGNORECASE)
 
@@ -355,7 +355,9 @@ async def archive_dive_bin_logs(
         _write_record(dive_file, record)
         return {"status": "no_match", "files": []}
 
-    usb_dir = usb_storage.get_recording_dir_if_available(USB_SUBDIR)
+    slug = slug_for_dive(record, dive_file)
+    # Mission product: live with the rest of this dive, not in a shared binlogs/.
+    usb_dir = usb_storage.get_recording_dir_if_available(f"dives/{slug}/autopilot")
     if usb_dir is None:
         logger.warning(
             "BIN archive: USB unavailable; skipping copy for %s (%d files matched)",
@@ -367,7 +369,6 @@ async def archive_dive_bin_logs(
         return {"status": "skipped_no_usb", "matched": len(src_paths)}
 
     dest_root = Path(usb_dir)
-    slug = slug_for_dive(record, dive_file)
 
     written: list[str] = []
     last_error: str | None = None

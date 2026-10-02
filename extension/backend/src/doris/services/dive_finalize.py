@@ -171,15 +171,15 @@ async def _ffprobe_duration_s(path: Path) -> float | None:
         return None
 
 
-def _copy_diagnostic_logs(rec_dir: Path) -> dict:
-    """Copy the persistent doris/dmesg logs into ``<dive_dir>/logs/``.
+def _copy_diagnostic_logs(rec_dir: Path, dest_dir: Path | None = None) -> dict:
+    """Copy the persistent doris/dmesg logs.
 
     The canonical logs live on *internal* storage
-    (``persistent_log.LOG_DIR``), but the recordings (and thus this dive
-    folder) frequently live on a USB stick the operator pulls -- so the
-    logs are otherwise easy to miss.  Copying ``doris.log*`` and
-    ``dmesg.log*`` here makes the whole diagnostic bundle travel with the
-    recordings.
+    (``persistent_log.LOG_DIR``).  ``dest_dir`` is where this copy lands.
+    Finalize passes the recording folder and the logs sit in its ``logs/``
+    subdir until post-dive processing moves them to ``DORIS/system/logs/``
+    on the stick.  Processing passes that system directory directly so the
+    dive folder stays limited to mission products.
 
     Synchronous (runs in an executor); strictly best-effort -- a copy
     failure is logged and summarised but never raises into finalize.
@@ -191,7 +191,7 @@ def _copy_diagnostic_logs(rec_dir: Path) -> dict:
         if not src_dir.is_dir():
             out["skipped"] = "log_dir_missing"
             return out
-        logs_dir = rec_dir / "logs"
+        logs_dir = dest_dir if dest_dir is not None else rec_dir / "logs"
         logs_dir.mkdir(parents=True, exist_ok=True)
         for src in sorted(src_dir.iterdir()):
             if not src.is_file():
