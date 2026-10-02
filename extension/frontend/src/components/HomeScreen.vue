@@ -188,6 +188,9 @@ onUnmounted(() => {
 })
 
 const diveName = ref('')
+const receiptNotice = ref('')
+const receiptText = ref('')
+const receiptFilename = ref('doris-dive-receipt.txt')
 const username = ref('')
 const selectedConfiguration = ref('')
 const estimatedDepth = ref('')
@@ -443,14 +446,43 @@ async function handleStartDive() {
     release_weight_date: releaseWeightDate.value,
     release_weight_time: releaseWeightTime.value,
   }
-  // Capture the surface launch position so the dive record has a start
-  // location (the end position is filled in from the log at dive end).
+  // Snapshot where and how the vehicle was sitting when the mission
+  // was loaded. The receipt and dive record keep this with the plan.
   const loc = location.value
-  if (loc && loc.fix_type !== 'none' && Number.isFinite(loc.latitude) && Number.isFinite(loc.longitude)) {
-    diveData.latitude = loc.latitude
-    diveData.longitude = loc.longitude
+  if (loc) {
+    diveData.fix_type = loc.fix_type
+    if (Number.isFinite(loc.satellites)) diveData.satellites = loc.satellites
+    if (loc.fix_type !== 'none' && Number.isFinite(loc.latitude) && Number.isFinite(loc.longitude)) {
+      diveData.latitude = loc.latitude
+      diveData.longitude = loc.longitude
+    }
   }
-  await startDive(selectedConfiguration.value, diveData)
+  const voltage = Number(battery.value?.voltage ?? systemStatus.value?.battery_voltage)
+  const level = Number(battery.value?.level ?? systemStatus.value?.battery_level)
+  if (Number.isFinite(voltage) && voltage > 0) diveData.battery_voltage = voltage
+  if (Number.isFinite(level)) diveData.battery_level = level
+  receiptNotice.value = ''
+  receiptText.value = ''
+  const result = await startDive(selectedConfiguration.value, diveData)
+  if (result?.success && result.receipt) {
+    receiptText.value = result.receipt
+    receiptFilename.value = result.receipt_filename || 'doris-dive-receipt.txt'
+    downloadTextFile(receiptFilename.value, receiptText.value)
+    receiptNotice.value = 'Dive receipt downloaded.'
+  }
+}
+
+function downloadTextFile(fileName: string, text: string) {
+  const blob = new Blob([text], { type: 'text/plain;charset=utf-8' })
+  const url = URL.createObjectURL(blob)
+  const anchor = document.createElement('a')
+  anchor.href = url
+  anchor.download = fileName
+  anchor.rel = 'noopener'
+  document.body.appendChild(anchor)
+  anchor.click()
+  document.body.removeChild(anchor)
+  window.setTimeout(() => URL.revokeObjectURL(url), 1000)
 }
 
 const formatReleaseTime = (date: Date) => {
@@ -672,6 +704,21 @@ const formatReleaseTime = (date: Date) => {
         style="color: #FCD869"
       >
         Mission loaded — ready for deployment.
+      </p>
+      <p
+        v-if="receiptNotice"
+        class="text-sm mt-1"
+        style="color: #96EEF2"
+      >
+        {{ receiptNotice }}
+        <button
+          v-if="receiptText"
+          type="button"
+          class="underline ml-2"
+          @click="downloadTextFile(receiptFilename, receiptText)"
+        >
+          Download again
+        </button>
       </p>
       <p
         v-if="missionPersistedLine"

@@ -1719,6 +1719,15 @@ export interface DiveMissionState {
   cancelled_at?: string
 }
 
+export interface DiveStartResult {
+  success: boolean
+  message: string
+  dive_file?: string
+  profile_id?: number
+  receipt?: string
+  receipt_filename?: string
+}
+
 export function useDiveControl() {
   const status = ref<DiveStatus | null>(null)
   const mission = ref<DiveMissionState | null>(null)
@@ -1726,22 +1735,22 @@ export function useDiveControl() {
   const sitlDropLoading = ref(false)
   const error = ref<string | null>(null)
 
-  async function startDive(configurationName?: string, diveData?: Record<string, unknown>): Promise<boolean> {
+  async function startDive(configurationName?: string, diveData?: Record<string, unknown>): Promise<DiveStartResult | null> {
     loading.value = true
     error.value = null
     try {
       const body: Record<string, unknown> = {}
       if (configurationName) body.configuration = configurationName
       if (diveData) Object.assign(body, diveData)
-      const result = await postApi<{ success: boolean; message: string }>('/dive/start', Object.keys(body).length > 0 ? body : undefined)
+      const result = await postApi<DiveStartResult>('/dive/start', Object.keys(body).length > 0 ? body : undefined)
       if (result.success) {
         await fetchDiveStatus()
         await fetchDiveMission()
       }
-      return result.success
+      return result
     } catch (e) {
       error.value = e instanceof Error ? e.message : 'Failed to start dive'
-      return false
+      return null
     } finally {
       loading.value = false
     }

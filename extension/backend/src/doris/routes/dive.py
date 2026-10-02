@@ -25,6 +25,7 @@ from ..services import ip_camera_recorder as iprec
 from ..services.camera import CameraService
 from ..services.dive import DiveService
 from ..services.dive_processing import dive_processing_service, quiesce_dive
+from ..services.dive_receipt import format_dive_receipt
 from ..services.dive_records import (
     find_latest_active_dive_record,
     set_mission_terminal_status,
@@ -45,6 +46,27 @@ camera_service = CameraService()
 DIVES_DIR = DATA_ROOT / "dives"
 MISSION_STATE_PATH = DATA_ROOT / "mission_state.json"
 PROFILE_SEQ_PATH = DATA_ROOT / "doris_profile_seq.txt"
+
+
+def _optional_float(value: object) -> float | None:
+    """Parse a JSON number, ignoring blanks and non-numeric values."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        number = float(value)
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        try:
+            number = float(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if number != number:
+        return None
+    return number
 
 
 def _allocate_profile_id() -> int:
@@ -308,13 +330,23 @@ def register_dive_routes(app: Robyn) -> None:
             "profile_id": profile_id,
             "bin_log_start_num": bin_log_start_num,
         }
-        lat, lon = body.get("latitude"), body.get("longitude")
+        lat = _optional_float(body.get("latitude"))
+        lon = _optional_float(body.get("longitude"))
         if lat is not None and lon is not None:
-            try:
-                dive_record["latitude"] = float(lat)
-                dive_record["longitude"] = float(lon)
-            except (TypeError, ValueError):
-                pass
+            dive_record["latitude"] = lat
+            dive_record["longitude"] = lon
+        fix_type = body.get("fix_type")
+        if isinstance(fix_type, str) and fix_type.strip():
+            dive_record["fix_type"] = fix_type.strip()
+        satellites = _optional_float(body.get("satellites"))
+        if satellites is not None:
+            dive_record["satellites"] = int(satellites)
+        battery_voltage = _optional_float(body.get("battery_voltage"))
+        battery_level = _optional_float(body.get("battery_level"))
+        if battery_voltage is not None:
+            dive_record["battery_voltage"] = battery_voltage
+        if battery_level is not None:
+            dive_record["battery_level"] = battery_level
         loc_str = body.get("location")
         if isinstance(loc_str, str) and loc_str.strip():
             dive_record["location"] = loc_str.strip()
@@ -322,6 +354,46 @@ def register_dive_routes(app: Robyn) -> None:
             dive_record["configuration_snapshot"] = json.loads(
                 config.model_dump_json()
             )
+
+        receipt_text = ""
+        receipt_filename = ""
+        if config is not None:
+            try:
+                receipt_text = format_dive_receipt(
+                    config,
+                    dive_name=str(dive_record.get("dive_name") or ""),
+                    username=str(dive_record.get("username") or ""),
+                    configuration_name=config_name or config.name,
+                    estimated_depth=str(dive_record.get("estimated_depth") or ""),
+                    release_date=str(dive_record.get("release_weight_date") or ""),
+                    release_time=str(dive_record.get("release_weight_time") or ""),
+                    loaded_at=loaded_at,
+                    profile_id=profile_id,
+                    latitude=dive_record.get("latitude"),
+                    longitude=dive_record.get("longitude"),
+                    fix_type=dive_record.get("fix_type"),
+                    satellites=dive_record.get("satellites"),
+                    battery_voltage=dive_record.get("battery_voltage"),
+                    battery_level=dive_record.get("battery_level"),
+                )
+                logger.info(
+                    "Mission loaded profile=%s lat=%s lon=%s fix=%s sats=%s "
+                    "battery_v=%s battery_pct=%s",
+                    profile_id,
+                    dive_record.get("latitude"),
+                    dive_record.get("longitude"),
+                    dive_record.get("fix_type"),
+                    dive_record.get("satellites"),
+                    dive_record.get("battery_voltage"),
+                    dive_record.get("battery_level"),
+                )
+                receipt_filename = f"{dive_file.stem}_receipt.txt"
+                (DIVES_DIR / receipt_filename).write_text(receipt_text, encoding="utf-8")
+                dive_record["receipt_file"] = receipt_filename
+            except Exception as e:
+                logger.warning("Failed to build dive receipt: %s", e)
+                receipt_text = ""
+                receipt_filename = ""
 
         try:
             dive_file.write_text(json.dumps(dive_record, indent=2, default=str))
@@ -351,12 +423,16 @@ def register_dive_routes(app: Robyn) -> None:
             logger.warning("Failed to schedule camera start sample: %s", e)
 
         msg = f"DORIS_START set to 1 (dive: {dive_file.name})"
-        return json.dumps({
+        payload = {
             "success": True,
             "message": msg,
             "dive_file": dive_file.name,
             "profile_id": profile_id,
-        })
+        }
+        if receipt_text:
+            payload["receipt"] = receipt_text
+            payload["receipt_filename"] = receipt_filename
+        return json.dumps(payload)
 
     @app.post("/api/v1/dive/stop")
     async def stop_dive():
