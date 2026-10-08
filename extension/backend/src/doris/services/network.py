@@ -1,6 +1,7 @@
 """Network/WiFi service."""
 
 import asyncio
+import base64
 import json
 import logging
 from datetime import datetime, timezone
@@ -52,6 +53,11 @@ V1_NM_UNMANAGED_CONF = "/etc/NetworkManager/conf.d/99-blueos-hotspot-uap0.conf"
 V1_NM_UNMANAGED_STASH = "/tmp/doris-99-blueos-hotspot-uap0.conf.stash"
 V1_UAP0_CONNECTION_PREFIX = "doris-uap0-sta-"
 V1_DHCP_TIMEOUT_S = 30
+# nmcli connection up does not hand a stored PSK to the activation
+# request when it has no terminal to ask on (Commander). It then fails
+# with "Secrets were required, but not provided" even though the
+# profile contains the password. passwd-file supplies it explicitly.
+V1_PSK_FILE = "/tmp/doris-uap0-sta.psk"
 
 # BlueOS wifi-manager's disable_hotspot() runs ``iw dev uap0 del``
 # because it assumes uap0 is a virtual interface it created. On DORIS
@@ -1155,9 +1161,16 @@ class NetworkService:
             self._record_failure(ssid, f"nmcli add failed: {err[:200]}")
             return
 
-        ok, err = await _run_host_command(
-            f"sudo nmcli --wait 30 connection up '{conn_name}'", timeout=45.0,
-        )
+        up_cmd = f"sudo nmcli --wait 30 connection up '{conn_name}'"
+        if password:
+            if not await self._v1_write_psk_file(password):
+                await self._v1_restore_hotspot(iface, conn_name)
+                self._record_failure(ssid, "Could not stage the WiFi password")
+                return
+            up_cmd += f" passwd-file {V1_PSK_FILE}"
+        ok, err = await _run_host_command(up_cmd, timeout=45.0)
+        if password:
+            await _run_host_command(f"sudo rm -f {V1_PSK_FILE}")
         if not ok:
             logger.warning("[v1] nmcli connection up failed: %s", err)
             await _run_host_command(
@@ -1321,6 +1334,24 @@ class NetworkService:
         await asyncio.sleep(1)
         logger.info("[v1] create_ap stopped on uap0")
         return True
+
+    async def _v1_write_psk_file(self, password: str) -> bool:
+        """Write *password* to :data:`V1_PSK_FILE` for ``nmcli passwd-file``.
+
+        The payload is base64 so the password is never parsed by the
+        shell. Caller deletes the file after ``connection up`` returns.
+        """
+        encoded = base64.b64encode(
+            f"802-11-wireless-security.psk:{password}\n".encode()
+        ).decode("ascii")
+        ok, err = await _run_host_command(
+            f"printf %s '{encoded}' | base64 -d | sudo tee {V1_PSK_FILE} >/dev/null "
+            f"&& sudo chmod 600 {V1_PSK_FILE}"
+        )
+        if not ok:
+            logger.warning("[v1] could not write PSK file: %s", err)
+            await _run_host_command(f"sudo rm -f {V1_PSK_FILE}")
+        return ok
 
     async def _v1_saved_psk(self, ssid: str) -> str | None:
         """PSK from the first saved NM WiFi profile whose SSID is *ssid*.

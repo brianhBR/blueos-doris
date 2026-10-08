@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import base64
+
 import pytest
 
 from doris.services import network
@@ -66,6 +68,12 @@ async def test_saved_network_reuses_saved_psk(
 
     [add_cmd] = host.find("nmcli connection add")
     assert "wifi-sec.key-mgmt wpa-psk wifi-sec.psk 's3cret'" in add_cmd
+    [up_cmd] = host.find("nmcli --wait 30 connection up")
+    assert f"passwd-file {network.V1_PSK_FILE}" in up_cmd
+    [stage_cmd] = host.find("base64 -d")
+    encoded = stage_cmd.split("'", 2)[1]
+    assert base64.b64decode(encoded) == b"802-11-wireless-security.psk:s3cret\n"
+    assert host.find(f"sudo rm -f {network.V1_PSK_FILE}")
     state = await service.get_wlan_state()
     assert state.mode == "sta_connected"
     assert state.ip_address == "10.0.0.5"
