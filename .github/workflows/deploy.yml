@@ -18,6 +18,16 @@ jobs:
     runs-on: ubuntu-latest
     if: github.event_name != 'pull_request'
     steps:
+      # The publish action logs into Docker Hub only after the image
+      # build, so base-image pulls are anonymous and GitHub-hosted
+      # runners hit the 429 pull limit. Logging in first makes those
+      # pulls count against the authenticated quota.
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: sailorman225
+          password: ${{ secrets.DOCKER_PASSWORD }}
+
       - name: Deploy to Docker Hub
         uses: BlueOS-community/Deploy-BlueOS-Extension@main
         with:
@@ -42,6 +52,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: Login to Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: sailorman225
+          password: ${{ secrets.DOCKER_PASSWORD }}
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v4
