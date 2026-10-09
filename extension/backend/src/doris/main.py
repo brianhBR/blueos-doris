@@ -192,20 +192,21 @@ def create_app() -> Robyn:
             logger.warning("doris.local setup skipped: %s", e)
 
         network_service = get_network_service()
+        # Drop any leftover client profile before deciding the hotspot is
+        # healthy. nmcli connection down on doris-uap0-sta-* takes uap0
+        # down, so this has to run first or it knocks out an access point
+        # that configure_hotspot() just accepted.
+        try:
+            await network_service.reset_wlan_to_ap_on_boot()
+        except Exception as e:
+            logger.warning("WLAN intent reset skipped: %s", e)
+
         hotspot_changed = False
         try:
             await network_service.configure_hotspot()
             hotspot_changed = True
         except Exception as e:
             logger.warning("Hotspot configuration skipped: %s", e)
-
-        # Force the AP/STA intent back to AP and pre-emptively disconnect
-        # any client association so a saved client WLAN can't quietly
-        # auto-join behind our back. Power cycle == AP, always.
-        try:
-            await network_service.reset_wlan_to_ap_on_boot()
-        except Exception as e:
-            logger.warning("WLAN intent reset skipped: %s", e)
 
         try:
             await start_hotspot_dns()

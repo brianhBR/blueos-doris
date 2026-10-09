@@ -111,3 +111,72 @@ async def test_restores_hotspot_when_create_ap_will_not_stop(
     assert state.mode == "ap"
     assert state.last_attempt is not None
     assert state.last_attempt.status == "failed"
+
+
+class _V1HotspotClient:
+    def __init__(self) -> None:
+        self.hotspot_calls: list[bool] = []
+
+    async def get_hotspot_credentials(self) -> dict[str, str]:
+        return {"ssid": "DORIS (D-0F58)", "password": "blueosap"}
+
+    async def get_smart_hotspot(self) -> bool:
+        return False
+
+    async def set_smart_hotspot(self, enable: bool) -> None:
+        pass
+
+    async def get_hotspot(self) -> bool:
+        return True
+
+    async def set_hotspot(self, enable: bool) -> None:
+        self.hotspot_calls.append(enable)
+
+
+class _RadioHost:
+    def __init__(self, *, ap: bool) -> None:
+        self.ap = ap
+        self.commands: list[str] = []
+
+    async def __call__(self, command: str, timeout: float = 30.0) -> tuple[bool, str]:
+        self.commands.append(command)
+        if "test -d /sys/class/net/uap0" in command:
+            return True, "uap0"
+        if "iw dev uap0 info" in command:
+            if self.ap:
+                return True, "Interface uap0\n\ttype AP\n\tchannel 6 (2437 MHz)"
+            return True, "Interface uap0\n\ttype managed\n\ttxpower -100.00 dBm"
+        if "ip -br link show dev uap0" in command:
+            return True, "UP" if self.ap else "DOWN"
+        if "pgrep" in command:
+            return True, ""
+        return True, ""
+
+
+async def test_v1_hotspot_left_alone_when_radio_is_an_ap(
+    service: network.NetworkService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _V1HotspotClient()
+    service._client = client  # type: ignore[assignment]
+    monkeypatch.setattr(network, "_run_host_command", _RadioHost(ap=True))
+
+    await service._configure_hotspot_v1("DORIS (D-0F58)", "blueosap")
+
+    assert client.hotspot_calls == []
+
+
+async def test_v1_hotspot_restarts_when_radio_is_down(
+    service: network.NetworkService, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client = _V1HotspotClient()
+    service._client = client  # type: ignore[assignment]
+    host = _RadioHost(ap=False)
+    monkeypatch.setattr(network, "_run_host_command", host)
+
+    await service._configure_hotspot_v1("DORIS (D-0F58)", "blueosap")
+
+    assert client.hotspot_calls == [True]
+    assert host.commands
+    assert any("pkill -INT" in cmd for cmd in host.commands)
+    assert not any("hotspot?enable=false" in cmd for cmd in host.commands)
+

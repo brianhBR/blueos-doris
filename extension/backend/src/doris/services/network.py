@@ -520,6 +520,25 @@ class NetworkService:
         logger.debug("v1 hotspot: unrecognised state payload %r", hs)
         return None
 
+    async def _v1_radio_is_ap(self) -> bool:
+        """Whether the external radio is up and in access-point mode.
+
+        hostapd can report ``state=ENABLED`` while ``uap0`` is
+        administratively down and still typed ``managed``. ``iw``
+        showing ``type AP`` plus a channel, with the link up, is the
+        state a client can actually join.
+        """
+        iface = await self._resolve_external_iface_v1()
+        if not iface:
+            return False
+        ok, info = await _run_host_command(f"sudo iw dev {iface} info 2>/dev/null")
+        if not ok or "type AP" not in info or "channel " not in info:
+            return False
+        ok, state = await _run_host_command(
+            f"ip -br link show dev {iface} | awk '{{print $2}}'"
+        )
+        return ok and state.strip() == "UP"
+
     async def _configure_hotspot_v1(self, ssid: str, password: str) -> None:
         """Point the global BlueOS hotspot at DORIS and make sure it is up.
 
@@ -559,18 +578,25 @@ class NetworkService:
             logger.debug("v1 hotspot: smart_hotspot check failed: %s", e)
 
         enabled = await self._is_hotspot_enabled_v1()
+        beaconing = await self._v1_radio_is_ap()
 
-        if enabled and not renamed:
-            # Already broadcasting under the right name — leave it be so
-            # a backend restart doesn't kick connected clients off.
+        if enabled and not renamed and beaconing:
+            # The radio is actually an access point under the right name.
+            # Leave it be so a backend restart doesn't kick clients off.
+            # The BlueOS "enabled" flag alone is not enough: a leftover
+            # STA profile teardown can leave hostapd reporting success
+            # while uap0 is administratively down.
             logger.info("Hotspot already up and broadcasting %r (v1 path)", ssid)
             return
 
         try:
             if enabled:
-                # New credentials only take effect on a restart of the AP.
-                await self._client.set_hotspot(False)
-                await asyncio.sleep(3)
+                # Restart the AP without set_hotspot(False). That call
+                # runs ``iw dev uap0 del`` and deletes the physical dongle.
+                if not await self._v1_stop_create_ap():
+                    logger.warning(
+                        "v1 hotspot: create_ap did not exit before restart",
+                    )
             await self._client.set_hotspot(True)
             logger.info("Hotspot enabled via v1; broadcasting %r", ssid)
         except Exception as e:
@@ -802,7 +828,7 @@ class NetworkService:
     async def reset_wlan_to_ap_on_boot(self) -> None:
         """Force WLAN intent back to ``ap`` and proactively disconnect
         any STA association *on the external interface only*. Called
-        once at startup *after* ``configure_hotspot()``.
+        once at startup *before* ``configure_hotspot()``.
 
         Saved networks are *kept* (option (b)) so the user can pick a
         previously-used SSID from the scan list and reconnect with one
@@ -841,11 +867,12 @@ class NetworkService:
                     "Boot-time WLAN disconnect skipped on %s: %s", v2_iface, e,
                 )
         else:
-            # v1 fallback: if a previous run crashed mid-switch we may
-            # still have an unmanaged-conf stash sitting in /tmp and a
-            # leftover doris-uap0-sta-* nmcli profile holding the
-            # interface. Roll back so configure_hotspot() (which the
-            # caller just ran) can actually drive create_ap.
+            # v1 fallback: a previous STA session leaves a
+            # doris-uap0-sta-* profile, and maybe an unmanaged-conf
+            # stash in /tmp. Remove those before configure_hotspot()
+            # starts the AP. ``connection down`` drops uap0, so the
+            # caller must check that the radio is actually beaconing
+            # afterwards rather than trusting the hotspot setting.
             v1_iface = await self._resolve_external_iface_v1()
             if v1_iface:
                 # Tear down any stale doris-uap0-sta-* profiles.
